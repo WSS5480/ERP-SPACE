@@ -1,11 +1,10 @@
 // The ERP's front door: an HTTP service over the core, with nothing clever in it.
 //
-// It does four jobs. It runs migrations when it starts, so a fresh database
-// becomes a working one without anyone touching it. It serves the first
-// screen -- feed health, what is quarantined, which days have no statement,
-// and an upload button -- at the root address. It exposes read endpoints for
-// the same views, for scripts. And it gives every push channel a real door:
-// hand upload, signed webhooks, and inbound email.
+// It runs migrations when it starts, so a fresh database becomes a working one
+// without anyone touching it. It serves the app -- every company the operator
+// keeps books for, each with its home, approvals, payables, payroll, books,
+// cash, reconciliation and feeds -- and the API behind it. And it gives every
+// push channel a real door: hand upload, signed webhooks, and inbound email.
 //
 // Security posture, stated plainly because this holds financial data:
 //
@@ -14,14 +13,18 @@
 //
 //   Every /api route needs either that token (scripts) or a signed-in
 //   browser session (people). /health is the only other public data route
-//   and it returns no business data. The page itself is public, but it is
-//   only a shell: every number on it comes from /api after sign-in.
+//   and it returns no business data. The page and its script are public, but
+//   they are only a shell: every number comes from /api after sign-in.
 //
 //   Signing in takes the same token plus the person's name. The session is a
 //   cookie the browser cannot read from script, sent only to this site, and
 //   signed with a key derived from the token -- rotate the token in Render and
 //   every session ends. Anything that changes data from a browser must also
 //   carry a header a cross-site form cannot send.
+//
+//   Every change names the person it is done as, and that person has to be
+//   one of the company's own. The engine then applies that person's roles:
+//   the maker is never the checker, whoever builds a run cannot release it.
 //
 //   Webhooks are not bearer-authenticated -- the sender cannot hold our token
 //   -- so each one must carry an HMAC signature made with that connection's
@@ -34,10 +37,10 @@
 //   Secrets live in environment variables named from the connection's
 //   credential_ref, never in the database.
 //
-// The token is an operator key, not per-person sign-in. The name typed at
-// sign-in goes on every upload and dismissal in the audit trail, but nothing
-// checks it. Real users, roles and sessions are still the next piece of work;
-// until then, treat the token like the keys to the office.
+// The token is an operator key, not per-person sign-in, and choosing who to
+// act as is the operator's to make. That is right for the trial and wrong for
+// real books: per-person sign-in, with each person only ever acting as
+// themselves, comes before any real data does.
 
 import http from "node:http";
 import { readFileSync } from "node:fs";
@@ -49,8 +52,17 @@ import {
   ingest, loadConnection, openQuarantine, releaseQuarantine, handlerFor,
   ChannelRefused, type Offered, type Connection,
 } from "../packages/core/connections.ts";
+import { ApprovalError } from "../packages/core/approvals.ts";
+import { TransitionError } from "../packages/core/invoice.ts";
+import { PayrollError } from "../packages/core/payroll.ts";
+import { BankingError } from "../packages/core/banking.ts";
+import { ReconcileError } from "../packages/core/reconcile.ts";
 import "../packages/core/statements.ts"; // registers the bank_statement handler
 import { migrate } from "../scripts/migrate.ts";
+import * as views from "./views.ts";
+import * as act from "./actions.ts";
+import { ActionError, type Actor } from "./actions.ts";
+import { loadSampleActivity } from "./sample.ts";
 
 const PORT = Number(process.env.PORT ?? 10000);
 const TOKEN = process.env.ERP_API_TOKEN ?? "";
@@ -64,10 +76,6 @@ const STARTED = new Date().toISOString();
 
 const SESSION_COOKIE = "erp_session";
 const SESSION_HOURS = 12;
-// Which network clients this build actually has. The pipeline is wired for
-// both; the clients themselves are the next thing to write. The screen reads
-// this to say honestly what each feed is still waiting on.
-const TRANSPORTS = { sftp: false, http: false };
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -86,6 +94,16 @@ class Html {
   text: string;
   constructor(text: string) {
     this.text = text;
+  }
+}
+
+/** A static file, served as-is. */
+class Asset {
+  text: string;
+  type: string;
+  constructor(text: string, type: string) {
+    this.text = text;
+    this.type = type;
   }
 }
 
@@ -135,8 +153,8 @@ function page(res: http.ServerResponse, status: number, text: string, nonce: str
     "content-type": "text/html; charset=utf-8",
     "content-security-policy": [
       "default-src 'none'",
-      `script-src 'nonce-${nonce}'`,
-      `style-src 'nonce-${nonce}'`,
+      "script-src 'self'",
+      `style-src 'self' 'nonce-${nonce}'`,
       "img-src 'self' data:",
       "connect-src 'self'",
       "form-action 'self'",
@@ -165,7 +183,7 @@ async function readBody(req: http.IncomingMessage, limit = MAX_BODY): Promise<Bu
 }
 
 async function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
-  const raw = await readBody(req, 64 * 1024);
+  const raw = await readBody(req, 256 * 1024);
   if (!raw.length) return {};
   try {
     const v = JSON.parse(raw.toString("utf8"));
@@ -233,7 +251,7 @@ function authenticate(req: http.IncomingMessage): Who | null {
   return s ? { via: "session", ...s } : null;
 }
 
-/** What the audit trail records as the actor. */
+/** What the audit trail records as the actor, when nobody has been chosen. */
 const labelFor = (who: Who | null, apiLabel: string): string =>
   who?.via === "session" ? `${who.name} (web)` : apiLabel;
 
@@ -250,21 +268,24 @@ const signInThrottled = () => Date.now() - failWindow <= 10 * 60_000 && failCoun
 
 // --------------------------------------------------------------------- page
 
-function loadPage(): string | null {
+const readHere = (name: string): string | null => {
   try {
-    return readFileSync(join(here, "app.html"), "utf8");
+    return readFileSync(join(here, name), "utf8");
   } catch {
     return null;
   }
-}
-const APP = loadPage();
+};
+const APP = readHere("app.html");
+const APP_JS = readHere("app.js");
+const APP_CSS = readHere("app.css");
+const ASSET_VERSION = `${VERSION}-${Date.parse(STARTED).toString(36)}`;
 
 const MISSING_PAGE = `<!doctype html><meta charset="utf-8"><title>Pentex ERP</title>
 <style nonce="__NONCE__">body{font:16px/1.5 system-ui,sans-serif;margin:3rem auto;max-width:36rem;padding:0 1rem}</style>
-<h1>Pentex ERP</h1><p>The service is running, but the screen file <code>server/app.html</code> is not in this deploy.
-Add it to the repository's <code>server</code> folder and deploy again.</p>`;
+<h1>Pentex ERP</h1><p>The service is running, but the app files (<code>server/app.html</code>, <code>app.js</code> and
+<code>app.css</code>) are not all in this deploy. Add them to the repository's <code>server</code> folder and deploy again.</p>`;
 
-// ------------------------------------------------------------------ overview
+// ------------------------------------------------------------------ helpers
 
 const scopeFor = (conn: Connection, label: string, kind: "user" | "agent" | "system" = "user"): Scope => ({
   tenantId: conn.tenant_id,
@@ -273,6 +294,7 @@ const scopeFor = (conn: Connection, label: string, kind: "user" | "agent" | "sys
 });
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
 
 async function connectionOr404(id: string): Promise<Connection> {
   if (!UUID.test(id)) throw new HttpError(404, "no such connection");
@@ -286,151 +308,28 @@ async function connectionOr404(id: string): Promise<Connection> {
   }
 }
 
-type Step = { kind: "setup" | "build"; text: string };
+async function companyOr404(c: Client, id: string): Promise<views.Company> {
+  if (!UUID.test(id)) throw new HttpError(404, "no such company");
+  const co = await views.loadCompany(c, id);
+  if (!co) throw new HttpError(404, "no such company");
+  return co;
+}
 
-type ConnRow = {
-  id: string; name: string; source_code: string; source_name: string; direction: string;
-  channel: string; mode: string; status: string; verdict: string; days_since_success: number | null;
-  consecutive_failures: number; last_error: string | null; last_success_at: string | null;
-  last_attempt_at: string | null; credential_ref: string | null; format: string | null;
-  mailbox: string | null; host: string | null; account_name: string | null; bank_name: string | null;
-  account_last4: string | null; files: number; last_file_at: string | null;
+const actingId = (req: http.IncomingMessage): string | null => {
+  const v = String(req.headers["x-pentex-as"] ?? "").trim();
+  return UUID.test(v) ? v : null;
 };
 
-/**
- * What stands between a connection and its first file, split into what a
- * person has to arrange (setup) and what still has to be written (build).
- * An empty list means it is ready now.
- */
-function stepsFor(r: ConnRow): Step[] {
-  const steps: Step[] = [];
-  // "POS takings" stays POS; "Supplier invoice" becomes "supplier invoice".
-  const noun = r.source_name.split(" ").map((w) => (/^[A-Z0-9]{2,}$/.test(w) ? w : w.toLowerCase())).join(" ");
-  const a = /^[aeiou]/i.test(noun) ? "An" : "A";
-  if (!handlerFor(r.source_code)) {
-    steps.push({ kind: "build", text: `${a} ${noun} ${r.direction === "outbound" ? "writer" : "reader"}` });
-  }
-  const from = r.bank_name ? ` from ${r.bank_name}` : r.host ? ` for ${r.host}` : "";
-  const credentialSet = !!(r.credential_ref && secretFor(r.credential_ref));
-  switch (r.channel) {
-    case "sftp":
-      if (!credentialSet) steps.push({ kind: "setup", text: `SFTP login${from}` });
-      if (!TRANSPORTS.sftp) steps.push({ kind: "build", text: "The SFTP connector" });
-      break;
-    case "api":
-      if (!credentialSet) steps.push({ kind: "setup", text: `API key${from}` });
-      if (!TRANSPORTS.http) steps.push({ kind: "build", text: "The bank API connector" });
-      break;
-    case "email":
-      if (!EMAIL_TOKEN) steps.push({ kind: "setup", text: "The inbound-email token" });
-      if (!r.files) steps.push({ kind: "setup", text: `Mail to ${r.mailbox ?? "its mailbox"} forwarded here` });
-      break;
-    case "webhook":
-      if (!credentialSet) steps.push({ kind: "setup", text: "Its signing secret" });
-      break;
-  }
-  return steps;
-}
-
-async function connectionsFor(c: Client, tenantId: string) {
-  const rows = await q<ConnRow>(c, `
-    select c.id, c.name, c.source_code, s.name as source_name, s.direction,
-           c.channel, sc.mode, c.status, h.verdict, h.days_since_success,
-           c.consecutive_failures, c.last_error, c.last_success_at, c.last_attempt_at,
-           c.credential_ref, c.config->>'format' as format, c.config->>'mailbox' as mailbox, c.config->>'host' as host,
-           b.name as account_name, b.bank_name, b.account_last4,
-           (select count(*) from inbound_file f where f.connection_id = c.id)::int as files,
-           (select max(f.received_at) from inbound_file f where f.connection_id = c.id) as last_file_at
-      from connection c
-      join connection_health h on h.connection_id = c.id
-      join ingest_source s on s.code = c.source_code
-      join source_channel sc on sc.source_code = c.source_code and sc.channel = c.channel
-      left join bank_account b on b.id = c.bank_account_id
-     where c.entity_id = $1 or (c.entity_id is null and c.tenant_id = $2)
-     order by s.direction, c.name`, [ENTITY, tenantId]);
-  // The reference names where the secret lives; the screen only needs to
-  // know whether it is there.
-  return rows.map(({ credential_ref, ...r }) => ({ ...r, steps: stepsFor({ ...r, credential_ref }) }));
-}
-
-/**
- * Every weekday in the last 30 days (or since the account opened) with no
- * statement on file -- holes included. The statement_gaps view in 0013 only
- * counts days after an account's latest statement, so a missing Wednesday
- * between two good days went unseen; this is the rule the screen uses until
- * a migration corrects the view.
- */
-async function gapsFor(c: Client) {
-  return await q<{ bank_account_id: string; account_name: string; bank_name: string; missing_on: string; days_ago: number }>(c, `
-    with acct as (
-      select b.id, b.name, b.bank_name,
-             greatest(current_date - 30, coalesce(b.opened_on, current_date - 30)) as since
-        from bank_account b
-       where b.entity_id = $1 and b.status = 'active'
-    ), days as (
-      select a.id, a.name, a.bank_name, d::date as d
-        from acct a, generate_series(a.since::timestamp, (current_date - 1)::timestamp, interval '1 day') d
-       where extract(isodow from d) between 1 and 5
-    )
-    select id as bank_account_id, name as account_name, bank_name,
-           d::text as missing_on, (current_date - d)::int as days_ago
-      from days
-     where not exists (select 1 from bank_statement s where s.bank_account_id = days.id and s.statement_date = days.d)
-     order by d desc, name`, [ENTITY]);
-}
-
-async function overview(who: Who | null) {
-  const c = await pool.connect();
-  try {
-    const ent = await q<{ name: string; tenant_id: string }>(c,
-      `select e.name, e.tenant_id from entity e where e.id = $1 /* unscoped: the entity row itself */`, [ENTITY]);
-    if (!ent.length) throw new HttpError(404, "the configured company does not exist in this database");
-
-    const connections = await connectionsFor(c, ent[0].tenant_id);
-
-    const accounts = await q(c, `
-      select i.bank_account_id, i.account_name, i.bank_name, b.account_last4, b.purpose,
-             l.name as location, i.connection_id, c.name as connection_name, i.channel,
-             i.connection_status, i.through::text as through, i.quarantined::int as quarantined
-        from statement_intake i
-        join bank_account b on b.id = i.bank_account_id
-        left join location l on l.id = b.location_id
-        left join connection c on c.id = i.connection_id
-       where i.entity_id = $1
-       order by case b.purpose when 'operating' then 0 when 'deposit' then 1
-                               when 'payroll' then 2 else 3 end, i.account_name`, [ENTITY]);
-
-    const gaps = await gapsFor(c);
-    for (const a of accounts as Record<string, unknown>[]) {
-      const mine = gaps.filter((g) => g.bank_account_id === a.bank_account_id).map((g) => g.missing_on);
-      a.missing_days = mine.length;
-      a.missing_dates = mine;
-    }
-
-    const quarantine = await q(c, `
-      select file_id, connection_name, source_code, channel, origin, received_at,
-             quarantine_reason as reason, days_open
-        from quarantined_files where entity_id = $1 order by received_at`, [ENTITY]);
-
-    const runs = await q(c, `
-      select r.id, c.name as connection_name, c.channel, r.trigger, r.actor_kind,
-             r.started_at, r.finished_at, r.files_seen, r.files_new, r.files_failed, r.outcome, r.error
-        from ingest_run r join connection c on c.id = r.connection_id
-       where c.entity_id = $1 order by r.started_at desc limit 12`, [ENTITY]);
-
-    return {
-      entity: { name: ent[0].name },
-      viewer: who?.via === "session" ? { name: who.name, via: "session", until: new Date(who.exp * 1000).toISOString() }
-                                     : { name: "API token", via: "token" },
-      trial: TRIAL,
-      trialEnds: TRIAL_ENDS || null,
-      version: VERSION,
-      now: new Date().toISOString(),
-      connections, accounts, quarantine, runs,
-    };
-  } finally {
-    c.release();
-  }
+/** The person a change is done as: named by the request, and one of the company's own. */
+async function actorFor(c: Client, co: views.Company, req: http.IncomingMessage, who: Who): Promise<Actor> {
+  const id = actingId(req);
+  if (!id) throw new HttpError(400, "pick who you are acting as");
+  const p = await views.person(c, co, id);
+  if (!p) throw new HttpError(403, "that person cannot act for this company");
+  const label = who.via === "session"
+    ? (who.name.toLowerCase() === p.name.toLowerCase() ? `${who.name} (web)` : `${who.name} (web) as ${p.name}`)
+    : `api as ${p.name}`;
+  return { personId: p.id, personName: p.name, label };
 }
 
 /**
@@ -466,23 +365,72 @@ function requirePageHeader(req: http.IncomingMessage): void {
   }
 }
 
+const CO = "/api/c/([0-9a-fA-F-]{36})";
+
+/** A read about one company. The acting person, if named, must be one of its own. */
+function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: RegExpMatchArray, personId: string | null) => Promise<unknown>) {
+  route("GET", new RegExp(`^${CO}${tail}$`), "token", async (req, url, m) => {
+    const c = await pool.connect();
+    try {
+      const co = await companyOr404(c, m[1]);
+      let personId = actingId(req);
+      if (personId && !(await views.person(c, co, personId))) personId = null;
+      const out = await fn(c, co, url, m, personId);
+      if (out === null) throw new HttpError(404, "not found");
+      return [200, out];
+    } finally {
+      c.release();
+    }
+  });
+}
+
+/** A change to one company, done as a named person, in one transaction. */
+function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body: Record<string, unknown>, m: RegExpMatchArray) => Promise<unknown>) {
+  route("POST", new RegExp(`^${CO}${tail}$`), "token", async (req, _url, m, who) => {
+    const body = await readJson(req);
+    const c0 = await pool.connect();
+    let co: views.Company;
+    let actor: Actor;
+    try {
+      co = await companyOr404(c0, m[1]);
+      actor = await actorFor(c0, co, req, who!);
+    } finally {
+      c0.release();
+    }
+    const out = await tx({ kind: "user", id: actor.personId, label: actor.label }, (c) => fn(c, co, actor, body, m));
+    return [200, out];
+  });
+}
+
+const param = (url: URL, k: string) => url.searchParams.get(k) ?? "";
+const monthStart = () => new Date().toISOString().slice(0, 8) + "01";
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
 // Liveness. No business data, ever.
 route("GET", /^\/health$/, "none", async () => {
   let db = false;
   let migrations = 0;
   try {
     const r = await pool.query<{ n: string }>(
-      "select count(*) as n from schema_migration where filename not like 'seed/%'");
+      "select count(*) as n from schema_migration where filename not like 'seed/%' and filename not like 'sample/%'");
     migrations = Number(r.rows[0].n);
     db = true;
   } catch { /* reported as db:false */ }
   return [db ? 200 : 503, { ok: db, db, migrations, started: STARTED }];
 });
 
-// The screen. A shell with no data in it; everything it shows comes from
-// /api/overview once someone has signed in.
-route("GET", /^\/$/, "none", async () => [200, new Html(APP ?? MISSING_PAGE)]);
-
+// The app. A shell with no data in it; everything it shows comes from /api
+// once someone has signed in.
+route("GET", /^\/$/, "none", async () => [200, new Html(
+  APP && APP_JS && APP_CSS ? APP.replaceAll("__VERSION__", ASSET_VERSION) : MISSING_PAGE)]);
+route("GET", /^\/app\.js$/, "none", async () => {
+  if (!APP_JS) throw new HttpError(404, "not found");
+  return [200, new Asset(APP_JS, "text/javascript; charset=utf-8")];
+});
+route("GET", /^\/app\.css$/, "none", async () => {
+  if (!APP_CSS) throw new HttpError(404, "not found");
+  return [200, new Asset(APP_CSS, "text/css; charset=utf-8")];
+});
 route("GET", /^\/favicon\.ico$/, "none", async () => [204, null]);
 
 // Sign in with the operator key and a name for the audit trail.
@@ -509,8 +457,115 @@ route("POST", /^\/session\/end$/, "none", async (req) => {
   return [200, { ok: true }, { "set-cookie": CLEAR_COOKIE }];
 });
 
-// Everything the first screen shows, in one call.
-route("GET", /^\/api\/overview$/, "token", async (_req, _url, _m, who) => [200, await overview(who)]);
+// ------------------------------------------------------ the app's own API
+
+// Who is signed in, and every company the operator keeps books for.
+route("GET", /^\/api\/me$/, "token", async (_req, _url, _m, who) => {
+  const c = await pool.connect();
+  try {
+    return [200, {
+      viewer: who?.via === "session" ? { name: who.name, via: "session", until: new Date(who.exp * 1000).toISOString() }
+                                     : { name: "API token", via: "token" },
+      trial: TRIAL,
+      trialEnds: TRIAL_ENDS || null,
+      version: VERSION,
+      defaultCompany: ENTITY,
+      companies: await views.companies(c),
+    }];
+  } finally { c.release(); }
+});
+
+coGet("/people", (c, co) => views.people(c, co));
+coGet("/home", (c, co, _u, _m, p) => views.home(c, co, p));
+coGet("/options", (c, co) => views.formOptions(c, co));
+
+coGet("/approvals", (c, co, _u, _m, p) => views.approvals(c, co, p));
+coPost("/approvals/([0-9a-fA-F-]{36})", (c, co, a, b, m) =>
+  act.decideRequest(c, co, a, { requestId: m[2], decision: b.decision, note: b.note }));
+
+coGet("/bills", (c, co, url) => views.bills(c, co, param(url, "tab") || "attention"));
+coGet("/bills/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.bill(c, co, m[2]));
+coPost("/bills", (c, co, a, b) => act.newBill(c, co, a, b));
+coPost("/bills/([0-9a-fA-F-]{36})/accept", (c, co, a, b, m) => act.acceptBill(c, co, a, { id: m[2], reason: b.reason }));
+coPost("/bills/([0-9a-fA-F-]{36})/reject", (c, co, a, b, m) => act.rejectBill(c, co, a, { id: m[2], reason: b.reason }));
+
+coGet("/vendors", (c, co) => views.vendors(c, co));
+coPost("/vendors", (c, co, a, b) => act.addVendor(c, co, a, b));
+
+coGet("/payment-runs", (c, co) => views.paymentRuns(c, co));
+coGet("/payment-runs/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.paymentRun(c, co, m[2]));
+coPost("/payment-runs", (c, co, a, b) => act.createPaymentRun(c, co, a, b));
+coPost("/payment-runs/([0-9a-fA-F-]{36})/submit", (c, co, a, _b, m) => act.submitPaymentRun(c, co, a, { id: m[2] }));
+coPost("/payment-runs/([0-9a-fA-F-]{36})/release", (c, co, a, _b, m) => act.releasePaymentRun(c, co, a, { id: m[2] }));
+coPost("/payment-runs/([0-9a-fA-F-]{36})/cancel", (c, co, a, _b, m) => act.cancelPaymentRun(c, co, a, { id: m[2] }));
+
+coGet("/payroll", (c, co) => views.payroll(c, co));
+coGet("/payroll/runs/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.payrollRun(c, co, m[2]));
+coGet("/payroll/periods/([0-9a-fA-F-]{36})/timecards", (c, co, _u, m) => views.timecards(c, co, m[2]));
+coPost("/payroll/periods/([0-9a-fA-F-]{36})/approve-timecards", (c, co, a, _b, m) => act.approveTimecards(c, co, a, { periodId: m[2] }));
+coPost("/payroll/periods/([0-9a-fA-F-]{36})/build", (c, co, a, _b, m) => act.buildPayroll(c, co, a, { periodId: m[2] }));
+coPost("/payroll/runs/([0-9a-fA-F-]{36})/request", (c, co, a, _b, m) => act.requestPayroll(c, co, a, { runId: m[2] }));
+coPost("/payroll/runs/([0-9a-fA-F-]{36})/release", (c, co, a, _b, m) => act.releasePayroll(c, co, a, { runId: m[2] }));
+coPost("/payroll/runs/([0-9a-fA-F-]{36})/post", (c, co, a, _b, m) => act.postPayroll(c, co, a, { runId: m[2] }));
+coPost("/payroll/next-period", (c, co, a) => act.openNextPeriod(c, co, a));
+
+coGet("/books/pnl", (c, co, url) => {
+  const from = DAY.test(param(url, "from")) ? param(url, "from") : monthStart();
+  const to = DAY.test(param(url, "to")) ? param(url, "to") : todayStr();
+  return views.pnl(c, co, from, to);
+});
+coGet("/books/account/([0-9A-Za-z.-]{1,20})", (c, co, url, m) => {
+  const from = DAY.test(param(url, "from")) ? param(url, "from") : monthStart();
+  const to = DAY.test(param(url, "to")) ? param(url, "to") : todayStr();
+  const store = param(url, "store");
+  return views.accountLines(c, co, m[2], from, to, store === "none" || UUID.test(store) ? store : null);
+});
+coGet("/books/entry/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.entry(c, co, m[2]));
+coGet("/books/trial-balance", (c, co, url) =>
+  views.trialBalance(c, co, DAY.test(param(url, "asOf")) ? param(url, "asOf") : todayStr()));
+
+coGet("/cash", (c, co) => views.cash(c, co));
+coPost("/cash/plan", (c, co, a) => act.planTodaysSweeps(c, co, a));
+coPost("/cash/transfers/([0-9a-fA-F-]{36})/confirm", (c, co, a, _b, m) => act.confirmSweep(c, co, a, { transferId: m[2] }));
+
+coGet("/recon", (c, co) => views.recon(c, co));
+coGet("/recon/lines/([0-9a-fA-F-]{36})/candidates", (c, co, _u, m) => views.matchCandidates(c, co, m[2]));
+coPost("/recon/run", (c, co, a, b) => act.runMatching(c, co, a, { bankAccountId: b.bankAccountId }));
+coPost("/recon/lines/([0-9a-fA-F-]{36})/match", (c, co, a, b, m) =>
+  act.matchLine(c, co, a, { lineId: m[2], kind: b.kind, targetId: b.targetId, note: b.note }));
+coPost("/recon/lines/([0-9a-fA-F-]{36})/book", (c, co, a, b, m) =>
+  act.bookLine(c, co, a, { lineId: m[2], glAccountId: b.glAccountId, note: b.note }));
+
+coGet("/feeds", (c, co) => views.feeds(c, co));
+coPost("/feeds/files/([0-9a-fA-F-]{36})/dismiss", async (c, co, a, b, m) => {
+  const reason = String(b.reason ?? "").trim().slice(0, 500);
+  if (!reason) throw new ActionError("say why, so the next person knows");
+  const hit = await q<{ status: string }>(c, `
+    select f.status from inbound_file f join connection cn on cn.id = f.connection_id
+     where f.id = $1 and cn.entity_id = $2`, [m[2], co.id]);
+  if (!hit.length) throw new HttpError(404, "no such file");
+  if (hit[0].status !== "quarantined") throw new ActionError("that file is not in quarantine any more");
+  await releaseQuarantine(c, act.scopeOf(co, a), m[2], "ignored", reason);
+  return { ok: true };
+});
+
+// ------------------------------------------- the first screen's API, kept
+
+// Everything the original feeds screen showed, for the default company.
+route("GET", /^\/api\/overview$/, "token", async (_req, _url, _m, who) => {
+  const c = await pool.connect();
+  try {
+    const co = await views.loadCompany(c, ENTITY);
+    if (!co) throw new HttpError(404, "the configured company does not exist in this database");
+    return [200, {
+      entity: { name: co.name },
+      viewer: who?.via === "session" ? { name: who.name, via: "session", until: new Date(who.exp * 1000).toISOString() }
+                                     : { name: "API token", via: "token" },
+      trial: TRIAL, trialEnds: TRIAL_ENDS || null, version: VERSION, now: new Date().toISOString(),
+      ...(await views.feeds(c, co)),
+    }];
+  } finally { c.release(); }
+});
 
 // What the system knows how to move, and which kinds still lack a parser.
 route("GET", /^\/api\/sources$/, "token", async () => {
@@ -533,10 +588,9 @@ route("GET", /^\/api\/sources$/, "token", async () => {
 route("GET", /^\/api\/connections$/, "token", async () => {
   const c = await pool.connect();
   try {
-    const ent = await q<{ tenant_id: string }>(c,
-      `select e.tenant_id from entity e where e.id = $1 /* unscoped: the entity row itself */`, [ENTITY]);
-    if (!ent.length) throw new HttpError(404, "the configured company does not exist in this database");
-    return [200, await connectionsFor(c, ent[0].tenant_id)];
+    const co = await views.loadCompany(c, ENTITY);
+    if (!co) throw new HttpError(404, "the configured company does not exist in this database");
+    return [200, await views.connections(c, co)];
   } finally { c.release(); }
 });
 
@@ -555,7 +609,9 @@ route("GET", /^\/api\/intake$/, "token", async () => {
 route("GET", /^\/api\/gaps$/, "token", async () => {
   const c = await pool.connect();
   try {
-    return [200, (await gapsFor(c)).slice(0, 200).map(({ bank_account_id: _id, ...g }) => g)];
+    const co = await views.loadCompany(c, ENTITY);
+    if (!co) throw new HttpError(404, "the configured company does not exist in this database");
+    return [200, (await views.gaps(c, co)).slice(0, 200).map(({ bank_account_id: _id, ...g }) => g)];
   } finally { c.release(); }
 });
 
@@ -578,7 +634,16 @@ route("POST", /^\/api\/connections\/([^/]+)\/upload$/, "token", async (req, url,
   const bytes = await readBody(req);
   if (!bytes.length) throw new HttpError(400, "the request body is empty; send the file as the body");
   const filename = (url.searchParams.get("filename") ?? "upload").slice(0, 200);
-  const label = labelFor(who, "api upload");
+  let label = labelFor(who, "api upload");
+  const as = actingId(req);
+  if (as && conn.entity_id) {
+    const c0 = await pool.connect();
+    try {
+      const co = await views.loadCompany(c0, conn.entity_id);
+      const p = co ? await views.person(c0, co, as) : null;
+      if (p && who?.via === "session" && p.name.toLowerCase() !== who.name.toLowerCase()) label = `${who.name} (web) as ${p.name}`;
+    } finally { c0.release(); }
+  }
   const result = await tx({ kind: "user", label }, async (c) => {
     const r = await ingest(c, scopeFor(conn, label), conn.id, {
       trigger: "manual",
@@ -704,6 +769,22 @@ route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
 
 // ------------------------------------------------------------------- server
 
+// The engine's refusals are written for people; pass them on as they are.
+const REFUSALS = [ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
+
+function refusal(e: unknown): string | null {
+  if (REFUSALS.some((K) => e instanceof K)) return (e as Error).message;
+  const pg = e as { code?: string; message?: string };
+  // The database's own rules (check violations and raised exceptions) are
+  // also written as sentences. Strip the ids they carry.
+  if (pg?.code && ["23514", "23505", "P0001"].includes(pg.code) && pg.message) {
+    if (pg.code === "23505") return "that already exists";
+    return pg.message.replace(/\s*\((?:user|period|request)?\s*[0-9a-f-]{36}\)/gi, "")
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "").replace(/\s+/g, " ").trim();
+  }
+  return null;
+}
+
 export function createServer(): http.Server {
   return http.createServer(async (req, res) => {
     const t0 = Date.now();
@@ -728,6 +809,9 @@ export function createServer(): http.Server {
       if (body instanceof Html) {
         const nonce = randomBytes(16).toString("base64");
         page(res, s, body.text.replaceAll("__NONCE__", nonce), nonce, headers);
+      } else if (body instanceof Asset) {
+        res.writeHead(s, { ...BASE_HEADERS, "cache-control": "no-cache", "content-type": body.type, ...headers });
+        res.end(body.text);
       } else if (s === 204) {
         res.writeHead(204, { ...BASE_HEADERS, ...headers });
         res.end();
@@ -735,8 +819,10 @@ export function createServer(): http.Server {
         json(res, s, body, headers);
       }
     } catch (e) {
+      const why = refusal(e);
       if (e instanceof ChannelRefused) { status = 403; json(res, 403, { error: e.message }); }
       else if (e instanceof HttpError) { status = e.status; json(res, e.status, { error: e.message }); }
+      else if (why) { status = 409; json(res, 409, { error: why }); }
       else {
         status = 500;
         console.error(`error on ${req.method} ${url.pathname}: ${describeError(e)}`);
@@ -758,9 +844,15 @@ export async function start(): Promise<http.Server> {
       "DATABASE_URL is not set, so there is no database to connect to. On Render: " +
       "pentex-erp-api -> Environment -> add DATABASE_URL with the database's Internal Database URL.");
   }
-  if (!APP) console.warn("server/app.html is missing; the root address will say so instead of showing the screen");
+  if (!APP || !APP_JS || !APP_CSS) console.warn("the app files are not all in server/; the root address will say so");
   const applied = await migrate({ seed: TRIAL });
   console.log(applied.length ? `migrations: applied ${applied.length}` : "migrations: up to date");
+  if (TRIAL) {
+    // Placeholder activity for the trial's placeholder company. Never allowed
+    // to stop the service starting.
+    await loadSampleActivity((s) => console.log(s)).catch((e) =>
+      console.error(`sample activity could not load, and nothing of it was kept: ${describeError(e)}`));
+  }
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(PORT, "0.0.0.0", resolve));
   console.log(`pentex-erp ${VERSION} listening on ${PORT}`);
