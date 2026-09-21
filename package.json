@@ -1,0 +1,18 @@
+{
+  "name": "pentex-erp",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.6 <23"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types server/index.ts",
+    "migrate": "node --experimental-strip-types scripts/migrate.ts",
+    "db:apply": "./db/apply.sh",
+    "db:reset": "./db/apply.sh --reset --seed",
+    "smoke": "node --experimental-strip-types scripts/smoke.ts"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

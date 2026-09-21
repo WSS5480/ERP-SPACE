@@ -1,0 +1,71 @@
+# Render Blueprint for the Pentex ERP.
+#
+# This is the whole stack in one file: the database, the API, and (on a paid
+# plan) the scheduler. It is what Render builds when you create a Blueprint
+# from this repository, and it is the record of how the environment is meant
+# to look even when resources were created some other way.
+#
+# FREE TRIAL, as currently configured. Three consequences worth knowing:
+#   - Render deletes a free database 30 days after creation, and free
+#     databases have no backups. Nothing real should live here.
+#   - The API sleeps after 15 idle minutes and takes about a minute to wake.
+#   - Render has no free cron, so scheduled SFTP and API pulls do not run on
+#     their own. POST /api/connections/{id}/run runs one on demand instead.
+#
+# To move to a real environment: change both `plan: free` lines, uncomment the
+# cron job, and set ERP_SEED to nothing so placeholder data is never loaded.
+
+databases:
+  - name: pentex-erp-db
+    plan: free
+    region: ohio
+    databaseName: pentex_erp
+    user: pentex
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: pentex-erp-api
+    runtime: node
+    plan: free
+    region: ohio
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pentex-erp-db
+          property: connectionString
+      # Operator key for every /api route. Render generates it; read it from
+      # the service's Environment tab. Never commit it.
+      - key: ERP_API_TOKEN
+        generateValue: true
+      # Separate key for the inbound-email webhook, so leaking one does not
+      # leak the other.
+      - key: ERP_EMAIL_INBOUND_TOKEN
+        generateValue: true
+      # Trial only. Loads the placeholder company, banks and connections once.
+      - key: ERP_SEED
+        value: placeholder
+      # Connection secrets go here as ERP_SECRET_<credential_ref>, e.g.
+      #   secret://sftp/first-valley/pentex -> ERP_SECRET_SFTP_FIRST_VALLEY_PENTEX
+
+  # Paid plans only. Runs every active SFTP and API connection on its schedule.
+  # - type: cron
+  #   name: pentex-erp-intake
+  #   runtime: node
+  #   plan: starter
+  #   region: ohio
+  #   schedule: "*/15 * * * *"
+  #   buildCommand: npm ci
+  #   startCommand: node --experimental-strip-types scripts/run-due.ts
+  #   envVars:
+  #     - key: NODE_VERSION
+  #       value: "22"
+  #     - key: DATABASE_URL
+  #       fromDatabase:
+  #         name: pentex-erp-db
+  #         property: connectionString
