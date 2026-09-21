@@ -50,6 +50,8 @@ svg.i{width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-widt
   padding-top:env(safe-area-inset-top)}
 .side-top{display:flex;align-items:center;gap:8px;padding:8px 8px 4px 16px}
 .brand{font-weight:750;letter-spacing:.16em;font-size:13px;color:var(--accent);text-transform:uppercase;white-space:nowrap}
+.brand .ver{display:block;margin-top:3px;font-size:11.5px;font-weight:600;line-height:1.35;letter-spacing:0;text-transform:none;color:var(--bar-muted)}
+.brand .ver>span{display:block}
 .bar-actions{margin-left:auto;display:flex;gap:2px}
 .icon-btn{appearance:none;background:transparent;border:0;color:var(--bar-muted);min-width:40px;height:40px;border-radius:8px;
   display:inline-flex;align-items:center;justify-content:center;gap:10px;cursor:pointer;padding:0 10px}

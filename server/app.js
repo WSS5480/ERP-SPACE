@@ -73,6 +73,7 @@ const fmtDay = new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'shor
 const fmtShort = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
 const fmtDate = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 const fmtStamp = new Intl.DateTimeFormat('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+const fmtLive = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 const parseDay = (s) => { const [y, m, d] = String(s).slice(0, 10).split('-').map(Number); return new Date(y, m - 1, d); };
 const isoDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const dayLabel = (s) => (s ? fmtDay.format(parseDay(s)) : '');
@@ -342,6 +343,22 @@ function openPersonPicker() {
       icon('user'), el('span', {}, p.name, el('span', { class: 'sub', text: p.roles.length ? ` · ${roles(p.roles)}` : ' · no roles here' }))))));
 }
 function setPerson(p) { S.person = p; if (p) store.set(`erp.as.${S.co.id}`, p.id); }
+/**
+ * The version running, and when it went live, under the name top left: every
+ * deploy changes both. The page loads app.js?v=<version>-<start time in base 36>,
+ * so the start time comes from there; without it, the version alone shows.
+ */
+function showVersion() {
+  const brand = $('.side-top .brand');
+  if (!brand || !S.me) return;
+  const tag = document.querySelector('script[src*="app.js?v="]');
+  const v = tag ? new URL(tag.src, location.href).searchParams.get('v') || '' : '';
+  const at = v.includes('-') ? Number.parseInt(v.slice(v.lastIndexOf('-') + 1), 36) : NaN;
+  const since = Number.isFinite(at) && at > 0 ? `Deployed ${fmtLive.format(new Date(at))}` : null;
+  let line = brand.querySelector('.ver');
+  if (!line) { line = el('span', { class: 'ver' }); brand.append(line); }
+  line.replaceChildren(el('span', { text: `Version ${S.me.version}` }), since ? el('span', { text: since }) : '');
+}
 /** Overriding a gate or writing an entry is a sign-off: the controller's or the owner's. The server checks it too. */
 const signsOff = () => !!(S.person && S.person.roles.some((r) => r === 'controller' || r === 'owner'));
 async function setCompany(c) {
@@ -1942,6 +1959,7 @@ async function boot() {
   try {
     S.me = await api('/api/me');
     S.companies = S.me.companies;
+    showVersion();
     if (!S.companies.length) { $('#boot-msg').replaceChildren('No companies are set up in this database yet.'); $('#boot .spin').hidden = true; return; }
     const r = parseHash();
     const pickId = r.co || store.get('erp.company') || S.me.defaultCompany;
