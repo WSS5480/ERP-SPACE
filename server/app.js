@@ -102,7 +102,7 @@ const subjTitle = (s) => (s.date && s.kind !== 'bill' ? `${s.title} for ${dayLab
 // A bill's number never breaks across lines: "Meridian Supply · MS-260907".
 const billName = (vendor, ref) => (ref ? frag(vendor, ' · ', el('span', { class: 'nw', text: ref })) : vendor);
 const subjName = (s) => (s.kind === 'bill' && s.vendor ? billName(s.vendor, s.ref) : subjTitle(s));
-const subjDetail = (s) => [s.detail, s.kind === 'bill' && s.date ? `dated ${shortDay(s.date)}` : null].filter(Boolean).join(' · ');
+const subjDetail = (s) => [human(s.detail), s.kind === 'bill' && s.date ? `dated ${shortDay(s.date)}` : null].filter(Boolean).join(' · ');
 const size = (n) => (n < 1024 ? `${n} bytes` : n < 1048576 ? `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB` : `${(n / 1048576).toFixed(1)} MB`);
 const nextBusinessDay = () => { const d = new Date(); do { d.setDate(d.getDate() + 1); } while (d.getDay() === 0 || d.getDay() === 6); return isoDay(d); };
 const todayIso = () => isoDay(new Date());
@@ -120,7 +120,9 @@ const S = { me: null, companies: [], co: null, people: [], person: null, route: 
 // -------------------------------------------------------------------- api
 class Stop extends Error {}
 function friendly(e) {
-  if (e instanceof TypeError) return 'Couldn’t reach the service. A trial service that has been idle takes about a minute to wake; try again shortly.';
+  // fetch() fails with a TypeError when the network does; any other TypeError is a fault in this page.
+  if (e instanceof TypeError && /fetch|network|load failed/i.test(e.message)) return 'Couldn’t reach the service. A trial service that has been idle takes about a minute to wake; try again shortly.';
+  if (e instanceof TypeError || e instanceof ReferenceError) return `This page hit a fault (${e.message}). Reload it; if it happens again, it needs fixing.`;
   return sentence(e && e.message ? e.message : String(e));
 }
 async function api(path, opts = {}) {
@@ -178,6 +180,9 @@ async function act(btn, fn, okText, opts = {}) {
 function openDialog(title, sub, opts = {}) {
   const dlg = el('dialog', { class: [opts.wide ? 'wide' : '', opts.sheet ? 'sheet' : ''].join(' ').trim() || null, 'aria-label': title });
   const body = el('div', { class: 'dlg-b' });
+  // A piece that is not there (null or false) is left out, as el() leaves it
+  // out; the DOM's own append() would print it as the word "null".
+  body.append = (...kids) => Element.prototype.append.call(body, frag(...kids));
   const close = () => { if (dlg.open) dlg.close(); };
   dlg.append(el('div', { class: 'dlg-h' },
     el('div', {}, el('h2', { text: title }), sub ? el('div', { class: 'sub', text: sub }) : null),
@@ -289,7 +294,7 @@ const td = (text, cls) => el('td', { class: cls || null }, text);
 // ============================================================ navigation
 const SCREENS = [
   ['home', 'Home', 'home'], ['approvals', 'Approvals', 'check'], ['payables', 'Payables', 'file'], ['payroll', 'Payroll', 'people'],
-  ['books', 'Books', 'book'], ['cash', 'Cash', 'cash'], ['recon', 'Reconcile', 'recon'], ['feeds', 'Feeds', 'feed'],
+  ['books', 'Books', 'book'], ['cash', 'Cash', 'cash'], ['recon', 'Reconcile', 'recon'], ['feeds', 'Feeds', 'feed'], ['setup', 'Setup', 'building'],
 ];
 const TABS = ['home', 'approvals', 'payables', 'books'];
 let badgeCount = 0;
@@ -325,6 +330,8 @@ function openCompanyPicker() {
   for (const [tenant, list] of groups) {
     d.body.append(el('div', { class: 'group' }, el('div', { class: 'k', text: `Client: ${tenant}` }), el('div', { class: 'menu' }, list.map(pick))));
   }
+  d.body.append(el('div', { class: 'group' }, el('div', { class: 'menu' },
+    el('button', { type: 'button', onclick: () => { d.close(); openNewCompany(); } }, icon('plus'), 'Add a company'))));
 }
 function openPersonPicker() {
   const d = openDialog('Act as', `Whose approvals and whose name go on what you do in ${S.co.name}`, { sheet: true });
@@ -410,17 +417,24 @@ async function screenHome() {
   if (d.recon.lines || d.recon.late) items.push(item({ title: 'Money nobody has matched yet',
     detail: [d.recon.lines ? `${plural(d.recon.lines, 'bank line')} to explain` : null, d.recon.late ? `${plural(d.recon.late, 'store deposit')} late at the bank` : null].filter(Boolean).join(' · '),
     badge: chip('warning', 'warn', 'To look at'), onClick: () => go('recon') }));
-  const pr = d.payroll;
-  if (pr && !pr.run_status && pr.period_over && (pr.to_approve > 0 || pr.status === 'timecards_approved')) items.push(item({ title: `Payroll for ${dayLabel(pr.pay_date)}`,
-    detail: pr.to_approve > 0 ? `${plural(pr.to_approve, 'timecard')} for ${shortDay(pr.starts_on)} to ${shortDay(pr.ends_on)} to approve, then build the run` : 'Timecards approved; build the run',
-    badge: chip('neutral', 'clock', 'To run'), onClick: () => go('payroll') }));
+  // Each pay group runs on its own schedule; any that needs a hand shows here.
+  const periods = d.payroll || [];
+  for (const p of periods) {
+    const next = payrollNext(p);
+    if (next) items.push(item({ title: `Payroll · ${p.pay_group}`, detail: `${next} · pays ${dayLabel(p.pay_date)}`,
+      badge: chip('neutral', 'clock', 'To run'), onClick: () => go('payroll') }));
+  }
   if (d.feeds.quarantined || d.feeds.failing) items.push(item({ title: 'Feeds', detail: [d.feeds.quarantined ? `${plural(d.feeds.quarantined, 'file')} held for review` : null, d.feeds.failing ? `${plural(d.feeds.failing, 'feed')} failing` : null].filter(Boolean).join(' · '),
     badge: chip('serious', 'hold', 'To look at'), onClick: () => go('feeds') }));
 
-  const payrollCard = pr
-    ? item({ title: `Next pay date ${dayLabel(pr.pay_date)}`, detail: payrollStatusText(pr),
-             amount: pr.net_minor ? money(pr.net_minor) : null, onClick: () => go('payroll') })
-    : empty('No payroll here yet', `Payroll is not set up for ${S.co.name}.`, true);
+  const waitingOnOwner = [d.hires ? plural(d.hires, 'new hire') : null, d.payChanges ? plural(d.payChanges, 'pay change') : null].filter(Boolean);
+  const payrollCard = !d.payGroups
+    ? [empty('No payroll here yet', `Set up a pay group for ${S.co.name} from Payroll.`, true)]
+    : [...(periods.length ? periods.map((p) => item({ title: p.pay_group, detail: `Pays ${dayLabel(p.pay_date)} · ${payrollStatusText(p)}`,
+          amount: p.net_minor ? money(p.net_minor) : null, onClick: () => go('payroll') }))
+        : [item({ title: 'Every pay period is posted', detail: 'Open the next one from Payroll', onClick: () => go('payroll') })]),
+       waitingOnOwner.length ? item({ title: `${waitingOnOwner.join(' and ')} waiting on the owner`, detail: 'They take effect once the owner approves',
+         badge: chip('warning', 'clock', 'Waiting'), onClick: () => go('approvals') }) : null];
   const f = d.feeds;
   const idle = f.total - f.healthy - f.failing - f.stale;
   const feedsCard = item({
@@ -440,13 +454,28 @@ async function screenHome() {
         section('Payroll', null, null, el('div', { class: 'panel' }, payrollCard)),
         section('Feeds', null, null, el('div', { class: 'panel' }, feedsCard)))));
 }
+/** What a pay group's open period needs from a person now, or null if it is waiting on time or on someone else. */
+function payrollNext(p) {
+  if (p.run_status === 'building') return 'Built; send it for approval';
+  if (p.run_status === 'pending_release') return p.approval_status === 'open' ? null : 'Approved; release it for funding';
+  if (p.run_status === 'released') return 'Released; post it to the books';
+  if (p.run_status || !p.period_over) return null;
+  if (p.to_approve > 0) return `${plural(p.to_approve, 'timecard')} to approve, then build the run`;
+  if (p.status === 'timecards_approved') return 'Timecards approved; build the run';
+  if (!p.timecards && p.salaried) return 'Salaried; build the run';
+  return null;
+}
 function payrollStatusText(p) {
-  if (p.run_status === 'pending_release') return 'Built and sent for approval; released once approved';
+  const range = `${shortDay(p.starts_on)} to ${shortDay(p.ends_on)}`;
+  if (p.run_status === 'pending_release') return p.approval_status === 'open' ? 'Built and waiting on approval' : 'Approved; release it for funding';
   if (p.run_status === 'building') return 'Built; send it for approval';
   if (p.run_status === 'released') return 'Released; post it to the books';
   if (p.status === 'timecards_approved') return 'Timecards approved; build the run';
-  if (p.status === 'open' && !p.timecards) return `Pay period ${shortDay(p.starts_on)} to ${shortDay(p.ends_on)}; no time in yet`;
-  if (p.status === 'open') return p.period_over ? `${plural(p.to_approve, 'timecard')} to approve` : `Time coming in for ${shortDay(p.starts_on)} to ${shortDay(p.ends_on)}; ${plural(p.timecards, 'timecard')} so far`;
+  if (p.status === 'open' && !p.timecards) {
+    if (p.salaried) return p.period_over ? 'Salaried; build the run' : `Salaried; the period runs ${range}`;
+    return `Period ${range}; no time in yet`;
+  }
+  if (p.status === 'open') return p.period_over ? `${plural(p.to_approve, 'timecard')} to approve` : `Time coming in for ${range}; ${plural(p.timecards, 'timecard')} so far`;
   return cap(String(p.status).replace('_', ' '));
 }
 
@@ -486,13 +515,50 @@ function decisionButtons(a, after) {
 }
 async function decide(a, decision, btn, after) {
   let note = '';
+  let callback = false;
   if (decision === 'rejected') {
     note = await askReason({ title: 'Reject this?', sub: subjTitle(a.subject), label: 'Why', confirm: 'Reject', placeholder: 'e.g. Wrong store coded; please re-enter against Socorro.' });
     if (note == null) return;
+  } else if (a.subject.kind === 'vendor_bank') {
+    note = await askCallback(a);
+    if (note == null) return;
+    callback = true;
   }
-  await act(btn, () => post(`/approvals/${a.id}`, { decision, note }), (r) =>
-    r.status === 'approved' ? (a.subject_type === 'invoice' ? 'Approved, and posted to the books.' : 'Approved.')
+  await act(btn, () => post(`/approvals/${a.id}`, { decision, note, callback }), (r) =>
+    r.status === 'approved' ? (a.subject_type === 'invoice' ? 'Approved, and posted to the books.'
+      : a.subject.kind === 'vendor_bank' ? 'Approved. The new details are in use; the first payment to them waits three days.' : 'Approved.')
     : r.status === 'rejected' ? 'Rejected, with your reason on record.' : 'Your step is done; it moves on to the next person.', { close: after });
+}
+/**
+ * New bank details for a vendor are approved only after a call to the phone
+ * already on file. Resolves to what the approver writes about the call, or null.
+ */
+function askCallback(a) {
+  const cb = a.subject.callback || {};
+  return new Promise((resolve) => {
+    let answered = false;
+    const d = openDialog('Call the vendor back first', subjTitle(a.subject), { onClose: () => { if (!answered) resolve(null); } });
+    const called = el('input', { type: 'checkbox' });
+    const ta = el('textarea', { maxlength: '500', placeholder: 'e.g. Spoke to Dana in accounts at 10:40; she read back the new routing and account endings.' });
+    const err = el('div');
+    const recent = cb.phoneChangedAt && Date.now() - new Date(cb.phoneChangedAt).getTime() < 60 * 86400000;
+    const go = el('button', { class: 'btn primary', type: 'button', disabled: !cb.phone || null, onclick: () => {
+      const v = ta.value.trim();
+      if (!called.checked) { err.replaceChildren(resultBox('warning', 'warn', 'Make the call first', 'Tick the box once they have confirmed the new details on the phone.')); return; }
+      if (!v) { err.replaceChildren(resultBox('warning', 'warn', 'Say who you spoke to', 'It goes on the record with your approval.')); ta.focus(); return; }
+      answered = true; resolve(v); d.close();
+    } }, icon('check'), 'Approve');
+    d.body.append(
+      el('p', { class: 'lead', text: 'New bank details are how most payment fraud starts: a letter or an email that looks like the vendor, asking for payments to go somewhere new. Call the number already on file, never one given with the request, and have them confirm the new details.' }),
+      el('div', { class: 'panel' }, el('div', { class: 'facts' },
+        fact('Call', cb.phone || 'No phone on file'), fact('Ask for', cb.contact || 'Accounts receivable'),
+        el('div', { class: 'wide2' }, el('span', { class: 'k', text: 'They should confirm' }), el('div', { class: 'fv', text: a.subject.detail })))),
+      !cb.phone ? resultBox('critical', 'fail', 'No phone on file', 'This cannot be approved until the vendor has a phone number on file to call back. Reject it, or put the number on the vendor first.') : null,
+      recent ? resultBox('serious', 'warn', 'The phone on file changed recently', `It was changed ${ago(cb.phoneChangedAt)}. Whoever sent new bank details may have changed the phone too. Check the number against an old bill or the vendor’s own website before you call.`) : null,
+      el('label', { class: 'check' }, called, 'I called that number, and they confirmed the new details'),
+      el('label', { class: 'field' }, el('span', { text: 'Who you spoke to, and when' }), ta),
+      el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Cancel')), err);
+  });
 }
 function openApproval(a) {
   const d = openDialog(subjTitle(a.subject), [subjDetail(a.subject), a.amount_minor != null ? money(a.amount_minor) : null].filter(Boolean).join(' · '));
@@ -505,6 +571,8 @@ function openSubject(link) {
   if (kind === 'bill') openBill(id);
   if (kind === 'payrun') openRegister(id);
   if (kind === 'payment') openPaymentRun(id);
+  if (kind === 'person') openPerson(id);
+  if (kind === 'vendor') openVendor(id);
   if (kind === 'vendors') go('payables', 'vendors');
 }
 
@@ -743,62 +811,187 @@ async function vendorsView() {
     el('div', { class: 'toolbar' }, el('span', { class: 'grow sub', text: `${plural(v.length, 'vendor')} set up for ${S.co.name}.` }),
       el('button', { class: 'btn', type: 'button', onclick: openAddVendor }, icon('plus'), 'Add vendor')),
     el('div', { class: 'panel' }, v.length ? v.map((x) => item({
-      title: x.name, detail: [x.gl_code ? `codes to ${x.gl_code} ${x.gl_name}` : null, `${x.terms_days}-day terms`, x.store, plural(x.bills, 'bill'),
-        x.last_bill ? `last ${shortDay(x.last_bill)}` : null, x.is_1099 ? '1099' : null, x.w9_on_file ? 'W-9 on file' : 'no W-9', x.bank_last4 ? `pays to ••${x.bank_last4}` : null].filter(Boolean).join(' · '),
+      title: x.name, detail: [x.city && x.state ? `${x.city}, ${x.state}` : x.state, x.gl_code ? `codes to ${x.gl_code} ${x.gl_name}` : null, `${x.terms_days}-day terms`, plural(x.bills, 'bill'),
+        x.last_bill ? `last ${shortDay(x.last_bill)}` : null, x.is_1099 ? '1099' : null, x.w9_on_file ? null : 'no W-9', x.bank_last4 ? `pays to ••${x.bank_last4}` : null].filter(Boolean).join(' · '),
       amount: Number(x.open_minor) ? `${money(x.open_minor)} open` : null,
-      badge: x.status === 'active' ? null : x.status === 'hold' ? chip('warning', 'clock', 'Awaiting approval') : chip('neutral', 'pause', cap(x.status)) })) : empty('No vendors yet.', null, true)),
-    el('p', { class: 'foot', text: 'Bank details are kept as a reference and the last four digits only, and a change to them needs the controller and the owner, with a call-back to a number already on file.' }));
+      badge: x.status === 'hold' ? chip('warning', 'clock', 'Awaiting approval') : x.status !== 'active' ? chip('neutral', 'pause', cap(x.status))
+        : x.bank_change_pending ? chip('warning', 'clock', 'Bank change waiting') : null,
+      onClick: () => openVendor(x.id) })) : empty('No vendors yet.', null, true)),
+    el('p', { class: 'foot', text: 'Only the last four digits of a vendor’s bank numbers are kept here. New bank details need the controller and the owner, each after calling the vendor back on the phone already on file.' }));
 }
+
+const TAX_CLASS = { individual: 'Individual', sole_prop: 'Sole proprietor', partnership: 'Partnership', c_corp: 'C corporation', s_corp: 'S corporation', llc: 'LLC', other: 'Other' };
+const formSec = (text) => el('h3', { class: 'form-sec wide', text });
+const checkbox = (label, checked) => { const box = el('input', { type: 'checkbox', checked: !!checked }); return { box, node: el('label', { class: 'check wide' }, box, label) }; };
+
+/** The vendor fields a person types, for adding and for editing. */
+function vendorForm(o, v) {
+  v = v || {};
+  const f = {
+    taxClass: select([['', 'Not known yet'], ...Object.entries(TAX_CLASS)], v.tax_classification || ''),
+    tin: input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4 only', value: v.tin_last4 || '' }),
+    w9: checkbox('W-9 on file', v.w9_on_file), is1099: checkbox('Gets a 1099', v.is_1099),
+    addr1: input({ maxlength: '120', value: v.address_line1 || '' }), addr2: input({ maxlength: '120', placeholder: 'Optional', value: v.address_line2 || '' }),
+    city: input({ maxlength: '60', value: v.city || '' }), state: input({ maxlength: '2', class: 'upper', placeholder: 'TX', value: v.state || '' }),
+    zip: input({ maxlength: '10', inputmode: 'numeric', value: v.postal_code || '' }),
+    remit: input({ maxlength: '300', placeholder: 'Only if payments go somewhere other than the address', value: v.remit_to || '' }),
+    contact: input({ maxlength: '80', placeholder: 'e.g. Accounts receivable', value: v.contact_name || '' }),
+    phone: input({ type: 'tel', maxlength: '25', placeholder: '(555) 555-0100', value: v.contact_phone || '' }),
+    email: input({ type: 'email', maxlength: '120', value: v.contact_email || '' }),
+    terms: input({ type: 'number', min: '0', max: '120', value: String(v.terms_days ?? 30) }),
+    acct: select([['', 'None yet'], ...o.accounts.map((a) => [a.id, `${a.code} ${a.name}`])], v.default_gl_account_id || ''),
+    store: select([['', 'Company-wide'], ...o.stores.map((s) => [s.id, s.name])], v.default_profit_object_id || ''),
+  };
+  const body = () => ({ taxClassification: f.taxClass.value, tinLast4: f.tin.value, w9OnFile: f.w9.box.checked, is1099: f.is1099.box.checked,
+    addressLine1: f.addr1.value, addressLine2: f.addr2.value, city: f.city.value, state: f.state.value, postalCode: f.zip.value, remitTo: f.remit.value,
+    contactName: f.contact.value, contactPhone: f.phone.value, contactEmail: f.email.value,
+    termsDays: Number(f.terms.value), glAccountId: f.acct.value || null, storeId: f.store.value || null });
+  const fields = [
+    formSec('Tax papers'),
+    field('Tax classification', f.taxClass), field('Tax ID', f.tin, 'The last four digits; the full number stays on the W-9'),
+    f.w9.node, f.is1099.node,
+    formSec('Address'),
+    field('Street', f.addr1, null, true), field('Suite or unit', f.addr2, null, true),
+    field('City', f.city), field('State', f.state), field('ZIP code', f.zip), field('Remit payments to', f.remit, null, true),
+    formSec('Who to call'),
+    field('Contact', f.contact), field('Phone', f.phone, 'The number a bank change is called back on'), field('Email', f.email, null, true),
+    formSec('How they bill'),
+    field('Payment terms (days)', f.terms), field('Usual account', f.acct), field('Usual store', f.store),
+  ];
+  return { f, body, fields };
+}
+
 function openAddVendor() {
-  const d = openDialog('Add a vendor', `${S.co.name} · added as ${S.person ? S.person.name : 'nobody'}`);
+  const d = openDialog('Add a vendor', `${S.co.name} · added as ${S.person ? S.person.name : 'nobody'}`, { wide: true });
   fillDialog(d, async () => {
     const o = await coApi('/options');
-    const name = el('input', { type: 'text', maxlength: '120', placeholder: 'Legal name, as on the W-9' });
-    const dba = el('input', { type: 'text', maxlength: '120', placeholder: 'Optional' });
-    const terms = el('input', { type: 'number', min: '0', max: '120', value: '30' });
-    const acct = el('select', {}, el('option', { value: '', text: 'None yet' }), o.accounts.map((a) => el('option', { value: a.id, text: `${a.code} ${a.name}` })));
-    const storeSel = el('select', {}, el('option', { value: '', text: 'Company-wide' }), o.stores.map((s) => el('option', { value: s.id, text: s.name })));
-    const is1099 = el('input', { type: 'checkbox' });
+    const name = input({ maxlength: '120', placeholder: 'Legal name, as on the W-9' });
+    const dba = input({ maxlength: '120', placeholder: 'Optional' });
+    const vf = vendorForm(o, null);
     const out = el('div');
-    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/vendors', { name: name.value, dba: dba.value, termsDays: Number(terms.value),
-      glAccountId: acct.value || null, storeId: storeSel.value || null, is1099: is1099.checked }),
-      (r) => r.status === 'active' ? 'Vendor added.' : 'Vendor added; it can take bills once the controller approves it.', { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not added', friendly(e))) }) }, 'Add vendor');
-    return frag(el('div', { class: 'form-grid' },
-      el('label', { class: 'field wide' }, el('span', { text: 'Legal name' }), name),
-      el('label', { class: 'field' }, el('span', { text: 'Trading as' }), dba),
-      el('label', { class: 'field' }, el('span', { text: 'Payment terms (days)' }), terms),
-      el('label', { class: 'field' }, el('span', { text: 'Usual account' }), acct),
-      el('label', { class: 'field' }, el('span', { text: 'Usual store' }), storeSel),
-      el('label', { class: 'check wide' }, is1099, 'Gets a 1099')),
-      el('p', { class: 'lead', text: 'A new vendor waits on the controller’s approval before bills from it can go through.' }),
+    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/vendors', { name: name.value, dba: dba.value, ...vf.body() }),
+      (r) => r.status === 'active' ? 'Vendor added.' : 'Vendor added; it can take bills once the controller approves it.',
+      { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not added', friendly(e))) }) }, 'Add vendor');
+    return frag(
+      el('p', { class: 'lead', text: 'A new vendor waits on the controller’s approval before bills from it can go through. Bank details are added afterwards, from the vendor, and are approved separately.' }),
+      el('div', { class: 'form-grid' }, field('Legal name', name, null, true), field('Trading as', dba), el('div'), vf.fields),
       el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
   });
 }
 
+const BANK_STATUS = { current: ['good', 'ok', 'In use'], pending: ['warning', 'clock', 'Waiting on approval'], superseded: ['neutral', 'pause', 'Replaced'], rejected: ['critical', 'fail', 'Rejected'] };
+const recently = (iso, days) => iso && Date.now() - new Date(iso).getTime() < days * 86400000;
+
+/** One vendor: the record, its bank details over time, and its bills. */
+function openVendor(id) {
+  const d = openDialog('Vendor', null, { wide: true });
+  fillDialog(d, async () => {
+    const [v, ap] = await Promise.all([coApi(`/vendors/${id}`), coApi('/approvals').catch(() => ({ mine: [], others: [] }))]);
+    d.dlg.querySelector('h2').textContent = v.name;
+    const signs = signsOff();
+    const edit = el('button', { class: 'btn', type: 'button', disabled: !signs || null, onclick: () => { d.close(); openEditVendor(v); } }, 'Edit details…');
+    const bank = el('button', { class: 'btn', type: 'button', onclick: () => { d.close(); openVendorBank(v); } }, 'New bank details…');
+    const pendingBank = v.banks.find((b) => b.status === 'pending');
+    const mine = pendingBank ? ap.mine.find((x) => x.subject_id === pendingBank.id) : null;
+    const waiting = pendingBank ? ap.others.find((x) => x.subject_id === pendingBank.id) : null;
+    const address = [v.address_line1, v.address_line2, [v.city, [v.state, v.postal_code].filter(Boolean).join(' ')].filter(Boolean).join(', ')].filter(Boolean).join(', ');
+    return frag(
+      el('p', { class: 'lead', text: [v.dba && v.dba !== v.legal_name ? `Legal name ${v.legal_name}` : null, TAX_CLASS[v.tax_classification] || null,
+        v.tin_last4 ? `tax ID ••${v.tin_last4}` : null, v.is_1099 ? 'gets a 1099' : null, v.w9_on_file ? 'W-9 on file' : 'no W-9 on file'].filter(Boolean).join(' · ') }),
+      v.status === 'hold' ? resultBox('warning', 'clock', 'Waiting on approval', 'Bills from this vendor go through once the controller approves it.') : null,
+      recently(v.phone_changed_at, 60) ? resultBox('serious', 'warn', 'The phone on file changed recently',
+        `Changed ${ago(v.phone_changed_at)}. A call-back to a number changed alongside new bank details proves nothing; check it against an old bill or the vendor’s own website.`) : null,
+      el('div', { class: 'panel' }, el('div', { class: 'facts' },
+        fact('Address', address || '—'), fact('Contact', [v.contact_name, v.contact_phone].filter(Boolean).join(' · ') || '—'),
+        fact('Email', v.contact_email || '—'), fact('Terms', `${v.terms_days} days`),
+        fact('Usually codes to', v.gl_code ? `${v.gl_code} ${v.gl_name}` : '—'), fact('Usual store', v.store || 'Company-wide'),
+        v.remit_to ? fact('Remit to', v.remit_to) : null, fact('Added', `${fmtDate.format(new Date(v.created_at))}${v.created_by_name ? ' by ' + v.created_by_name : ''}`))),
+      el('div', { class: 'dlg-acts' }, edit, bank),
+      signs ? null : el('p', { class: 'foot', text: 'Changing a vendor’s details is for the controller or the owner, because the phone on file is what bank changes are checked against.' }),
+      section('Bank details', null, null,
+        mine ? el('div', { class: 'dlg-acts' }, decisionButtons(mine, d.close).filter((x) => x && x.textContent !== 'Open')) : null,
+        el('div', { class: 'panel' }, v.banks.length ? v.banks.map((b) => {
+          const [tone, ic, label] = BANK_STATUS[b.status] || ['neutral', 'info', b.status];
+          const held = String(b.account_ref || '').replace(/^held at:\s*/i, '');
+          return item({ title: `${b.bank_name || 'Bank'} · routing ••${b.routing_last4} · account ••${b.account_last4}`,
+            detail: [b.status === 'current' ? (b.cooling_off ? `first payment waits until ${fmtStamp.format(new Date(b.hold_until))}` : b.effective_from ? `in use since ${shortDay(isoDay(new Date(b.effective_from)))}` : 'in use')
+              : b.status === 'pending' ? `entered by ${b.created_by_name || 'someone'} ${ago(b.created_at)}` : null,
+              held && !held.startsWith('vault://') ? `full numbers: ${held}` : null,
+              b.callback_note && b.status !== 'pending' ? `“${b.callback_note}”` : null].filter(Boolean).join(' · '),
+            badge: chip(tone, ic, label), why: b.status === 'pending' && waiting ? sentence(waiting.why) : null });
+        }) : empty('No bank details on file', 'Payments go by check until bank details are added and approved.', true))),
+      v.bills.length ? section('Recent bills', null, null, el('div', { class: 'panel' }, v.bills.map((b) => item({ title: billName(v.name, b.reference),
+        detail: `dated ${shortDay(b.invoice_date)}`, amount: money(b.total_minor), badge: billChip(b.status), onClick: () => { d.close(); openBill(b.id); } })))) : null);
+  });
+}
+
+function openEditVendor(v) {
+  const d = openDialog(`Edit ${v.name}`, 'Recorded with your name. A change to the phone number is flagged on the vendor for sixty days.', { wide: true });
+  fillDialog(d, async () => {
+    const o = await coApi('/options');
+    const vf = vendorForm(o, v);
+    const out = el('div');
+    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post(`/vendors/${v.id}`, vf.body()), 'Vendor details saved.',
+      { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not saved', friendly(e))) }) }, 'Save');
+    return frag(el('div', { class: 'form-grid' }, vf.fields),
+      el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+  });
+}
+
+function openVendorBank(v) {
+  const d = openDialog(`New bank details for ${v.name}`, 'Nothing changes until the controller and the owner approve');
+  const bankName = input({ maxlength: '80', placeholder: 'e.g. First Keystone Bank' });
+  const routing = input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' });
+  const account = input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' });
+  const heldAt = input({ maxlength: '120', placeholder: 'e.g. The payee record at our bank' });
+  const reason = el('textarea', { maxlength: '500', placeholder: 'e.g. Letter on their letterhead, received Sep 18; asked them to confirm by phone.' });
+  const out = el('div');
+  const go = el('button', { class: 'btn primary', type: 'button', disabled: !v.contact_phone || null, onclick: () => act(go, () => post(`/vendors/${v.id}/bank`, {
+    bankName: bankName.value, routingLast4: routing.value, accountLast4: account.value, heldAt: heldAt.value, reason: reason.value }),
+    (r) => r.approval ? 'Sent for approval. The controller, then the owner, call the vendor back before approving.' : 'Bank details saved.',
+    { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not sent', friendly(e))) }) }, 'Send for approval');
+  d.body.append(
+    el('p', { class: 'lead', text: `Only the last four digits are kept here; the full numbers stay where payments are sent from. The controller and then the owner each call ${v.contact_phone || 'the phone on file'} before approving, and the first payment to the new account waits three days after that.` }),
+    !v.contact_phone ? resultBox('warning', 'warn', 'No phone on file', 'Put the vendor’s phone number on its details first: the call-back is made to a number already on file, never to one that came with the new details.') : null,
+    el('div', { class: 'form-grid' }, field('Bank', bankName, null, true), field('Routing number', routing, 'Last four digits'), field('Account number', account, 'Last four digits'),
+      field('Where the full numbers are kept', heldAt, null, true), field('How the new details arrived', reason, 'Goes to both approvers', true)),
+    el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+}
+
 // ============================================================== payroll
-async function screenPayroll() {
-  const d = await coApi('/payroll');
-  if (!d.periods.length && !d.employees.length) return frag(head('Payroll'), el('div', { class: 'panel' }, empty(`Payroll is not set up for ${S.co.name} yet.`, 'A pay group, its bank account and the employees come first.', true)));
-  const current = d.periods.find((p) => !['posted', 'cancelled'].includes(p.status)) || null;
-  const run = current && current.run_id ? d.runs.find((r) => r.id === current.run_id) : null;
+const FREQ = { weekly: 'Weekly', biweekly: 'Every two weeks', semimonthly: 'Twice a month', monthly: 'Monthly' };
+const PER_YEAR = { weekly: 52, biweekly: 26, semimonthly: 24, monthly: 12 };
+const DOW = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const dollars = (m) => (Number(m || 0) / 100).toFixed(2);
+const payText = (e) => (e.pay_type === 'salary' ? `${money(e.base_rate_minor)} a year` : `${money(e.base_rate_minor)} an hour`);
+const lagText = (n) => (Number(n) === 0 ? 'pays on the last day' : `pays ${plural(Number(n), 'day')} after`);
+/** A labelled field; the label's first span is its name. */
+const field = (label, control, hint, wide) => el('label', { class: 'field' + (wide ? ' wide' : '') }, el('span', { text: label }), control, hint ? el('span', { class: 'hint', text: hint }) : null);
+const select = (options, value) => el('select', {}, options.map(([v, t]) => el('option', { value: v, text: t, selected: String(v) === String(value ?? '') || null })));
+const input = (props) => el('input', Object.assign({ type: 'text' }, props));
+
+function groupState(g, runs) {
+  const p = g.current;
+  const run = p && p.run_id ? runs.find((r) => r.id === p.run_id) : null;
   const acts = [];
   let state = '';
-  if (!current) {
+  if (!p) {
     state = 'Every pay period is posted.';
-    const next = el('button', { class: 'btn primary', type: 'button', onclick: () => act(next, () => post('/payroll/next-period'), (p) => `Pay period ${shortDay(p.starts_on)} to ${shortDay(p.ends_on)} opened.`) }, 'Open the next period');
+    const next = el('button', { class: 'btn primary', type: 'button', onclick: () => act(next, () => post('/payroll/next-period', { payGroupId: g.id }),
+      (x) => `${x.group}: ${shortDay(x.starts_on)} to ${shortDay(x.ends_on)} opened, paid ${dayLabel(x.pay_date)}.`) }, 'Open the next period');
     acts.push(next);
   } else if (!run) {
-    if (current.to_approve > 0) {
-      state = `${plural(current.to_approve, 'timecard')} to approve.`;
-      const ap = el('button', { class: 'btn primary', type: 'button', onclick: () => act(ap, () => post(`/payroll/periods/${current.id}/approve-timecards`), (r) => `${plural(r.approved, 'timecard')} approved.`) }, 'Approve timecards');
+    if (p.to_approve > 0) {
+      state = `${plural(p.to_approve, 'timecard')} to approve.`;
+      const ap = el('button', { class: 'btn primary', type: 'button', onclick: () => act(ap, () => post(`/payroll/periods/${p.id}/approve-timecards`), (r) => `${plural(r.approved, 'timecard')} approved.`) }, 'Approve timecards');
       acts.push(ap);
-    } else if (current.exceptions > 0) {
-      state = `${plural(current.exceptions, 'timecard')} with exceptions to resolve first.`;
-    } else if (current.timecards === 0) {
+    } else if (p.exceptions > 0) {
+      state = `${plural(p.exceptions, 'timecard')} with exceptions to resolve first.`;
+    } else if (p.timecards === 0 && !g.salaried) {
       state = 'No time has come in for this period yet.';
     } else {
-      state = 'Timecards approved. Build the register next.';
-      const b = el('button', { class: 'btn primary', type: 'button', onclick: () => act(b, () => post(`/payroll/periods/${current.id}/build`), (r) => `Built: ${plural(r.employees, 'employee')}, net ${money(r.net)}.`) }, 'Build the run');
+      state = p.timecards ? 'Timecards approved. Build the register next.' : 'Salaried pay needs no timecards. Build the register when you are ready.';
+      const b = el('button', { class: 'btn primary', type: 'button', onclick: () => act(b, () => post(`/payroll/periods/${p.id}/build`), (r) => `Built: ${plural(r.employees, 'person', 'people')}, net ${money(r.net)}.`) }, 'Build the run');
       acts.push(b);
     }
   } else if (run.status === 'building') {
@@ -818,28 +1011,47 @@ async function screenPayroll() {
     const b = el('button', { class: 'btn primary', type: 'button', onclick: () => act(b, () => post(`/payroll/runs/${run.id}/post`), 'Posted: wages by store, taxes and deductions payable.') }, 'Post to the books');
     acts.push(b);
   }
-  if (current) acts.push(el('button', { class: 'btn', type: 'button', onclick: () => openTimecards(current) }, 'Timecards'));
+  if (p && p.timecards) acts.push(el('button', { class: 'btn', type: 'button', onclick: () => openTimecards(p) }, 'Timecards'));
   if (run) acts.push(el('button', { class: 'btn', type: 'button', onclick: () => openRegister(run.id) }, 'Register'));
-
-  const card = el('div', { class: 'panel' },
-    current ? el('div', { class: 'facts' }, fact('Pay date', dayLabel(current.pay_date)), fact('Period', `${shortDay(current.starts_on)} to ${shortDay(current.ends_on)}`),
-      fact('Time in', `${hours(current.hours)} hours, ${plural(current.employees, 'person', 'people')}`), fact('Net pay', run ? money(run.net_minor) : 'Not built yet')) : null,
+  return el('div', { class: 'panel' },
+    p ? el('div', { class: 'facts' }, fact('Pay date', dayLabel(p.pay_date)), fact('Period', `${shortDay(p.starts_on)} to ${shortDay(p.ends_on)}`),
+      fact(g.salaried && !p.timecards ? 'People' : 'Time in', g.salaried && !p.timecards ? `${plural(g.people, 'person', 'people')}, salaried` : `${hours(p.hours)} hours, ${plural(p.employees, 'person', 'people')}`),
+      fact('Net pay', run ? money(run.net_minor) : 'Not built yet')) : null,
     el('div', { class: 'li' }, el('div', { class: 't', text: state }), el('div', { class: 'acts' }, acts)));
+}
+
+async function screenPayroll() {
+  const d = await coApi('/payroll');
+  const addPerson = el('button', { class: 'btn primary', type: 'button', onclick: () => openHire() }, icon('plus'), 'Add person');
+  const addGroup = el('button', { class: 'btn', type: 'button', onclick: () => openAddGroup() }, icon('plus'), 'Add pay group');
+  if (!d.groups.length) {
+    return frag(head('Payroll', [addGroup]), el('div', { class: 'panel' }, empty(`Payroll is not set up for ${S.co.name} yet.`,
+      'Start with a pay group: how often it pays, from which account, and when the first period starts. Then add the people in it.', true)));
+  }
+  const groups = d.groups.map((g) => section(g.name, `${FREQ[g.frequency] || g.frequency} · ${lagText(g.pay_lag_days)} · ${plural(g.people, 'person', 'people')}`, null, groupState(g, d.runs)));
+  const people = d.employees.map((e) => item({
+    title: e.name,
+    detail: [e.position, e.pay_group, e.store, payText(e)].filter(Boolean).join(' · '),
+    badge: e.status === 'applicant' ? chip('warning', 'clock', 'Waiting on approval') : e.status === 'terminated' ? chip('neutral', 'pause', `Left ${shortDay(e.terminated_on)}`)
+      : e.status === 'leave' ? chip('neutral', 'pause', 'On leave') : e.pending_change ? chip('warning', 'clock', 'Pay change waiting') : null,
+    onClick: () => openPerson(e.id) }));
+  const current = people.filter((_, i) => d.employees[i].status !== 'terminated');
+  const former = people.filter((_, i) => d.employees[i].status === 'terminated');
   return frag(
-    head('Payroll'),
-    section(current ? `This period · ${current.pay_group}` : 'Payroll', null, null, card),
-    el('p', { class: 'foot', text: 'Taxes here are illustrative flat rates, not for filing: calculation and filing come from a payroll tax service, still to choose. Whoever builds a run cannot release it.' }),
+    head('Payroll', [addPerson, addGroup]),
+    ...groups,
+    el('p', { class: 'foot', text: 'Taxes here are illustrative flat rates, not for filing: calculation and filing come from a payroll tax service, still to choose. Whoever builds a run cannot release it, and new hires and pay changes wait on the owner.' }),
     el('div', { class: 'two' },
-      section('Runs', null, null, el('div', { class: 'panel' }, d.runs.length ? d.runs.map((r) => item({
-        title: `Pay date ${dayLabel(r.pay_date)}`, detail: `${plural(r.employees, 'employee')} · gross ${money(r.gross_minor)} · built by ${r.built_by_name}${r.released_by_name ? `, released by ${r.released_by_name}` : ''}`,
-        amount: money(r.net_minor), badge: payrollChip(r), onClick: () => openRegister(r.id) })) : empty('No runs yet.', null, true))),
       el('div', {},
+        section('People', `${current.length}`, null, el('div', { class: 'panel' }, current.length ? current : empty('Nobody on payroll yet.', 'Add a person to start.', true))),
+        former.length ? section('Left in the last 90 days', null, null, el('div', { class: 'panel' }, former)) : null),
+      el('div', {},
+        section('Runs', null, null, el('div', { class: 'panel' }, d.runs.length ? capped(d.runs.map((r) => item({
+          title: `${r.pay_group} · ${dayLabel(r.pay_date)}`, detail: `${plural(r.employees, 'person', 'people')} · gross ${money(r.gross_minor)} · built by ${r.built_by_name}${r.released_by_name ? `, released by ${r.released_by_name}` : ''}`,
+          amount: money(r.net_minor), badge: payrollChip(r), onClick: () => openRegister(r.id) })), 5, 'runs') : empty('No runs yet.', null, true))),
         section('Deductions to send on', null, null, el('div', { class: 'panel' }, d.remittances.length ? d.remittances.map((x) => item({
           title: x.name, detail: `due ${dayLabel(x.due_on)}${x.days_late ? ` · ${x.days_late} days late` : ''}${Number(x.employer_match_minor) ? ` · includes ${money(x.employer_match_minor)} employer match` : ''}`,
-          amount: money(BigInt(x.deducted_minor) + BigInt(x.employer_match_minor)), badge: x.days_late ? chip('serious', 'warn', 'Late') : null })) : empty('Nothing waiting to be sent.', null, true))),
-        section('People', `${d.employees.length}`, null, el('div', { class: 'panel' }, d.employees.map((e) => item({
-          title: e.name, detail: [e.store, e.pay_type === 'hourly' ? `${money(e.base_rate_minor)} an hour` : `${money(e.base_rate_minor)} a period`, e.comp_class_code ? `comp class ${e.comp_class_code}` : null].filter(Boolean).join(' · '),
-          badge: e.status === 'active' ? null : chip('neutral', 'pause', cap(e.status)) })))))));
+          amount: money(BigInt(x.deducted_minor) + BigInt(x.employer_match_minor)), badge: x.days_late ? chip('serious', 'warn', 'Late') : null })) : empty('Nothing waiting to be sent.', null, true))))));
 }
 function payrollChip(r) {
   return { building: chip('neutral', 'pending', 'Built'), pending_release: r.approval_status === 'open' ? chip('warning', 'clock', 'Awaiting approval') : chip('warning', 'clock', 'Ready to release'),
@@ -854,7 +1066,7 @@ function openRegister(id) {
       el('p', { class: 'lead', text: `${shortDay(r.starts_on)} to ${shortDay(r.ends_on)}. Gross ${money(r.gross_minor)}, employee taxes ${money(r.employee_tax_minor)}, deductions ${money(r.deductions_minor)}, employer taxes ${money(r.employer_tax_minor)}. Taxes: ${r.tax_provider}.` }),
       el('div', { class: 'panel' }, NARROW.matches
         ? r.lines.map((l) => item({ title: l.name, amount: `${money(l.net_minor)} net`,
-            detail: [l.store, `${hours(l.regular_hours)} h${Number(l.overtime_hours) ? ` + ${hours(l.overtime_hours)} overtime` : ''}`, `gross ${money(l.gross_minor)}`,
+            detail: [l.store, Number(l.regular_hours) || Number(l.overtime_hours) ? `${hours(l.regular_hours)} h${Number(l.overtime_hours) ? ` + ${hours(l.overtime_hours)} overtime` : ''}` : 'salary', `gross ${money(l.gross_minor)}`,
               `taxes ${money(l.employee_tax_minor)}`, `deductions ${money(l.deductions_minor)}`].filter(Boolean).join(' · ') }))
         : tbl([['Employee', 'first'], ['Store'], ['Hours', 'm'], ['Overtime', 'm'], ['Gross', 'm'], ['Taxes', 'm'], ['Deductions', 'm'], ['Net', 'm']],
           r.lines.map((l) => el('tr', {}, td(l.name, 'first'), td(l.store || ''), td(hours(l.regular_hours), 'm'), td(hours(l.overtime_hours), 'm'),
@@ -869,6 +1081,407 @@ function openTimecards(p) {
     return el('div', { class: 'panel' }, rows.map((r) => item({ title: r.name, amount: `${hours(r.hours)} h`,
       detail: [r.store, plural(r.days, 'day')].filter(Boolean).join(' · '),
       badge: r.exceptions ? chip('serious', 'warn', `${r.exceptions} exceptions`) : r.to_approve ? chip('warning', 'clock', `${r.to_approve} to approve`) : chip('good', 'ok', 'Approved') })));
+  });
+}
+
+/** One person's record, with what can be done to it. */
+function openPerson(id) {
+  const d = openDialog('Person', null, { wide: true });
+  fillDialog(d, async () => {
+    const e = await coApi(`/payroll/people/${id}`);
+    d.dlg.querySelector('h2').textContent = `${e.first_name} ${e.last_name}`;
+    const perPeriod = e.pay_type === 'salary' && e.frequency ? ` (${money(BigInt(e.base_rate_minor) / BigInt(PER_YEAR[e.frequency] || 1))} a period)` : '';
+    const acts = [];
+    if (e.status === 'active' || e.status === 'leave') {
+      acts.push(el('button', { class: 'btn', type: 'button', onclick: () => { d.close(); openChangePerson(e); } }, 'Change details or pay…'));
+      acts.push(el('button', { class: 'btn', type: 'button', onclick: () => { d.close(); openLeave(e); } }, 'Record leaving…'));
+    }
+    const status = e.status === 'applicant' ? resultBox('warning', 'clock', 'Waiting on approval', 'Nobody is paid until the owner approves the hire. It is in their Approvals.')
+      : e.status === 'terminated' ? resultBox('neutral', 'pause', `Left ${dayLabel(e.terminated_on)}`, 'Their last period pays them up to that day.') : null;
+    const pending = e.pending ? resultBox('warning', 'clock', 'Pay change waiting on the owner',
+      `${[e.pending.after.base_rate_minor !== e.pending.before.base_rate_minor || e.pending.after.pay_type !== e.pending.before.pay_type
+          ? `${money(e.pending.before.base_rate_minor)} ${e.pending.before.pay_type === 'salary' ? 'a year' : 'an hour'} to ${money(e.pending.after.base_rate_minor)} ${e.pending.after.pay_type === 'salary' ? 'a year' : 'an hour'}` : null,
+         e.pending.new_group && e.pending.after.pay_group_id !== e.pending.before.pay_group_id ? `moving to ${e.pending.new_group}` : null].filter(Boolean).join(', ')}. Asked by ${e.pending.requested_by}: “${e.pending.reason}”`) : null;
+    return frag(
+      el('p', { class: 'lead', text: [e.position, e.store, `employee ${e.employee_no}`].filter(Boolean).join(' · ') }),
+      status, pending,
+      el('div', { class: 'panel' }, el('div', { class: 'facts' },
+        fact('Pay group', e.pay_group ? `${e.pay_group}` : '—'), fact('Pay', `${payText(e)}${perPeriod}`),
+        fact('Hired', dayLabel(e.hired_on)), fact('Works in', `${e.work_state}${e.comp_class_code ? ` · comp class ${e.comp_class_code}` : ''}`))),
+      acts.length ? el('div', { class: 'dlg-acts' }, acts) : null,
+      e.pay.length ? section('Recent pay', null, null, el('div', { class: 'panel' }, e.pay.map((p) => item({ title: dayLabel(p.pay_date),
+        detail: Number(p.regular_hours) || Number(p.overtime_hours) ? `${hours(p.regular_hours)} h${Number(p.overtime_hours) ? ` + ${hours(p.overtime_hours)} overtime` : ''} · gross ${money(p.gross_minor)}` : `salary · gross ${money(p.gross_minor)}`,
+        amount: `${money(p.net_minor)} net` })))) : null,
+      e.history.length ? section('What happened', null, null, el('div', { class: 'panel' }, el('ul', { class: 'timeline' }, e.history.map((h) => el('li', {},
+        el('div', { text: sentence(human(h.reason || h.action)) }), el('div', { class: 'when', text: `${fmtStamp.format(new Date(h.at))} · ${h.actor_label}` })))))) : null,
+      el('p', { class: 'foot', text: 'Tax setup (the W-4 and Social Security number) belongs with the payroll tax service. None of it is kept here.' }));
+  });
+}
+
+/** The fields a hire and a change share. */
+async function personForm(e) {
+  const o = await coApi('/options');
+  const f = {
+    first: input({ maxlength: '60', value: e ? e.first_name : '' }), last: input({ maxlength: '60', value: e ? e.last_name : '' }),
+    position: input({ maxlength: '60', list: 'erp-positions', placeholder: 'e.g. Sales associate', value: e ? e.position || '' : '' }),
+    group: select([['', 'Pick the pay group'], ...o.payGroups.map((g) => [g.id, `${g.name} (${(FREQ[g.frequency] || '').toLowerCase()})`])], e ? e.pay_group_id : ''),
+    payType: select([['hourly', 'Hourly'], ['salary', 'Salary']], e ? e.pay_type : 'hourly'),
+    rate: input({ inputmode: 'decimal', placeholder: '0.00', value: e ? dollars(e.base_rate_minor) : '' }),
+    store: select([['', 'Company-wide'], ...o.stores.map((s) => [s.id, s.name])], e ? e.profit_object_id : ''),
+    state: input({ maxlength: '2', list: 'erp-states', placeholder: 'TX', value: e ? e.work_state : '' }),
+    comp: input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Optional', value: e ? e.comp_class_code || '' : '' }),
+  };
+  const rateField = field('Hourly rate', f.rate);
+  const syncRate = () => { rateField.querySelector('span').textContent = f.payType.value === 'salary' ? 'Annual salary' : 'Hourly rate'; f.rate.placeholder = f.payType.value === 'salary' ? 'e.g. 52000' : 'e.g. 18.50'; };
+  f.payType.addEventListener('change', syncRate); syncRate();
+  const lists = frag(el('datalist', { id: 'erp-positions' }, o.positions.map((p) => el('option', { value: p }))),
+    el('datalist', { id: 'erp-states' }, o.states.map((s) => el('option', { value: s }))));
+  return { f, o, rateField, lists };
+}
+
+async function openHire() {
+  const d = openDialog('Add a person', `${S.co.name} · entered by ${S.person ? S.person.name : 'nobody'}`, { wide: true });
+  fillDialog(d, async () => {
+    const { f, o, rateField, lists } = await personForm(null);
+    if (!o.payGroups.length) return empty('Set up a pay group first', 'A person is paid on a pay group’s schedule. Add one from the Payroll screen.', true);
+    const hired = input({ type: 'date', value: todayIso() });
+    const no = input({ maxlength: '20', placeholder: 'Next free number' });
+    const out = el('div');
+    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/payroll/people', {
+      firstName: f.first.value, lastName: f.last.value, position: f.position.value, payGroupId: f.group.value, payType: f.payType.value, rate: f.rate.value,
+      storeId: f.store.value || null, workState: f.state.value, compClassCode: f.comp.value, hiredOn: hired.value, employeeNo: no.value }),
+      (r) => r.status === 'active' ? `Added as ${r.employeeNo}.` : `Entered as ${r.employeeNo}. Nobody is paid until the owner approves the hire.`,
+      { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not added', friendly(e))) }) }, 'Add person');
+    return frag(lists,
+      el('p', { class: 'lead', text: 'The owner approves every hire before any run can pay them. Tax setup (the W-4 and Social Security number) happens with the payroll tax service, never here.' }),
+      el('div', { class: 'form-grid' },
+        field('First name', f.first), field('Last name', f.last),
+        field('Position', f.position), field('Pay group', f.group, 'How often they are paid'),
+        field('Pay type', f.payType), rateField,
+        field('Store', f.store), field('Works in (state)', f.state, 'Two letters, for tax and comp'),
+        field('Hire date', hired), field('Workers’ comp class', f.comp),
+        field('Employee number', no, 'Left empty, the next free number')),
+      el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+  });
+}
+
+function openChangePerson(e) {
+  const d = openDialog(`Change ${e.first_name} ${e.last_name}`, 'Position, store, state and comp class change now. Pay, pay type and pay group wait on the owner.', { wide: true });
+  fillDialog(d, async () => {
+    const { f, lists, rateField } = await personForm(e);
+    const reason = el('textarea', { maxlength: '500', placeholder: 'e.g. Promoted to store manager from October' });
+    const out = el('div');
+    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post(`/payroll/people/${e.id}`, {
+      position: f.position.value, storeId: f.store.value || null, workState: f.state.value, compClassCode: f.comp.value,
+      payGroupId: f.group.value, payType: f.payType.value, rate: f.rate.value, reason: reason.value }),
+      (r) => r.pay ? (r.approval ? 'Pay change sent to the owner for approval.' : 'Pay changed.') : r.details ? 'Details changed.' : 'Nothing was different.',
+      { close: d.close, errorInto: (x) => out.replaceChildren(resultBox('critical', 'fail', 'Not changed', friendly(x))) }) }, 'Save');
+    return frag(lists,
+      el('div', { class: 'form-grid' },
+        field('Position', f.position), field('Store', f.store),
+        field('Works in (state)', f.state), field('Workers’ comp class', f.comp),
+        field('Pay group', f.group), field('Pay type', f.payType), rateField),
+      field('Why', reason, 'Goes on the record, and to the owner with any pay change'),
+      el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+  });
+}
+
+function openLeave(e) {
+  const d = openDialog(`${e.first_name} ${e.last_name} is leaving`, 'Their last period still pays them up to the last day worked.');
+  const day = input({ type: 'date', value: todayIso() });
+  const reason = el('textarea', { maxlength: '500', placeholder: 'e.g. Resigned; two weeks’ notice given' });
+  const out = el('div');
+  const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post(`/payroll/people/${e.id}/end`, { terminatedOn: day.value, reason: reason.value }),
+    'Recorded. They stay on the record, off future runs.', { close: d.close, errorInto: (x) => out.replaceChildren(resultBox('critical', 'fail', 'Not recorded', friendly(x))) }) }, 'Record leaving');
+  d.body.append(field('Last day worked', day), field('Why', reason),
+    el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+}
+
+function openAddGroup() {
+  const d = openDialog('Add a pay group', `${S.co.name} · a schedule some people are paid on`, { wide: true });
+  fillDialog(d, async () => {
+    const o = await coApi('/options');
+    if (!o.payrollBanks.length) return empty('No account to pay from', 'Add the payroll or operating bank account in Setup first.', true);
+    const name = input({ maxlength: '60', placeholder: 'e.g. Managers, semimonthly' });
+    const freq = select(Object.entries(FREQ), 'weekly');
+    const start = input({ type: 'date' });
+    const startHint = el('span', { class: 'hint' });
+    const lag = input({ type: 'number', min: '0', max: '31', value: '5' });
+    const dow = select(DOW.map((n, i) => [i, n]), 0);
+    const ot = input({ type: 'number', min: '1', max: '60', value: '40' });
+    const bank = select(o.payrollBanks.map((b) => [b.id, `${b.name}, ${b.bank_name} ••${b.account_last4}`]), o.payrollBanks[0].id);
+    const sync = () => {
+      const f = freq.value;
+      startHint.textContent = f === 'semimonthly' ? 'The 1st or the 16th; periods run the 1st to the 15th and the 16th to the month’s end'
+        : f === 'monthly' ? 'The 1st; periods are calendar months' : f === 'biweekly' ? 'Any day; each period is 14 days' : 'Any day; each period is 7 days';
+      if (f === 'semimonthly' || f === 'monthly') { if (lag.value === '5') lag.value = '0'; } else if (lag.value === '0') lag.value = '5';
+    };
+    freq.addEventListener('change', sync); sync();
+    const out = el('div');
+    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/payroll/groups', {
+      name: name.value, frequency: freq.value, firstStartsOn: start.value, payLagDays: Number(lag.value), workweekStartDow: Number(dow.value),
+      overtimeAfterHours: Number(ot.value), bankAccountId: bank.value }),
+      (r) => `Pay group set up. First period ${shortDay(r.firstPeriod.startsOn)} to ${shortDay(r.firstPeriod.endsOn)}, paid ${dayLabel(r.firstPeriod.payDate)}.`,
+      { close: d.close, errorInto: (x) => out.replaceChildren(resultBox('critical', 'fail', 'Not set up', friendly(x))) }) }, 'Set up pay group');
+    return frag(
+      el('div', { class: 'form-grid' },
+        field('Name', name), field('How often', freq),
+        el('label', { class: 'field' }, el('span', { text: 'First period starts' }), start, startHint),
+        field('Pay date', lag, 'Days after a period ends; a weekend moves to the Friday before'),
+        field('Workweek starts', dow, 'Overtime is counted per workweek. Weekly and biweekly groups count from the period start'),
+        field('Overtime after (hours a week)', ot),
+        field('Paid from', bank, null, true)),
+      el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+  });
+}
+
+// ================================================================ setup
+const ROLE_LIST = [['owner', 'Owner', 'Approves payroll, hires and pay changes; changes setup'],
+  ['controller', 'Controller', 'Signs off stopped bills and vendor details; approves by the company’s rules'],
+  ['approver', 'Approver', 'Approves bills by the company’s rules'], ['ap_clerk', 'A/P clerk', 'Enters bills'],
+  ['viewer', 'Viewer', 'Sees everything; no rule asks them to approve']];
+const PURPOSE = { operating: 'Operating', deposit: 'Store deposits', payroll: 'Payroll', tax: 'Tax' };
+const SUBJECT = { invoice: 'Bills', payment_run: 'Payment runs', payroll_run: 'Payroll runs', vendor: 'New vendors', vendor_bank_account: 'Vendor bank details',
+  employee: 'New hires', employee_change: 'Pay changes', journal_entry: 'Journal entries', fiscal_period: 'Closing a month' };
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const KIND = { rto: 'Rent-to-own', retail: 'Retail', trucking: 'Trucking', services: 'Services' };
+const UNIT = { rto: ['Store', 'Stores'], retail: ['Store', 'Stores'], trucking: ['Truck', 'Trucks'], services: ['Job', 'Jobs'] };
+const isOwner = () => !!(S.person && S.person.roles.includes('owner'));
+
+/** Refresh who can act here after the people or their roles change, keeping the person picked. */
+async function refreshPeople() {
+  S.people = await coApi('/people');
+  const same = S.person && S.people.find((p) => p.id === S.person.id);
+  setPerson(same || S.people[0] || null);
+  renderNav();
+}
+
+async function screenSetup() {
+  const d = await coApi('/setup');
+  const c = d.company;
+  const [one, many] = UNIT[c.vertical] || ['Store', 'Stores'];
+  const owner = isOwner();
+  const ownerBtn = (label, fn) => el('button', { class: 'btn small', type: 'button', disabled: !owner || null, onclick: fn }, icon('plus'), label);
+  return frag(
+    head('Setup', [el('button', { class: 'btn', type: 'button', onclick: () => openNewCompany() }, icon('plus'), 'Add a company')]),
+    el('p', { class: 'lead', text: owner ? `What ${c.name} is made of: its ${many.toLowerCase()}, bank accounts, the people who act for it and the rules they approve by. Changes here are the owner’s, and each one is recorded with their name.`
+      : `Acting as ${S.person ? S.person.name : 'nobody'}, who is not an owner of ${c.name}: everything here can be seen, and only the owner changes it.` }),
+    section('Company', null, null, el('div', { class: 'panel' }, el('div', { class: 'facts' },
+      fact('Name', c.name), fact('Legal name', c.legal_name || '—'), fact('Client', `${c.client} · ${(KIND[c.vertical] || c.vertical).toLowerCase()}`),
+      fact('Fiscal year ends', MONTHS[(c.fiscal_year_end_month || 12) - 1]), fact('EIN', c.ein_last4 ? `••${c.ein_last4}` : 'Not entered')))),
+    el('div', { class: 'two' },
+      el('div', {},
+        section(many, `${d.stores.length}`, [ownerBtn(`Add ${one.toLowerCase()}`, () => openAddStore(c, one))],
+          el('div', { class: 'panel' }, d.stores.length ? d.stores.map((s) => item({ title: s.name,
+            detail: [s.code, s.state, s.kind === 'company' ? 'company-wide' : null, s.people ? `${plural(s.people, 'person', 'people')} on payroll` : null].filter(Boolean).join(' · '),
+            badge: s.status === 'active' ? null : chip('neutral', 'pause', cap(s.status)) })) : empty(`No ${many.toLowerCase()} yet.`, null, true))),
+        section('Bank accounts', `${d.banks.length}`, [ownerBtn('Add account', () => openAddBank(d.stores, one))],
+          el('div', { class: 'panel' }, d.banks.length ? d.banks.map((b) => item({ title: b.name,
+            detail: [PURPOSE[b.purpose] || b.purpose, `${b.bank_name} ••${b.account_last4}`, b.location, `books to ${b.gl_code}`, b.ach_origination_enabled ? 'sends ACH' : null].filter(Boolean).join(' · '),
+            badge: b.status === 'active' ? null : chip('neutral', 'pause', cap(b.status)) })) : empty('No bank accounts yet.', null, true)),
+          el('p', { class: 'foot', text: 'Only the last four digits of an account are kept here; the full numbers stay with the bank.' }))),
+      el('div', {},
+        section('People and roles', `${d.people.length}`, [ownerBtn('Add person', () => openAddPerson())],
+          el('div', { class: 'panel' }, d.people.map((p) => item({ title: p.name,
+            detail: [p.email, p.own_roles.some((r) => !p.client_roles.includes(r)) ? p.own_roles.filter((r) => !p.client_roles.includes(r)).map((r) => ROLE[r] || r).join(', ') : null,
+              p.client_roles.length ? `${p.client_roles.map((r) => ROLE[r] || r).join(', ')} for every ${c.client} company` : null,
+              p.own_roles.length || p.client_roles.length ? null : 'no roles here'].filter(Boolean).join(' · '),
+            acts: owner ? [el('button', { class: 'btn small', type: 'button', onclick: () => openRoles(p) }, 'Roles…')] : null })))),
+        section('Approval rules', null, null,
+          el('div', { class: 'panel' }, d.policies.length ? d.policies.map((p) => item({ title: SUBJECT[p.subject_type] || cap(p.subject_type.replace(/_/g, ' ')),
+            detail: `${Number(p.min_amount_minor) ? `From ${money(p.min_amount_minor)}: approved` : 'Approved'} by the ${p.steps.join(', then the ')}${p.requires_callback ? ', each after a call-back to the number on file' : ''}` }))
+            : empty('No approval rules', 'Nothing here needs a second person yet.', true)),
+          el('p', { class: 'foot', text: 'The rules were set up with the company to fit the roles its people hold. Changing them from this screen is still to build.' })))));
+}
+
+function openAddStore(c, one) {
+  const d = openDialog(`Add a ${one.toLowerCase()}`, S.co.name);
+  const code = input({ maxlength: '12', class: 'upper', placeholder: 'e.g. ENL' });
+  const name = input({ maxlength: '60', placeholder: one === 'Store' ? 'e.g. Enola' : '' });
+  const state = input({ maxlength: '2', class: 'upper', placeholder: 'PA' });
+  const out = el('div');
+  const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/setup/stores', { code: code.value, name: name.value, state: state.value }),
+    `${one} added.`, { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not added', friendly(e))) }) }, `Add ${one.toLowerCase()}`);
+  d.body.append(el('div', { class: 'form-grid' }, field('Short code', code, 'Letters and numbers, on reports'), field('Name', name),
+      one === 'Store' ? field('State', state, 'Two letters') : null),
+    el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+  code.focus();
+}
+
+/** The fields of one bank account, shared by Setup and a new company. storeCodes() lists the stores to pick from. */
+function bankFields(storeCodes, init, unit) {
+  init = init || {};
+  const f = {
+    purpose: select(Object.entries(PURPOSE), init.purpose || 'operating'),
+    name: input({ maxlength: '60', placeholder: 'e.g. Operating', value: init.name || '' }),
+    bankName: input({ maxlength: '80', placeholder: 'e.g. First Keystone Bank' }),
+    routing: input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' }),
+    account: input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' }),
+    store: el('select', {}),
+    ach: checkbox('Sends ACH payments from it', false),
+  };
+  const fillStores = () => {
+    const keep = f.store.value;
+    f.store.replaceChildren(el('option', { value: '', text: 'Company-wide' }), ...storeCodes().map(([code, name]) => el('option', { value: code, text: `${name} (${code})` })));
+    f.store.value = keep;
+  };
+  fillStores();
+  f.store.addEventListener('focus', fillStores);
+  f.store.addEventListener('mousedown', fillStores);
+  const value = () => ({ purpose: f.purpose.value, name: f.name.value, bankName: f.bankName.value, routingLast4: f.routing.value,
+    accountLast4: f.account.value, storeCode: f.store.value || null, ach: f.ach.box.checked });
+  const blank = () => !f.name.value.trim() && !f.bankName.value.trim() && !f.routing.value.trim() && !f.account.value.trim();
+  const storeField = field('Store', f.store, 'A deposit account belongs to a store');
+  const setUnit = (one) => {
+    storeField.querySelector('span').textContent = one;
+    storeField.querySelector('.hint').textContent = `A deposit account belongs to a ${one.toLowerCase()}`;
+  };
+  setUnit(unit || 'Store');
+  const fields = [field('Used for', f.purpose), field('Name', f.name), field('Bank', f.bankName, null, true),
+    field('Routing number', f.routing, 'Last four digits'), field('Account number', f.account, 'Last four digits'),
+    storeField, f.ach.node];
+  return { f, value, blank, fields, setUnit, focus: () => f.name.focus() };
+}
+
+function openAddBank(stores, one) {
+  const d = openDialog('Add a bank account', S.co.name, { wide: true });
+  const b = bankFields(() => stores.filter((s) => s.kind !== 'company').map((s) => [s.code, s.name]), { purpose: 'deposit' }, one);
+  const out = el('div');
+  const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/setup/banks', b.value()),
+    'Account added.', { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not added', friendly(e))) }) }, 'Add account');
+  d.body.append(el('p', { class: 'lead', text: 'Only the last four digits are kept here. The full numbers stay with the bank and in the secrets store the bank connection reads.' }),
+    el('div', { class: 'form-grid' }, b.fields),
+    el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+}
+
+/** Role checkboxes. Roles held for every company of the client show ticked and fixed. */
+function roleChecks(own, clientWide) {
+  own = own || []; clientWide = clientWide || [];
+  const boxes = ROLE_LIST.map(([code, label, hint]) => {
+    const fixed = clientWide.includes(code);
+    const box = el('input', { type: 'checkbox', checked: fixed || own.includes(code), disabled: fixed || null, value: code });
+    return { code, box, fixed, node: el('label', { class: 'check role' }, box, el('span', {}, el('b', { text: label }), el('span', { class: 'sub', text: fixed ? ' · held for every company of the client' : ` · ${hint}` }))) };
+  });
+  return { node: el('div', { class: 'checks' }, boxes.map((b) => b.node)), value: () => boxes.filter((b) => !b.fixed && b.box.checked).map((b) => b.code) };
+}
+
+function openAddPerson() {
+  const d = openDialog('Add a person', `Someone who acts for ${S.co.name}`);
+  const name = input({ maxlength: '80' });
+  const email = input({ type: 'email', maxlength: '120' });
+  const rc = roleChecks([], []);
+  const out = el('div');
+  const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, async () => { const r = await post('/setup/people', { name: name.value, email: email.value, roles: rc.value() }); await refreshPeople(); return r; },
+    'Added. They can be picked under Act as.', { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not added', friendly(e))) }) }, 'Add person');
+  d.body.append(el('p', { class: 'lead', text: 'A person here is someone who enters or approves things, not an employee on payroll; those are added from Payroll. Their roles decide what waits on them.' }),
+    el('div', { class: 'form-grid' }, field('Name', name), field('Email', email)),
+    el('div', { class: 'k', text: 'Roles' }), rc.node,
+    el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+  name.focus();
+}
+
+function openRoles(p) {
+  const d = openDialog(`Roles for ${p.name}`, `What waits on them in ${S.co.name}`);
+  const rc = roleChecks(p.own_roles, p.client_roles);
+  const out = el('div');
+  const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, async () => { const r = await post(`/setup/people/${p.id}/roles`, { roles: rc.value() }); await refreshPeople(); return r; },
+    'Roles saved.', { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not saved', friendly(e))) }) }, 'Save roles');
+  d.body.append(el('p', { class: 'lead', text: 'Someone never approves what they entered themselves, whatever roles they hold. The company always keeps at least one owner.' }), rc.node,
+    el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+}
+
+/** Rows of the same fields: one more on a tap, any one taken out. */
+function rowList(make, addLabel, initial) {
+  const rows = [];
+  const list = el('div', { class: 'rowlist' });
+  const add = (init) => {
+    const r = make(init || {});
+    const box = el('div', { class: 'rowbox' }, el('div', { class: 'form-grid' }, r.fields));
+    box.append(el('button', { class: 'icon-btn rm', type: 'button', 'aria-label': 'Take this one out', onclick: () => { rows.splice(rows.indexOf(r), 1); box.remove(); } }, icon('x')));
+    rows.push(r); list.append(box);
+    return r;
+  };
+  for (const init of initial) add(init);
+  const more = el('button', { class: 'btn small', type: 'button', onclick: () => add({}).focus() }, icon('plus'), addLabel);
+  return { node: el('div', {}, list, more), rows };
+}
+
+/** A new company, for a client already here or a new one: who it is, its stores, bank accounts and people. */
+function openNewCompany() {
+  const d = openDialog('Add a company', 'Everything it needs to start: its stores, where its money is, and who acts for it', { wide: true });
+  fillDialog(d, async () => {
+    const clients = await api('/api/clients');
+    const client = select([...clients.map((t) => [t.id, `${t.name} (${plural(t.companies, 'company', 'companies')})`]), ['new', 'A new client…']], S.co.tenant_id || (clients[0] && clients[0].id) || 'new');
+    const clientName = input({ maxlength: '60', placeholder: 'The business this company belongs to' });
+    const vertical = select(Object.entries(KIND), 'rto');
+    const chartFrom = select([...clients.map((t) => [t.id, `Copy ${t.name}’s chart (${t.accounts} accounts)`]), ['', 'Only the accounts the ERP posts to']], S.co.tenant_id || (clients[0] ? clients[0].id : ''));
+    const newClient = el('div', { class: 'form-grid' }, field('Client name', clientName), field('Kind of business', vertical), field('Chart of accounts', chartFrom, 'A new client starts from a copy; it can be changed after', true));
+    const name = input({ maxlength: '60', placeholder: 'e.g. Buddy’s Home Furnishings West' });
+    const legal = input({ maxlength: '120', placeholder: 'As on its tax filings' });
+    const ein = input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' });
+    const fy = select(MONTHS.map((m, i) => [i + 1, m]), 12);
+    const verticalNow = () => (client.value === 'new' ? vertical.value : (clients.find((t) => t.id === client.value) || {}).vertical || 'rto');
+    const storeHead = formSec('Stores');
+    const stores = rowList(() => {
+      const code = input({ maxlength: '12', class: 'upper', placeholder: 'e.g. ENL' });
+      const nm = input({ maxlength: '60' });
+      const st = input({ maxlength: '2', class: 'upper', placeholder: 'PA' });
+      return { fields: [field('Short code', code), field('Name', nm), field('State', st)], focus: () => code.focus(),
+        value: () => (code.value.trim() || nm.value.trim() ? { code: code.value, name: nm.value, state: st.value } : null) };
+    }, 'Add another', [{}]);
+    const storeCodes = () => stores.rows.map((r) => r.value()).filter(Boolean).map((s) => [s.code.trim().toUpperCase(), s.name.trim() || s.code]);
+    const unitNow = () => (UNIT[verticalNow()] || UNIT.rto)[0];
+    const banks = rowList((init) => bankFields(storeCodes, init, unitNow()), 'Add another account', [{ purpose: 'operating', name: 'Operating' }]);
+    const people = rowList(() => {
+      const nm = input({ maxlength: '80' });
+      const em = input({ type: 'email', maxlength: '120' });
+      const rc = roleChecks([], []);
+      return { fields: [field('Name', nm), field('Email', em), el('div', { class: 'wide' }, rc.node)], focus: () => nm.focus(),
+        value: () => (nm.value.trim() || em.value.trim() ? { name: nm.value, email: em.value, roles: rc.value() } : null) };
+    }, 'Add another person', [{}]);
+    const sync = () => {
+      newClient.hidden = client.value !== 'new';
+      const [one, many] = UNIT[verticalNow()] || UNIT.rto;
+      storeHead.textContent = many;
+      for (const r of banks.rows) r.setUnit(one);
+    };
+    client.addEventListener('change', sync); vertical.addEventListener('change', sync); sync();
+    const out = el('div');
+    const setUp = el('button', { class: 'btn primary', type: 'button', onclick: async () => {
+      out.replaceChildren();
+      const body = { clientId: client.value === 'new' ? null : client.value, clientName: clientName.value, vertical: vertical.value, chartFrom: chartFrom.value || null,
+        name: name.value, legalName: legal.value, einLast4: ein.value, fiscalYearEndMonth: Number(fy.value),
+        stores: stores.rows.map((r) => r.value()).filter(Boolean), banks: banks.rows.filter((r) => !r.blank()).map((r) => r.value()),
+        people: people.rows.map((r) => r.value()).filter(Boolean) };
+      busy(setUp, true, 'Setting it up…');
+      try {
+        const r = await api('/api/companies', { method: 'POST', body });
+        S.me = await api('/api/me');
+        S.companies = S.me.companies;
+        const c = S.companies.find((x) => x.id === r.id);
+        d.close();
+        if (c) { await setCompany(c); go('setup'); }
+        toast(r.warning || `${body.name.trim()} is set up.`, r.warning ? 'warning' : 'good');
+      } catch (e) {
+        if (!(e instanceof Stop)) out.replaceChildren(resultBox('critical', 'fail', 'Not set up', friendly(e)));
+      } finally { if (setUp.isConnected) busy(setUp, false); }
+    } }, 'Set up the company');
+    return frag(
+      el('div', { class: 'form-grid' },
+        formSec('Client'), field('Belongs to', client, 'A client’s companies share one chart of accounts and one vendor list', true)),
+      newClient,
+      el('div', { class: 'form-grid' },
+        formSec('Company'), field('Name', name), field('Legal name', legal), field('EIN', ein, 'Last four digits only'), field('Fiscal year ends', fy),
+        storeHead),
+      stores.node,
+      el('div', { class: 'form-grid' }, formSec('Bank accounts')),
+      el('p', { class: 'lead', text: 'Exactly one operating account. Only the last four digits are kept here; the full numbers stay with the bank.' }),
+      banks.node,
+      el('div', { class: 'form-grid' }, formSec('People')),
+      el('p', { class: 'lead', text: 'Who enters and approves things for this company, not the employees on payroll. At least one owner; with two or more people, nobody approves what they entered.' }),
+      people.node,
+      el('p', { class: 'foot', text: 'The approval rules are set up to fit the roles given here, and a year of monthly periods is opened for the books.' }),
+      el('div', { class: 'dlg-acts' }, setUp, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
   });
 }
 
@@ -1290,7 +1903,7 @@ function openUpload(targets, id, accounts) {
       ': five weekdays of made-up activity for this account, every line marked SAMPLE. Trial only.') : null);
 }
 
-const RENDER = { home: screenHome, approvals: screenApprovals, payables: screenPayables, payroll: screenPayroll, books: screenBooks, cash: screenCash, recon: screenRecon, feeds: screenFeeds };
+const RENDER = { home: screenHome, approvals: screenApprovals, payables: screenPayables, payroll: screenPayroll, books: screenBooks, cash: screenCash, recon: screenRecon, feeds: screenFeeds, setup: screenSetup };
 
 // ================================================================ sign in
 function showSignIn(msg) {
