@@ -8,7 +8,8 @@ import { pool, tx, guard, q, one, type Scope } from "../packages/core/db.ts";
 import * as money from "../packages/core/money.ts";
 import { decide, openRequest } from "../packages/core/approvals.ts";
 import { runGates, postToLedger, canTransition } from "../packages/core/invoice.ts";
-import { buildRun, requestRelease, release, postRun, IllustrativeTaxProvider } from "../packages/core/payroll.ts";
+import { buildRun, requestRelease, release, postRun, IllustrativeTaxProvider,
+         nextPeriod, periodStartingOn, splitHours, salaryForPeriod, payDateFor } from "../packages/core/payroll.ts";
 import { listAccounts, resolveAccount, resolveDisbursementAccount, operatingAccount,
          planSweeps, confirmTransfer, outstandingSweeps, automationCoverage,
          positions, footprint } from "../packages/core/banking.ts";
@@ -947,6 +948,73 @@ async function main() {
         `select kind, name from profit_object where entity_id = $1 and kind='truck'`, [RIO_ENTITY]);
       ok("its profit objects are trucks, not stores", po.length === 2, po.map((x) => x.name).join(", "));
     });
+
+  console.log("\npay schedules: weekly, biweekly, semimonthly, monthly");
+  {
+    const w = nextPeriod("weekly", "2026-09-21", 5);
+    ok("weekly steps seven days", w.startsOn === "2026-09-22" && w.endsOn === "2026-09-28", `${w.startsOn} to ${w.endsOn}`);
+    const b = nextPeriod("biweekly", "2026-09-21", 5);
+    ok("biweekly steps fourteen", b.startsOn === "2026-09-22" && b.endsOn === "2026-10-05");
+    const s1 = nextPeriod("semimonthly", "2026-09-15", 0);
+    const s2 = nextPeriod("semimonthly", "2026-09-30", 0);
+    const s3 = nextPeriod("semimonthly", "2028-02-15", 0);
+    ok("semimonthly runs the 1st to the 15th and the 16th to the month's end",
+       s1.startsOn === "2026-09-16" && s1.endsOn === "2026-09-30" && s2.startsOn === "2026-10-01" && s2.endsOn === "2026-10-15"
+       && s3.endsOn === "2028-02-29", `${s1.startsOn}-${s1.endsOn}, ${s2.startsOn}-${s2.endsOn}, leap ${s3.endsOn}`);
+    const m = nextPeriod("monthly", "2026-01-31", 0);
+    ok("monthly is the calendar month", m.startsOn === "2026-02-01" && m.endsOn === "2026-02-28");
+    ok("a pay date on a weekend moves to the Friday before",
+       payDateFor("2026-10-31", 0) === "2026-10-30" && payDateFor("2026-11-15", 0) === "2026-11-13" && payDateFor("2026-09-30", 0) === "2026-09-30",
+       `Sat Oct 31 -> ${payDateFor("2026-10-31", 0)}, Sun Nov 15 -> ${payDateFor("2026-11-15", 0)}`);
+
+    const fortnight = (h: number[]) => h.map((hours, i) => ({ day: new Date(Date.UTC(2026, 8, 7 + i)).toISOString().slice(0, 10), hours, prior: false }));
+    const even = splitHours(fortnight([8, 8, 8, 8, 8, 0, 0, 8, 8, 8, 8, 8, 0, 0]), "biweekly", "2026-09-07", 0, 40);
+    ok("biweekly: 80 hours over two 40-hour weeks is no overtime", even.overtime === 0 && even.regular === 80, `${even.regular} + ${even.overtime}`);
+    const uneven = splitHours(fortnight([9, 9, 9, 9, 9, 0, 0, 7, 7, 7, 7, 7, 0, 0]), "biweekly", "2026-09-07", 0, 40);
+    ok("biweekly: a 45-hour week pays 5 overtime even when the fortnight is 80", uneven.overtime === 5 && uneven.regular === 75, `${uneven.regular} + ${uneven.overtime}`);
+    // Semimonthly, Sunday workweeks. Tue Sep 15 ends a period; the workweek Sun 13 - Sat 19 straddles it.
+    const straddle = splitHours([
+      { day: "2026-09-14", hours: 10, prior: true }, { day: "2026-09-15", hours: 10, prior: true },
+      { day: "2026-09-16", hours: 10, prior: false }, { day: "2026-09-17", hours: 10, prior: false }, { day: "2026-09-18", hours: 5, prior: false },
+    ], "semimonthly", "2026-09-16", 0, 40);
+    ok("semimonthly: a workweek spanning two periods counts the hours paid in the first", straddle.overtime === 5 && straddle.regular === 20,
+       `${straddle.regular} regular + ${straddle.overtime} overtime now`);
+    const alreadyOver = splitHours([
+      { day: "2026-09-13", hours: 45, prior: true }, { day: "2026-09-16", hours: 8, prior: false },
+    ], "semimonthly", "2026-09-16", 0, 40);
+    ok("semimonthly: overtime already paid in the first period is not paid twice", alreadyOver.overtime === 8 && alreadyOver.regular === 0,
+       `${alreadyOver.regular} + ${alreadyOver.overtime}`);
+
+    ok("salary: $52,000 is $1,000 a week, $2,166.67 semimonthly, $4,333.33 a month",
+       salaryForPeriod(5200000n, "weekly", "2026-09-14", "2026-09-20", "2020-01-01", null) === 100000n
+       && salaryForPeriod(5200000n, "semimonthly", "2026-09-16", "2026-09-30", "2020-01-01", null) === 216667n
+       && salaryForPeriod(5200000n, "monthly", "2026-09-01", "2026-09-30", "2020-01-01", null) === 433333n);
+    const half = salaryForPeriod(5200000n, "semimonthly", "2026-09-16", "2026-09-30", "2026-09-23", null);
+    ok("salary: a mid-period start is paid for the weekdays worked", half > 0n && half < 216667n, money.format(half));
+    const p = periodStartingOn("semimonthly", "2026-09-16", 0);
+    ok("a semimonthly period starting the 16th ends the month's last day", p.endsOn === "2026-09-30" && p.payDate === "2026-09-30");
+  }
+
+  console.log("\npay groups run separately");
+  await tx(scope(CLERK, "A/P clerk"), async (c) => {
+    const mg = await one<{ id: string }>(c, `
+      select pp.id from pay_period pp join pay_group pg on pg.id = pp.pay_group_id
+       where pg.entity_id = $1 and pg.frequency = 'semimonthly' and pp.status = 'open' order by pp.starts_on limit 1`, [ENTITY]);
+    const out = await buildRun(c, scope(CLERK, "A/P clerk"), { payPeriodId: mg.id, builtBy: CLERK, taxProvider: new IllustrativeTaxProvider() });
+    ok("the managers' semimonthly run carries only the two managers", out.employees === 2, `${out.employees} people, ${money.format(out.grossMinor)}`);
+    ok("each salary is its annual amount over 24", out.grossMinor === 216667n + 260000n, money.format(out.grossMinor));
+    throw new Error("rollback: test only");
+  }).catch((e) => { if (!/rollback: test only/.test((e as Error).message)) throw e; });
+
+  console.log("\na client-wide role counts only inside its own client");
+  await throws("Pentex's owner cannot approve a request at Rio Freight",
+    () => tx({ tenantId: RIO_TENANT, entityId: RIO_ENTITY, actor: { kind: "user", id: STEVE, label: "Steve" } }, async (c) => {
+      const r = await openRequest(c, { tenantId: RIO_TENANT, entityId: RIO_ENTITY, actor: { kind: "user", id: RIO_OWNER, label: "Rio owner" } },
+        { subjectType: "payroll_run", subjectId: "00000000-0000-0000-0000-00000000abcd", amountMinor: 100n, makerId: RIO_OWNER });
+      if (!r.required) throw new Error("expected Rio's payroll policy");
+      return decide(c, { tenantId: RIO_TENANT, entityId: RIO_ENTITY, actor: { kind: "user", id: STEVE, label: "Steve" } },
+        { requestId: r.requestId, actorId: STEVE, decision: "approved" });
+    }), /does not hold the role/);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   await pool.end();
