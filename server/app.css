@@ -234,7 +234,7 @@ button.tile{appearance:none;text-align:left;cursor:pointer;width:100%}
 .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 12px}
 .toolbar .grow{flex:1}
 .panel+.toolbar{margin-top:10px}
-input[type=text],input[type=password],input[type=date],input[type=number],textarea,select{width:100%;font-size:16px;color:var(--ink);background:var(--panel);
+input[type=text],input[type=password],input[type=date],input[type=number],input[type=tel],input[type=email],textarea,select{width:100%;font-size:16px;color:var(--ink);background:var(--panel);
   border:1px solid var(--line-2);border-radius:9px;padding:9px 11px;min-height:42px}
 select{appearance:auto}
 textarea{min-height:80px;resize:vertical}
@@ -249,6 +249,19 @@ textarea{min-height:80px;resize:vertical}
 .check{display:flex;gap:10px;align-items:center;margin:12px 0;font-size:14.5px}
 .check input{width:20px;height:20px;accent-color:var(--teal)}
 input.pickbox{width:20px;height:20px;accent-color:var(--teal);margin:0}
+input.upper{text-transform:uppercase}
+input.upper::placeholder{text-transform:none}
+.form-sec{grid-column:1/-1;margin:18px 0 0;padding-top:14px;border-top:1px solid var(--line);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-2)}
+.form-grid:first-child>.form-sec:first-child{margin-top:4px;padding-top:0;border-top:0}
+.facts .wide2{grid-column:1/-1}
+.checks{display:flex;flex-direction:column;gap:2px;margin:4px 0 8px}
+.check.role{align-items:flex-start;margin:6px 0}
+.check.role input{flex:none;margin-top:1px}
+.check.role b{font-weight:650}
+.rowlist{display:flex;flex-direction:column;gap:10px;margin:8px 0 10px}
+.rowbox{position:relative;border:1px solid var(--line);border-radius:12px;padding:2px 44px 6px 14px;background:var(--soft)}
+.rowbox .rm{position:absolute;top:8px;right:6px;color:var(--ink-2)}
+.rowbox .rm:hover{background:var(--head);color:var(--ink)}
 
 /* --------------------------------------------------------------- dialogs */
 dialog{border:0;padding:0;border-radius:16px;width:min(640px,calc(100vw - 20px));max-height:calc(100dvh - 24px);

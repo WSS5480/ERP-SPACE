@@ -105,7 +105,16 @@ export async function formOptions(c: Client, co: Company) {
        and not exists (select 1 from bank_account ba where ba.gl_account_id = ga.id and ba.entity_id = $2)
      order by ga.code /* unscoped: the chart of accounts is shared across the client's companies */`,
     [co.tenantId, co.id]);
-  return { accounts, vendors, stores: await stores(c, co), bookable };
+  const payGroups = await q(c, `
+    select id, name, frequency from pay_group where entity_id = $1 and status = 'active' order by name`, [co.id]);
+  const positions = (await q<{ position: string }>(c, `
+    select distinct position from employee where entity_id = $1 and position is not null order by 1`, [co.id])).map((r) => r.position);
+  const payrollBanks = await q(c, `
+    select id, name, purpose, bank_name, account_last4 from bank_account
+     where entity_id = $1 and status = 'active' and purpose in ('payroll', 'operating') order by purpose desc, name`, [co.id]);
+  const states = (await q<{ state: string }>(c, `
+    select distinct state from location where entity_id = $1 and state is not null order by 1`, [co.id])).map((r) => r.state);
+  return { accounts, vendors, stores: await stores(c, co), bookable, payGroups, positions, payrollBanks, states };
 }
 
 // -------------------------------------------------------------- approvals
@@ -119,7 +128,23 @@ type OpenRequest = {
  * What an approval is about. Dates stay YYYY-MM-DD and the page words them,
  * so a phone in another time zone never shows the wrong day.
  */
-type Subject = { kind: string; title: string; detail: string; date: string | null; link: string | null; vendor?: string; ref?: string | null };
+type Subject = { kind: string; title: string; detail: string; date: string | null; link: string | null; vendor?: string; ref?: string | null;
+                 callback?: { phone: string | null; contact: string | null; phoneChangedAt: string | null } };
+const usd = (m: string | bigint) => USD.format(Number(m) / 100);
+
+/**
+ * When a vendor's phone on file last changed, from any of the client's
+ * companies: a vendor is shared across them, and a call-back to a number
+ * changed alongside the bank details proves nothing.
+ */
+async function phoneChangedAt(c: Client, co: Company, vendorId: string): Promise<string | null> {
+  const r = await q<{ at: string | null }>(c, `
+    select max(ae.at) as at from audit_event ae
+     where ae.tenant_id = $1 and ae.table_name = 'vendor' and ae.row_id = $2
+       and ae.reason = 'details changed, including the phone on file'
+    /* unscoped: a vendor's record is shared across the client's companies */`, [co.tenantId, vendorId]);
+  return r[0]?.at ?? null;
+}
 async function subjectSummary(c: Client, co: Company, type: string, id: string): Promise<Subject> {
   if (type === "invoice") {
     const r = await q<{ vendor: string; reference: string | null; invoice_date: string; stores: string | null }>(c, `
@@ -145,12 +170,46 @@ async function subjectSummary(c: Client, co: Company, type: string, id: string):
     if (r[0]) return { kind: "payment_run", title: "Payment run", detail: `${r[0].n} bill${r[0].n === 1 ? "" : "s"} by ${r[0].method.toUpperCase()}`,
                        date: r[0].pay_date, link: `payment:${id}` };
   }
+  if (type === "employee") {
+    const r = await q<{ name: string; position: string | null; pay_type: string; base_rate_minor: string; pay_group: string | null; hired_on: string }>(c, `
+      select e.first_name || ' ' || e.last_name as name, e.position, e.pay_type, e.base_rate_minor, pg.name as pay_group, e.hired_on::text
+        from employee e left join pay_group pg on pg.id = e.pay_group_id
+       where e.id = $1 and e.entity_id = $2`, [id, co.id]);
+    if (r[0]) return { kind: "employee", title: `New hire · ${r[0].name}`, date: null, link: `person:${id}`,
+      detail: [r[0].position, r[0].pay_group, `${usd(r[0].base_rate_minor)} ${r[0].pay_type === "salary" ? "a year" : "an hour"}`, `starts ${r[0].hired_on}`].filter(Boolean).join(" · ") };
+  }
+  if (type === "employee_change") {
+    const r = await q<{ name: string; employee_id: string; before: Record<string, string>; after: Record<string, string>; old_group: string | null; new_group: string | null }>(c, `
+      select e.first_name || ' ' || e.last_name as name, e.id as employee_id, ch.before, ch.after,
+             (select pg.name from pay_group pg where pg.id = (ch.before->>'pay_group_id')::uuid) as old_group,
+             (select pg.name from pay_group pg where pg.id = (ch.after->>'pay_group_id')::uuid) as new_group
+        from employee_change ch join employee e on e.id = ch.employee_id
+       where ch.id = $1 and ch.entity_id = $2`, [id, co.id]);
+    if (r[0]) {
+      const b = r[0].before, a = r[0].after;
+      const per = (t: string) => (t === "salary" ? "a year" : "an hour");
+      const parts = [];
+      if (b.base_rate_minor !== a.base_rate_minor || b.pay_type !== a.pay_type) parts.push(`${usd(b.base_rate_minor)} ${per(b.pay_type)} to ${usd(a.base_rate_minor)} ${per(a.pay_type)}`);
+      if (r[0].old_group !== r[0].new_group) parts.push(`${r[0].old_group ?? "no group"} to ${r[0].new_group ?? "no group"}`);
+      return { kind: "employee_change", title: `Pay change · ${r[0].name}`, detail: parts.join(" · "), date: null, link: `person:${r[0].employee_id}` };
+    }
+  }
+  if (type === "vendor_bank_account") {
+    const r = await q<{ vendor: string; vendor_id: string; bank_name: string | null; routing_last4: string; account_last4: string; contact_phone: string | null; contact_name: string | null }>(c, `
+      select coalesce(v.dba, v.legal_name) as vendor, v.id as vendor_id, b.bank_name, b.routing_last4, b.account_last4, v.contact_phone, v.contact_name
+        from vendor_bank_account b join vendor v on v.id = b.vendor_id
+       where b.id = $1 and b.vendor_id in (select vendor_id from vendor_entity where entity_id = $2)`, [id, co.id]);
+    if (r[0]) return { kind: "vendor_bank", title: `Bank details · ${r[0].vendor}`, date: null, link: `vendor:${r[0].vendor_id}`,
+      detail: `${r[0].bank_name ?? "bank"} · routing ••${r[0].routing_last4} · account ••${r[0].account_last4}`,
+      callback: { phone: r[0].contact_phone, contact: r[0].contact_name,
+                  phoneChangedAt: await phoneChangedAt(c, co, r[0].vendor_id) } };
+  }
   if (type === "vendor") {
     const r = await q<{ name: string }>(c, `
       select coalesce(v.dba, v.legal_name) as name from vendor v
         join vendor_entity ve on ve.vendor_id = v.id and ve.entity_id = $2
        where v.id = $1`, [id, co.id]);
-    if (r[0]) return { kind: "vendor", title: `New vendor · ${r[0].name}`, detail: "Set up to receive bills", date: null, link: "vendors" };
+    if (r[0]) return { kind: "vendor", title: `New vendor · ${r[0].name}`, detail: "Set up to receive bills", date: null, link: `vendor:${id}` };
   }
   return { kind: type, title: type.replace(/_/g, " "), detail: "", date: null, link: null };
 }
@@ -363,19 +422,49 @@ export async function bill(c: Client, co: Company, id: string) {
 export async function vendors(c: Client, co: Company) {
   return await q(c, `
     select v.id, coalesce(v.dba, v.legal_name) as name, v.legal_name, v.is_1099, v.w9_on_file, v.status as vendor_status,
+           v.city, v.state, v.contact_name, v.contact_phone,
            ve.status, ve.terms_days, ga.code as gl_code, ga.name as gl_name, po.name as store,
            (select count(*) from invoice i where i.vendor_id = v.id and i.entity_id = $1)::int as bills,
            (select coalesce(sum(i.total_minor), 0) from invoice i
              where i.vendor_id = v.id and i.entity_id = $1 and i.status in ('approved','scheduled','pending','validated','held','exception')) as open_minor,
            (select max(i.invoice_date)::text from invoice i where i.vendor_id = v.id and i.entity_id = $1) as last_bill,
            (select vba.account_last4 from vendor_bank_account vba
-             where vba.vendor_id = v.id and vba.status = 'current' order by vba.version desc limit 1) as bank_last4
+             where vba.vendor_id = v.id and vba.status = 'current' order by vba.version desc limit 1) as bank_last4,
+           exists (select 1 from vendor_bank_account vba where vba.vendor_id = v.id and vba.status = 'pending') as bank_change_pending
       from vendor_entity ve
       join vendor v on v.id = ve.vendor_id
       left join gl_account ga on ga.id = ve.default_gl_account_id
       left join profit_object po on po.id = ve.default_profit_object_id
      where ve.entity_id = $1
      order by 2`, [co.id]);
+}
+
+/** One vendor: the whole record, its bank details and their history, and its recent bills. */
+export async function vendor(c: Client, co: Company, id: string) {
+  const rows = await q(c, `
+    select v.id, v.legal_name, v.dba, coalesce(v.dba, v.legal_name) as name, v.status as vendor_status, v.tax_classification,
+           v.is_1099, v.tin_last4, v.w9_on_file, v.address_line1, v.address_line2, v.city, v.state, v.postal_code, v.remit_to,
+           v.contact_name, v.contact_phone, v.contact_email, v.created_at, cu.name as created_by_name,
+           ve.status, ve.terms_days, ve.default_gl_account_id, ve.default_profit_object_id,
+           ga.code as gl_code, ga.name as gl_name, po.name as store
+      from vendor_entity ve
+      join vendor v on v.id = ve.vendor_id
+      left join app_user cu on cu.id = v.created_by
+      left join gl_account ga on ga.id = ve.default_gl_account_id
+      left join profit_object po on po.id = ve.default_profit_object_id
+     where ve.entity_id = $2 and v.id = $1`, [id, co.id]);
+  if (!rows.length) return null;
+  const banks = await q(c, `
+    select b.id, b.version, b.bank_name, b.routing_last4, b.account_last4, b.status, b.effective_from, b.hold_until,
+           b.callback_note, b.account_ref, b.created_at, u.name as created_by_name,
+           (b.hold_until is not null and b.hold_until > now()) as cooling_off
+      from vendor_bank_account b left join app_user u on u.id = b.created_by
+     where b.vendor_id = $1 and b.vendor_id in (select vendor_id from vendor_entity where entity_id = $2)
+     order by b.version desc`, [id, co.id]);
+  const bills = await q(c, `
+    select i.id, i.reference, i.invoice_date::text, i.total_minor, i.status
+      from invoice i where i.vendor_id = $1 and i.entity_id = $2 order by i.invoice_date desc limit 8`, [id, co.id]);
+  return { ...rows[0], banks, bills, phone_changed_at: await phoneChangedAt(c, co, id) };
 }
 
 export async function paymentRuns(c: Client, co: Company) {
@@ -430,9 +519,22 @@ export async function paymentRun(c: Client, co: Company, id: string) {
 
 // ------------------------------------------------------------------ payroll
 
+/**
+ * Payroll, one pay group at a time: each group runs on its own schedule, with
+ * its own period open and its own people.
+ */
 export async function payroll(c: Client, co: Company) {
-  const periods = await q(c, `
-    select pp.id, pg.name as pay_group, pg.frequency, pp.starts_on::text, pp.ends_on::text, pp.pay_date::text, pp.status,
+  const groups = await q<{ id: string }>(c, `
+    select pg.id, pg.name, pg.frequency, pg.pay_lag_days, pg.workweek_start_dow, pg.overtime_after_hours,
+           ba.name as bank_account, ba.account_last4,
+           (select count(*) from employee e where e.pay_group_id = pg.id and e.status in ('active','leave'))::int as people,
+           (select count(*) from employee e where e.pay_group_id = pg.id and e.status = 'active' and e.pay_type = 'salary')::int as salaried
+      from pay_group pg join bank_account ba on ba.id = pg.bank_account_id
+     where pg.entity_id = $1 and pg.status = 'active'
+     order by case pg.frequency when 'weekly' then 0 when 'biweekly' then 1 when 'semimonthly' then 2 else 3 end, pg.name`, [co.id]);
+  const periods = await q<{ pay_group_id: string }>(c, `
+    select pp.id, pp.pay_group_id, pg.name as pay_group, pg.frequency, pp.starts_on::text, pp.ends_on::text, pp.pay_date::text, pp.status,
+           (pp.ends_on <= current_date) as period_over,
            (select count(*) from timecard t where t.pay_period_id = pp.id)::int as timecards,
            (select coalesce(sum(t.hours), 0) from timecard t where t.pay_period_id = pp.id) as hours,
            (select count(*) from timecard t where t.pay_period_id = pp.id and t.status = 'recorded')::int as to_approve,
@@ -441,10 +543,10 @@ export async function payroll(c: Client, co: Company) {
            (select pr.id from payroll_run pr where pr.pay_period_id = pp.id and pr.status <> 'cancelled'
              order by pr.created_at desc limit 1) as run_id
       from pay_period pp join pay_group pg on pg.id = pp.pay_group_id
-     where pg.entity_id = $1
-     order by pp.pay_date desc limit 8`, [co.id]);
+     where pg.entity_id = $1 and pp.status not in ('posted','cancelled')
+     order by pp.pay_date`, [co.id]);
   const runs = await q(c, `
-    select pr.id, pp.pay_date::text, pp.starts_on::text, pp.ends_on::text, pr.status, pr.gross_minor, pr.net_minor,
+    select pr.id, pg.name as pay_group, pp.pay_date::text, pp.starts_on::text, pp.ends_on::text, pr.status, pr.gross_minor, pr.net_minor,
            pr.employee_tax_minor, pr.employer_tax_minor, pr.deductions_minor, pr.tax_provider,
            pr.built_by, bu.name as built_by_name, ru.name as released_by_name, pr.released_at,
            (select count(*) from payroll_line pl where pl.payroll_run_id = pr.id)::int as employees,
@@ -456,22 +558,63 @@ export async function payroll(c: Client, co: Company) {
              order by s.seq limit 1) as waiting_on
       from payroll_run pr
       join pay_period pp on pp.id = pr.pay_period_id
+      join pay_group pg on pg.id = pp.pay_group_id
       join app_user bu on bu.id = pr.built_by
       left join app_user ru on ru.id = pr.released_by
      where pr.entity_id = $1
-     order by pp.pay_date desc, pr.created_at desc limit 10`, [co.id]);
+     order by pp.pay_date desc, pr.created_at desc limit 12`, [co.id]);
   const employees = await q(c, `
-    select e.id, e.first_name || ' ' || e.last_name as name, e.pay_type, e.base_rate_minor, e.status,
-           po.name as store, e.comp_class_code
-      from employee e left join profit_object po on po.id = e.profit_object_id
-     where e.entity_id = $1 order by e.last_name`, [co.id]);
+    select e.id, e.employee_no, e.first_name || ' ' || e.last_name as name, e.position, e.pay_type, e.base_rate_minor, e.status,
+           e.hired_on::text, e.terminated_on::text, po.name as store, e.comp_class_code, e.work_state,
+           pg.name as pay_group, pg.frequency,
+           (select ch.after from employee_change ch where ch.employee_id = e.id and ch.status = 'pending' limit 1) as pending_change
+      from employee e
+      left join profit_object po on po.id = e.profit_object_id
+      left join pay_group pg on pg.id = e.pay_group_id
+     where e.entity_id = $1
+       and (e.status <> 'terminated' or e.terminated_on >= current_date - 90)
+     order by case e.status when 'applicant' then 0 when 'active' then 1 when 'leave' then 2 else 3 end, e.last_name`, [co.id]);
   const remittances = await q(c, `
     select dt.name, dr.due_on::text, dr.deducted_minor, dr.employer_match_minor, dr.remitted_minor, dr.status,
            greatest(0, current_date - dr.due_on)::int as days_late
       from deduction_remittance dr join deduction_type dt on dt.id = dr.deduction_type_id
      where dr.entity_id = $1 and dr.status <> 'remitted'
      order by dr.due_on limit 20`, [co.id]);
-  return { periods, runs, employees, remittances };
+  const out = groups.map((g) => ({ ...g, current: periods.find((p) => p.pay_group_id === g.id) ?? null }));
+  return { groups: out, periods, runs, employees, remittances };
+}
+
+/** One person: their record, a pay change waiting on approval, and what has happened to them. */
+export async function employee(c: Client, co: Company, id: string) {
+  const rows = await q(c, `
+    select e.id, e.employee_no, e.first_name, e.last_name, e.position, e.pay_type, e.base_rate_minor, e.status,
+           e.hired_on::text, e.terminated_on::text, e.work_state, e.comp_class_code, e.profit_object_id, po.name as store,
+           e.pay_group_id, pg.name as pay_group, pg.frequency
+      from employee e
+      left join profit_object po on po.id = e.profit_object_id
+      left join pay_group pg on pg.id = e.pay_group_id
+     where e.id = $1 and e.entity_id = $2`, [id, co.id]);
+  if (!rows.length) return null;
+  const pending = await q(c, `
+    select ch.id, ch.before, ch.after, ch.reason, ch.requested_at, u.name as requested_by,
+           (select pg.name from pay_group pg where pg.id = (ch.after->>'pay_group_id')::uuid) as new_group
+      from employee_change ch join app_user u on u.id = ch.requested_by
+     where ch.employee_id = $1 and ch.entity_id = $2 and ch.status = 'pending'`, [id, co.id]);
+  const history = await q(c, `
+    select ae.at, ae.actor_label, ae.table_name, ae.action, ae.reason
+      from audit_event ae
+     where ae.entity_id = $2
+       and ((ae.table_name = 'employee' and ae.row_id = $3)
+         or (ae.table_name = 'employee_change' and ae.row_id in (select ch.id::text from employee_change ch where ch.employee_id = $1 and ch.entity_id = $2)))
+     order by ae.id desc limit 30`, [id, co.id, id]);
+  const pay = await q(c, `
+    select pp.pay_date::text, pl.regular_hours, pl.overtime_hours, pl.gross_minor, pl.net_minor, pr.status
+      from payroll_line pl
+      join payroll_run pr on pr.id = pl.payroll_run_id and pr.entity_id = $2
+      join pay_period pp on pp.id = pr.pay_period_id
+     where pl.employee_id = $1 and pr.status <> 'cancelled'
+     order by pp.pay_date desc limit 6`, [id, co.id]);
+  return { ...rows[0], pending: pending[0] ?? null, history, pay };
 }
 
 export async function payrollRun(c: Client, co: Company, id: string) {
@@ -877,18 +1020,24 @@ export async function home(c: Client, co: Company, personId: string | null) {
 
   const appr = await approvals(c, co, personId);
 
+  // One open period per pay group, soonest pay date first.
   const nextPay = await q(c, `
-    select pp.id, pp.pay_date::text, pp.status, pp.starts_on::text, pp.ends_on::text,
-           (select pr.status from payroll_run pr where pr.pay_period_id = pp.id and pr.status <> 'cancelled'
-             order by pr.created_at desc limit 1) as run_status,
-           (select pr.net_minor from payroll_run pr where pr.pay_period_id = pp.id and pr.status <> 'cancelled'
-             order by pr.created_at desc limit 1) as net_minor,
+    select pp.id, pg.id as pay_group_id, pg.name as pay_group, pg.frequency, pp.pay_date::text, pp.status, pp.starts_on::text, pp.ends_on::text,
+           run.status as run_status, run.net_minor,
+           (select r.status from approval_request r where r.subject_type = 'payroll_run' and r.subject_id = run.id
+             order by r.created_at desc limit 1) as approval_status,
            (select count(*) from timecard t where t.pay_period_id = pp.id)::int as timecards,
            (select count(*) from timecard t where t.pay_period_id = pp.id and t.status = 'recorded')::int as to_approve,
+           (select count(*) from employee e where e.pay_group_id = pg.id and e.status = 'active' and e.pay_type = 'salary')::int as salaried,
            (pp.ends_on <= current_date) as period_over
       from pay_period pp join pay_group pg on pg.id = pp.pay_group_id
-     where pg.entity_id = $1 and pp.status not in ('posted','cancelled')
-     order by pp.pay_date limit 1`, [co.id]);
+      left join lateral (select pr.id, pr.status, pr.net_minor from payroll_run pr
+                          where pr.pay_period_id = pp.id and pr.status <> 'cancelled'
+                          order by pr.created_at desc limit 1) run on true
+     where pg.entity_id = $1 and pg.status = 'active' and pp.status not in ('posted','cancelled')
+     order by pp.pay_date limit 6`, [co.id]);
+  const payGroups = await one<{ n: number }>(c, `
+    select count(*)::int as n from pay_group where entity_id = $1 and status = 'active'`, [co.id]);
 
   const rec = await one<{ lines: number; lines_minor: string; deposits: number; deposits_minor: string; late: number }>(c, `
     select (select count(*) from unmatched_bank_lines u where u.entity_id = $1)::int as lines,
@@ -932,7 +1081,10 @@ export async function home(c: Client, co: Company, personId: string | null) {
     cash: { total: cashTotal.toString(), operating, byPurpose: cashRows },
     bills: billStats,
     approvals: { mine: appr.mine, othersCount: appr.others.length },
-    payroll: nextPay[0] ?? null,
+    payroll: nextPay,
+    payGroups: payGroups.n,
+    hires: (await q<{ n: number }>(c, `select count(*)::int as n from employee where entity_id = $1 and status = 'applicant'`, [co.id]))[0].n,
+    payChanges: (await q<{ n: number }>(c, `select count(*)::int as n from employee_change where entity_id = $1 and status = 'pending'`, [co.id]))[0].n,
     recon: rec,
     sweepsOverdue,
     feeds: {
@@ -945,4 +1097,54 @@ export async function home(c: Client, co: Company, personId: string | null) {
     month: { from, to, revenue: pl.revenue, expenses: pl.expenses, net: (BigInt(pl.revenue) - BigInt(pl.expenses)).toString() },
     attention: await plainReasons(c, co, attention),
   };
+}
+
+// -------------------------------------------------------------------- setup
+
+/** A company's setup: who it is, its stores, bank accounts, people and roles, and its approval rules. */
+export async function setup(c: Client, co: Company) {
+  const company = await one(c, `
+    select e.id, e.name, e.legal_name, e.ein_last4, e.fiscal_year_end_month, e.created_at, t.name as client, t.vertical,
+           t.location_label, t.profit_object_label
+      from entity e join tenant t on t.id = e.tenant_id
+     where e.id = $1 /* unscoped: the company itself */`, [co.id]);
+  const storesList = await q(c, `
+    select po.id, po.code, po.name, po.kind, po.status, l.state,
+           (select count(*) from employee e where e.profit_object_id = po.id and e.status = 'active')::int as people
+      from profit_object po left join location l on l.id = po.location_id
+     where po.entity_id = $1 order by case po.kind when 'store' then 0 else 1 end, po.name`, [co.id]);
+  const banks = await q(c, `
+    select ba.id, ba.name, ba.purpose, ba.bank_name, ba.routing_last4, ba.account_last4, ba.ach_origination_enabled,
+           ba.status, l.name as location, ga.code as gl_code
+      from bank_account ba left join location l on l.id = ba.location_id join gl_account ga on ga.id = ba.gl_account_id
+     where ba.entity_id = $1
+     order by case ba.purpose when 'operating' then 0 when 'payroll' then 1 when 'tax' then 2 else 3 end, ba.name`, [co.id]);
+  // A role granted for this company can be changed here; one granted for every
+  // company of the client (client_roles) is the operator's to change.
+  const team = await q<{ id: string; name: string; email: string; status: string; own_roles: string[]; client_roles: string[] }>(c, `
+    select u.id, u.name, u.email, u.status,
+           coalesce(array_agg(distinct g.role order by g.role) filter (where g.entity_id = $1), '{}') as own_roles,
+           coalesce(array_agg(distinct g.role order by g.role) filter (where g.entity_id is null and u.tenant_id = $2), '{}') as client_roles
+      from app_user u
+      left join role_grant g on g.app_user_id = u.id
+     where u.tenant_id = $2 or exists (select 1 from role_grant g2 where g2.app_user_id = u.id and g2.entity_id = $1)
+     group by u.id, u.name, u.email, u.status
+     order by u.name`, [co.id, co.tenantId]);
+  const policies = await q<{ subject_type: string; min_amount_minor: string; steps: { seq: number; role: string }[]; requires_callback: boolean }>(c, `
+    select subject_type, min_amount_minor, steps, requires_callback from approval_policy
+     where entity_id = $1 and active order by subject_type, min_amount_minor`, [co.id]);
+  return {
+    company, stores: storesList, banks,
+    people: team.map((p) => ({ ...p, roles: [...new Set([...p.client_roles, ...p.own_roles])].map(roleWord) })),
+    policies: policies.map((p) => ({ ...p, steps: p.steps.map((s) => roleWord(s.role)) })),
+  };
+}
+
+/** The clients kept here, for starting a new company: its chart can be copied from any of them. */
+export async function clients(c: Client) {
+  return await q(c, `
+    select t.id, t.name, t.vertical,
+           (select count(*) from entity e where e.tenant_id = t.id)::int as companies,
+           (select count(*) from gl_account g where g.tenant_id = t.id)::int as accounts
+      from tenant t order by t.name /* unscoped: the operator's list of clients */`);
 }

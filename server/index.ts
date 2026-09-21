@@ -475,13 +475,24 @@ route("GET", /^\/api\/me$/, "token", async (_req, _url, _m, who) => {
   } finally { c.release(); }
 });
 
+// The clients kept here, and a new company for one of them (or for a new client).
+route("GET", /^\/api\/clients$/, "token", async () => {
+  const c = await pool.connect();
+  try { return [200, await views.clients(c)]; } finally { c.release(); }
+});
+route("POST", /^\/api\/companies$/, "token", async (req, _url, _m, who) => {
+  const body = await readJson(req);
+  const label = who?.via === "session" ? `${who.name} (web)` : "api";
+  return [200, await tx({ kind: "user", label }, (c) => act.createCompany(c, label, body))];
+});
+
 coGet("/people", (c, co) => views.people(c, co));
 coGet("/home", (c, co, _u, _m, p) => views.home(c, co, p));
 coGet("/options", (c, co) => views.formOptions(c, co));
 
 coGet("/approvals", (c, co, _u, _m, p) => views.approvals(c, co, p));
 coPost("/approvals/([0-9a-fA-F-]{36})", (c, co, a, b, m) =>
-  act.decideRequest(c, co, a, { requestId: m[2], decision: b.decision, note: b.note }));
+  act.decideRequest(c, co, a, { requestId: m[2], decision: b.decision, note: b.note, callback: b.callback }));
 
 coGet("/bills", (c, co, url) => views.bills(c, co, param(url, "tab") || "attention"));
 coGet("/bills/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.bill(c, co, m[2]));
@@ -491,6 +502,9 @@ coPost("/bills/([0-9a-fA-F-]{36})/reject", (c, co, a, b, m) => act.rejectBill(c,
 
 coGet("/vendors", (c, co) => views.vendors(c, co));
 coPost("/vendors", (c, co, a, b) => act.addVendor(c, co, a, b));
+coGet("/vendors/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.vendor(c, co, m[2]));
+coPost("/vendors/([0-9a-fA-F-]{36})", (c, co, a, b, m) => act.updateVendor(c, co, a, { ...b, id: m[2] }));
+coPost("/vendors/([0-9a-fA-F-]{36})/bank", (c, co, a, b, m) => act.requestVendorBank(c, co, a, { ...b, vendorId: m[2] }));
 
 coGet("/payment-runs", (c, co) => views.paymentRuns(c, co));
 coGet("/payment-runs/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.paymentRun(c, co, m[2]));
@@ -507,7 +521,18 @@ coPost("/payroll/periods/([0-9a-fA-F-]{36})/build", (c, co, a, _b, m) => act.bui
 coPost("/payroll/runs/([0-9a-fA-F-]{36})/request", (c, co, a, _b, m) => act.requestPayroll(c, co, a, { runId: m[2] }));
 coPost("/payroll/runs/([0-9a-fA-F-]{36})/release", (c, co, a, _b, m) => act.releasePayroll(c, co, a, { runId: m[2] }));
 coPost("/payroll/runs/([0-9a-fA-F-]{36})/post", (c, co, a, _b, m) => act.postPayroll(c, co, a, { runId: m[2] }));
-coPost("/payroll/next-period", (c, co, a) => act.openNextPeriod(c, co, a));
+coPost("/payroll/next-period", (c, co, a, b) => act.openNextPeriod(c, co, a, { payGroupId: b.payGroupId }));
+coPost("/payroll/groups", (c, co, a, b) => act.addPayGroup(c, co, a, b));
+coPost("/payroll/people", (c, co, a, b) => act.hireEmployee(c, co, a, b));
+coGet("/payroll/people/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.employee(c, co, m[2]));
+coPost("/payroll/people/([0-9a-fA-F-]{36})", (c, co, a, b, m) => act.changeEmployee(c, co, a, { ...b, id: m[2] }));
+coPost("/payroll/people/([0-9a-fA-F-]{36})/end", (c, co, a, b, m) => act.terminateEmployee(c, co, a, { ...b, id: m[2] }));
+
+coGet("/setup", (c, co) => views.setup(c, co));
+coPost("/setup/stores", (c, co, a, b) => act.addStore(c, co, a, b));
+coPost("/setup/banks", (c, co, a, b) => act.addBankAccount(c, co, a, b));
+coPost("/setup/people", (c, co, a, b) => act.addPerson(c, co, a, b));
+coPost("/setup/people/([0-9a-fA-F-]{36})/roles", (c, co, a, b, m) => act.setRoles(c, co, a, { ...b, personId: m[2] }));
 
 coGet("/books/pnl", (c, co, url) => {
   const from = DAY.test(param(url, "from")) ? param(url, "from") : monthStart();

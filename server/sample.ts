@@ -20,6 +20,7 @@ import { tx, q, one, type Client } from "../packages/core/db.ts";
 import { planSweeps, confirmTransfer } from "../packages/core/banking.ts";
 import { autoMatch } from "../packages/core/reconcile.ts";
 import { runGates, postToLedger } from "../packages/core/invoice.ts";
+import { nextPeriod } from "../packages/core/payroll.ts";
 import { loadCompany, type Company } from "./views.ts";
 import {
   scopeOf, decideRequest, createPaymentRun, submitPaymentRun, releasePaymentRun,
@@ -438,18 +439,22 @@ async function build(c: Client, co: Company, log: (s: string) => void): Promise<
   void b9; void fuelBills;
 
   // ------------------------------------------------------------ payroll
-  const group = (await q<{ id: string }>(c, `select id from pay_group where entity_id = $1 and status = 'active' limit 1`, [co.id]))[0];
+  // Store staff, paid weekly. The managers' semimonthly group has no time to enter.
+  const group = (await q<{ id: string; pay_lag_days: number }>(c, `
+    select id, pay_lag_days from pay_group where entity_id = $1 and status = 'active' and frequency = 'weekly' order by name limit 1`, [co.id]))[0];
   let runs = 0;
   if (group) {
     let last = (await q<{ starts_on: string; ends_on: string; pay_date: string }>(c, `
       select starts_on::text, ends_on::text, pay_date::text from pay_period pp
         join pay_group pg on pg.id = pp.pay_group_id
        where pp.pay_group_id = $1 and pg.entity_id = $2 order by starts_on desc limit 1`, [group.id, co.id]))[0];
+    // Each new week is paid on the group's own schedule: a pay date on a weekend moves to the Friday before.
     for (let guard = 0; last && last.ends_on < today && guard < 8; guard++) {
+      const n = nextPeriod("weekly", last.ends_on, group.pay_lag_days);
       last = await one(c, `
         insert into pay_period (pay_group_id, starts_on, ends_on, pay_date)
-        select $1, $2::date + 7, $3::date + 7, $4::date + 7 where exists (select 1 from pay_group where id = $1 and entity_id = $5)
-        returning starts_on::text, ends_on::text, pay_date::text`, [group.id, last.starts_on, last.ends_on, last.pay_date, co.id]);
+        select $1, $2::date, $3::date, $4::date where exists (select 1 from pay_group where id = $1 and entity_id = $5)
+        returning starts_on::text, ends_on::text, pay_date::text`, [group.id, n.startsOn, n.endsOn, n.payDate, co.id]);
     }
     const periods = await q<{ id: string; starts_on: string; ends_on: string; status: string }>(c, `
       select pp.id, pp.starts_on::text, pp.ends_on::text, pp.status from pay_period pp
@@ -457,7 +462,8 @@ async function build(c: Client, co: Company, log: (s: string) => void): Promise<
        where pp.pay_group_id = $1 and pg.entity_id = $2 and pp.status in ('open', 'timecards_approved')
        order by pp.starts_on`, [group.id, co.id]);
     const staff = await q<{ id: string; profit_object_id: string | null; employee_no: string }>(c, `
-      select id, profit_object_id, employee_no from employee where entity_id = $1 and status = 'active' order by employee_no`, [co.id]);
+      select id, profit_object_id, employee_no from employee
+       where entity_id = $1 and status = 'active' and pay_group_id = $2 order by employee_no`, [co.id, group.id]);
     for (const p of periods) {
       const cards = await q<{ n: number }>(c, `
         select count(*)::int as n from timecard t join employee e on e.id = t.employee_id and e.entity_id = $2
