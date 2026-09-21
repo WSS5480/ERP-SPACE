@@ -53,6 +53,114 @@ export class IllustrativeTaxProvider implements TaxProvider {
 
 export class PayrollError extends Error {}
 
+// ------------------------------------------------------------ schedules --
+//
+// Dates are YYYY-MM-DD strings, worked in UTC so no time zone moves a day.
+
+export type Frequency = "weekly" | "biweekly" | "semimonthly" | "monthly";
+export const PERIODS_PER_YEAR: Record<Frequency, number> = { weekly: 52, biweekly: 26, semimonthly: 24, monthly: 12 };
+export const isFrequency = (s: unknown): s is Frequency =>
+  s === "weekly" || s === "biweekly" || s === "semimonthly" || s === "monthly";
+
+const DAY = 86_400_000;
+const toUtc = (s: string) => Date.UTC(Number(s.slice(0, 4)), Number(s.slice(5, 7)) - 1, Number(s.slice(8, 10)));
+const fromUtc = (t: number) => new Date(t).toISOString().slice(0, 10);
+export const addDays = (s: string, n: number) => fromUtc(toUtc(s) + n * DAY);
+export const dayOfWeek = (s: string) => new Date(toUtc(s)).getUTCDay(); // 0 = Sunday
+export const daysBetween = (a: string, b: string) => Math.round((toUtc(b) - toUtc(a)) / DAY);
+const endOfMonth = (s: string) => fromUtc(Date.UTC(Number(s.slice(0, 4)), Number(s.slice(5, 7)), 0));
+
+/** Pay date: so many days after the period ends; a weekend moves to the Friday before. Bank holidays are not known yet. */
+export function payDateFor(endsOn: string, lagDays: number): string {
+  const d = addDays(endsOn, lagDays);
+  const w = dayOfWeek(d);
+  return w === 6 ? addDays(d, -1) : w === 0 ? addDays(d, -2) : d;
+}
+
+/** Where a schedule's periods may start: semimonthly on the 1st or the 16th, monthly on the 1st. */
+export function periodStartProblem(freq: Frequency, startsOn: string): string | null {
+  const day = Number(startsOn.slice(8, 10));
+  if (freq === "semimonthly" && day !== 1 && day !== 16) return "a semimonthly period starts on the 1st or the 16th";
+  if (freq === "monthly" && day !== 1) return "a monthly period starts on the 1st";
+  return null;
+}
+
+/** The period of a schedule that starts on a given day. */
+export function periodStartingOn(freq: Frequency, startsOn: string, lagDays: number) {
+  let endsOn: string;
+  if (freq === "weekly") endsOn = addDays(startsOn, 6);
+  else if (freq === "biweekly") endsOn = addDays(startsOn, 13);
+  else if (freq === "semimonthly") endsOn = Number(startsOn.slice(8, 10)) <= 15 ? `${startsOn.slice(0, 8)}15` : endOfMonth(startsOn);
+  else endsOn = endOfMonth(startsOn);
+  return { startsOn, endsOn, payDate: payDateFor(endsOn, lagDays) };
+}
+
+/** The period after the one that ends on endsOn. */
+export const nextPeriod = (freq: Frequency, endsOn: string, lagDays: number) =>
+  periodStartingOn(freq, addDays(endsOn, 1), lagDays);
+
+/**
+ * The first day of the workweek a day falls in. Weekly and biweekly groups
+ * count workweeks from the period start, so a week never spans two periods;
+ * semimonthly and monthly groups use the group's fixed workweek.
+ */
+export function workweekStart(day: string, freq: Frequency, periodStart: string, startDow: number): string {
+  if (freq === "weekly" || freq === "biweekly") {
+    return addDays(periodStart, 7 * Math.floor(daysBetween(periodStart, day) / 7));
+  }
+  return addDays(day, -((dayOfWeek(day) - startDow + 7) % 7));
+}
+
+/**
+ * Regular and overtime hours for one person's period, counted per workweek as
+ * federal rules require. A workweek that began in the previous period counts
+ * the hours already paid there, and only the overtime not yet paid lands now.
+ * Hours are worked in hundredths so nothing drifts.
+ */
+export function splitHours(
+  days: { day: string; hours: number; prior: boolean }[],
+  freq: Frequency, periodStart: string, startDow: number, overtimeAfter: number,
+): { regular: number; overtime: number } {
+  const cap = Math.round(overtimeAfter * 100);
+  const weeks = new Map<string, { prior: number; now: number }>();
+  for (const d of days) {
+    const k = workweekStart(d.day, freq, periodStart, startDow);
+    const w = weeks.get(k) ?? { prior: 0, now: 0 };
+    const h = Math.round(d.hours * 100);
+    if (d.prior) w.prior += h; else w.now += h;
+    weeks.set(k, w);
+  }
+  let regular = 0, overtime = 0;
+  for (const w of weeks.values()) {
+    const ot = Math.max(0, w.prior + w.now - cap) - Math.max(0, w.prior - cap);
+    overtime += ot;
+    regular += w.now - ot;
+  }
+  return { regular: regular / 100, overtime: overtime / 100 };
+}
+
+const weekdaysBetween = (a: string, b: string) => {
+  let n = 0;
+  for (let d = a; d <= b; d = addDays(d, 1)) { const w = dayOfWeek(d); if (w !== 0 && w !== 6) n++; }
+  return n;
+};
+
+/**
+ * One period's salary: the annual amount over the schedule's periods a year,
+ * cut by weekdays when someone starts or leaves partway through.
+ */
+export function salaryForPeriod(annualMinor: bigint, freq: Frequency, startsOn: string, endsOn: string,
+                                hiredOn: string, terminatedOn: string | null): bigint {
+  const from = hiredOn > startsOn ? hiredOn : startsOn;
+  const to = terminatedOn && terminatedOn < endsOn ? terminatedOn : endsOn;
+  if (to < from) return 0n;
+  const all = BigInt(weekdaysBetween(startsOn, endsOn));
+  const worked = BigInt(weekdaysBetween(from, to));
+  if (all === 0n) return 0n;
+  const den = BigInt(PERIODS_PER_YEAR[freq]) * all;
+  return (annualMinor * worked * 2n + den) / (den * 2n); // rounded to the cent
+}
+
 // --------------------------------------------------------------- build --
 
 type LineDraft = {
@@ -66,18 +174,26 @@ type LineDraft = {
   deductions: { typeId: string; amountMinor: bigint; employerMatchMinor: bigint; preTax: boolean }[];
 };
 
+/**
+ * Build one pay group's run for one period. Only that group's people are on
+ * it: store staff paid weekly never share a register with managers paid
+ * semimonthly.
+ */
 export async function buildRun(
   c: Client,
   scope: Scope,
   input: { payPeriodId: string; builtBy: string; taxProvider: TaxProvider }
 ): Promise<{ runId: string; grossMinor: bigint; netMinor: bigint; employees: number }> {
   const period = await one<{
-    id: string; pay_group_id: string; status: string; pay_date: string;
+    id: string; pay_group_id: string; status: string; pay_date: string; starts_on: string; ends_on: string;
     bank_account_id: string; overtime_after_hours: string; overtime_multiplier: string;
+    frequency: Frequency; workweek_start_dow: number;
   }>(
     c,
-    `select pp.id, pp.pay_group_id, pp.status, pp.pay_date,
-            pg.bank_account_id, pg.overtime_after_hours, pg.overtime_multiplier
+    `select pp.id, pp.pay_group_id, pp.status, pp.pay_date::text as pay_date,
+            pp.starts_on::text as starts_on, pp.ends_on::text as ends_on,
+            pg.bank_account_id, pg.overtime_after_hours, pg.overtime_multiplier,
+            pg.frequency, pg.workweek_start_dow
        from pay_period pp
        join pay_group pg on pg.id = pp.pay_group_id and pg.entity_id = $2
       where pp.id = $1`,
@@ -89,44 +205,66 @@ export async function buildRun(
   const otAfter = Number(period.overtime_after_hours);
   const otMult = Number(period.overtime_multiplier);
 
+  // The group's people who were employed at some point in the period.
   const rows = await q<{
     employee_id: string; profit_object_id: string | null; department_id: string | null;
-    comp_class_code: string | null; pay_type: string; base_rate_minor: string; hours: string;
-    unapproved: string;
+    comp_class_code: string | null; pay_type: string; base_rate_minor: string;
+    hired_on: string; terminated_on: string | null; unapproved: number;
   }>(
     c,
     `select e.id as employee_id, e.profit_object_id, e.department_id, e.comp_class_code,
-            e.pay_type, e.base_rate_minor,
-            coalesce(sum(t.hours) filter (where t.status = 'approved'), 0) as hours,
-            count(*) filter (where t.status <> 'approved')                 as unapproved
+            e.pay_type, e.base_rate_minor, e.hired_on::text as hired_on, e.terminated_on::text as terminated_on,
+            (select count(*) from timecard t
+              where t.employee_id = e.id and t.pay_period_id = $1 and t.status <> 'approved')::int as unapproved
        from employee e
-       left join timecard t on t.employee_id = e.id and t.pay_period_id = $1
-      where e.entity_id = $2 and e.status = 'active'
-      group by e.id`,
-    [input.payPeriodId, scope.entityId]
+      where e.entity_id = $2 and e.pay_group_id = $3
+        and e.hired_on <= $5::date
+        and (e.status = 'active' or (e.status = 'terminated' and e.terminated_on >= $4::date))
+      order by e.employee_no`,
+    [input.payPeriodId, scope.entityId, period.pay_group_id, period.starts_on, period.ends_on]
   );
 
   const blocked = rows.filter((r) => Number(r.unapproved) > 0);
   if (blocked.length > 0)
     throw new PayrollError(`${blocked.length} employee(s) still have unapproved timecards`);
 
+  // Approved time in this period, plus the days of a workweek that began in
+  // the previous one, so overtime is counted over the whole workweek.
+  const weekFrom = workweekStart(period.starts_on, period.frequency, period.starts_on, period.workweek_start_dow);
+  const cards = await q<{ employee_id: string; day: string; hours: string; prior: boolean }>(
+    c,
+    `select t.employee_id, t.worked_on::text as day, sum(t.hours) as hours, (t.pay_period_id <> $1) as prior
+       from timecard t
+       join employee e on e.id = t.employee_id and e.entity_id = $2
+      where e.pay_group_id = $3 and t.status = 'approved'
+        and (t.pay_period_id = $1 or (t.worked_on >= $4::date and t.worked_on < $5::date))
+      group by t.employee_id, t.worked_on, (t.pay_period_id <> $1)`,
+    [input.payPeriodId, scope.entityId, period.pay_group_id, weekFrom, period.starts_on]
+  );
+  const byPerson = new Map<string, { day: string; hours: number; prior: boolean }[]>();
+  for (const t of cards) {
+    const list = byPerson.get(t.employee_id) ?? [];
+    list.push({ day: t.day, hours: Number(t.hours), prior: t.prior });
+    byPerson.set(t.employee_id, list);
+  }
+
   const drafts: LineDraft[] = [];
   for (const r of rows) {
-    const hours = Number(r.hours);
-    if (hours === 0 && r.pay_type === "hourly") continue;
     const rate = BigInt(r.base_rate_minor);
-    let regular = hours;
+    let regular = 0;
     let overtime = 0;
     let gross: bigint;
 
     if (r.pay_type === "hourly") {
-      regular = Math.min(hours, otAfter);
-      overtime = Math.max(0, hours - otAfter);
+      const days = byPerson.get(r.employee_id) ?? [];
+      if (!days.some((d) => !d.prior && d.hours > 0)) continue;
+      ({ regular, overtime } = splitHours(days, period.frequency, period.starts_on, period.workweek_start_dow, otAfter));
       gross =
         rate * BigInt(Math.round(regular * 100)) / 100n +
         mulBps(rate * BigInt(Math.round(overtime * 100)) / 100n, Math.round(otMult * 10000));
     } else {
-      gross = rate; // per-period salary
+      gross = salaryForPeriod(rate, period.frequency, period.starts_on, period.ends_on, r.hired_on, r.terminated_on);
+      if (gross === 0n) continue;
     }
 
     const deds = await q<{
@@ -329,7 +467,7 @@ export async function postRun(c: Client, scope: Scope, runId: string): Promise<s
     deductions_minor: string; net_minor: string;
   }>(
     c,
-    `select pr.id, pr.status, pr.bank_account_id, pp.pay_date, pr.gross_minor,
+    `select pr.id, pr.status, pr.bank_account_id, pp.pay_date::text as pay_date, pr.gross_minor,
             pr.employee_tax_minor, pr.employer_tax_minor, pr.deductions_minor, pr.net_minor
        from payroll_run pr
        join pay_period pp on pp.id = pr.pay_period_id

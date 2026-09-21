@@ -15,7 +15,9 @@ export type SubjectType =
   | "payment_run"
   | "journal_entry"
   | "fiscal_period"
-  | "payroll_run";
+  | "payroll_run"
+  | "employee"
+  | "employee_change";
 
 export type Policy = {
   id: string;
@@ -101,12 +103,18 @@ export async function openRequest(
 
 export class ApprovalError extends Error {}
 
+/**
+ * A grant for this company, or a client-wide one -- and a client-wide grant
+ * counts only inside its own client, never at another client's company.
+ */
 async function holdsRole(c: Client, userId: string, entityId: string, role: string): Promise<boolean> {
   const rows = await q(
     c,
-    `select 1 from role_grant
-      where app_user_id = $1 and role = $2
-        and (entity_id is null or entity_id = $3)
+    `select 1 from role_grant g
+       join app_user u on u.id = g.app_user_id
+       join entity e on e.id = $3
+      where g.app_user_id = $1 and g.role = $2
+        and (g.entity_id = $3 or (g.entity_id is null and u.tenant_id = e.tenant_id))
       limit 1`,
     [userId, role, entityId]
   );
