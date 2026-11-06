@@ -373,3 +373,15 @@ dialog.sheet{margin:auto auto 0;width:100%;max-width:520px;border-radius:16px 16
 }
 @media (prefers-reduced-motion:reduce){.spin{animation-duration:2.4s}.chip .chev{transition:none}}
 .nw{white-space:nowrap}
+
+/* module nav groups */
+.side nav .nav-group{padding:14px 21px 4px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--bar-muted);opacity:.75}
+.pack-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.pack-grid .pack{display:flex;flex-direction:column;gap:6px;padding:16px}
+.pack-grid .pack h3{margin:0;font-size:16px}
+.pack-grid .pack .d{margin:0;color:var(--muted,inherit)}
+.pack-grid .pack .acts{margin-top:auto}
+.pack-grid .pack.on{outline:2px solid var(--accent)}
+.li.check-row{display:grid;grid-template-columns:auto 1fr;column-gap:12px;align-items:start;cursor:pointer}
+.li.check-row input{margin-top:3px}
+.li.check-row .d{grid-column:2}

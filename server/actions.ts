@@ -164,7 +164,7 @@ export async function newBill(c: Client, co: Company, a: Actor, input: Record<st
 }
 
 /** The roles a person holds in this company: their own grants for it, or client-wide ones. */
-async function rolesOf(c: Client, co: Company, personId: string): Promise<Set<string>> {
+export async function rolesOf(c: Client, co: Company, personId: string): Promise<Set<string>> {
   const r = await q<{ role: string }>(c, `
     select distinct g.role from role_grant g join app_user u on u.id = g.app_user_id
      where g.app_user_id = $2 and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $3))`,
@@ -979,10 +979,11 @@ export async function terminateEmployee(c: Client, co: Company, a: Actor, input:
 // account numbers never come here -- only the last four digits and where the
 // full numbers are kept.
 
-type Vertical = "rto" | "retail" | "trucking" | "services";
+type Vertical = "rto" | "retail" | "furniture" | "trucking" | "services";
 const VERTICALS: Record<Vertical, { location: string; profitObject: string; aging: string; kind: string }> = {
   rto:      { location: "Store",    profitObject: "Store", aging: "Back balances", kind: "store" },
   retail:   { location: "Store",    profitObject: "Store", aging: "Receivables",   kind: "store" },
+  furniture:{ location: "Store",    profitObject: "Store", aging: "Receivables",   kind: "store" },
   trucking: { location: "Terminal", profitObject: "Truck", aging: "Settlements",   kind: "truck" },
   services: { location: "Office",   profitObject: "Job",   aging: "Receivables",   kind: "job" },
 };
@@ -996,7 +997,8 @@ const REQUIRED_ACCOUNTS: [string, string, string, "D" | "C"][] = [
   ["6120", "Employee benefits", "expense", "D"], ["6350", "Card processing fees", "expense", "D"],
 ];
 
-const ROLES = ["owner", "controller", "approver", "ap_clerk", "viewer"];
+const ROLES = ["owner", "controller", "approver", "ap_clerk", "viewer",
+  "store_manager", "sales", "cashier", "buyer", "warehouse", "dispatcher", "driver", "ar_clerk", "hr", "web_admin"];
 const PURPOSES = ["operating", "deposit", "payroll", "tax"];
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "x";
 
@@ -1123,7 +1125,7 @@ export async function createCompany(c: Client, operator: string, input: Record<s
   } else {
     const clientName = text(input.clientName, 60);
     need(clientName.length >= 2, "name the client, the business this company belongs to");
-    need(["rto", "retail", "trucking", "services"].includes(String(input.vertical)), "pick the kind of business");
+    need(["rto", "retail", "furniture", "trucking", "services"].includes(String(input.vertical)), "pick the kind of business");
     vertical = input.vertical as Vertical;
     const dupe = await q(c, `select 1 from tenant where lower(name) = lower($1) /* unscoped: client names are checked across the install */`, [clientName]);
     need(!dupe.length, `there is already a client called ${clientName}; add the company to it instead`);

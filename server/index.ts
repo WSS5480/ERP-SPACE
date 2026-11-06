@@ -63,11 +63,23 @@ import * as views from "./views.ts";
 import * as act from "./actions.ts";
 import { ActionError, type Actor } from "./actions.ts";
 import { loadSampleActivity } from "./sample.ts";
+import { MODULES } from "./modules/index.ts";
+import { ModuleError, PublicPage, PublicAsset } from "./modules/kit.ts";
+import { InventoryError } from "../packages/core/inventory.ts";
+import { ArError } from "../packages/core/ar.ts";
+import { PostingError } from "../packages/core/posting.ts";
+import { PricingError } from "../packages/core/pricing.ts";
+import { SetupError } from "../packages/core/setup.ts";
+import { PosError } from "../packages/core/pos.ts";
+import { WorkforceError } from "../packages/core/workforce.ts";
 
 const PORT = Number(process.env.PORT ?? 10000);
 const TOKEN = process.env.ERP_API_TOKEN ?? "";
 const EMAIL_TOKEN = process.env.ERP_EMAIL_INBOUND_TOKEN ?? "";
-const ENTITY = process.env.ERP_ENTITY_ID ?? "22222222-2222-2222-2222-222222222222";
+// The company the install-wide feed screens (connections, quarantine,
+// statement intake) open on: ERP_ENTITY_ID if set, otherwise the first
+// company created here -- never a hard-coded demo company.
+let ENTITY = (process.env.ERP_ENTITY_ID ?? "").trim();
 const TRIAL = process.env.ERP_SEED === "placeholder";
 const TRIAL_ENDS = process.env.ERP_TRIAL_ENDS ?? "";
 const VERSION = (process.env.RENDER_GIT_COMMIT ?? "").slice(0, 7) || "dev";
@@ -426,6 +438,35 @@ const param = (url: URL, k: string) => url.searchParams.get(k) ?? "";
 const monthStart = () => new Date().toISOString().slice(0, 8) + "01";
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
+// --------------------------------------------------------- retail modules
+// Each module registers through the same coGet/coPost doors, so every rule
+// above applies to it. Public routes (the web store) get their own door that
+// carries no token and no session, and can only reach what the module exposes.
+const publicRoute = (method: "GET" | "POST", path: RegExp,
+  fn: (req: http.IncomingMessage, url: URL, m: RegExpMatchArray, body: Record<string, unknown>) => Promise<[number, unknown]>) =>
+  route(method, path, "none", async (req, url, m) => {
+    let body: Record<string, unknown> = {};
+    if (method === "POST") {
+      if (req.headers["x-erp-shop"] !== "1") throw new HttpError(403, "this request did not come from the store's own page");
+      body = await readJson(req);
+    }
+    const [s, out] = await fn(req, url, m, body);
+    // A page or asset goes out through the app's own responses, with every header and the CSP.
+    if (out instanceof PublicPage) return [s, new Html(out.text)];
+    if (out instanceof PublicAsset) return [s, new Asset(out.text, out.type)];
+    return [s, out];
+  });
+for (const mod of MODULES) mod.register({ coGet, coPost, publicRoute });
+
+// Module screens: server/ui/<id>.js, read once at start like app.js.
+const UI_JS = new Map<string, string>();
+for (const mod of MODULES) { const t = readHere(join("ui", `${mod.id}.js`)); if (t) UI_JS.set(mod.id, t); }
+route("GET", /^\/ui\/([a-z]+)\.js$/, "none", async (_req, _url, m) => {
+  const t = UI_JS.get(m[1]);
+  if (!t) throw new HttpError(404, "not found");
+  return [200, new Asset(t, "text/javascript; charset=utf-8")];
+});
+
 // Liveness. No business data, ever.
 route("GET", /^\/health$/, "none", async () => {
   let db = false;
@@ -442,7 +483,8 @@ route("GET", /^\/health$/, "none", async () => {
 // The app. A shell with no data in it; everything it shows comes from /api
 // once someone has signed in.
 route("GET", /^\/$/, "none", async () => [200, new Html(
-  APP && APP_JS && APP_CSS ? APP.replaceAll("__VERSION__", ASSET_VERSION) : MISSING_PAGE)]);
+  APP && APP_JS && APP_CSS ? APP.replaceAll("__VERSION__", ASSET_VERSION).replace("<!--MODULE_SCRIPTS-->",
+    MODULES.map((x) => `<script src="/ui/${x.id}.js?v=${ASSET_VERSION}" defer></script>`).join("\n")) : MISSING_PAGE)]);
 route("GET", /^\/app\.js$/, "none", async () => {
   if (!APP_JS) throw new HttpError(404, "not found");
   return [200, new Asset(APP_JS, "text/javascript; charset=utf-8")];
@@ -826,7 +868,7 @@ route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
 // ------------------------------------------------------------------- server
 
 // The engine's refusals are written for people; pass them on as they are.
-const REFUSALS = [ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
+const REFUSALS = [ModuleError, InventoryError, ArError, PostingError, PricingError, SetupError, PosError, WorkforceError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
 
 function refusal(e: unknown): string | null {
   if (REFUSALS.some((K) => e instanceof K)) return (e as Error).message;
@@ -903,6 +945,10 @@ export async function start(): Promise<http.Server> {
   if (!APP || !APP_JS || !APP_CSS) console.warn("the app files are not all in server/; the root address will say so");
   const applied = await migrate({ seed: TRIAL });
   console.log(applied.length ? `migrations: applied ${applied.length}` : "migrations: up to date");
+  if (!ENTITY) {
+    const first = await pool.query<{ id: string }>("select id from entity where status = 'active' order by created_at, name limit 1");
+    ENTITY = first.rows[0]?.id ?? "00000000-0000-0000-0000-000000000000";
+  }
   if (TRIAL) {
     // Placeholder activity for the trial's placeholder company. Never allowed
     // to stop the service starting.

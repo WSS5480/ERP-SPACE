@@ -10,7 +10,8 @@
     "migrate": "node --experimental-strip-types scripts/migrate.ts",
     "db:apply": "./db/apply.sh",
     "db:reset": "./db/apply.sh --reset --seed",
-    "smoke": "node --experimental-strip-types scripts/smoke.ts"
+    "smoke": "node --experimental-strip-types scripts/smoke.ts",
+    "smoke:modules": "node --experimental-strip-types scripts/smoke-modules.ts"
   },
   "dependencies": {
     "pg": "^8.13.1"

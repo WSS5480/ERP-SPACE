@@ -97,7 +97,9 @@ const human = (s) => String(s == null ? '' : s)
   .replace(/(?<![\w-])(\d{4})-(\d{2})-(\d{2})(?![\w-])/g, (m) => shortDay(m))
   // An older payroll entry wrote its date the long way; it reads the same as the rest.
   .replace(/\b(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat) ([A-Z][a-z]{2}) (\d{1,2}) \d{4} \d{2}:\d{2}:\d{2} GMT[+-]\d{4}(?: \([^)]*\))?/g, (m, mon, day) => `${mon} ${Number(day)}`);
-const ROLE = { owner: 'owner', controller: 'controller', approver: 'approver', ap_clerk: 'A/P clerk', viewer: 'viewer' };
+const ROLE = { owner: 'owner', controller: 'controller', approver: 'approver', ap_clerk: 'A/P clerk', viewer: 'viewer',
+  store_manager: 'store manager', sales: 'sales', cashier: 'cashier', buyer: 'buyer', warehouse: 'warehouse', dispatcher: 'dispatcher',
+  driver: 'driver', ar_clerk: 'A/R clerk', hr: 'HR', web_admin: 'web admin' };
 const roles = (list) => (list || []).map((r) => ROLE[r] || r).join(', ');
 const subjTitle = (s) => (s.date && s.kind !== 'bill' ? `${s.title} for ${dayLabel(s.date)}` : s.title);
 // A bill's number never breaks across lines: "Meridian Supply · MS-260907".
@@ -300,11 +302,17 @@ const SCREENS = [
 const TABS = ['home', 'approvals', 'payables', 'books'];
 let badgeCount = 0;
 function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + sub : ''}`; }
+const visibleScreens = () => SCREENS.filter((r) => !r[4] || !S.modules || S.modules.includes(r[4]));
 function renderNav() {
   const cur = S.route.screen;
   const badge = (name) => (name === 'approvals' && badgeCount ? el('span', { class: 'badge', text: String(badgeCount), 'aria-label': `${badgeCount} waiting on you` }) : null);
-  $('#nav').replaceChildren(...SCREENS.map(([name, label, ic]) =>
-    el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null, 'aria-current': cur === name ? 'page' : null }, icon(ic), label, badge(name))));
+  const navKids = []; let lastGroup = null;
+  for (const [name, label, ic, group] of visibleScreens()) {
+    const g = group || 'Back office';
+    if (g !== lastGroup) { navKids.push(el('div', { class: 'nav-group', text: g })); lastGroup = g; }
+    navKids.push(el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null, 'aria-current': cur === name ? 'page' : null }, icon(ic), label, badge(name)));
+  }
+  $('#nav').replaceChildren(...navKids);
   $('#tabbar').replaceChildren(
     ...TABS.map((name) => { const [, label, ic] = SCREENS.find((s) => s[0] === name);
       return el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null }, icon(ic), label === 'Payables' ? 'Bills' : label, badge(name)); }),
@@ -316,7 +324,7 @@ function renderNav() {
 function openMore() {
   const d = openDialog('More', S.co.name, { sheet: true });
   d.body.append(el('div', { class: 'menu' },
-    SCREENS.filter(([n]) => !TABS.includes(n)).map(([name, label, ic]) =>
+    visibleScreens().filter(([n]) => !TABS.includes(n)).map(([name, label, ic]) =>
       el('button', { type: 'button', class: S.route.screen === name ? 'on' : null, onclick: () => { d.close(); go(name); } }, icon(ic), label)),
     el('button', { type: 'button', onclick: () => { d.close(); render(); } }, icon('refresh'), 'Refresh'),
     el('button', { type: 'button', onclick: () => { d.close(); signOut(); } }, icon('out'), 'Sign out')));
@@ -365,6 +373,7 @@ async function setCompany(c) {
   S.co = c;
   store.set('erp.company', c.id);
   S.people = await api(`/api/c/${c.id}/people`);
+  try { S.modules = (await api(`/api/c/${c.id}/setup/modules`)).modules; } catch (_) { S.modules = null; }
   const saved = store.get(`erp.as.${c.id}`);
   const byName = S.people.find((p) => p.name.toLowerCase() === (S.me.viewer.name || '').toLowerCase());
   const owner = S.people.find((p) => p.roles.includes('owner'));
@@ -1256,13 +1265,19 @@ function openAddGroup() {
 const ROLE_LIST = [['owner', 'Owner', 'Approves payroll, hires and pay changes; changes setup'],
   ['controller', 'Controller', 'Signs off stopped bills and vendor details; approves by the company’s rules'],
   ['approver', 'Approver', 'Approves bills by the company’s rules'], ['ap_clerk', 'A/P clerk', 'Enters bills'],
-  ['viewer', 'Viewer', 'Sees everything; no rule asks them to approve']];
+  ['viewer', 'Viewer', 'Sees everything; no rule asks them to approve'],
+  ['store_manager', 'Store manager', 'Overrides prices and discounts; approves counts and time edits'],
+  ['sales', 'Sales', 'Writes quotes and sales; earns commission'], ['cashier', 'Cashier', 'Takes payments; opens and closes the drawer'],
+  ['buyer', 'Buyer', 'Places purchase orders within budget'], ['warehouse', 'Warehouse', 'Receives, moves, counts and loads stock'],
+  ['dispatcher', 'Dispatcher', 'Schedules deliveries and builds routes'], ['driver', 'Driver', 'Runs their own route and takes proof of delivery'],
+  ['ar_clerk', 'A/R clerk', 'Posts customer payments; works collections'], ['hr', 'HR', 'Time clock, schedules and commissions'],
+  ['web_admin', 'Web admin', 'Runs the online store']];
 const PURPOSE = { operating: 'Operating', deposit: 'Store deposits', payroll: 'Payroll', tax: 'Tax' };
 const SUBJECT = { invoice: 'Bills', payment_run: 'Payment runs', payroll_run: 'Payroll runs', vendor: 'New vendors', vendor_bank_account: 'Vendor bank details',
   employee: 'New hires', employee_change: 'Pay changes', journal_entry: 'Journal entries', fiscal_period: 'Closing a month' };
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-const KIND = { rto: 'Rent-to-own', retail: 'Retail', trucking: 'Trucking', services: 'Services' };
-const UNIT = { rto: ['Store', 'Stores'], retail: ['Store', 'Stores'], trucking: ['Truck', 'Trucks'], services: ['Job', 'Jobs'] };
+const KIND = { furniture: 'Furniture / home furnishings', rto: 'Rent-to-own', retail: 'Retail', trucking: 'Trucking', services: 'Services' };
+const UNIT = { furniture: ['Store', 'Stores'], rto: ['Store', 'Stores'], retail: ['Store', 'Stores'], trucking: ['Truck', 'Trucks'], services: ['Job', 'Jobs'] };
 const isOwner = () => !!(S.person && S.person.roles.includes('owner'));
 
 /** Refresh who can act here after the people or their roles change, keeping the person picked. */
@@ -1922,6 +1937,26 @@ function openUpload(targets, id, accounts) {
 
 const RENDER = { home: screenHome, approvals: screenApprovals, payables: screenPayables, payroll: screenPayroll, books: screenBooks, cash: screenCash, recon: screenRecon, feeds: screenFeeds, setup: screenSetup };
 
+// ========================================================== module screens
+// Retail modules (server/ui/*.js) add screens here before boot. They get the
+// same helpers this file uses, so every screen looks and behaves alike.
+window.ERP = {
+  S, $, el, frag, icon, ICONS, chip, money, dayLabel, shortDay, plural, cap, sentence, human, ago, size, todayIso, isoDay,
+  api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
+  head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input,
+  /** register('pos', 'Point of sale', 'cash', screenFn, 'Retail', {icon: 'M..', module: 'pos'}) -- hidden when the company has that module off */
+  register(name, label, ic, fn, group, opts = {}) {
+    if (opts.icon) ICONS[ic] = opts.icon;
+    const i = SCREENS.findIndex((x) => x[0] === name);
+    // The module a screen belongs to is the script it came from (/ui/pos.js -> pos), unless it says otherwise.
+    const src = document.currentScript && /\/ui\/([a-z]+)\.js/.exec(document.currentScript.src);
+    const mod = opts.module !== undefined ? opts.module : (src && src[1] !== 'setup' ? src[1] : null);
+    const row = [name, label, ic, group || 'Retail', mod];
+    if (i >= 0) SCREENS[i] = row; else SCREENS.push(row);
+    RENDER[name] = fn;
+  },
+};
+
 // ================================================================ sign in
 function showSignIn(msg) {
   show('signin');
@@ -1991,6 +2026,5 @@ function wire() {
     else if (S.co && hiddenAt && Date.now() - hiddenAt > 60000 && !document.querySelector('dialog[open]')) render();
   });
 }
-wire();
-boot();
+document.addEventListener('DOMContentLoaded', () => { wire(); boot(); }, { once: true });
 })();

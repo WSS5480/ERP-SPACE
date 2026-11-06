@@ -59,6 +59,17 @@ export async function migrate(opts: { seed?: boolean; log?: (s: string) => void 
     if (schema) {
       if (!/^[a-z_][a-z0-9_]{0,40}$/.test(schema)) throw new Error("ERP_DB_SCHEMA must be a plain lower-case name");
       await client.query(`create schema if not exists ${schema}`);
+      // Nov 6 2026: the first attempt at a shared-database home used a schema
+      // named after the old product. It held only placeholder data and was
+      // replaced within the hour; take it away so the old name is gone.
+      if (schema !== "pentex_erp") {
+        const old = await client.query(
+          `select 1 from information_schema.tables where table_schema = 'pentex_erp' and table_name = 'schema_migration'`);
+        if (old.rowCount) {
+          await client.query(`drop schema pentex_erp cascade`);
+          log("removed the abandoned pentex_erp schema");
+        }
+      }
     }
 
     await client.query(`
