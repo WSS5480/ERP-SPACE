@@ -61,11 +61,11 @@ export function routes(t: T, mod: { register: (k: never) => void }) {
   return {
     post: <R = Record<string, unknown>>(tail: string, who: string, body: Record<string, unknown>, id?: string) =>
       asPerson(t, who, (c, co, a) => posts.get(key(tail))!(c, co, a, body, ["", co.id, id]) as Promise<R>),
-    get: async <R = Record<string, unknown>>(tail: string, query = "", id?: string, entityId = ENTITY): Promise<R> => {
+    get: async <R = Record<string, unknown>>(tail: string, query = "", id?: string | string[], entityId = ENTITY): Promise<R> => {
       const c = await t.pool.connect();
       try {
         const co = await companyOf(t, entityId);
-        return await gets.get(key(tail))!(c, co, new URL("http://x/" + query), ["", co.id, id], null) as R;
+        return await gets.get(key(tail))!(c, co, new URL("http://x/" + query), ["", co.id, ...(Array.isArray(id) ? id : [id])], null) as R;
       } finally { c.release(); }
     },
   };

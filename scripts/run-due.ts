@@ -13,6 +13,7 @@
 import { pool, tx } from "../packages/core/db.ts";
 import { ingest, loadConnection } from "../packages/core/connections.ts";
 import "../packages/core/statements.ts";
+import { runConnection, liveEnv, type FeedEnv } from "../packages/core/vendor_feeds.ts";
 
 /** Does a five-field cron expression match this minute (UTC)? */
 export function cronMatches(expr: string, d: Date): boolean {
@@ -48,6 +49,31 @@ export function isDue(expr: string, since: Date | null, now: Date): boolean {
   return false;
 }
 
+/**
+ * Vendor connections (catalog, availability and freight pulls) keep their own
+ * schedules too. Each due one runs in its own transaction as the scheduler;
+ * a failure is recorded on that connection and its run log, never thrown.
+ */
+export async function runDueVendorConnections(now: Date, env: FeedEnv = liveEnv(), only?: { entityId: string }) {
+  const rows = await pool.query<{ id: string; name: string; entity_id: string; tenant_id: string; schedule_cron: string; last_run_at: Date | null }>(
+    `select k.id, k.name, k.entity_id, e.tenant_id, k.schedule_cron, k.last_run_at
+       from vendor_connection k join entity e on e.id = k.entity_id
+      where k.active and k.kind = 'api' and k.schedule_cron is not null and ($1::uuid is null or k.entity_id = $1)
+      /* unscoped: the scheduler walks every company's connections */`, [only?.entityId ?? null]);
+  const out: { name: string; ok: boolean; note: string }[] = [];
+  for (const row of rows.rows) {
+    if (!isDue(row.schedule_cron, row.last_run_at, now)) continue;
+    try {
+      const r = await tx({ kind: "system", label: "scheduler" }, (cl) =>
+        runConnection(cl, { tenantId: row.tenant_id, entityId: row.entity_id, actor: { kind: "system", label: "scheduler" } }, row.id, env, "schedule"));
+      out.push({ name: row.name, ok: r.ok, note: r.note });
+    } catch (e) {
+      out.push({ name: row.name, ok: false, note: (e as Error).message });
+    }
+  }
+  return { due: out.length, of: rows.rows.length, runs: out };
+}
+
 async function main() {
   const now = new Date();
   const due = await pool.query<{ id: string; name: string; schedule_cron: string; last_attempt_at: Date | null }>(
@@ -74,6 +100,9 @@ async function main() {
     }
   }
   console.log(`${ran} of ${due.rows.length} scheduled connections were due`);
+  const vendors = await runDueVendorConnections(now);
+  for (const r of vendors.runs) console.log(`${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
+  console.log(`${vendors.due} of ${vendors.of} scheduled vendor connections were due`);
   await pool.end();
 }
 

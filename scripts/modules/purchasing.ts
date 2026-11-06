@@ -34,20 +34,31 @@ export async function run(t: T) {
   t.ok("order form: a vendor's active stock items, without the dropped one", form.products.some((p) => p.id === P.NIGHTSTAND) && !form.products.some((p) => p.id === P.OTTOMAN));
   const nsSugg = form.suggestions.find((s) => s.productId === P.NIGHTSTAND && s.locationId === DC);
   t.ok("reorder: nothing on hand, two customers waiting, min 2 max 6 suggests 8", nsSugg?.qty === 8, JSON.stringify(nsSugg));
-  t.ok("reorder: at the minimum it orders up to the maximum (bed 8 on hand, 8/12)", form.suggestions.find((s) => s.productId === P.DARCY) === undefined
-    && (await read(t, (c) => pur.replenishment(c, ENTITY, { vendorId: V.ASHLEY }))).some((s) => s.sku === "ASH-B192-QBED" && s.suggest === 4));
+  // The dresser at the DC: its own min/max (8/12) set here, measured against whatever stock other modules' seeds left.
+  await r.post("/purchasing/reorder-rules", BUYER, { productId: "77777777-0000-0000-0000-000000000004", locationId: DC, min: 8, max: 12 });
+  const dr = await read(t, async (c) => (await q<{ available: string; on_order: string }>(c,
+    `select available, on_order from product_availability where entity_id = $1 and product_id = $2 and location_id = $3`, [ENTITY, "77777777-0000-0000-0000-000000000004", DC]))[0]);
+  const drWait = await read(t, async (c) => Number((await q<{ n: string }>(c, `select coalesce(sum(qty),0) n from sales_order_line where entity_id = $1 and product_id = $2
+    and fulfil_from_id = $3 and line_status = 'on_order'`, [ENTITY, "77777777-0000-0000-0000-000000000004", DC]))[0].n));
+  const drProj = Number(dr?.available ?? 0) + Number(dr?.on_order ?? 0) - drWait;
+  const drSugg = (await read(t, (c) => pur.replenishment(c, ENTITY, { vendorId: V.ASHLEY }))).find((s) => s.sku === "ASH-B192-31");
+  t.ok("reorder: at the minimum it orders up to the maximum (dresser 8/12)", drProj <= 8 ? drSugg?.suggest === 12 - drProj && drSugg?.projected === drProj : drSugg === undefined,
+    `projected ${drProj}, suggested ${drSugg?.suggest}`);
+  const darcyRule = (await read(t, (c) => pur.replenishment(c, ENTITY, { vendorId: V.ASHLEY }))).find((s) => s.sku === "ASH-2930338");
+  t.ok("reorder: above the minimum nothing is suggested (Darcy 4/10)", darcyRule === undefined || darcyRule.projected <= 4);
   t.ok("reorder: a dropped product is never suggested", !(await read(t, (c) => pur.replenishment(c, ENTITY))).some((s) => s.product_id === P.OTTOMAN));
 
   const month = day(21).slice(0, 8) + "01";        // Ashley's lead time is 21 days
   const bedBefore = await otb(t, month, "Bedroom", DC);
   const nsBefore = await stock(t, P.NIGHTSTAND, DC);
+  const darcyBefore = await stock(t, P.DARCY, DC), loveBefore = await stock(t, P.LOVESEAT, LOC.ENOLA);
   await t.throws("order form: an AP clerk cannot place POs", () => r.post("/purchasing/order-form", PEOPLE.CLERK, { lines: [{ productId: P.NIGHTSTAND, locationId: DC, qty: 1 }] }), /needs one of: buyer/);
   await t.throws("order form: a dropped product cannot be reordered", () => r.post("/purchasing/order-form", BUYER, { lines: [{ productId: P.OTTOMAN, locationId: DC, qty: 1 }] }), /dropped/);
   await t.throws("order form: a floor sample is not reordered as stock", () => r.post("/purchasing/order-form", BUYER, { lines: [{ productId: P.FLOOR, locationId: DC, qty: 1 }] }), /floor sample/);
   await t.throws("order form: a made-to-order sofa goes through a special order", () => r.post("/purchasing/order-form", BUYER, { lines: [{ productId: P.HUDSON, locationId: DC, qty: 1 }] }), /made to order/);
   await t.throws("order form: no quantities, nothing placed", () => r.post("/purchasing/order-form", BUYER, { lines: [{ productId: P.DARCY, locationId: DC, qty: 0 }] }), /at least one line/);
   await t.throws("order form: one bad line stops the whole form", () => r.post("/purchasing/order-form", BUYER, { lines: [{ productId: P.DARCY, locationId: DC, qty: 2 }, { productId: P.OTTOMAN, locationId: DC, qty: 1 }] }), /dropped/);
-  t.ok("order form: a refused form placed nothing", (await stock(t, P.DARCY, DC)) === 0);
+  t.ok("order form: a refused form placed nothing", (await stock(t, P.DARCY, DC)) === darcyBefore);
   const pf = await r.post<Placed>("/purchasing/order-form", BUYER, { lines: [
     { productId: P.DARCY, locationId: DC, qty: 2 }, { productId: P.NIGHTSTAND, locationId: DC, qty: 8 }, { productId: P.LOVESEAT, locationId: LOC.ENOLA, qty: 1 },
     { productId: P.TABLE, locationId: DC, qty: 1 }] });
@@ -57,7 +68,7 @@ export async function run(t: T) {
   t.ok("order form: one PO per vendor per ship-to", pf.placed.length === 3 && !!dcAsh && !!enAsh && !!dcCoa);
   t.ok("POs: numbered in sequence, total at cost, due after the vendor's lead time", /^PO-\d{6}$/.test(dcAsh.number) && dcAsh.totalMinor === String(2 * 38500 + 8 * 9500) && dcAsh.expectedOn === day(21));
   t.ok("POs: the vendor's freight minimum is a warning, not a refusal", enAsh.warnings.some((w) => /freight minimum is \$2,500.00/.test(w)));
-  t.ok("POs: placing one puts the goods on order at the ship-to", (await stock(t, P.NIGHTSTAND, DC)) === nsBefore + 8 && (await stock(t, P.LOVESEAT, LOC.ENOLA)) === 1);
+  t.ok("POs: placing one puts the goods on order at the ship-to", (await stock(t, P.NIGHTSTAND, DC)) === nsBefore + 8 && (await stock(t, P.LOVESEAT, LOC.ENOLA)) === loveBefore + 1);
   const bedAfter = await otb(t, month, "Bedroom", DC);
   t.ok("open-to-buy: drops by what the PO commits", BigInt(bedBefore!.open_minor) - BigInt(bedAfter!.open_minor) === 76000n, `${bedBefore?.open_minor} -> ${bedAfter?.open_minor}`);
   t.ok("reorder: once ordered, the suggestion goes away", !(await read(t, (c) => pur.replenishment(c, ENTITY))).some((s) => s.product_id === P.NIGHTSTAND));
@@ -73,6 +84,7 @@ export async function run(t: T) {
   await t.throws("budgets: only the owner sets them", () => r.post("/purchasing/budgets", BUYER, { month: coaMonth.slice(0, 7), category: "Dining", locationId: LOC.ENOLA, budget: "100" }), /needs one of: owner/);
   await r.post("/purchasing/budgets", PEOPLE.STEVE, { month: coaMonth.slice(0, 7), category: "Dining", locationId: LOC.ENOLA, budget: "100" });
   const tableLine = [{ productId: P.TABLE, locationId: LOC.ENOLA, qty: 1 }];
+  const tableBefore = await stock(t, P.TABLE, LOC.ENOLA);
   await t.throws("open-to-buy: a buyer cannot place a PO over budget", () => r.post("/purchasing/order-form", BUYER, { lines: tableLine }), /over budget: Dining at Enola.*\$100\.00 left.*\$190\.00/);
   await t.throws("open-to-buy: the owner goes over only with a reason", () => r.post("/purchasing/order-form", PEOPLE.STEVE, { lines: tableLine }), /Say why/);
   const over = await r.post<Placed>("/purchasing/order-form", PEOPLE.STEVE, { lines: tableLine, overBudgetReason: "Floor model sold, need a replacement now" });
@@ -84,7 +96,7 @@ export async function run(t: T) {
   await t.throws("cancel: needs a reason", () => r.post("/purchasing/pos/:id/cancel", BUYER, { reason: " " }, over.placed[0].poId), /say why/);
   await r.post("/purchasing/pos/:id/cancel", BUYER, { reason: "Owner changed mind" }, over.placed[0].poId);
   t.ok("cancel: the budget comes back and the goods come off order",
-    (await otb(t, coaMonth, "Dining", LOC.ENOLA))?.open_minor === "10000" && (await stock(t, P.TABLE, LOC.ENOLA)) === 0);
+    (await otb(t, coaMonth, "Dining", LOC.ENOLA))?.open_minor === "10000" && (await stock(t, P.TABLE, LOC.ENOLA)) === tableBefore);
   await t.throws("cancel: a cancelled PO cannot be cancelled again", () => r.post("/purchasing/pos/:id/cancel", BUYER, { reason: "again" }, over.placed[0].poId), /is cancelled/);
   const finPo = await read(t, async (c) => (await q<{ id: string }>(c, `select id from purchase_order where entity_id = $1 and ship_to_location_id is null limit 1`, [ENTITY]))[0]?.id);
   if (finPo) await t.throws("cancel: a PO entered in payables is not purchasing's to change", () => r.post("/purchasing/pos/:id/cancel", BUYER, { reason: "x" }, finPo), /entered in payables/);
@@ -135,7 +147,7 @@ export async function run(t: T) {
     (await stock(t, P.NIGHTSTAND, DC)) === nsOnOrder - 2 && (await r.get<{ lines: { sales_line_id: string }[] }>("/purchasing/special-orders")).lines.some((l) => l.sales_line_id === NS_LINE));
   const nsHdr = await r.get<{ po: Record<string, string> }>("/purchasing/pos/:id", "", nsPo.poId);
   t.ok("ack import: a PO whose every line was rejected is cancelled with that reason", nsHdr.po.status === "cancelled" && /rejected every line/.test(nsHdr.po.cancel_reason));
-  t.ok("ack import: a changed quantity takes the difference off order", (await stock(t, P.DARCY, DC)) === 1);
+  t.ok("ack import: a changed quantity takes the difference off order", (await stock(t, P.DARCY, DC)) === darcyBefore + 1);
   const dcDet = await r.get<{ lines: { ack_status: string; expected_on: string; cancelled_qty: string }[] }>("/purchasing/pos/:id", "", dcAsh.poId);
   t.ok("ack import: US dates read, line statuses recorded", dcDet.lines[0].ack_status === "changed" && Number(dcDet.lines[0].cancelled_qty) === 1 && dcDet.lines[1].expected_on === "2026-12-01");
   await t.throws("ack: a line cannot go up through an acknowledgment", () => r.post("/purchasing/pos/:id/ack", BUYER, { lines: [{ lineId: (dcDet.lines[0] as unknown as { id: string }).id, status: "change", qty: 5 }] }, dcAsh.poId), /can only go down/);

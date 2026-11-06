@@ -16,6 +16,22 @@
   const errInto = (box) => (e) => box.replaceChildren(resultBox('critical', 'fail', 'Not done', friendly(e)));
   const cents = (dollars) => Math.round(Number(String(dollars || '0').replace(/[$,\s]/g, '')) * 100);
   const thisMonth = () => todayIso().slice(0, 7);
+
+  /** A product photo through the app's own image route (outside images are blocked by the page's policy), fetched when it scrolls into view. */
+  const IMG_SEEN = new Map();
+  const proxyImg = (productId, seq, alt, cls) => {
+    const img = el('img', { alt: alt || '', class: cls || null, width: '76', height: '76' });
+    const load = () => {
+      const k = `${productId}/${seq}`;
+      if (!IMG_SEEN.has(k)) IMG_SEEN.set(k, coApi(`/catalog/image/${productId}/${seq}`).then((r) => r.dataUrl).catch(() => null));
+      IMG_SEEN.get(k).then((src) => { if (src) img.src = src; else img.title = 'Photo could not be fetched'; });
+    };
+    if ('IntersectionObserver' in window) {
+      const io = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) { io.disconnect(); load(); } });
+      io.observe(img);
+    } else load();
+    return img;
+  };
   const ACK = { pending: ['neutral', 'pending', 'Waiting on vendor'], accepted: ['good', 'ok', 'Confirmed'], backordered: ['warning', 'clock', 'Backordered'],
     changed: ['warning', 'info', 'Changed'], rejected: ['critical', 'fail', 'Rejected'] };
   const STAT = { open: ['neutral', 'pending', 'Open'], received: ['good', 'ok', 'Received'], closed: ['good', 'ok', 'Closed'], cancelled: ['neutral', 'none', 'Cancelled'] };
@@ -151,7 +167,7 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
       const atp = p.vendor_atp;
       const frt = Object.fromEntries((p.sku_freight || []).map((f) => [f.location, f.freight]));
       return el('div', { class: 'po-card' },
-        el('div', { class: 'po-head' }, p.image ? el('img', { src: p.image, alt: '', loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => e.target.replaceWith(el('div', { class: 'po-noimg' })) }) : el('div', { class: 'po-noimg' }),
+        el('div', { class: 'po-head' }, p.image ? proxyImg(p.id, 1, '') : el('div', { class: 'po-noimg' }),
           item({ title: p.name, amount: money(p.cost_minor), detail: [p.sku, p.vendor_sku ? `model ${p.vendor_sku}` : null, p.category, p.collection].filter(Boolean).join(' · '),
             badge: atp ? (Number(atp.qty) > 0 ? chip('good', 'ok', `Vendor has ${Number(atp.qty)}${atp.leadDays != null ? ` · ships in ${atp.leadDays}d` : ''}`)
               : chip('warning', 'clock', `Vendor out${atp.leadDays != null ? ` · ETA ${atp.leadDays}d` : ''}`)) : null,

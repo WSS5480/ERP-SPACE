@@ -842,3 +842,62 @@ export function decode128(widths: number[]): string {
   need(sum % 103 === syms[syms.length - 2], "barcode check digit is wrong");
   return String.fromCharCode(...data.map((v) => v + 32));
 }
+
+// -------------------------------------------------------- photo proxy --
+// A product's photo, fetched from the address stored on that product only,
+// over https, image types only, at most 5 MB, with a short timeout, and kept
+// in catalog_image_cache so the vendor is asked once a week at most. Served
+// back as a data: URL, which the page's image policy already allows.
+
+export type ImageFetch = (url: string, init: { signal: AbortSignal; redirect: "follow"; headers: Record<string, string> }) =>
+  Promise<{ status: number; url?: string; headers: { get(k: string): string | null }; arrayBuffer(): Promise<ArrayBuffer> }>;
+
+const IMAGE_TYPES = /^image\/(jpeg|png|gif|webp|avif)$/;
+export const IMAGE_MAX = 5 * 1024 * 1024;
+
+function publicHttps(raw: string): URL {
+  let u: URL;
+  try { u = new URL(raw); } catch { throw new CatalogError("that photo address is not a web address"); }
+  need(u.protocol === "https:", "only https photo addresses are fetched");
+  const h = u.hostname.toLowerCase();
+  const privateHost = h === "localhost" || h.endsWith(".local") || h.endsWith(".internal") || /^\[/.test(h)
+    || /^(127|10|0)\./.test(h) || /^169\.254\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h);
+  need(!privateHost, "photo addresses on private networks are not fetched");
+  return u;
+}
+
+export async function productImage(c: Client, entityId: string, productId: string, seq: number,
+  fetchImpl: ImageFetch = globalThis.fetch as unknown as ImageFetch, maxAgeDays = 7): Promise<{ contentType: string; dataUrl: string; bytes: number; cached: boolean } | null> {
+  const im = (await q<{ url: string }>(c, `select url from product_image where entity_id = $1 and product_id = $2 and seq = $3`, [entityId, productId, seq]))[0];
+  if (!im) return null;
+  const hit = (await q<{ content_type: string; bytes: Buffer; fresh: boolean }>(c, `
+    select content_type, bytes, fetched_at > now() - make_interval(days => $3) fresh from catalog_image_cache where entity_id = $1 and url = $2`,
+    [entityId, im.url, maxAgeDays]))[0];
+  const out = (type: string, b: Buffer, cached: boolean) => ({ contentType: type, dataUrl: `data:${type};base64,${b.toString("base64")}`, bytes: b.length, cached });
+  if (hit?.fresh) return out(hit.content_type, hit.bytes, true);
+  const u = publicHttps(im.url);
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 8000);
+  let type = "", body: Buffer;
+  try {
+    let r;
+    try { r = await fetchImpl(u.toString(), { signal: ctl.signal, redirect: "follow", headers: { accept: "image/*" } }); }
+    catch (e) {
+      if (hit) return out(hit.content_type, hit.bytes, true);      // an old copy beats nothing
+      throw new CatalogError(ctl.signal.aborted ? "the photo's host took too long to answer" : "the photo's host could not be reached");
+    }
+    if (r.url) publicHttps(r.url);                                   // a redirect may not leave https or go private
+    need(r.status === 200, `the photo's host answered ${r.status}`);
+    type = (r.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    need(IMAGE_TYPES.test(type), `that address is not a photo (${type || "no type"}); JPEG, PNG, GIF, WebP or AVIF only`);
+    const len = Number(r.headers.get("content-length") ?? "0");
+    need(!(len > IMAGE_MAX), "that photo is larger than 5 MB");
+    body = Buffer.from(await r.arrayBuffer());
+    need(body.length <= IMAGE_MAX, "that photo is larger than 5 MB");
+    need(body.length > 0, "the photo's host sent an empty file");
+  } finally { clearTimeout(timer); }
+  await c.query(`insert into catalog_image_cache (entity_id, url, content_type, bytes, fetched_at) values ($1,$2,$3,$4,now())
+                 on conflict (entity_id, url) do update set content_type = excluded.content_type, bytes = excluded.bytes, fetched_at = now()`,
+    [entityId, im.url, type, body]);
+  return out(type, body, false);
+}
