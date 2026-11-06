@@ -63,6 +63,8 @@
 .pc-sw{display:inline-block;width:12px;height:12px;border-radius:3px;border:1px solid var(--line-2);vertical-align:-1px;margin-right:5px}
 .pc-group{padding:12px 16px;border-top:1px solid var(--line)}.pc-group:first-child{border-top:0}
 .pc-group b{display:block;margin-bottom:6px}
+.pc-raw{white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:280px;overflow:auto;background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:8px}
+.form-grid .foot.wide{grid-column:1/-1}
 .panel.pad{padding:4px 16px 12px}.panel.pad-g{padding:6px 14px;margin:10px 0}
 input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--panel);border:1px solid var(--line-2);border-radius:9px;padding:9px 11px;min-height:42px}
 `);
@@ -490,76 +492,288 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
   // ---------------------------------------------------------------- vendors
   async function tabVendors() {
     const d = await coApi('/catalog/vendors');
-    const cs = (await coApi('/catalog/connections')).connections;
-    const connOf = (vid) => cs.find((k) => k.vendor_id === vid && k.kind === 'api') || cs.find((k) => k.vendor_id === vid);
-    const connChip = (k) => !k ? null : k.last_ok === false ? chip('critical', 'fail', `${cap(k.kind)} feed failing`)
-      : k.last_ok ? chip('good', 'ok', `${cap(k.kind)} feed ok`) : chip('neutral', 'pending', `${cap(k.kind)} feed not run yet`);
+    const feedChip = (v) => !Number(v.feeds) ? null : Number(v.feeds_failing) ? chip('critical', 'fail', `${plural(Number(v.feeds_failing), 'feed')} failing`)
+      : v.feeds_last_run ? chip('good', 'ok', `${plural(Number(v.feeds), 'feed')} ok`) : chip('neutral', 'pending', `${plural(Number(v.feeds), 'feed')}, not run yet`);
     return section('Vendors', `${d.vendors.length}`, null,
-      el('p', { class: 'lead', text: 'Where orders go, the freight minimum for a prepaid truck, lead time, freight to each place, and the vendor’s feed: catalog, live availability and freight pulled from their API.' }),
-      el('div', { class: 'panel' }, d.vendors.map((v) => {
-        const k = connOf(v.id);
-        const check = k && k.kind === 'api' ? el('button', { class: 'btn small primary', type: 'button', onclick: () => act(check, () => post(`/catalog/connections/${k.id}/run`),
-          (r) => (r.ok ? `Pulled: ${r.note}` : `Failed: ${r.note}`)) }, 'Check now') : null;
-        return item({
-          title: v.name, amount: `${v.lead_days} days`, badge: connChip(k),
-          detail: [v.order_email || 'no order email', v.account_no ? `account ${v.account_no}` : null, v.sku_prefix ? `SKUs ${v.sku_prefix}-…` : null,
-            Number(v.freight_min_minor) ? `freight min ${money(v.freight_min_minor)}` : null, v.freight_min_qty ? `${v.freight_min_qty} pieces min` : null,
-            plural(Number(v.products), 'product'), v.last_import ? `imported ${shortDay(String(v.last_import).slice(0, 10))}` : null].filter(Boolean).join(' · '),
-          why: [k && k.last_note ? `Last pull${k.last_run_at ? ` ${shortDay(String(k.last_run_at).slice(0, 10))}` : ''}: ${k.last_note}` : null,
-            v.freight.length ? `Freight: ${v.freight.map((f) => `${f.location} ${f.freight_bps / 100}%${Number(f.per_unit_minor) ? ` + ${money(f.per_unit_minor)}` : ''}`).join(' · ')}` : null].filter(Boolean).join(' — ') || null,
-          acts: [el('button', { class: 'btn small', type: 'button', onclick: () => openVendor(v) }, 'Edit'),
-            el('button', { class: 'btn small', type: 'button', onclick: () => openFreight(v) }, 'Freight'),
-            el('button', { class: 'btn small', type: 'button', onclick: () => openConnection(v, k) }, k ? 'Connection' : 'Connect'),
-            check,
-            el('button', { class: 'btn small', type: 'button', onclick: () => { IMP.vendorId = v.id; go('catalog', 'import'); } }, 'Import file')],
-        });
-      })));
+      el('p', { class: 'lead', text: 'Where orders go, the freight minimum for a prepaid truck, lead time, freight to each place, and the vendor’s APIs: products, prices, quantities, freight and photos, each its own feed.' }),
+      el('div', { class: 'panel' }, d.vendors.map((v) => item({
+        title: v.name, amount: `${v.lead_days} days`, badge: feedChip(v),
+        detail: [v.order_email || 'no order email', v.account_no ? `account ${v.account_no}` : null, v.sku_prefix ? `SKUs ${v.sku_prefix}-…` : null,
+          Number(v.freight_min_minor) ? `freight min ${money(v.freight_min_minor)}` : null, v.freight_min_qty ? `${v.freight_min_qty} pieces min` : null,
+          plural(Number(v.products), 'product'), v.last_import ? `imported ${shortDay(String(v.last_import).slice(0, 10))}` : null].filter(Boolean).join(' · '),
+        why: v.freight.length ? `Freight: ${v.freight.map((f) => `${f.location} ${f.freight_bps / 100}%${Number(f.per_unit_minor) ? ` + ${money(f.per_unit_minor)}` : ''}`).join(' · ')}` : null,
+        acts: [el('button', { class: 'btn small primary', type: 'button', onclick: () => openApiSetup(v) }, 'API setup'),
+          el('button', { class: 'btn small', type: 'button', onclick: () => openVendor(v) }, 'Edit'),
+          el('button', { class: 'btn small', type: 'button', onclick: () => openFreight(v) }, 'Freight'),
+          el('button', { class: 'btn small', type: 'button', onclick: () => { IMP.vendorId = v.id; go('catalog', 'import'); } }, 'Import file')],
+      }))));
   }
 
-  async function openConnection(v, k) {
-    const fo = await form();
-    const cfg = (k && k.config) || {};
-    const d = openDialog(`${v.name} connection`, 'Secrets never go here: name a reference, and the key lives in the server’s environment', { wide: true });
-    const f = {
-      kind: select([['api', 'API pull'], ['manual', 'Manual upload'], ['email', 'Email'], ['sftp', 'SFTP']], k ? k.kind : 'api'),
-      adapter: select([['generic', 'Generic JSON API'], ['ashley', 'Ashley (catalog, ATP, freight, orders)']], k ? k.adapter : (/ashley/i.test(v.name) ? 'ashley' : 'generic')),
-      url: input({ value: cfg.url || '', placeholder: 'https://…/products' }), pageSize: input({ type: 'number', min: '0', value: cfg.pageSize ?? 250 }),
-      authUrl: input({ value: cfg.authUrl || '', placeholder: 'OAuth address, if the vendor uses one' }), customer: input({ value: cfg.customer || '', placeholder: 'Our customer number with them' }),
-      cred: input({ value: k ? k.credential_ref || '' : `secret://vendor/${v.name.toLowerCase().split(/\s+/)[0].replace(/[^a-z0-9]/g, '')}` }),
-      cron: input({ value: k ? k.schedule_cron || '' : '', placeholder: '15 5 * * *  (daily 5:15)' }),
-      atpOn: el('input', { type: 'checkbox', checked: !!cfg.atpOn }), atpUrl: input({ value: cfg.atpUrl || '', placeholder: 'Ashley’s ATP service (default)' }),
-      atpCustomer: input({ value: cfg.atpCustomer || '' }), atpShipTo: input({ value: cfg.atpShipTo || '' }), atpBatch: input({ type: 'number', min: '1', max: '200', value: cfg.atpBatch ?? 40 }),
-      freightOn: el('input', { type: 'checkbox', checked: !!cfg.freightOn }), freightUrl: input({ value: cfg.freightUrl || '', placeholder: 'https://…/prices' }),
-      poUrl: input({ value: cfg.poUrl || '', placeholder: 'Order service address, to send POs by API' }),
+  // ------------------------------------------------------- vendor API setup
+  const PURPOSE = { products: 'Products', pricing: 'Prices', quantities: 'Quantities', freight: 'Freight by store', images: 'Photos', orders: 'Order sending', acknowledgments: 'Acknowledgments / ship notices' };
+  const SECRET_LABEL = { apiKey: 'Key', token: 'Bearer token', password: 'Password', clientSecret: 'Client secret', atpKeyCode: 'ATP KeyCode', atpPassword: 'ATP password', sftpPassword: 'SFTP password' };
+  const feedHealth = (f) => f.running ? chip('warning', 'clock', 'Running') : !f.active ? chip('neutral', 'pause', 'Off') : f.last_ok === false ? chip('critical', 'fail', 'Failing')
+    : f.last_ok ? chip('good', 'ok', 'OK') : chip('neutral', 'pending', 'Not run yet');
+  const schedWords = (f) => f.purpose === 'orders' ? 'sends when you send a PO' : f.every_hours ? `every ${f.every_hours} h` : f.schedule_cron ? `cron ${f.schedule_cron}` : 'on demand';
+
+  async function openApiSetup(v) {
+    const d = openDialog(`${v.name} · API setup`, 'One feed per endpoint: products, prices, quantities, freight, photos, orders', { wide: true, sheet: true });
+    const again = () => { d.close(); openApiSetup(v); };
+    await fillDialog(d, async () => {
+      const x = await coApi(`/catalog/vendors/${v.id}/feeds`);
+      const tplSel = select(x.templates, /ashley/i.test(v.name) ? 'ashley' : 'generic_json');
+      const purSel = select(x.purposes.map((p) => [p, PURPOSE[p]]), 'products');
+      const addOne = el('button', { class: 'btn small primary', type: 'button', onclick: async () => {
+        const t = await coApi(`/catalog/vendors/${v.id}/feed-templates?template=${tplSel.value}`);
+        let dr = t.drafts.find((y) => y.purpose === purSel.value) || { ...t.drafts[0], purpose: purSel.value, name: `${v.name} ${PURPOSE[purSel.value].toLowerCase()}`, mapping: {} };
+        // one tap for another endpoint: same auth shape, borrowing the first feed's keys
+        const first = x.feeds.find((f) => f.kind === 'api');
+        if (first && !t.drafts.some((y) => y.purpose === purSel.value && tplSel.value !== 'blank')) dr = { ...dr, auth: { ...first.auth }, secrets_from_feed_id: first.id, options: { ...first.options, ...dr.options } };
+        if (first && tplSel.value !== 'blank' && !dr.secrets_from_feed_id && first.auth && JSON.stringify(first.auth) === JSON.stringify(dr.auth)) dr.secrets_from_feed_id = first.id;
+        dr.name = uniqueName(dr.name, x.feeds);
+        d.close(); openFeedEditor(v, { ...dr, vendor_id: v.id }, x);
+      } }, icon('plus'), 'Add');
+      const addAll = tplSel.value === 'ashley' || /ashley/i.test(v.name) ? el('button', { class: 'btn small', type: 'button', onclick: () => act(addAll, async () => {
+        const t = await coApi(`/catalog/vendors/${v.id}/feed-templates?template=ashley`);
+        let n = 0;
+        for (const dr of t.drafts) { if (x.feeds.some((f) => f.name === dr.name)) continue; await post('/catalog/feeds', { feed: { ...dr, vendor_id: v.id } }); n++; }
+        return n;
+      }, (n) => `${plural(n, 'Ashley feed')} added; type each one’s keys`, { close: again }) }, 'Add all Ashley feeds') : null;
+      const hostBtn = el('button', { class: 'btn small', type: 'button', onclick: () => act(hostBtn, () => post(`/catalog/vendors/${v.id}/host-photos`),
+        (r) => `${r.hosted} of ${r.total} photos hosted${r.failed ? `; ${r.failed} could not be fetched` : ''}`, { close: again }) }, 'Host photos now');
+      const cards = x.feeds.map((f) => {
+        const test = el('button', { class: 'btn small', type: 'button', onclick: () => runTest(test, f, null, null) }, 'Test');
+        const run = el('button', { class: 'btn small primary', type: 'button', onclick: () => act(run, () => post(`/catalog/feeds/${f.id}/run`),
+          (r) => (r.ok ? `Done: ${r.note}` : `Failed: ${r.note}`), { close: again }) }, 'Run now');
+        const stop = el('button', { class: 'btn small', type: 'button', onclick: () => act(stop, () => post(`/catalog/feeds/${f.id}/stop`), 'Stop asked; the run ends at its next call', { close: again }) }, 'Stop runs');
+        return item({
+          title: f.name, badge: frag(chip('neutral', 'feed', PURPOSE[f.purpose] || f.purpose), ' ', feedHealth(f)),
+          detail: [f.kind === 'api' ? hostOf(f.url) : f.kind.toUpperCase(), schedWords(f), f.secrets.length ? `keys ${f.secrets.map((k) => `${SECRET_LABEL[k.name] || k.name} ${k.masked}`).join(', ')}`
+            : f.secrets_from_feed_id ? `keys from ${(x.feeds.find((y) => y.id === f.secrets_from_feed_id) || {}).name || 'another feed'}` : f.credential_ref ? `keys in ${f.credential_env}${f.credential_set ? '' : ' (not set)'}` : 'no keys',
+            f.last_run_at ? `last run ${shortDay(String(f.last_run_at).slice(0, 10))}` : null].filter(Boolean).join(' · '),
+          why: f.transport_note || f.last_note || null,
+          acts: [el('button', { class: 'btn small', type: 'button', onclick: () => { d.close(); openFeedEditor(v, f, x); } }, 'Edit'),
+            f.kind === 'api' && f.purpose !== 'orders' ? test : null, f.kind === 'api' && f.purpose !== 'orders' ? run : null,
+            f.running ? stop : null, el('button', { class: 'btn small', type: 'button', onclick: () => openRuns(f) }, 'History')],
+        });
+      });
+      return frag(
+        x.secretKeySet ? null : resultBox('warning', 'warn', 'Passwords cannot be stored here yet', 'Add ERP_SECRET_KEY (32 random bytes, base64) to the service’s environment; then keys typed into a feed are kept encrypted. Until then a feed can read keys from an ERP_SECRET_<NAME> variable.'),
+        el('div', { class: 'panel pad' }, el('div', { class: 'form-grid' }, field('Start from', tplSel), field('Endpoint for', purSel)),
+          el('div', { class: 'dlg-acts' }, addOne, addAll)),
+        section('Feeds', `${x.feeds.length}`, null, el('div', { class: 'panel' }, cards.length ? cards : empty('No feeds yet.', 'Add one: products first, then prices, quantities and freight. Each endpoint is its own feed with its own key.', true))),
+        section('Photos', `${x.photos.hosted} of ${x.photos.total} hosted`, [hostBtn],
+          el('p', { class: 'foot', text: 'Vendor photo links are copied into the ERP’s own store and served from here, so they show even where outside images are blocked.' })),
+        el('p', { class: 'foot', text: 'When a products feed and a prices feed both send cost, the prices feed wins for cost, MAP and MSRP; the products feed sets them only on products it creates. They meet on the vendor’s model number.' }));
+    });
+  }
+  const hostOf = (u) => { try { return new URL(u).host; } catch (_) { return u || 'no address'; } };
+  const uniqueName = (n, list) => { let k = n, i = 2; while (list.some((f) => f.name === k)) k = `${n} ${i++}`; return k; };
+
+  async function openRuns(f) {
+    const d = openDialog(`${f.name} · runs`, 'Newest first');
+    await fillDialog(d, async () => {
+      const r = await coApi(`/catalog/feeds/${f.id}/runs`);
+      return el('div', { class: 'panel' }, r.runs.length ? r.runs.map((x) => item({
+        title: `${shortDay(String(x.started_at).slice(0, 10))} · ${x.trigger === 'schedule' ? 'scheduled' : x.run_by || 'by hand'}`, amount: `${x.rows} rows`,
+        badge: !x.finished_at ? chip('warning', 'clock', 'Running') : chip(x.outcome === 'ok' ? 'good' : 'critical', x.outcome === 'ok' ? 'ok' : 'fail', x.outcome === 'ok' ? 'OK' : 'Failed'),
+        detail: x.note || '' })) : empty('Not run yet.', null, true));
+    });
+  }
+
+  /** Test a feed (saved, or the editor's unsaved state): one call, status, sample, mapped rows. */
+  async function runTest(btn, f, draftFn, into) {
+    const box = into || openDialog(`Test · ${f.name || 'new feed'}`, 'One call; nothing in the catalog changes', { wide: true }).body;
+    box.replaceChildren(E.loadingNode('Calling the vendor…'));
+    try {
+      const body = draftFn ? draftFn() : { feed: { id: f.id } };
+      const r = await post('/catalog/feeds/test', body);
+      if (draftFn && r.columns && r.columns.length) LAST_COLS.splice(0, LAST_COLS.length, ...r.columns);
+      if (draftFn) refreshColLists();
+      box.replaceChildren(frag(
+        resultBox(r.ok ? 'good' : 'warning', r.ok ? 'ok' : 'warn', r.ok ? `Works: ${r.recordsFound} records in the first call` : 'Not ready', r.problem || `Answer ${r.status}; ${r.columns.length} columns.`),
+        el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Answer', r.status == null ? '—' : String(r.status)), fact('Records', String(r.recordsFound)),
+          fact('Calls', String(r.calls)), fact('Address', r.url || '—'))),
+        r.missing && r.missing.length ? resultBox('warning', 'warn', 'Required fields with no column', r.missing.join(', ')) : null,
+        r.rows && r.rows.length ? section('First rows, mapped to our fields', `${r.rows.length}`, null, el('div', { class: 'panel' }, r.rows.map((row, i) => item({
+          title: `Row ${i + 1}${row.vendor_sku ? ` · ${row.vendor_sku}` : ''}`, detail: Object.entries(row).filter(([k]) => k !== 'vendor_sku').map(([k, v2]) => `${k.replace(/_/g, ' ')}: ${v2 || '—'}`).join(' · ') })))) : null,
+        r.columns && r.columns.length ? el('details', {}, el('summary', { text: `Columns in the answer (${r.columns.length})` }), el('p', { class: 'foot', text: r.columns.join(' · ') })) : null,
+        r.sample ? el('details', {}, el('summary', { text: 'Raw answer (first 2,000 characters, keys masked)' }), el('pre', { class: 'pc-raw', text: r.sample })) : null));
+    } catch (e) { box.replaceChildren(resultBox('critical', 'fail', 'Test did not run', friendly(e))); }
+  }
+  const LAST_COLS = [];
+  const COL_LISTS = [];
+  const refreshColLists = () => { for (const dl of COL_LISTS) if (dl.isConnected) dl.replaceChildren(...LAST_COLS.map((c2) => el('option', { value: c2 }))); };
+
+  /** The feed editor: Connection, Authentication, Request, Response & paging, Freight by store, Price rule, ETL steps, Field mapping, Schedule. */
+  function openFeedEditor(v, f0, x) {
+    const f = JSON.parse(JSON.stringify(f0));
+    f.query_params = f.query_params || {}; f.headers = f.headers || {}; f.paging = f.paging || { mode: 'none' }; f.batching = f.batching || {};
+    f.auth = f.auth || { mode: 'none' }; f.options = f.options || {}; f.mapping = f.mapping || {}; f.etl = f.etl || [];
+    LAST_COLS.splice(0, LAST_COLS.length, ...Object.values(f.mapping));
+    const d = openDialog(f.id ? `Edit · ${f.name}` : `New feed · ${v.name}`, PURPOSE[f.purpose] || f.purpose, { wide: true, sheet: true });
+    const back = () => { d.close(); openApiSetup(v); };
+    const listId = `pc-cols-${Math.random().toString(36).slice(2)}`;
+    const colList = el('datalist', { id: listId }); COL_LISTS.push(colList); refreshColLists();
+    const sec = (t) => el('div', { class: 'form-sec', text: t });
+    const chk = (on, label) => { const b = el('input', { type: 'checkbox', checked: !!on }); return [b, el('label', { class: 'check wide' }, b, label)]; };
+    const optIn = (k, ph) => input({ value: f.options[k] ?? '', placeholder: ph || '' });
+    // Connection
+    const name = input({ value: f.name || '' }), purpose = select(x.purposes.map((p) => [p, PURPOSE[p]]), f.purpose);
+    const kind = select([['api', 'API pull'], ['sftp', 'SFTP pull'], ['email', 'Email in'], ['manual', 'Manual upload']], f.kind || 'api');
+    const method = select([['GET', 'GET'], ['POST', 'POST']], f.method || 'GET'), url = input({ value: f.url || '', placeholder: 'https://…', inputmode: 'url' });
+    const [active, activeL] = chk(f.active !== false, 'On (runs on its schedule and from Run now)');
+    const sftp = { host: optIn('host', 'sftp.vendor.com'), port: optIn('port', '22'), user: optIn('user', 'user'), path: optIn('path', '/outbound/ (folder or one file)'), pattern: optIn('pattern', '*.csv') };
+    const email = { fromContains: optIn('fromContains', '@vendor.com'), subjectContains: optIn('subjectContains', 'price file') };
+    const sftpBox = el('div', { class: 'form-grid' }, field('Host', sftp.host), field('Port', sftp.port), field('User', sftp.user), field('Folder or file', sftp.path), field('Pattern', sftp.pattern));
+    const emailBox = el('div', { class: 'form-grid' }, field('Sender contains', email.fromContains), field('Subject contains', email.subjectContains));
+    const transportNote = el('div');
+    // Authentication
+    const mode = select([['none', 'None'], ['header', 'Key in a header (e.g. Ocp-Apim-Subscription-Key)'], ['query', 'Key as a query parameter'], ['bearer', 'Bearer token'],
+      ['basic', 'Basic (user + password)'], ['oauth2', 'OAuth (client id + secret traded for a token)'], ['auto', 'As the old connection did']], f.auth.mode || 'none');
+    const a = { headerName: input({ value: f.auth.headerName || '', placeholder: 'Ocp-Apim-Subscription-Key' }), paramName: input({ value: f.auth.paramName || '', placeholder: 'api_key' }),
+      authUrl: input({ value: f.auth.authUrl || '', placeholder: 'Token URL from the vendor’s API documents' }), scope: input({ value: f.auth.scope || '' }),
+      clientId: input({ value: f.auth.clientId || '' }), user: input({ value: f.auth.user || '' }),
+      atpExternalId: input({ value: f.auth.atpExternalId || '', placeholder: 'e.g. Company3989100' }), atpUser: input({ value: f.auth.atpUser || '', placeholder: 'e.g. AD_…_VP' }) };
+    const have = Object.fromEntries((f.secrets || []).map((k) => [k.name, k.masked]));
+    const secretBoxes = Object.keys(SECRET_LABEL).map((k) => {
+      const i2 = el('input', { type: 'password', autocomplete: 'new-password', placeholder: have[k] ? `${have[k]} kept — type to replace` : 'type to set' });
+      const clr = el('input', { type: 'checkbox' });
+      return { k, i: i2, clr, node: field(SECRET_LABEL[k], i2, have[k] ? null : null, false), clrNode: have[k] ? el('label', { class: 'check' }, clr, `Clear the ${SECRET_LABEL[k].toLowerCase()}`) : null };
+    });
+    const others = (x.feeds || []).filter((y) => y.id !== f.id);
+    const borrow = select([['', 'This feed’s own keys'], ...others.map((y) => [y.id, `Use ${y.name}’s keys`])], f.secrets_from_feed_id || '');
+    const cref = input({ value: f.credential_ref || '', placeholder: 'secret://vendor/ashley/pricing (optional)' });
+    // Request
+    const reqFmt = select([['query', 'Query parameters only'], ['json', 'JSON body'], ['xml', 'XML / SOAP body']], f.request_format || 'query');
+    const kv = (obj, kph, vph) => rowEditor(Object.entries(obj).map(([k, v2]) => ({ k, v: v2 })), (r) => {
+      const ki = input({ value: r.k || '', placeholder: kph }), vi = input({ value: r.v || '', placeholder: vph });
+      return { nodes: [field('Name', ki), field('Value', vi)], read: () => [ki.value.trim(), vi.value] };
+    }, 'Add', 'three');
+    const qp = kv(f.query_params, 'Customer', '3989100 or {{customer}}'), hd = kv(f.headers, 'SOAPAction', 'non-secret header value');
+    const body = el('textarea', { rows: '6', value: f.body_template || '', placeholder: '{"skus": [{{#skus}}"{{sku}}",{{/skus}}], "customer": "{{customer}}"}' });
+    const o = { customer: optIn('customer', 'your customer number with them'), shipTo: optIn('shipTo', 'ship-to number'), duns: optIn('duns', '052738531') };
+    // Response & paging
+    const resFmt = select([['json', 'JSON'], ['xml', 'XML'], ['csv', 'CSV']], f.response_format || 'json');
+    const recPath = input({ value: f.records_path || '', placeholder: 'JSON path (data.items) or XML element (itemAdvice); blank = find the list' });
+    const unwrap = optIn('unwrap', 'XML element whose text is the real document (ATPRequestResult)');
+    const pmode = select([['none', 'One call'], ['page', 'Page + size, until a short page'], ['offset', 'Offset + limit'], ['cursor', 'Cursor from the answer'], ['link', 'Next link (answer or Link header)']], f.paging.mode || 'none');
+    const pg = (k, ph) => input({ value: f.paging[k] ?? '', placeholder: ph });
+    const p = { size: pg('size', '250'), pageParam: pg('pageParam', 'page'), sizeParam: pg('sizeParam', 'limit'), offsetParam: pg('offsetParam', 'offset'),
+      cursorPath: pg('cursorPath', 'paging.next_cursor'), cursorParam: pg('cursorParam', 'cursor'), nextPath: pg('nextPath', 'links.next'), totalPath: pg('totalPath', 'metadata.totalRecords') };
+    const bsize = input({ type: 'number', min: '0', value: f.batching.size ?? '', placeholder: '40 (blank = no batching)' }), bdelay = input({ type: 'number', min: '0', value: f.batching.delayMs ?? '', placeholder: '1000' });
+    const rate = input({ type: 'number', min: '0', value: f.rate_limit_ms ?? 0 }), tmo = input({ type: 'number', min: '1', value: Math.round((f.timeout_ms ?? 30000) / 1000) });
+    // Freight by store
+    const ships = (x.locations || []).map((l) => [l, input({ value: (f.options.shipTos || {})[l.id] || '', placeholder: 'their ship-to no.' })]);
+    const useCodes = el('button', { class: 'btn small', type: 'button', onclick: () => { for (const [l, i2] of ships) if (!i2.value) i2.value = l.code; } }, 'Fill from store codes');
+    // Price rule
+    const prMode = select([['none', 'Leave retail alone'], ['markup', 'Set retail from cost × markup']], (f.options.priceRule || {}).mode || 'none');
+    const prMark = input({ inputmode: 'decimal', value: (f.options.priceRule || {}).markupBps ? (f.options.priceRule.markupBps / 10000).toFixed(2) : '', placeholder: '2.00 (= 2× cost)' });
+    const [pr99, pr99L] = chk((f.options.priceRule || {}).ending99, 'End prices in .99 (never under MAP)');
+    // ETL
+    const ops = [['subtract', '−'], ['percent_off', '− %'], ['add', '+'], ['multiply', '×'], ['fill_blank', 'if blank →']];
+    const etl = rowEditor(f.etl, (st) => {
+      const out = input({ value: st.out || '', placeholder: 'Promo Cost' }), aIn = input({ value: st.a || '', list: listId, placeholder: 'column' });
+      const op = select(ops, st.op || 'subtract'), bIn = input({ value: st.b || '', list: listId, placeholder: 'column or number' });
+      return { nodes: [field('New column', out), field('=', aIn), field('Operation', op), field('Column or number', bIn)], read: () => ({ out: out.value.trim(), a: aIn.value.trim(), op: op.value, b: bIn.value.trim() }) };
+    }, 'Step', 'opt');
+    // Mapping
+    const mapBox = el('div', { class: 'pc-map' });
+    const mapIns = {};
+    const drawMap = () => {
+      mapBox.replaceChildren(...(x.fields[purpose.value] || []).map((fl) => {
+        const i2 = mapIns[fl.name] || (mapIns[fl.name] = input({ value: f.mapping[fl.name] || '', list: listId, placeholder: 'vendor field' }));
+        return el('label', { class: 'field' }, el('span', {}, fl.name.replace(/_/g, ' '), fl.required ? el('span', { class: 'pc-req', text: ' *' }) : null), i2, fl.help ? el('span', { class: 'hint', text: fl.help }) : null);
+      }));
     };
-    const shipTos = fo.locations.map((l) => [l, input({ value: (cfg.shipTos || {})[l.id] || '', placeholder: 'their ship-to no.' })]);
-    const runsBox = el('div');
-    if (k) coApi(`/catalog/connections/${k.id}/runs`).then((r) => runsBox.replaceChildren(section('Recent pulls', `${r.runs.length}`, null, el('div', { class: 'panel' },
-      r.runs.length ? r.runs.slice(0, 8).map((x) => item({ title: shortDay(String(x.started_at).slice(0, 10)), badge: chip(x.outcome === 'ok' ? 'good' : 'critical', x.outcome === 'ok' ? 'ok' : 'fail', x.outcome === 'ok' ? 'OK' : 'Failed'),
-        detail: [x.note, x.run_by].filter(Boolean).join(' · ') })) : empty('Not run yet.', null, true))))).catch(() => {});
-    const err = el('div');
-    const save = el('button', { class: 'btn primary', type: 'button', onclick: () => {
-      const config = { url: f.url.value.trim(), pageSize: Number(f.pageSize.value) || 0, authUrl: f.authUrl.value.trim(), customer: f.customer.value.trim(),
-        atpOn: f.atpOn.checked, atpUrl: f.atpUrl.value.trim(), atpCustomer: f.atpCustomer.value.trim(), atpShipTo: f.atpShipTo.value.trim(), atpBatch: Number(f.atpBatch.value) || 40,
-        freightOn: f.freightOn.checked, freightUrl: f.freightUrl.value.trim(), poUrl: f.poUrl.value.trim(),
-        shipTos: Object.fromEntries(shipTos.filter(([, i]) => i.value.trim()).map(([l, i]) => [l.id, i.value.trim()])) };
-      for (const key of Object.keys(config)) if (config[key] === '') delete config[key];
-      act(save, () => post('/catalog/connections', { vendorId: v.id, kind: f.kind.value, adapter: f.adapter.value, name: `${v.name} ${f.kind.value}`, config,
-        credentialRef: f.cred.value.trim(), scheduleCron: f.kind.value === 'api' || f.kind.value === 'sftp' ? f.cron.value.trim() : '', mapping: k ? k.mapping : {} }),
-        'Connection saved', { errorInto: errInto(err), close: d.close });
-    } }, 'Save connection');
-    d.body.append(
-      k ? resultBox(k.credential_set ? 'good' : 'warning', k.credential_set ? 'ok' : 'warn', k.credential_set ? 'Secret is set' : 'Secret not set',
-        `The server reads it from ${k.credential_env}. ${k.credential_set ? '' : 'Add it to the service’s environment as JSON, for example {"clientId":"…","clientSecret":"…","atpExternalId":"…","atpKeyCode":"…","atpUser":"…","atpPassword":"…"}.'}`) : null,
-      el('div', { class: 'form-grid' }, field('How it connects', f.kind), field('Adapter', f.adapter), field('Catalog address', f.url, 'Paginated JSON; a short page ends the pull', true),
-        field('Page size', f.pageSize), field('Our customer no.', f.customer), field('OAuth address', f.authUrl, null, true), field('Credential reference', f.cred, 'Only the name of the secret'),
-        field('Schedule (cron)', f.cron),
-        el('div', { class: 'form-sec', text: 'Availability (Ashley ATP)' }), el('label', { class: 'check wide' }, f.atpOn, 'Pull vendor quantity and lead time for every model'),
-        field('ATP service address', f.atpUrl, null, true), field('ATP customer', f.atpCustomer), field('ATP ship-to', f.atpShipTo), field('Models per call', f.atpBatch),
-        el('div', { class: 'form-sec', text: 'Freight by store' }), el('label', { class: 'check wide' }, f.freightOn, 'Pull the vendor’s freight per model to each place'),
-        field('Price API address', f.freightUrl, null, true), shipTos.map(([l, i]) => field(`${l.name} ship-to`, i)),
-        el('div', { class: 'form-sec', text: 'Sending orders' }), field('Order service address', f.poUrl, 'Leave blank to send by email or file', true)),
-      el('div', { class: 'dlg-acts' }, save, el('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Cancel')), err, runsBox);
+    // Schedule
+    const every = input({ type: 'number', min: '1', max: '720', value: f.every_hours ?? '', placeholder: '24' }), cron = input({ value: f.schedule_cron || '', placeholder: 'or cron: 15 5 * * *' });
+    const alert = optIn('alertEmail', 'who hears when it starts failing');
+    const [hostPh, hostPhL] = chk(f.options.hostPhotos, 'Host this vendor’s photos here after each products run');
+
+    const authF = { headerName: field('Key header name', a.headerName, 'Ashley: Ocp-Apim-Subscription-Key'), paramName: field('Key parameter name', a.paramName),
+      authUrl: field('OAuth token URL', a.authUrl, null, true), scope: field('OAuth scope', a.scope), clientId: field('Client ID', a.clientId), user: field('User', a.user),
+      atpExternalId: field('ATP External ID', a.atpExternalId), atpUser: field('ATP user', a.atpUser) };
+    const bodyF = field('Body template — {{customer}} {{shipTo}} {{page}} {{pageSize}} {{offset}} {{cursor}} {{#skus}}{{sku}}{{/skus}} {{skuList}} {{cred.name}} {{#xml}}…{{/xml}}', body, null, true);
+    const groups = { sftp: sftpBox, email: emailBox };
+    const freightSec = el('div', {}, sec('Freight by store'), el('p', { class: 'foot', text: 'The API is asked once per ship-to (four at a time); a store it will not quote is skipped and named.' }),
+      el('div', { class: 'form-grid' }, ships.map(([l, i2]) => field(`${l.name} (${l.code})`, i2))), useCodes,
+      (f.options.unmatchedShipTos || []).length ? resultBox('warning', 'warn', 'Ship-to numbers to place', `From the catalog app, not matched to a store: ${f.options.unmatchedShipTos.join(', ')}. Type each beside its store.`) : null);
+    const priceSec = el('div', {}, sec('Price rule'), el('div', { class: 'form-grid' }, field('Retail', prMode), field('Markup', prMark), pr99L));
+    const sync = () => {
+      const k = kind.value;
+      for (const [g, n] of Object.entries(groups)) n.hidden = k !== g;
+      transportNote.replaceChildren(k === 'sftp' || k === 'email' ? resultBox('neutral', 'info', `${k === 'sftp' ? 'SFTP' : 'Email-in'} is not built in this version yet`, 'These settings are kept for when it is. Use the Import tab to load a file today.') : '');
+      freightSec.hidden = purpose.value !== 'freight';
+      bodyF.hidden = reqFmt.value === 'query' && !body.value.trim();
+      // Only the boxes the chosen authentication uses; a key header can ride along with OAuth or basic.
+      const m = mode.value, atp = purpose.value === 'quantities' || !!a.atpExternalId.value;
+      const showAuth = { headerName: ['header', 'oauth2', 'basic', 'auto'].includes(m), paramName: m === 'query', authUrl: m === 'oauth2', scope: m === 'oauth2', clientId: m === 'oauth2',
+        user: m === 'basic' || m === 'auto', atpExternalId: atp, atpUser: atp };
+      for (const [k2, n] of Object.entries(authF)) n.hidden = !showAuth[k2];
+      const showSec = { apiKey: ['header', 'query', 'oauth2', 'basic', 'auto'].includes(m), token: m === 'bearer' || m === 'auto', password: m === 'basic' || m === 'auto',
+        clientSecret: m === 'oauth2' || m === 'auto', atpKeyCode: atp, atpPassword: atp, sftpPassword: kind.value === 'sftp' };
+      for (const sb of secretBoxes) if (sb.wrap) sb.wrap.hidden = !(showSec[sb.k] || have[sb.k]);
+      priceSec.hidden = purpose.value !== 'pricing';
+      drawMap();
+    };
+    kind.onchange = sync; purpose.onchange = sync; mode.onchange = sync; reqFmt.onchange = sync;
+
+    const collect = () => {
+      const mapping = {}; for (const [k, i2] of Object.entries(mapIns)) if (i2.value.trim() && (x.fields[purpose.value] || []).some((fl) => fl.name === k)) mapping[k] = i2.value.trim();
+      const num = (i2) => (i2.value === '' ? undefined : Number(i2.value));
+      const paging = { mode: pmode.value };
+      for (const [k, i2] of Object.entries(p)) if (i2.value.trim()) paging[k] = k === 'size' ? Number(i2.value) : i2.value.trim();
+      const options = { ...f.options };
+      for (const [k, i2] of Object.entries({ ...o, ...sftp, ...email, unwrap, alertEmail: alert })) { if (i2.value.trim()) options[k] = i2.value.trim(); else delete options[k]; }
+      options.shipTos = Object.fromEntries(ships.filter(([, i2]) => i2.value.trim()).map(([l, i2]) => [l.id, i2.value.trim()]));
+      options.priceRule = prMode.value === 'markup' ? { mode: 'markup', markupBps: Math.round(Number(prMark.value || 0) * 10000), ending99: pr99.checked } : { mode: 'none' };
+      options.hostPhotos = hostPh.checked;
+      const auth = { mode: mode.value };
+      for (const [k, i2] of Object.entries(a)) if (i2.value.trim()) auth[k] = i2.value.trim();
+      const secrets = {};
+      for (const sb of secretBoxes) { if (sb.clr.checked) secrets[sb.k] = null; else if (sb.i.value) secrets[sb.k] = sb.i.value; }
+      return { feed: { id: f.id || null, vendor_id: v.id, purpose: purpose.value, name: name.value.trim(), template: f.template || 'blank', kind: kind.value, method: method.value,
+        url: url.value.trim(), request_format: reqFmt.value, query_params: Object.fromEntries(qp.read().filter(([k]) => k)), headers: Object.fromEntries(hd.read().filter(([k]) => k)),
+        body_template: body.value, response_format: resFmt.value, records_path: recPath.value.trim(), paging,
+        batching: num(bsize) ? { size: num(bsize), delayMs: num(bdelay) ?? 0 } : {}, auth, credential_ref: cref.value.trim() || null, secrets_from_feed_id: borrow.value || null,
+        mapping, options, etl: etl.read().filter((st) => st.out && st.a), schedule_cron: cron.value.trim() || null, every_hours: num(every) ?? null, active: active.checked,
+        rate_limit_ms: Number(rate.value || 0), timeout_ms: Math.round(Number(tmo.value || 30) * 1000) }, secrets };
+    };
+    const err = el('div'), testBox = el('div');
+    const save = (thenRun) => async (e) => {
+      const btn = e.currentTarget;
+      await act(btn, async () => {
+        const r = await post('/catalog/feeds', collect());
+        if (thenRun) { const rr = await post(`/catalog/feeds/${r.id}/run`); toast(rr.ok ? `Done: ${rr.note}` : `Failed: ${rr.note}`, rr.ok ? 'good' : 'critical'); }
+        return r;
+      }, thenRun ? null : 'Feed saved', { errorInto: errInto(err), close: back });
+    };
+    const testBtn = el('button', { class: 'btn', type: 'button', onclick: () => runTest(testBtn, f, collect, testBox) }, 'Test this feed');
+    d.body.append(colList,
+      el('div', { class: 'form-grid' },
+        sec('Connection'), field('Name', name, null, true), field('Purpose', purpose), field('Arrives by', kind), field('Method', method), field('Address', url, 'https only; placeholders like {{customer}} work here too', true), activeL),
+      transportNote, sftpBox, emailBox,
+      el('div', { class: 'form-grid' },
+        sec('Authentication'), field('How', mode, null, true), authF.headerName, authF.paramName, authF.authUrl, authF.scope, authF.clientId, authF.user,
+        authF.atpExternalId, authF.atpUser,
+        el('p', { class: 'foot wide', text: 'Keys and passwords are stored encrypted and never shown again; leave a box empty to keep what is there.' }),
+        secretBoxes.map((sb) => { sb.wrap = el('div', { class: 'wide' }, sb.node, sb.clrNode); return sb.wrap; }), field('Or use keys from', borrow), field('Or an environment secret', cref, f.credential_env ? `reads ${f.credential_env}${f.credential_set ? '' : ' (not set)'}` : 'ERP_SECRET_<NAME> on the server')),
+      el('div', { class: 'form-grid' }, sec('Request'), field('Format', reqFmt), field('Customer no.', o.customer), field('Ship-to', o.shipTo), field('DUNS (Ashley ATP)', o.duns)),
+      el('p', { class: 'foot', text: 'Query parameters' }), qp.node, el('p', { class: 'foot', text: 'Headers (no keys here; keys go under Authentication)' }), hd.node,
+      bodyF,
+      el('div', { class: 'form-grid' }, sec('Response & paging'), field('Answer format', resFmt), field('Records are at', recPath, null, true), field('XML inside element', unwrap, null, true),
+        field('Paging', pmode, null, true), field('Page size', p.size), field('Page parameter', p.pageParam), field('Size parameter', p.sizeParam), field('Offset parameter', p.offsetParam),
+        field('Cursor at (answer)', p.cursorPath), field('Cursor parameter', p.cursorParam), field('Next link at (answer)', p.nextPath), field('Total records at', p.totalPath),
+        field('Models per call', bsize, 'For APIs that take a list of models (Ashley ATP: 40)'), field('Pause between calls (ms)', bdelay), field('Rate limit (ms between pages)', rate), field('Timeout (seconds)', tmo)),
+      freightSec, priceSec,
+      el('div', {}, sec('ETL steps'), el('p', { class: 'foot', text: 'Computed columns before mapping, as in the catalog app: Promo Cost = RegularCost − Discount. No discount means no promo.' }), etl.node),
+      el('div', {}, sec('Field mapping'), el('p', { class: 'foot', text: 'Our field ← their field. Test first and the boxes offer the columns the answer has; blank ones are recognised by name when they can be.' }), mapBox),
+      el('div', { class: 'form-grid' }, sec('Schedule'), field('Every N hours', every), field('Or cron (UTC)', cron), field('Alert email', alert, 'Told once when the feed starts failing (needs a mail service)', true), hostPhL),
+      el('div', { class: 'dlg-acts' }, testBtn, el('button', { class: 'btn primary', type: 'button', onclick: save(false) }, 'Save'),
+        el('button', { class: 'btn', type: 'button', onclick: save(true) }, 'Save & run now'), el('button', { class: 'btn', type: 'button', onclick: back }, 'Back')),
+      err, testBox);
+    sync();
   }
 
   function openVendor(v) {
