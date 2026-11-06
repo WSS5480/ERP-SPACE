@@ -272,7 +272,7 @@ async function build(c: Client, co: Company, log: (s: string) => void): Promise<
         const t = await one<{ from_bank_account_id: string }>(c, `
           select from_bank_account_id from bank_transfer where id = $1 and entity_id = $2`, [p.transferId, co.id]);
         addLine(t.from_bank_account_id, { posted: nextBankDay(day), amount: -p.amountMinor, ref: `ACH${compact(day)}`,
-                                          description: "ACH DEBIT PENTEX CONCENTRATION" });
+                                          description: "ACH DEBIT DEMOCO CONCENTRATION" });
       }
     }
   }

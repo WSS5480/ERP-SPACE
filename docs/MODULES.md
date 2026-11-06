@@ -1,6 +1,6 @@
 # Retail modules — the contract
 
-Pentex ERP is becoming an out-of-the-box **retail furniture ERP** that any
+ERP is becoming an out-of-the-box **retail furniture ERP** that any
 business can switch on: a furniture or appliance retailer, a general retailer,
 a rent-to-own chain, or a trucking company. All of them share the finance
 core in migrations 0001–0014 (GL, AP, banking, reconciliation, payroll), and

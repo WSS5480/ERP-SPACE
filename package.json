@@ -1,5 +1,5 @@
 {
-  "name": "pentex-erp",
+  "name": "erp-api",
   "private": true,
   "type": "module",
   "engines": {

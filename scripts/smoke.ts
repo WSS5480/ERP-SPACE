@@ -729,8 +729,8 @@ async function main() {
   console.log("\na statement arriving by every channel");
 
   const BAI2 = [
-    "01,FIRSTVALLEY,PENTEX,260919,0600,1,,,2/",
-    "02,PENTEX,FIRSTVALLEY,1,260919,,,/",
+    "01,FIRSTVALLEY,DEMOCO,260919,0600,1,,,2/",
+    "02,DEMOCO,FIRSTVALLEY,1,260919,,,/",
     "03,7788,USD,010,1844200,,,015,1867500,,/",
     "16,175,52100,0,DEP88201,,BRANCH DEPOSIT/",
     "88,PALESTINE STORE/",
@@ -844,7 +844,7 @@ async function main() {
     const seenNames: string[] = [];
     const sftp = {
       list: async () => [
-        { name: "PENTEX_20260919.BAI", size: 10, modifiedAt: "2026-09-19T06:00:00Z" },
+        { name: "DEMOCO_20260919.BAI", size: 10, modifiedAt: "2026-09-19T06:00:00Z" },
         { name: "OTHERCO_20260919.BAI", size: 10, modifiedAt: "2026-09-19T06:00:00Z" },
         { name: "notes.txt", size: 3, modifiedAt: "2026-09-19T06:00:00Z" },
       ],
@@ -902,8 +902,8 @@ async function main() {
     ok("an exact sender matches", senderAllowed("Bank <statements@rio.example>", ["statements@rio.example"]));
     ok("a domain entry matches any address at it", senderAllowed("new.person@rio.example", ["@rio.example"]));
     ok("a look-alike domain does not", !senderAllowed("a@rio.example.evil.com", ["@rio.example"]));
-    ok("globbing takes * and ? and nothing clever", globMatch("PENTEX_20260919.BAI", "PENTEX_*.BAI")
-       && !globMatch("OTHER.BAI", "PENTEX_*.BAI"));
+    ok("globbing takes * and ? and nothing clever", globMatch("DEMOCO_20260919.BAI", "DEMOCO_*.BAI")
+       && !globMatch("OTHER.BAI", "DEMOCO_*.BAI"));
   }
 
   console.log("\nknowing when a feed stopped");
@@ -1007,7 +1007,7 @@ async function main() {
   }).catch((e) => { if (!/rollback: test only/.test((e as Error).message)) throw e; });
 
   console.log("\na client-wide role counts only inside its own client");
-  await throws("Pentex's owner cannot approve a request at Rio Freight",
+  await throws("The demo company's owner cannot approve a request at Rio Freight",
     () => tx({ tenantId: RIO_TENANT, entityId: RIO_ENTITY, actor: { kind: "user", id: STEVE, label: "Steve" } }, async (c) => {
       const r = await openRequest(c, { tenantId: RIO_TENANT, entityId: RIO_ENTITY, actor: { kind: "user", id: RIO_OWNER, label: "Rio owner" } },
         { subjectType: "payroll_run", subjectId: "00000000-0000-0000-0000-00000000abcd", amountMinor: 100n, makerId: RIO_OWNER });

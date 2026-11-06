@@ -6,10 +6,10 @@
 <meta name="robots" content="noindex, nofollow">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#12212E">
-<title>Pentex ERP</title>
+<title>ERP</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2312212E'/%3E%3Cpath d='M11.5 24V8.5h6a4.6 4.6 0 0 1 0 9.2h-6' fill='none' stroke='%23D98C4A' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <!--
-  Pentex ERP. This page is a shell: every figure on it comes from /api after
+  ERP. This page is a shell: every figure on it comes from /api after
   sign-in, and every piece of data is placed with textContent, never parsed as
   markup. Script and styles come only from this site (see the server's
   Content-Security-Policy).
@@ -24,7 +24,7 @@
 
 <div id="signin" class="signin" hidden>
   <form class="card" id="si-form" autocomplete="on" novalidate>
-    <div class="brand">Pentex ERP</div>
+    <div class="brand">ERP</div>
     <h1>Sign in</h1>
     <p class="lead" id="si-msg">Use the operator access key.</p>
     <label class="field"><span>Your name</span>
@@ -33,14 +33,14 @@
       <input type="password" id="si-key" name="password" autocomplete="current-password" required></label>
     <button class="btn primary" type="submit" id="si-go">Sign in</button>
     <div class="result critical" id="si-err" role="alert" hidden></div>
-    <p class="fine">The access key is <b>ERP_API_TOKEN</b> in Render, under pentex-erp-api → Environment. Your name is recorded on everything you do here.</p>
+    <p class="fine">The access key is <b>ERP_API_TOKEN</b> in Render, under ERP-api → Environment. Your name is recorded on everything you do here.</p>
   </form>
 </div>
 
 <div id="app" class="app" hidden>
   <header class="side">
     <div class="side-top">
-      <div class="brand">Pentex ERP</div>
+      <div class="brand">ERP</div>
       <div class="bar-actions">
         <button class="icon-btn" type="button" data-act="refresh" aria-label="Refresh"></button>
         <button class="icon-btn" type="button" data-act="signout" aria-label="Sign out"></button>
