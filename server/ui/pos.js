@@ -244,7 +244,7 @@
         const rows = await coApi(`/pos/orders?kind=${kind}&status=${status}&q=${encodeURIComponent(q.value.trim())}`);
         list.replaceChildren(...(rows.length ? rows.map((o) => item({ title: `${o.number}${o.customer ? ' · ' + o.customer : ''}`, amount: money(o.total_minor),
           badge: o.overrides_waiting ? chip('warning', 'clock', 'override waiting') : statusChip(o.kind === 'quote' && o.status === 'draft' ? 'quote' : o.status),
-          detail: [words(o.kind), o.location, Number(o.balance_minor) > 0 && o.status !== 'draft' ? `${money(o.balance_minor)} owed` : null,
+          detail: [words(o.kind), o.channel && o.channel !== 'pos' ? `${o.channel} order` : null, o.location, Number(o.balance_minor) > 0 && o.status !== 'draft' ? `${money(o.balance_minor)} owed` : null,
             o.quote_expires_on ? `good until ${shortDay(o.quote_expires_on)}` : null, o.promised_on ? `promised ${shortDay(o.promised_on)}` : null, ago(o.ordered_at)].filter(Boolean).join(' · '),
           onClick: () => openOrder(o.id) })) : [empty('No orders here.', null, true)]));
       } catch (e) { list.replaceChildren(E.errorBox(e, load)); }

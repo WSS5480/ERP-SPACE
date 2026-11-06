@@ -8,13 +8,18 @@ import { tx, type Scope } from "../../packages/core/db.ts";
 import * as pos from "../../packages/core/pos.ts";
 import * as inv from "../../packages/core/inventory.ts";
 import { module } from "../../server/modules/pos.ts";
+import { module as invModule } from "../../server/modules/inventory.ts";
+import { module as purModule } from "../../server/modules/purchasing.ts";
 import { routesOf, companyOf } from "./inventory.ts";
 
 const R = routesOf(module as never);
+const RI = routesOf(invModule as never);
+const RP = routesOf(purModule as never);
 const DC = "33333333-0000-0000-0000-0000000000dc";
 const LUIS = "55555555-0000-0000-0000-000000000012";     // cashier
 const MARIA = "55555555-0000-0000-0000-000000000011";    // sales
 const MGR = "55555555-0000-0000-0000-000000000018";      // store manager + sales
+const DEE = "55555555-0000-0000-0000-000000000013";      // warehouse
 const REG = "9a9a0000-0000-0000-0000-000000000001";      // Enola front counter
 const CUST = { ALICIA: "88888888-0000-0000-0000-000000000001", BRIAN: "88888888-0000-0000-0000-000000000002", RIVERSIDE: "88888888-0000-0000-0000-000000000005" };
 const P = { SOFA: "77777777-0000-0000-0000-000000000001", DRESSER: "77777777-0000-0000-0000-000000000004", RECLINER: "77777777-0000-0000-0000-000000000007",
@@ -130,6 +135,9 @@ export async function run(t: T) {
         throw ROLLBACK;
       });
     } catch (e) { if (e !== ROLLBACK) throw e; }
+    const feeLines = kitLines.filter((l) => !l.package_sku);
+    kitLines = kitLines.filter((l) => l.package_sku);
+    t.ok("delivery fee: a package going by delivery picks up the zone's fee on its own", feeLines.length === 1 && feeLines[0].unit_price_minor === "9900");
     const pkgTotal = kitLines.reduce((a, l) => a + Math.round(Number(l.qty) * Number(l.unit_price_minor)), 0);
     t.ok("package: sells as its components, each stocked on its own", kitLines.length === 2 && kitLines.every((l) => l.package_sku === "PKG-DINE-5"));
     t.ok("package: the components carry the package price between them", Math.abs(pkgTotal - 79999) <= 2, String(pkgTotal));
@@ -160,7 +168,7 @@ export async function run(t: T) {
 
     // ----------------------------------------------------------------- layaway
     const dr0 = await level(P.DRESSER, LOC.ENOLA);
-    const lw = await R.post(t, MARIA, "/pos/orders", { kind: "layaway", locationId: LOC.ENOLA, customerId: CUST.BRIAN, lines: [{ productId: P.DRESSER, qty: 1 }] }) as { id: string };
+    const lw = await R.post(t, MARIA, "/pos/orders", { kind: "layaway", locationId: LOC.ENOLA, customerId: CUST.BRIAN, lines: [{ productId: P.DRESSER, qty: 1, fulfillment: "pickup" }] }) as { id: string };
     await t.throws("layaway: needs the minimum deposit", () => R.post(t, LUIS, `/pos/orders/${lw.id}/checkout`, { sessionId: ses.id,
       tenders: [{ method: "cash", amount: "10" }] }), /needs a deposit of at least \$116\.60/);
     await R.post(t, LUIS, `/pos/orders/${lw.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "cash", amount: "120" }] });
@@ -238,6 +246,107 @@ export async function run(t: T) {
     const sv = await view(qt.id);
     t.ok("signature: kept on the order with the signer", sv.signed_name === "Alicia Gomez" && String(sv.signature_data_url).startsWith("data:image/png"));
     t.ok("audit: the order's history lists who did what", (sv.history as unknown[]).length >= 3);
+
+    // ------------------------------------------- tie-out after selling and returns
+    const tie1 = await inv.tieOut(c0, ENTITY);
+    t.ok("tie-out: after sales and returns, stock at cost still equals GL 1300 + 1310", tie1.ties && tie1.quantityOutOfStep.length === 0,
+      `diff ${tie1.differenceMinor}`);
+
+    // ----------------------- special order: POS → purchasing PO → receive → transfer → pickup
+    const so = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.ALICIA, promisedOn: plus(30),
+      lines: [{ productId: P.HUDSON, qty: 1, fulfillment: "pickup", choices: { size: "84", fabric: "linen-oat", legs: "walnut" } }] }) as { id: string; number: string };
+    await R.post(t, MARIA, `/pos/orders/${so.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "400.00", reference: "5151" }] });
+    const soLine = ((await view(so.id)).lines as { id: string; line_status: string }[])[0];
+    t.ok("special order: the made-to-order sofa goes on order", soLine.line_status === "on_order");
+    const placed = await RP.post(t, MGR, "/purchasing/special-orders", { lineIds: [soLine.id] }) as { placed?: { poId: string }[] } | { poId: string }[];
+    const poId = (Array.isArray(placed) ? placed : (placed.placed ?? (placed as unknown as { pos: { poId: string }[] }).pos ?? []))[0]?.poId
+      ?? (await read<{ id: string }>(`select pol.purchase_order_id id from po_line_sales_line k join purchase_order_line pol on pol.id = k.purchase_order_line_id
+           where k.entity_id = $1 and k.sales_order_line_id = $2 and k.active`, [ENTITY, soLine.id]))[0]?.id;
+    t.ok("special order: purchasing places a PO tied to the customer's line", !!poId);
+    const pol = (await read<{ id: string; unit: string; landed: string; qty: string }>(`select pol.id, pol.unit_price_minor::text unit, pol.landed_minor::text landed, pol.quantity::text qty
+      from purchase_order_line pol join po_line_sales_line k on k.purchase_order_line_id = pol.id where k.entity_id = $1 and k.sales_order_line_id = $2`, [ENTITY, soLine.id]))[0];
+    const huds0 = await level(P.HUDSON, DC);
+    const rcv = await RI.post(t, DEE, "/inventory/receiving", { purchaseOrderId: poId, locationId: DC, lines: [{ poLineId: pol.id, qty: 1 }] }) as
+      { lines: { reservedFor: string[]; labels: string[] }[]; valueMinor: bigint; receiptId: string };
+    const afterRcv = (await view(so.id)).lines as { line_status: string; fulfil_from: string }[];
+    const huds1 = await level(P.HUDSON, DC);
+    const allocated = await read<{ n: string }>(`select count(*) n from inv_piece where entity_id = $1 and sales_order_line_id = $2 and status = 'reserved'`, [ENTITY, soLine.id]);
+    t.ok("special order: receiving reserves it for the customer at the DC", afterRcv[0].line_status === "reserved" && afterRcv[0].fulfil_from === "Distribution center"
+      && huds1.reserved === huds0.reserved + 1 && huds1.onHand === huds0.onHand + 1 && rcv.lines[0].reservedFor.includes(so.number));
+    t.ok("special order: its received cartons are allocated to the customer, not free stock", Number(allocated[0].n) === rcv.lines[0].labels.length && Number(allocated[0].n) >= 1);
+    const recvJe = await je(rcv.receiptId);
+    t.ok("special order: the receipt posts Dr 1300 Cr 2050 at the PO's cost", net(recvJe, "1300") === BigInt(rcv.valueMinor) && net(recvJe, "2050") === -BigInt(rcv.valueMinor)
+      && BigInt(rcv.valueMinor) === BigInt(pol.unit) + BigInt(Math.round(Number(pol.landed ?? 0) / Number(pol.qty))));
+    const soHand0 = await R.post(t, LUIS, `/pos/orders/${so.id}/fulfil`, { lineIds: [soLine.id] }).then(() => null, (e: Error) => e.message);
+    t.ok("special order: not handed over while the balance is owed", /goods leave paid for/.test(soHand0 ?? ""), soHand0 ?? "handed over");
+    const tr = await RI.post(t, DEE, "/inventory/transfers", { fromId: DC, toId: LOC.ENOLA, lines: [{ salesOrderLineId: soLine.id }] }) as { id: string };
+    await RI.post(t, DEE, `/inventory/transfers/${tr.id}/ship`);
+    const inTransit = (await view(so.id)).lines as { line_status: string }[];
+    t.ok("special order: on its way to the store the line waits on the transfer", inTransit[0].line_status === "on_order");
+    const midTie = await inv.tieOut(c0, ENTITY);
+    t.ok("tie-out: with the sofa in transit, 1310 holds its value", midTie.ties && midTie.inTransitMinor === BigInt(rcv.valueMinor));
+    await RI.post(t, DEE, `/inventory/transfers/${tr.id}/receive`);
+    const atStore = (await view(so.id)).lines as { line_status: string; fulfil_from: string }[];
+    const enolaH = await level(P.HUDSON, LOC.ENOLA);
+    t.ok("special order: it lands at Enola still reserved for the customer", atStore[0].line_status === "reserved" && atStore[0].fulfil_from === "Enola" && enolaH.reserved === 1);
+    const owed = (await view(so.id)).balance_minor as string;
+    await R.post(t, LUIS, `/pos/orders/${so.id}/pay`, { sessionId: ses.id, tenders: [{ method: "card", amount: String(Number(owed) / 100), reference: "5151" }] });
+    await R.post(t, LUIS, `/pos/orders/${so.id}/fulfil`, { lineIds: [soLine.id] });
+    const done = await view(so.id);
+    const saleJe = await je(so.id, "sale");
+    t.ok("special order: picked up, the sale posts and every dollar of deposit is released from 2300", done.status === "fulfilled"
+      && net(saleJe, "2300") === BigInt(done.total_minor as string) && net(saleJe, "1100") === 0n);
+    t.ok("special order: cost of goods is exactly what the receipt put on the books", net(saleJe, "5000") === BigInt(rcv.valueMinor) && net(saleJe, "1300") === -BigInt(rcv.valueMinor));
+    const tie2 = await inv.tieOut(c0, ENTITY);
+    t.ok("tie-out: after the special order's whole life, the books still tie", tie2.ties && tie2.quantityOutOfStep.length === 0, `diff ${tie2.differenceMinor}`);
+
+    // ------------------------------------------------- a web order at the counter
+    const web = await tx({ kind: "system", label: "test" }, async (c) => {
+      const o = (await t.q<{ id: string }>(c, `insert into sales_order (entity_id, number, channel, location_id, customer_id, status, fulfillment)
+        values ($1,'WEB-TEST-1','web',$2,$3,'open','pickup') returning id`, [ENTITY, LOC.ENOLA, CUST.BRIAN]))[0];
+      const l = (await t.q<{ id: string }>(c, `insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, fulfil_from_id)
+        values ($1,$2,1,$3,'ACC-LAMP-01','Ceramic table lamp',1,5999,360,$4) returning id`, [ENTITY, o.id, P.LAMP, LOC.ENOLA]))[0];
+      await c.query(`select sales_order_retotal($1) /* unscoped: test order */`, [o.id]);
+      await inv.reserveOrder(c, ENTITY, o.id);
+      const r = (await t.q<{ id: string }>(c, `insert into customer_receipt (entity_id, number, customer_id, sales_order_id, location_id, channel, method, amount_minor, reference)
+        values ($1,'R-WEB-1',$2,$3,$4,'web','card',6359,'9911') returning id`, [ENTITY, CUST.BRIAN, o.id, LOC.ENOLA]))[0];
+      const co = await companyOf();
+      const { postReceipt } = await import("../../packages/core/ar.ts");
+      await postReceipt(c, { tenantId: co.tenantId, entityId: ENTITY, actor: { kind: "system", label: "web" } }, r.id);
+      return { id: o.id, line: l.id };
+    });
+    const webList = await R.get(t, "/pos/orders?q=WEB-TEST") as { channel: string }[];
+    t.ok("web order: POS can find it", webList.length === 1 && webList[0].channel === "web");
+    await R.post(t, LUIS, `/pos/orders/${web.id}/fulfil`, { lineIds: [web.line] });
+    t.ok("web order: a web pickup is handed over at the counter", (await view(web.id)).status === "fulfilled" && (await je(web.id, "sale")).length > 0);
+    const wret = await R.post(t, LUIS, `/pos/orders/${web.id}/return`, { sessionId: ses.id, lines: [{ lineId: web.line, qty: 1, reason: "changed_mind", disposition: "restock" }] }) as
+      { refundMinor: bigint; receipts: { method: string; amountMinor: bigint }[] };
+    const wr = await read<{ method: string; amount_minor: string; reference: string }>(`select r.method, r.amount_minor::text, r.reference from customer_receipt r
+      join pos_order po on po.sales_order_id = r.sales_order_id where r.entity_id = $1 and po.original_order_id = $2`, [ENTITY, web.id]);
+    t.ok("web order: returned at the register, refunded to the card it was paid with", wret.refundMinor === 6359n && wr.length === 1 && wr[0].method === "card"
+      && wr[0].amount_minor === "-6359" && wr[0].reference === "9911");
+
+    // ----------------------------------------------------- delivery fee, defaults
+    const df = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.ALICIA, promisedOn: plus(6),
+      lines: [{ productId: P.SOFA, qty: 1 }, { productId: P.PROTECT, qty: 1 }] }) as { id: string; deliveryFeeMinor: bigint };
+    const dfv = await view(df.id);
+    const dfl = dfv.lines as { id: string; sku: string; fulfillment: string; unit_price_minor: string; description: string }[];
+    t.ok("defaults: a sofa with no fulfilment named goes by delivery, and its protection plan with it",
+      dfl.find((l) => l.sku === "ASH-2930338")?.fulfillment === "delivery" && dfl.find((l) => l.sku === "SVC-PROTECT-5Y")?.fulfillment === "delivery");
+    const feeLine = dfl.find((l) => l.sku === "SVC-DELIVERY");
+    t.ok("delivery fee: added at the customer's zone rate (West Shore $99)", !!feeLine && feeLine.unit_price_minor === "9900" && /WSH/.test(feeLine.description));
+    await t.throws("delivery fee: sales cannot waive it on a delivery", () => R.post(t, MARIA, `/pos/orders/${df.id}/lines/${feeLine!.id}/void`, { reason: "customer asked" }),
+      /waiving the delivery fee on a delivery needs a store manager/);
+    await R.post(t, MGR, `/pos/orders/${df.id}/lines/${feeLine!.id}/void`, { reason: "First-time customer promotion" });
+    const dfv2 = await view(df.id);
+    t.ok("delivery fee: a manager waives it, and the waiver is on record", (dfv2.overrides as { detail: string; reason: string }[]).some((o) => o.detail === "delivery fee waived")
+      && !(dfv2.lines as { sku: string; line_status: string }[]).some((l) => l.sku === "SVC-DELIVERY" && l.line_status !== "cancelled"));
+    const dvFees = ((await view(dv.id)).lines as { sku: string }[]).filter((l) => l.sku === "SVC-DELIVERY");
+    t.ok("delivery fee: an order that already has one gets no second", dvFees.length === 1);
+    const mto = await R.post(t, MARIA, "/pos/orders", { kind: "quote", locationId: LOC.ENOLA, customerId: CUST.ALICIA,
+      lines: [{ productId: P.HUDSON, qty: 1, choices: { size: "84", fabric: "linen-oat", legs: "walnut" } }], promisedOn: plus(40) }) as { id: string };
+    t.ok("defaults: a made-to-order sofa defaults to delivery, never take-with",
+      ((await view(mto.id)).lines as { sku: string; fulfillment: string }[]).find((l) => l.sku === "CUW-SOFA-CUSTOM")?.fulfillment === "delivery");
 
     // ------------------------------------------------------- close and Z report
     await R.post(t, LUIS, `/pos/sessions/${ses.id}/cash`, { kind: "drop", amount: "100.00" });

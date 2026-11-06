@@ -22,6 +22,7 @@ const RETAIL_ACCOUNTS: Account[] = [
   ["1190", "Allowance for doubtful accounts", "asset", "C"],
   ["1300", "Merchandise inventory", "asset", "D"],
   ["1310", "Inventory in transit", "asset", "D"],
+  ["2050", "Accrued liabilities / received not invoiced", "liability", "C"],
   ["2100", "Sales tax payable", "liability", "C"],
   ["2160", "Commissions payable", "liability", "C"],
   ["2300", "Customer deposits", "liability", "C"],

@@ -111,9 +111,9 @@ export async function fulfilLines(c: Client, entityId: string, orderId: string, 
     if (stocked) {
       if (!l.fulfil_from_id) throw new InventoryError("a line has no location to fulfil from");
       const qty = Number(l.qty);
+      cost += await costOut(c, entityId, l.product_id!, qty);      // the value valuation loses is the cost of goods
       await bump(c, entityId, l.product_id!, l.fulfil_from_id, {
         onHand: -qty, reserved: l.line_status === "reserved" || l.line_status === "ready" ? -qty : 0 });
-      cost += BigInt(Math.round(qty * Number(l.cost_minor ?? 0)));
       if (l.serialized) {
         const units = await unitsForLine(c, entityId, l.id, l.product_id!, l.fulfil_from_id, qty);
         for (const u of units) await transitionUnit(c, entityId, null, u, "delivered", { kind: "deliver", refType: "order_line", refId: l.id, stock: false, salesOrderLineId: l.id });
@@ -145,8 +145,11 @@ export async function releaseLines(c: Client, entityId: string, orderId: string,
  * stock (the same labels); any shortfall gets new labels.
  */
 export async function restock(c: Client, entityId: string, productId: string, locationId: string, qty: number,
-  opts: { lineIds?: string[]; binId?: string | null; by?: string | null } = {}): Promise<void> {
+  opts: { lineIds?: string[]; binId?: string | null; by?: string | null; unitCostMinor?: bigint } = {}): Promise<void> {
   if (qty <= 0) throw new InventoryError("restock a positive quantity");
+  // Back into the cost pool at the unit cost the caller posts to 1300 (default: today's average).
+  const unit = opts.unitCostMinor ?? await unitCost(c, entityId, productId);
+  await costIn(c, entityId, productId, qty, BigInt(Math.round(qty * Number(unit))));
   await bump(c, entityId, productId, locationId, { onHand: qty });
   await returnUnits(c, entityId, productId, locationId, qty, "in_stock", opts);
 }
@@ -160,25 +163,71 @@ export const _bump = bump;
  * claim or a write-off.
  */
 export async function returnToDamage(c: Client, scope: Scope, e: { productId: string; locationId: string; qty: number;
-  lineIds?: string[]; description: string; photoUrls?: string[] }): Promise<{ damageId: string; number: string }> {
+  lineIds?: string[]; description: string; photoUrls?: string[]; unitCostMinor?: bigint }): Promise<{ damageId: string; number: string }> {
   need(e.qty > 0, "return a positive quantity");
   need(e.description?.trim(), "say what is wrong with it");
   const by = scope.actor.id || null;
+  const unit = e.unitCostMinor ?? await unitCost(c, scope.entityId, e.productId);
+  await costIn(c, scope.entityId, e.productId, e.qty, BigInt(Math.round(e.qty * Number(unit))));
   await bump(c, scope.entityId, e.productId, e.locationId, { onHand: e.qty, held: e.qty });
   const units = await returnUnits(c, scope.entityId, e.productId, e.locationId, e.qty, "damaged", { lineIds: e.lineIds, by });
-  const p = await productOf(c, scope.entityId, e.productId);
   let first: { damageId: string; number: string } | null = null;
   if (units.length) {
     for (const u of units) {
       const d = await insertDamage(c, scope.entityId, { productId: e.productId, locationId: e.locationId, unitId: u, qty: 1,
-        source: "customer_return", description: e.description, photoUrls: e.photoUrls ?? [], cost: BigInt(p.cost_minor), by });
+        source: "customer_return", description: e.description, photoUrls: e.photoUrls ?? [], cost: unit, by });
       first ??= d;
     }
   } else {
     first = await insertDamage(c, scope.entityId, { productId: e.productId, locationId: e.locationId, unitId: null, qty: e.qty,
-      source: "customer_return", description: e.description, photoUrls: e.photoUrls ?? [], cost: BigInt(p.cost_minor), by });
+      source: "customer_return", description: e.description, photoUrls: e.photoUrls ?? [], cost: unit, by });
   }
   return first!;
+}
+
+// ============================================================ cost pool
+//
+// Perpetual average cost per product per company: the quantity on hand and
+// what it is worth. Every caller takes value out (costOut) or puts it in
+// (costIn) before it moves the quantity, and posts the same amount to 1300.
+
+async function poolOf(c: Client, entityId: string, productId: string): Promise<{ qty: number; value: bigint }> {
+  const r = await q<{ qty: string; value_minor: string }>(c, `select qty, value_minor from inv_cost where entity_id = $1 and product_id = $2 for update`, [entityId, productId]);
+  if (r.length) return { qty: Number(r[0].qty), value: BigInt(r[0].value_minor) };
+  // Stock that predates the pool comes in at the catalog cost (the demo seed posts its opening entry).
+  const init = await one<{ qty: string; cost: string }>(c, `select coalesce((select sum(on_hand) from stock_level where entity_id = $1 and product_id = $2), 0)::text qty,
+      (select cost_minor from product where id = $2 and entity_id = $1)::text cost`, [entityId, productId]);
+  const qty = Number(init.qty), value = BigInt(Math.round(qty * Number(init.cost ?? 0)));
+  await c.query(`insert into inv_cost (entity_id, product_id, qty, value_minor) values ($1,$2,$3,$4) on conflict do nothing`, [entityId, productId, qty, value.toString()]);
+  return { qty, value };
+}
+
+/** Today's average cost of one unit; the catalog cost when none is on hand. */
+export async function unitCost(c: Client, entityId: string, productId: string): Promise<bigint> {
+  const p = await poolOf(c, entityId, productId);
+  if (p.qty > 0 && p.value > 0n) return BigInt(Math.round(Number(p.value) / p.qty));
+  const r = await q<{ cost_minor: string }>(c, `select cost_minor from product where id = $1 and entity_id = $2`, [productId, entityId]);
+  return BigInt(r[0]?.cost_minor ?? 0);
+}
+
+async function costIn(c: Client, entityId: string, productId: string, qty: number, valueMinor: bigint) {
+  const p = await poolOf(c, entityId, productId);
+  await c.query(`update inv_cost set qty = $3, value_minor = $4, updated_at = now() where entity_id = $1 and product_id = $2`,
+    [entityId, productId, p.qty + qty, (p.value + valueMinor).toString()]);
+}
+
+/** Take qty out of the pool at its average; returns the value taken (the last unit takes whatever is left). */
+async function costOut(c: Client, entityId: string, productId: string, qty: number): Promise<bigint> {
+  if (qty <= 0) return 0n;
+  const p = await poolOf(c, entityId, productId);
+  let v: bigint;
+  if (p.qty <= 0) v = BigInt(Math.round(qty * Number(await unitCost(c, entityId, productId))));
+  else if (qty >= p.qty) v = p.value + (qty > p.qty ? BigInt(Math.round((qty - p.qty) * Number(p.value) / p.qty)) : 0n);
+  else v = BigInt(Math.round(Number(p.value) * qty / p.qty));
+  if (v < 0n) v = 0n;
+  await c.query(`update inv_cost set qty = $3, value_minor = $4, updated_at = now() where entity_id = $1 and product_id = $2`,
+    [entityId, productId, p.qty - qty, (p.value - v).toString()]);
+  return v;
 }
 
 // ================================================================ helpers
@@ -476,13 +525,14 @@ export async function openPurchaseOrders(c: Client, entityId: string) {
   const eta = hcols.has("expected_on") ? `coalesce(${lineEta}, po.expected_on)` : lineEta;
   const cancelled = cols.has("cancelled_qty") ? "l.cancelled_qty" : "0";
   const shipTo = hcols.has("ship_to_location_id") ? "po.ship_to_location_id" : "null::uuid";
+  const landed = cols.has("landed_minor") ? "l.landed_minor" : "0";
   return q<{ po_id: string; number: string; vendor: string; ordered_on: string; line_id: string; seq: number; description: string;
     product_id: string | null; sku: string | null; serialized: boolean | null; ordered: string; received: string; expected_on: string | null; unit_price_minor: string;
-    ship_to_id: string | null }>(c, `
+    ship_to_id: string | null; landed_minor: string; agreement_ref: string | null }>(c, `
     select po.id po_id, po.number, v.legal_name vendor, po.ordered_on::text, l.id line_id, l.seq, l.description,
            ${prod} product_id, p.sku, p.serialized, (l.quantity - ${cancelled})::text ordered, ${shipTo} ship_to_id,
            coalesce((select sum(gl.quantity) from goods_receipt_line gl where gl.purchase_order_line_id = l.id), 0)::text received,
-           ${eta}::text expected_on, l.unit_price_minor::text
+           ${eta}::text expected_on, l.unit_price_minor::text, ${landed}::text landed_minor, l.agreement_ref
       from purchase_order po join purchase_order_line l on l.purchase_order_id = po.id
       join vendor v on v.id = po.vendor_id
       left join product p on p.id = ${prod} and p.entity_id = po.entity_id
@@ -521,8 +571,10 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
   need(cols.has("product_id"), "purchase order lines do not name products yet, so nothing can be received into stock");
   const gr = await one<{ id: string }>(c, `insert into goods_receipt (purchase_order_id, received_on, received_by, note) values ($1,$2,$3,$4) returning id`,
     [po[0].id, today(), by, e.note ?? null]);
-  const out: { poLineId: string; sku: string; qty: number; labels: string[] }[] = [];
+  const out: { poLineId: string; sku: string; qty: number; labels: string[]; unitCostMinor: bigint; reservedFor: string[] }[] = [];
   const seen = new Set<string>();
+  const received = new Set<string>(), linked = new Set<string>();
+  let total = 0n;
   for (const ln of e.lines) {
     const l = open.find((x) => x.line_id === ln.poLineId && x.po_id === po[0].id);
     need(l, "that line is not on this purchase order");
@@ -535,13 +587,20 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
     const remaining = Number(l!.ordered) - Number(l!.received);
     need(qty <= remaining, `line ${l!.seq} (${l!.sku}) has ${remaining} left to receive, not ${qty}`);
     const p = await productOf(c, entityId, l!.product_id!);
-    const unitCost = BigInt(l!.unit_price_minor);
+    // What a unit cost: the PO price plus its share of any landed cost purchasing spread over the line.
+    const ordered = Number(l!.ordered);
+    const unitCost = BigInt(l!.unit_price_minor) + (ordered > 0 ? BigInt(Math.round(Number(l!.landed_minor ?? 0) / ordered)) : 0n);
+    const value = BigInt(Math.round(qty * Number(unitCost)));
     const grl = await one<{ id: string }>(c, `insert into goods_receipt_line (goods_receipt_id, purchase_order_line_id, quantity) values ($1,$2,$3) returning id`,
       [gr.id, l!.line_id, qty]);
     const labels: string[] = [];
+    let good: string[] = [];
     if (p.serialized) {
-      if (qty - dmg > 0) labels.push(...(await createUnits(c, entityId, p, { locationId: e.locationId, binId, qty: qty - dmg, status: "in_stock", costMinor: unitCost,
-        kind: "receive", refType: "receipt", refId: gr.id, by, grLineId: grl.id })).labels);
+      if (qty - dmg > 0) {
+        const made = await createUnits(c, entityId, p, { locationId: e.locationId, binId, qty: qty - dmg, status: "in_stock", costMinor: unitCost,
+          kind: "receive", refType: "receipt", refId: gr.id, by, grLineId: grl.id });
+        labels.push(...made.labels); good = made.unitIds;
+      }
       if (dmg > 0) {
         const made = await createUnits(c, entityId, p, { locationId: e.locationId, binId: null, qty: dmg, status: "damaged", costMinor: unitCost,
           kind: "receive", refType: "receipt", refId: gr.id, by, grLineId: grl.id, reason: "arrived damaged" });
@@ -556,15 +615,92 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
       if (dmg > 0) await insertDamage(c, entityId, { productId: p.id, locationId: e.locationId, unitId: null, qty: dmg, source: "receiving",
         description: ln.damageNote || `Arrived damaged on PO ${po[0].number}`, photoUrls: [], cost: unitCost, by });
     }
+    await costIn(c, entityId, p.id, qty, value);
+    total += value;
     await bump(c, entityId, p.id, e.locationId, { onHand: qty, onOrder: -qty, held: dmg });
-    out.push({ poLineId: l!.line_id, sku: p.sku, qty, labels });
+    // A customer's special order (or back order) on this PO line gets these goods: reserved, and the pieces allocated to it.
+    const reservedFor: string[] = [];
+    let free = qty - dmg;
+    for (const sl of await salesLinesFor(c, entityId, l!.line_id, l!.agreement_ref, p.id)) {
+      const n = Number(sl.qty);
+      if (n > free || (p.serialized && good.length < n)) break;
+      await bump(c, entityId, p.id, e.locationId, { reserved: n });
+      await c.query(`update sales_order_line set line_status = 'reserved', fulfil_from_id = $3 where id = $1 and entity_id = $2`, [sl.id, entityId, e.locationId]);
+      if (p.serialized) for (const u of good.splice(0, n)) await transitionUnit(c, entityId, by, u, "reserved",
+        { kind: "allocate", refType: "order_line", refId: sl.id, salesOrderLineId: sl.id, reason: `special order ${sl.number}` });
+      free -= n;
+      linked.add(sl.id);
+      reservedFor.push(sl.number);
+    }
+    received.add(p.id);
+    out.push({ poLineId: l!.line_id, sku: p.sku, qty, labels, unitCostMinor: unitCost, reservedFor });
+  }
+  // Received, not yet invoiced: the vendor's bill clears 2050.
+  if (total > 0n) {
+    const pobj = await profitObjectFor(c, entityId, e.locationId);
+    await post(c, scope, { date: today(), sourceType: "inventory", sourceId: gr.id, description: `Received on ${po[0].number}`,
+      lines: [{ code: "1300", debit: total, profitObjectId: pobj }, { code: "2050", credit: total, profitObjectId: pobj, memo: "received not invoiced" }] });
   }
   // Closed when every line is in.
   const after = await openPurchaseOrders(c, entityId);
   const left = after.filter((x) => x.po_id === po[0].id && Number(x.received) < Number(x.ordered));
   if (!left.length) await c.query(`update purchase_order set status = 'received' where id = $1 and entity_id = $2`, [po[0].id, entityId]);
   if (e.appointmentId) await c.query(`update inv_receiving_appt set status = 'received' where id = $1 and entity_id = $2`, [e.appointmentId, entityId]);
-  return { receiptId: gr.id, poNumber: po[0].number, lines: out, poStatus: left.length ? "open" : "received" };
+  // Other back orders for what just arrived can be covered now.
+  const backorders = await recheckBackorders(c, entityId, { productIds: [...received] });
+  return { receiptId: gr.id, poNumber: po[0].number, lines: out, poStatus: left.length ? "open" : "received", valueMinor: total, backordersReserved: backorders.reserved };
+}
+
+/** The customer order lines waiting on a PO line: purchasing's link table, else the PO line's agreement_ref naming the order. */
+async function salesLinesFor(c: Client, entityId: string, poLineId: string, agreementRef: string | null, productId: string) {
+  type SL = { id: string; qty: string; number: string };
+  if (await hasRelation(c, "po_line_sales_line")) {
+    const r = await q<SL>(c, `select l.id, l.qty, so.number from po_line_sales_line k join sales_order_line l on l.id = k.sales_order_line_id
+        join sales_order so on so.id = l.sales_order_id
+       where k.entity_id = $1 and k.purchase_order_line_id = $2 and k.active and l.line_status = 'on_order' and l.product_id = $3
+       order by so.ordered_at, l.seq for update of l`, [entityId, poLineId, productId]);
+    if (r.length) return r;
+  }
+  if (!agreementRef) return [];
+  return q<SL>(c, `select l.id, l.qty, so.number from sales_order_line l join sales_order so on so.id = l.sales_order_id
+     where l.entity_id = $1 and so.number = $2 and l.product_id = $3 and l.line_status = 'on_order' order by l.seq for update of l`,
+    [entityId, agreementRef.trim(), productId]);
+}
+
+/**
+ * Re-check back orders: stock order lines waiting on_order that can be
+ * covered now. A line takes stock where it ships from; a delivery line may
+ * take it from a warehouse instead. Lines whose own goods are on a transfer
+ * are left alone. Returns how many lines were reserved.
+ */
+export async function recheckBackorders(c: Client, entityId: string, f: { productIds?: string[]; orderIds?: string[] } = {}): Promise<{ reserved: number; lines: string[] }> {
+  const posLine = await hasRelation(c, "pos_line");
+  const lines = await q<{ id: string; product_id: string; qty: string; fulfil_from_id: string | null; how: string }>(c, `
+    select l.id, l.product_id, l.qty, l.fulfil_from_id,
+           ${posLine ? "coalesce((select pl.fulfillment from pos_line pl where pl.sales_order_line_id = l.id and pl.entity_id = l.entity_id), so.fulfillment)" : "so.fulfillment"} how
+      from sales_order_line l join sales_order so on so.id = l.sales_order_id join product p on p.id = l.product_id
+     where l.entity_id = $1 and l.line_status = 'on_order' and l.qty > 0 and p.kind = 'stock' and so.status in ('open','fulfilling')
+       and ($2::uuid[] is null or l.product_id = any($2)) and ($3::uuid[] is null or l.sales_order_id = any($3))
+       and not exists (select 1 from inv_piece x where x.entity_id = l.entity_id and x.sales_order_line_id = l.id and x.status = 'in_transit')
+     order by so.ordered_at, l.seq for update of l`, [entityId, f.productIds ?? null, f.orderIds ?? null]);
+  const done: string[] = [];
+  for (const l of lines) {
+    const qty = Number(l.qty);
+    const where = [l.fulfil_from_id].filter(Boolean) as string[];
+    if (["delivery", "ship"].includes(l.how)) {
+      const wh = await q<{ id: string }>(c, `select id from location where entity_id = $1 and kind = 'warehouse' and status = 'active' order by name`, [entityId]);
+      where.push(...wh.map((x) => x.id).filter((x) => x !== l.fulfil_from_id));
+    }
+    for (const loc of where) {
+      const lv = await level(c, entityId, l.product_id, loc);
+      if (lv.available < qty) continue;
+      await bump(c, entityId, l.product_id, loc, { reserved: qty });
+      await c.query(`update sales_order_line set line_status = 'reserved', fulfil_from_id = $3 where id = $1 and entity_id = $2`, [l.id, entityId, loc]);
+      done.push(l.id);
+      break;
+    }
+  }
+  return { reserved: done.length, lines: done };
 }
 
 /** Book a delivery slot at a dock. Refused when the day would go over the dock's piece limit. */
@@ -595,7 +731,15 @@ export async function bookReceiving(c: Client, scope: Scope, e: { locationId: st
 
 // ================================================================ transfers
 
-export async function createTransfer(c: Client, scope: Scope, e: { fromId: string; toId: string; lines: { productId: string; qty: number; labels?: string[] }[]; note?: string }) {
+export type TransferLineIn = { productId?: string; qty?: number; labels?: string[]; salesOrderLineId?: string | null };
+
+/**
+ * Draft a transfer. A line is a product and a quantity (optionally the exact
+ * labels), or a customer's order line: its reserved goods move with it, still
+ * theirs -- a special order received at the DC going to the store it is
+ * picked up from.
+ */
+export async function createTransfer(c: Client, scope: Scope, e: { fromId: string; toId: string; lines: TransferLineIn[]; note?: string }) {
   need(e.fromId !== e.toId, "a transfer goes between two different locations");
   const locs = await q<{ id: string }>(c, `select id from location where entity_id = $1 and id = any($2) and status = 'active'`, [scope.entityId, [e.fromId, e.toId]]);
   need(locs.length === 2, "pick two of this company's locations");
@@ -604,7 +748,20 @@ export async function createTransfer(c: Client, scope: Scope, e: { fromId: strin
   const t = await one<{ id: string }>(c, `insert into inv_transfer (entity_id, number, from_location_id, to_location_id, note, created_by)
     values ($1,$2,$3,$4,$5,$6) returning id`, [scope.entityId, number, e.fromId, e.toId, e.note ?? null, scope.actor.id || null]);
   for (const l of e.lines) {
-    const p = await productOf(c, scope.entityId, l.productId);
+    if (l.salesOrderLineId) {
+      const sl = await lineOf(c, scope.entityId, l.salesOrderLineId);
+      need(sl.product_id, "that order line has no product to move");
+      need(["reserved", "ready"].includes(sl.line_status), `${sl.number}'s line is ${sl.line_status.replace("_", " ")}; only reserved goods move for a customer`);
+      need(sl.fulfil_from_id === e.fromId, `${sl.number}'s goods are not reserved at the origin`);
+      const units = (await q<{ unit_id: string }>(c, `select distinct unit_id from inv_piece where entity_id = $1 and sales_order_line_id = $2 and status = 'reserved' and location_id = $3`,
+        [scope.entityId, sl.id, e.fromId])).map((x) => x.unit_id);
+      const p = await productOf(c, scope.entityId, sl.product_id!);
+      if (p.serialized) need(units.length === Number(sl.qty), `${sl.number}: ${units.length} of ${Number(sl.qty)} pieces are allocated; allocate them before moving the order`);
+      await c.query(`insert into inv_transfer_line (entity_id, transfer_id, product_id, qty, unit_ids, cost_minor, sales_order_line_id) values ($1,$2,$3,$4,$5,0,$6)`,
+        [scope.entityId, t.id, p.id, sl.qty, units, sl.id]);
+      continue;
+    }
+    const p = await productOf(c, scope.entityId, l.productId ?? "");
     need(Number(l.qty) > 0, "transfer a positive quantity");
     need(!p.serialized || Number.isInteger(Number(l.qty)), `${p.name} moves in whole units`);
     let units: string[] = [];
@@ -615,24 +772,50 @@ export async function createTransfer(c: Client, scope: Scope, e: { fromId: strin
       units = r.map((x) => x.unit_id);
       need(units.length === Number(l.qty), `the labels name ${units.length} unit${units.length === 1 ? "" : "s"} of ${p.name}, not ${l.qty}`);
     }
-    await c.query(`insert into inv_transfer_line (entity_id, transfer_id, product_id, qty, unit_ids, cost_minor) values ($1,$2,$3,$4,$5,$6)`,
-      [scope.entityId, t.id, p.id, l.qty, units, p.cost_minor]);
+    await c.query(`insert into inv_transfer_line (entity_id, transfer_id, product_id, qty, unit_ids, cost_minor) values ($1,$2,$3,$4,$5,0)`,
+      [scope.entityId, t.id, p.id, l.qty, units]);
   }
   return { id: t.id, number };
 }
 
-/** Ship: stock leaves the origin and is in transit, at cost (Dr 1310 Cr 1300). */
+/** Ship: stock leaves the origin and is in transit, at its average cost (Dr 1310 Cr 1300). */
 export async function shipTransfer(c: Client, scope: Scope, id: string) {
   const t = await transferOf(c, scope.entityId, id);
   need(t.status === "draft", `transfer ${t.number} is ${t.status.replace("_", " ")}, so it cannot ship`);
-  const lines = await q<{ id: string; product_id: string; qty: string; unit_ids: string[]; cost_minor: string }>(c,
-    `select id, product_id, qty, unit_ids, cost_minor from inv_transfer_line where entity_id = $1 and transfer_id = $2`, [scope.entityId, id]);
+  const lines = await q<{ id: string; product_id: string; qty: string; unit_ids: string[]; sales_order_line_id: string | null }>(c,
+    `select id, product_id, qty, unit_ids, sales_order_line_id from inv_transfer_line where entity_id = $1 and transfer_id = $2`, [scope.entityId, id]);
   let value = 0n;
+  const by = scope.actor.id || null;
   for (const l of lines) {
     const p = await productOf(c, scope.entityId, l.product_id);
     const qty = Number(l.qty);
+    if (l.sales_order_line_id) {
+      // A customer's goods: they stay theirs. The reservation leaves with them; the line waits on the transfer.
+      const sl = await lineOf(c, scope.entityId, l.sales_order_line_id);
+      need(["reserved", "ready"].includes(sl.line_status) && sl.fulfil_from_id === t.from_location_id, `${sl.number}'s goods are no longer reserved at the origin`);
+      const lineValue = await costOut(c, scope.entityId, p.id, qty);
+      if (p.serialized) {
+        for (const u of l.unit_ids) {
+          const pcs = await piecesOfUnit(c, scope.entityId, u);
+          need(pcs.every((x) => ["reserved", "picked"].includes(x.status) && x.sales_order_line_id === sl.id && x.location_id === t.from_location_id),
+            `${pcs[0]?.label ?? "a piece"} is no longer this order's at the origin`);
+          await transitionUnit(c, scope.entityId, by, u, "in_transit", { kind: "transfer_out", refType: "transfer", refId: id, transferId: id });
+        }
+        await bump(c, scope.entityId, p.id, t.from_location_id, { reserved: -qty });
+      } else {
+        await bump(c, scope.entityId, p.id, t.from_location_id, { onHand: -qty, reserved: -qty });
+        await binStockTake(c, scope.entityId, p.id, t.from_location_id, qty);
+        await logMove(c, scope.entityId, { kind: "transfer_out", productId: p.id, qty, fromLoc: t.from_location_id, toStatus: "in_transit", refType: "transfer", refId: id, by });
+      }
+      await c.query(`update sales_order_line set line_status = 'on_order' where id = $1 and entity_id = $2`, [sl.id, scope.entityId]);
+      await c.query(`update inv_transfer_line set value_minor = $3, cost_minor = $4 where id = $1 and entity_id = $2`, [l.id, scope.entityId, lineValue.toString(),
+        (qty ? BigInt(Math.round(Number(lineValue) / qty)) : 0n).toString()]);
+      value += lineValue;
+      continue;
+    }
     const lv = await level(c, scope.entityId, p.id, t.from_location_id);
     need(lv.available >= qty, `${p.name}: ${lv.available} available at the origin, ${qty} on the transfer`);
+    const lineValue = await costOut(c, scope.entityId, p.id, qty);
     if (p.serialized) {
       let units = l.unit_ids;
       if (units.length) {
@@ -646,7 +829,7 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
         need(units.length === qty, `${p.name}: only ${units.length} free labelled unit${units.length === 1 ? "" : "s"} at the origin`);
         await c.query(`update inv_transfer_line set unit_ids = $3 where id = $1 and entity_id = $2`, [l.id, scope.entityId, units]);
       }
-      for (const u of units) await transitionUnit(c, scope.entityId, scope.actor.id || null, u, "in_transit",
+      for (const u of units) await transitionUnit(c, scope.entityId, by, u, "in_transit",
         { kind: "transfer_out", refType: "transfer", refId: id, transferId: id });
     } else {
       await bump(c, scope.entityId, p.id, t.from_location_id, { onHand: -qty });
@@ -654,9 +837,11 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
       await logMove(c, scope.entityId, { kind: "transfer_out", productId: p.id, qty, fromLoc: t.from_location_id, toStatus: "in_transit",
         refType: "transfer", refId: id, by: scope.actor.id });
     }
-    value += BigInt(Math.round(qty * Number(l.cost_minor)));
+    await c.query(`update inv_transfer_line set value_minor = $3, cost_minor = $4 where id = $1 and entity_id = $2`, [l.id, scope.entityId, lineValue.toString(),
+      (qty ? BigInt(Math.round(Number(lineValue) / qty)) : 0n).toString()]);
+    value += lineValue;
   }
-  await c.query(`update inv_transfer set status = 'in_transit', shipped_by = $3, shipped_at = now() where id = $1 and entity_id = $2`, [id, scope.entityId, scope.actor.id || null]);
+  await c.query(`update inv_transfer set status = 'in_transit', shipped_by = $3, shipped_at = now() where id = $1 and entity_id = $2`, [id, scope.entityId, by]);
   if (value > 0n) {
     const po = await profitObjectFor(c, scope.entityId, t.from_location_id);
     await post(c, scope, { date: today(), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} shipped`,
@@ -665,33 +850,47 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
   return { number: t.number, valueMinor: value };
 }
 
-/** Receive: stock lands at the destination (Dr 1300 Cr 1310). */
+/** Receive: stock lands at the destination at the value that left (Dr 1300 Cr 1310). A customer's goods arrive reserved to them. */
 export async function receiveTransfer(c: Client, scope: Scope, id: string, e: { binId?: string | null } = {}) {
   const t = await transferOf(c, scope.entityId, id);
   need(t.status === "in_transit", `transfer ${t.number} is ${t.status.replace("_", " ")}, not in transit`);
   const bin = await binAt(c, scope.entityId, e.binId, t.to_location_id);
-  const lines = await q<{ product_id: string; qty: string; unit_ids: string[]; cost_minor: string }>(c,
-    `select product_id, qty, unit_ids, cost_minor from inv_transfer_line where entity_id = $1 and transfer_id = $2`, [scope.entityId, id]);
+  const lines = await q<{ product_id: string; qty: string; unit_ids: string[]; value_minor: string; sales_order_line_id: string | null }>(c,
+    `select product_id, qty, unit_ids, value_minor, sales_order_line_id from inv_transfer_line where entity_id = $1 and transfer_id = $2`, [scope.entityId, id]);
   let value = 0n;
+  const by = scope.actor.id || null;
+  const products = new Set<string>();
   for (const l of lines) {
     const qty = Number(l.qty);
+    await costIn(c, scope.entityId, l.product_id, qty, BigInt(l.value_minor));
+    // Still the customer's? A line cancelled meanwhile lands as free stock.
+    let forLine: string | null = null;
+    if (l.sales_order_line_id) {
+      const sl = await lineOf(c, scope.entityId, l.sales_order_line_id);
+      if (sl.line_status === "on_order") forLine = sl.id;
+    }
     if (l.unit_ids.length) {
-      for (const u of l.unit_ids) await transitionUnit(c, scope.entityId, scope.actor.id || null, u, "in_stock",
-        { kind: "transfer_in", toLocation: t.to_location_id, toBin: bin, refType: "transfer", refId: id, transferId: null });
+      for (const u of l.unit_ids) await transitionUnit(c, scope.entityId, by, u, forLine ? "reserved" : "in_stock",
+        { kind: "transfer_in", toLocation: t.to_location_id, toBin: bin, refType: "transfer", refId: id, transferId: null, salesOrderLineId: forLine });
     } else {
       await bump(c, scope.entityId, l.product_id, t.to_location_id, { onHand: qty });
       if (bin) await binStockAdd(c, scope.entityId, bin, l.product_id, qty);
       await logMove(c, scope.entityId, { kind: "transfer_in", productId: l.product_id, qty, toLoc: t.to_location_id, toBin: bin, fromStatus: "in_transit",
-        toStatus: "in_stock", refType: "transfer", refId: id, by: scope.actor.id });
+        toStatus: forLine ? "reserved" : "in_stock", refType: "transfer", refId: id, by });
     }
-    value += BigInt(Math.round(qty * Number(l.cost_minor)));
+    if (forLine) {
+      await bump(c, scope.entityId, l.product_id, t.to_location_id, { reserved: qty });
+      await c.query(`update sales_order_line set line_status = 'reserved', fulfil_from_id = $3 where id = $1 and entity_id = $2`, [forLine, scope.entityId, t.to_location_id]);
+    } else products.add(l.product_id);
+    value += BigInt(l.value_minor);
   }
-  await c.query(`update inv_transfer set status = 'received', received_by = $3, received_at = now() where id = $1 and entity_id = $2`, [id, scope.entityId, scope.actor.id || null]);
+  await c.query(`update inv_transfer set status = 'received', received_by = $3, received_at = now() where id = $1 and entity_id = $2`, [id, scope.entityId, by]);
   if (value > 0n) {
     const po = await profitObjectFor(c, scope.entityId, t.to_location_id);
     await post(c, scope, { date: today(), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} received`,
       lines: [{ code: "1300", debit: value, profitObjectId: po }, { code: "1310", credit: value, profitObjectId: po }] });
   }
+  if (products.size) await recheckBackorders(c, scope.entityId, { productIds: [...products] });
   return { number: t.number, valueMinor: value };
 }
 
@@ -1023,6 +1222,8 @@ export async function resolveDamage(c: Client, scope: Scope, id: string, e: { re
   const by = scope.actor.id || null;
   const qty = Number(d.qty);
   let je: string | null = null;
+  const leaving = ["written_off", "returned_to_vendor"].includes(e.resolution);
+  const value = leaving ? await costOut(c, scope.entityId, d.product_id, qty) : 0n;
   if (d.unit_id) {
     const to = e.resolution === "restocked" ? "in_stock" : e.resolution === "as_is" ? "as_is" : e.resolution;
     await transitionUnit(c, scope.entityId, by, d.unit_id, to, { kind: e.resolution === "restocked" ? "restore" : e.resolution === "as_is" ? "as_is" : e.resolution === "written_off" ? "write_off" : "vendor_return",
@@ -1034,7 +1235,7 @@ export async function resolveDamage(c: Client, scope: Scope, id: string, e: { re
       fromLoc: d.location_id, toLoc: gone ? null : d.location_id, fromStatus: "damaged", toStatus: gone ? e.resolution : "in_stock", refType: "damage", refId: d.id, reason: e.note, by });
   }
   if (["written_off", "returned_to_vendor"].includes(e.resolution)) {
-    je = await postValue(c, scope, d.location_id, -BigInt(Math.round(qty * Number(d.cost_minor))), d.id,
+    je = await postValue(c, scope, d.location_id, -value, d.id,
       `${d.number} ${e.resolution === "written_off" ? "written off" : "returned to vendor"}`);
   }
   await c.query(`update inv_damage set status = 'resolved', resolution = $3, resolution_note = $4, resolved_by = $5, resolved_at = now(), journal_entry_id = $6
@@ -1143,39 +1344,51 @@ export async function decideCount(c: Client, scope: Scope, id: string, e: { appr
         const exp = await q<{ unit_id: string; labels: string[] }>(c, `select unit_id, array_agg(upper(label)) labels from inv_piece
           where entity_id = $1 and upper(label) = any($2) group by unit_id`, [scope.entityId, l.expected_labels.map((x) => x.toUpperCase())]);
         for (const u of exp) if (!u.labels.some((x) => scanned.has(x))) {
+          value -= await costOut(c, scope.entityId, l.product_id, 1);
           await transitionUnit(c, scope.entityId, me, u.unit_id, "written_off", { kind: "count", refType: "count", refId: id, reason: `not found in count ${ct.number}`, salesOrderLineId: null });
-          value -= BigInt(l.unit_cost_minor);
         }
         const found = await q<{ unit_id: string; location_id: string; status: string }>(c, `select unit_id, min(location_id::text)::uuid location_id, min(status) status from inv_piece
           where entity_id = $1 and upper(label) = any($2) and not (upper(label) = any($3)) group by unit_id`,
           [scope.entityId, [...scanned], l.expected_labels.map((x) => x.toUpperCase())]);
         for (const u of found) {
           const sameHere = u.location_id === ct.location_id && COUNTABLE.includes(u.status);
+          // A unit already on hand somewhere only moves; one that had left the books comes back at today's average.
+          if (!ON_HAND.includes(u.status)) {
+            const unit = await unitCost(c, scope.entityId, l.product_id);
+            await costIn(c, scope.entityId, l.product_id, 1, unit);
+            value += unit;
+          }
           await transitionUnit(c, scope.entityId, me, u.unit_id, sameHere ? u.status : "in_stock", { kind: "count", toLocation: ct.location_id, toBin: ct.bin_id,
             refType: "count", refId: id, reason: `found in count ${ct.number}` });
-          if (!sameHere) value += BigInt(l.unit_cost_minor);
         }
       } else if (delta < 0) {
         const units = await q<{ unit_id: string }>(c, `select unit_id from inv_piece where entity_id = $1 and label = any($2)
           group by unit_id order by bool_or(sales_order_line_id is not null), max(created_at) desc limit $3`, [scope.entityId, l.expected_labels, -delta]);
         for (const u of units) {
+          value -= await costOut(c, scope.entityId, l.product_id, 1);
           await transitionUnit(c, scope.entityId, me, u.unit_id, "written_off", { kind: "count", refType: "count", refId: id, reason: `short in count ${ct.number}`, salesOrderLineId: null });
-          value -= BigInt(l.unit_cost_minor);
         }
       } else if (delta > 0) {
         const p = await productOf(c, scope.entityId, l.product_id);
-        await createUnits(c, scope.entityId, p, { locationId: ct.location_id, binId: ct.bin_id, qty: delta, status: "in_stock", costMinor: BigInt(l.unit_cost_minor),
+        const unit = await unitCost(c, scope.entityId, l.product_id);
+        await costIn(c, scope.entityId, l.product_id, delta, BigInt(delta) * unit);
+        await createUnits(c, scope.entityId, p, { locationId: ct.location_id, binId: ct.bin_id, qty: delta, status: "in_stock", costMinor: unit,
           kind: "count", refType: "count", refId: id, reason: `over in count ${ct.number}`, by: me });
         await bump(c, scope.entityId, l.product_id, ct.location_id, { onHand: delta });
-        value += BigInt(delta) * BigInt(l.unit_cost_minor);
+        value += BigInt(delta) * unit;
       }
     } else if (delta !== 0) {
+      if (delta < 0) value -= await costOut(c, scope.entityId, l.product_id, -delta);
+      else {
+        const v = BigInt(Math.round(delta * Number(await unitCost(c, scope.entityId, l.product_id))));
+        await costIn(c, scope.entityId, l.product_id, delta, v);
+        value += v;
+      }
       await bump(c, scope.entityId, l.product_id, ct.location_id, { onHand: delta });
       if (ct.bin_id) await c.query(`insert into inv_bin_stock (entity_id, bin_id, product_id, qty) values ($1,$2,$3,$4)
         on conflict (bin_id, product_id) do update set qty = $4`, [scope.entityId, ct.bin_id, l.product_id, l.counted_qty]);
       await logMove(c, scope.entityId, { kind: "count", productId: l.product_id, qty: delta, fromLoc: ct.location_id, toLoc: ct.location_id, toBin: ct.bin_id,
         refType: "count", refId: id, reason: `count ${ct.number}`, by: me });
-      value += BigInt(Math.round(delta * Number(l.unit_cost_minor)));
     }
   }
   const je = await postValue(c, scope, ct.location_id, value, id, `Cycle count ${ct.number} variance`);
@@ -1203,6 +1416,11 @@ export async function adjust(c: Client, scope: Scope, e: { locationId: string; p
   const by = scope.actor.id || null;
   const number = await nextNo(c, scope.entityId, "adjustment", "ADJ-");
   const adjId = (await q<{ u: string }>(c, `select gen_random_uuid()::text u /* unscoped: no table */`))[0].u;
+  // The value moves through the cost pool first: out at the average, or in at today's average.
+  const unitNow = await unitCost(c, scope.entityId, p.id);
+  let value: bigint;
+  if (qty < 0) value = -(await costOut(c, scope.entityId, p.id, -qty));
+  else { value = BigInt(Math.round(qty * Number(unitNow))); await costIn(c, scope.entityId, p.id, qty, value); }
   let labels: string[] = [];
   if (p.serialized) {
     need(Number.isInteger(qty), `${p.name} is adjusted in whole units`);
@@ -1217,7 +1435,7 @@ export async function adjust(c: Client, scope: Scope, e: { locationId: string; p
       for (const u of units) await transitionUnit(c, scope.entityId, by, u.unit_id, "written_off", { kind: "adjust", refType: "adjustment", refId: adjId, reason: e.reasonCode });
       labels = given;
     } else {
-      const made = await createUnits(c, scope.entityId, p, { locationId: e.locationId, binId: bin, qty, status: "in_stock", costMinor: BigInt(p.cost_minor),
+      const made = await createUnits(c, scope.entityId, p, { locationId: e.locationId, binId: bin, qty, status: "in_stock", costMinor: unitNow,
         kind: "adjust", refType: "adjustment", refId: adjId, reason: e.reasonCode, by });
       await bump(c, scope.entityId, p.id, e.locationId, { onHand: qty });
       labels = made.labels;
@@ -1232,7 +1450,6 @@ export async function adjust(c: Client, scope: Scope, e: { locationId: string; p
     await logMove(c, scope.entityId, { kind: "adjust", productId: p.id, qty, fromLoc: e.locationId, toLoc: e.locationId, toBin: bin, refType: "adjustment", refId: adjId,
       reason: e.reasonCode, by });
   }
-  const value = BigInt(Math.round(qty * Number(p.cost_minor)));
   const je = await postValue(c, scope, e.locationId, value, adjId, `Adjustment ${number}: ${e.reasonCode.replace(/_/g, " ")}`);
   await c.query(`insert into inv_adjustment (id, entity_id, number, location_id, bin_id, product_id, qty, reason_code, note, labels, value_minor, journal_entry_id, by_user)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, [adjId, scope.entityId, number, e.locationId, bin, p.id, qty, e.reasonCode, e.note ?? null, labels,
@@ -1279,19 +1496,51 @@ export async function availableToPromise(c: Client, entityId: string, productId:
   };
 }
 
-/** What stock is worth at cost, by location and category. */
+/**
+ * What stock is worth at cost, by location and category. The total is the
+ * cost pool itself (what 1300 should hold); the rows spread each product's
+ * value over its locations by quantity.
+ */
 export async function valuation(c: Client, entityId: string) {
   const rows = await q<{ location_id: string; location: string; category: string; units: string; value_minor: string; held_units: string; held_minor: string }>(c, `
+    with avg as (
+      select p.id product_id, coalesce(case when ic.qty > 0 then ic.value_minor::numeric / ic.qty end, p.cost_minor) unit
+        from product p left join inv_cost ic on ic.product_id = p.id and ic.entity_id = p.entity_id where p.entity_id = $1)
     select l.id location_id, l.name location, coalesce(p.category,'Uncategorised') category,
-           sum(s.on_hand)::text units, sum(round(s.on_hand * p.cost_minor))::bigint::text value_minor,
-           sum(s.held)::text held_units, sum(round(s.held * p.cost_minor))::bigint::text held_minor
-      from stock_level s join product p on p.id = s.product_id join location l on l.id = s.location_id
+           sum(s.on_hand)::text units, sum(round(s.on_hand * a.unit))::bigint::text value_minor,
+           sum(s.held)::text held_units, sum(round(s.held * a.unit))::bigint::text held_minor
+      from stock_level s join product p on p.id = s.product_id join location l on l.id = s.location_id join avg a on a.product_id = s.product_id
      where s.entity_id = $1 and s.on_hand <> 0
      group by l.id, l.name, p.category order by l.name, category`, [entityId]);
-  const transit = await q<{ v: string }>(c, `select coalesce(sum(round(tl.qty * tl.cost_minor)),0)::bigint::text v from inv_transfer_line tl
+  const tot = await one<{ v: string }>(c, `
+    select (coalesce((select sum(value_minor) from inv_cost where entity_id = $1), 0)
+          + coalesce((select sum(round(s.on_hand * p.cost_minor)) from stock_level s join product p on p.id = s.product_id
+                       where s.entity_id = $1 and not exists (select 1 from inv_cost ic where ic.entity_id = s.entity_id and ic.product_id = s.product_id)), 0))::bigint::text v`,
+    [entityId]);
+  const transit = await q<{ v: string }>(c, `select coalesce(sum(tl.value_minor),0)::bigint::text v from inv_transfer_line tl
      join inv_transfer t on t.id = tl.transfer_id where tl.entity_id = $1 and t.status = 'in_transit'`, [entityId]);
-  const total = rows.reduce((a, r) => a + BigInt(r.value_minor), 0n);
-  return { rows, totalMinor: total, inTransitMinor: BigInt(transit[0].v) };
+  return { rows, totalMinor: BigInt(tot.v), inTransitMinor: BigInt(transit[0].v) };
+}
+
+/**
+ * The inventory tie-out: stock at cost (plus in transit) against what the
+ * ledger holds in 1300 (plus 1310). A difference means something moved
+ * stock without posting, or posted without moving stock.
+ */
+export async function tieOut(c: Client, entityId: string) {
+  const v = await valuation(c, entityId);
+  const gl = await q<{ code: string; bal: string }>(c, `
+    select g.code, coalesce(sum(jl.debit_minor - jl.credit_minor),0)::text bal
+      from journal_line jl join journal_entry je on je.id = jl.journal_entry_id join gl_account g on g.id = jl.gl_account_id
+     where je.entity_id = $1 and g.code in ('1300','1310') group by g.code`, [entityId]);
+  const bal = (code: string) => BigInt(gl.find((x) => x.code === code)?.bal ?? "0");
+  const off = await q<{ sku: string; pool: string; stock: string }>(c, `
+    select p.sku, ic.qty::text pool, coalesce((select sum(s.on_hand) from stock_level s where s.entity_id = ic.entity_id and s.product_id = ic.product_id), 0)::text stock
+      from inv_cost ic join product p on p.id = ic.product_id
+     where ic.entity_id = $1 and ic.qty <> coalesce((select sum(s.on_hand) from stock_level s where s.entity_id = ic.entity_id and s.product_id = ic.product_id), 0)`, [entityId]);
+  const books = bal("1300") + bal("1310"), stock = v.totalMinor + v.inTransitMinor;
+  return { stockMinor: v.totalMinor, inTransitMinor: v.inTransitMinor, gl1300Minor: bal("1300"), gl1310Minor: bal("1310"),
+    differenceMinor: books - stock, ties: books === stock, quantityOutOfStep: off };
 }
 
 // ---------------------------------------------------------------------------

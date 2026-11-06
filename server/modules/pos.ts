@@ -213,8 +213,8 @@ export const module: ErpModule = {
       return pos.addLines(c, sc(co, a), roles, m[2], lines(b.lines), str(b.overrideReason) || undefined);
     }));
     coPost(`/pos/orders/${ID}/lines/${ID}/void`, safe(async (c, co, a, b, m) => {
-      await requireRole(c, co, a, SELL, "taking a line off a sale");
-      return pos.voidLine(c, sc(co, a), m[2], m[3], str(b.reason));
+      const roles = await requireRole(c, co, a, SELL, "taking a line off a sale");
+      return pos.voidLine(c, sc(co, a), m[2], m[3], str(b.reason), roles);
     }));
     coPost(`/pos/orders/${ID}/override`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, MANAGER, "a price override");

@@ -15,7 +15,7 @@
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor } from "./posting.ts";
 import { priceConfigured, type Choice } from "./pricing.ts";
-import { reserveOrder, fulfilLines, releaseLines, restock, returnToDamage } from "./inventory.ts";
+import { reserveOrder, fulfilLines, releaseLines, restock, returnToDamage, unitCost } from "./inventory.ts";
 import { postReceipt, invoiceFulfilment, chargeRoom } from "./ar.ts";
 import { accrueCommissions } from "./workforce.ts";
 
@@ -188,12 +188,30 @@ type OrderRow = { id: string; number: string; status: string; location_id: strin
   kind: string; quote_expires_on: string | null; tax_exempt_ref: string | null; paid_off_at: string | null; layaway_schedule: unknown;
   ship_address_id: string | null; promised_on: string | null };
 
+/**
+ * POS can act on any order of the company, not just its own: a web pickup
+ * handed over at the counter, a web order returned at the register. The
+ * first time it does, the order gets its POS side rows (kind 'sale'; each
+ * line keeps the order's own fulfilment, marked adopted).
+ */
+async function adopt(c: Client, entityId: string, id: string) {
+  const so = await q<{ id: string }>(c, `select id from sales_order where id = $1 and entity_id = $2`, [id, entityId]);
+  if (!so.length) return;
+  await c.query(`insert into pos_order (sales_order_id, entity_id, kind) values ($1,$2,'sale') on conflict (sales_order_id) do nothing`, [id, entityId]);
+  await c.query(`insert into pos_line (sales_order_line_id, entity_id, sales_order_id, fulfillment, promised_on, ship_address_id, unit_cost_minor, list_price_minor, origin)
+    select l.id, l.entity_id, l.sales_order_id, so.fulfillment, so.promised_on, so.ship_address_id, coalesce(p.cost_minor, 0), l.unit_price_minor, 'adopted'
+      from sales_order_line l join sales_order so on so.id = l.sales_order_id left join product p on p.id = l.product_id
+     where l.entity_id = $2 and l.sales_order_id = $1
+       and not exists (select 1 from pos_line pl where pl.sales_order_line_id = l.id and pl.entity_id = l.entity_id)`, [id, entityId]);
+}
+
 async function orderOf(c: Client, entityId: string, id: string, lock = true): Promise<OrderRow> {
+  if (lock) await adopt(c, entityId, id);
   const r = await q<OrderRow>(c, `select so.id, so.number, so.status, so.location_id, so.customer_id, so.total_minor, so.paid_minor,
       po.kind, po.quote_expires_on::text, po.tax_exempt_ref, po.paid_off_at, po.layaway_schedule, so.ship_address_id, so.promised_on::text
     from sales_order so join pos_order po on po.sales_order_id = so.id
    where so.id = $1 and so.entity_id = $2${lock ? " for update of so" : ""}`, [id, entityId]);
-  need(r.length, "no such POS order");
+  need(r.length, "no such order");
   return r[0];
 }
 
@@ -221,6 +239,28 @@ async function sourceFor(c: Client, entityId: string, productId: string, storeId
 type Ctx = { entityId: string; orderId: string; customerId: string | null; storeId: string; taxRate: number; exempt: boolean; settings: Settings;
   defaultAddress: string | null; defaultPromised: string | null; actorId: string; managerReason: string | null; kind: string };
 
+/**
+ * How a line goes when the salesperson did not say: a fee rides on the
+ * delivery; a protection plan or service goes the way the goods on the order
+ * go; goods go by their shipping class -- take-with only for carry items,
+ * delivery for furniture, ship for parcel, otherwise pickup. Made-to-order
+ * goods are never take-with.
+ */
+async function defaultFulfil(c: Client, ctx: Ctx, kind: string, shipClass: string, siblings: LineIn[]): Promise<Fulfil> {
+  if (kind === "fee") return "delivery";
+  if (!STOCKED.includes(kind) && kind !== "kit") {
+    const already = await q<{ fulfillment: Fulfil }>(c, `select pl.fulfillment from pos_line pl join sales_order_line l on l.id = pl.sales_order_line_id
+      join product p on p.id = l.product_id where pl.entity_id = $1 and pl.sales_order_id = $2 and l.line_status <> 'cancelled'
+       and p.kind in ('stock','configurable','special_order','kit')`, [ctx.entityId, ctx.orderId]);
+    const goods = [...already.map((x) => x.fulfillment), ...(siblings.map((x) => x.fulfillment).filter(Boolean) as Fulfil[])];
+    return goods.includes("delivery") ? "delivery" : goods.includes("ship") ? "ship" : goods.includes("pickup") ? "pickup" : goods[0] ?? "carry";
+  }
+  if (shipClass === "carry" && kind === "stock") return "carry";
+  if (shipClass === "delivery") return "delivery";
+  if (shipClass === "parcel") return "ship";
+  return "pickup";
+}
+
 async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): Promise<{ lineIds: string[]; pendingOverrides: string[] }> {
   const seq0 = await one<{ s: number }>(c, `select coalesce(max(seq),0)::int s from sales_order_line where entity_id = $1 and sales_order_id = $2`, [ctx.entityId, ctx.orderId]);
   let seq = seq0.s;
@@ -229,17 +269,17 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
   for (const ln of lines) {
     const qty = Number(ln.qty);
     need(Number.isFinite(qty) && qty > 0, "each line needs a quantity above zero");
-    const base = await q<{ id: string; kind: string; taxable: boolean; name: string; status: string }>(c,
-      `select id, kind, taxable, name, status from product where id = $1 and entity_id = $2`, [ln.productId, ctx.entityId]);
+    const base = await q<{ id: string; kind: string; taxable: boolean; name: string; status: string; ship_class: string }>(c,
+      `select id, kind, taxable, name, status, ship_class from product where id = $1 and entity_id = $2`, [ln.productId, ctx.entityId]);
     need(base.length, "no such product");
     const cfg = await priceConfigured(c, ctx.entityId, ln.productId, ln.choices ?? []);
     // A package sells as its components, the package price spread over them by their own prices.
     type Part = { productId: string; sku: string; description: string; kind: string; taxable: boolean; qty: number; gross: bigint; unitCost: bigint;
-      listPrice: bigint; config: unknown; packageSku: string | null };
+      listPrice: bigint; config: unknown; packageSku: string | null; shipClass: string };
     let parts: Part[];
     if (base[0].kind === "kit" && kitTable) {
-      const comps = await q<{ id: string; sku: string; name: string; kind: string; taxable: boolean; price_minor: string; cost_minor: string; qty: string }>(c, `
-        select p.id, p.sku, p.name, p.kind, p.taxable, p.price_minor, p.cost_minor, k.qty from product_kit_component k join product p on p.id = k.component_id
+      const comps = await q<{ id: string; sku: string; name: string; kind: string; taxable: boolean; price_minor: string; cost_minor: string; qty: string; ship_class: string }>(c, `
+        select p.id, p.sku, p.name, p.kind, p.taxable, p.price_minor, p.cost_minor, k.qty, p.ship_class from product_kit_component k join product p on p.id = k.component_id
          where k.entity_id = $1 and k.kit_id = $2 order by k.seq, p.sku`, [ctx.entityId, ln.productId]);
       need(comps.length, `${base[0].name} has no components set up`);
       const packageGross = BigInt(Math.round(qty * Number(cfg.unitPriceMinor)));
@@ -250,11 +290,11 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
         const share = i === comps.length - 1 ? left : listTotal > 0n ? (packageGross * weight) / listTotal : 0n;
         left -= share;
         return { productId: x.id, sku: x.sku, description: `${x.name} (in ${cfg.name})`, kind: x.kind, taxable: x.taxable, qty: qty * Number(x.qty),
-          gross: share, unitCost: BigInt(x.cost_minor), listPrice: BigInt(x.price_minor), config: { package: cfg.sku }, packageSku: cfg.sku };
+          gross: share, unitCost: BigInt(x.cost_minor), listPrice: BigInt(x.price_minor), config: { package: cfg.sku }, packageSku: cfg.sku, shipClass: x.ship_class };
       });
     } else {
       parts = [{ productId: cfg.productId, sku: cfg.sku, description: cfg.description, kind: base[0].kind, taxable: base[0].taxable, qty,
-        gross: BigInt(Math.round(qty * Number(cfg.unitPriceMinor))), unitCost: cfg.unitCostMinor, listPrice: cfg.unitPriceMinor, config: cfg.config, packageSku: null }];
+        gross: BigInt(Math.round(qty * Number(cfg.unitPriceMinor))), unitCost: cfg.unitCostMinor, listPrice: cfg.unitPriceMinor, config: cfg.config, packageSku: null, shipClass: base[0].ship_class }];
     }
     const lineGross = parts.reduce((a, p) => a + p.gross, 0n);
     let discount = ln.discountMinor ?? 0n;
@@ -272,7 +312,7 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
       const share = i === parts.length - 1 ? left : lineGross > 0n ? (discount * p.gross) / lineGross : 0n;
       left -= share;
       const stocked = STOCKED.includes(p.kind);
-      let f: Fulfil = ln.fulfillment ?? (p.kind === "fee" ? "delivery" : stocked ? "carry" : "carry");
+      let f: Fulfil = ln.fulfillment ?? await defaultFulfil(c, ctx, p.kind, p.shipClass, lines);
       need(FULFIL.includes(f), "fulfilment is take-with, pickup, delivery or direct ship");
       if (ctx.kind === "layaway" && f === "carry") f = "pickup";       // layaway goods leave when paid in full
       if (f === "carry" && stocked) need(p.kind === "stock", `${p.description} is made or ordered for the customer; it cannot be taken today`);
@@ -322,6 +362,54 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
     }
   }
   return { lineIds: ids, pendingOverrides: pending };
+}
+
+/** What delivery costs to an address: the fleet zone for its postal code, else the company's flat delivery fee setting, else the fee product's price. */
+export async function deliveryFeeFor(c: Client, entityId: string, addressId: string | null): Promise<{ feeMinor: bigint; zone: string | null }> {
+  const postal = addressId ? (await q<{ postal: string }>(c, `select postal from customer_address where id = $1 and entity_id = $2`, [addressId, entityId]))[0]?.postal : null;
+  if (postal && await hasRelation(c, "delivery_zone")) {
+    const z = await q<{ code: string; fee_minor: string }>(c, `select code, fee_minor from delivery_zone where entity_id = $1 and active and $2 = any(postal_codes) limit 1`,
+      [entityId, postal.trim().slice(0, 5)]);
+    if (z.length) return { feeMinor: BigInt(z[0].fee_minor), zone: z[0].code };
+  }
+  if (await hasRelation(c, "entity_setting")) {
+    const st = await q<{ v: string }>(c, `select value::text v from entity_setting where entity_id = $1 and key = 'fleet.delivery_fee_minor'`, [entityId]);
+    if (st.length && /^\d+$/.test(st[0].v)) return { feeMinor: BigInt(st[0].v), zone: null };
+  }
+  const set = await settings(c, entityId);
+  if (!set.deliveryProductId) return { feeMinor: 0n, zone: null };
+  const pr = await q<{ price_minor: string }>(c, `select price_minor from product where id = $1 and entity_id = $2`, [set.deliveryProductId, entityId]);
+  return { feeMinor: BigInt(pr[0]?.price_minor ?? 0), zone: null };
+}
+
+/**
+ * A delivery sale carries a delivery fee. When goods on the order go by
+ * delivery and no delivery fee is on it, one is added at the customer's zone
+ * rate. Taking it off later needs a reason, and a manager when goods are
+ * still being delivered (voidLine). A fee taken off is not put back.
+ */
+async function ensureDeliveryFee(c: Client, ctx: Ctx) {
+  const feeProduct = ctx.settings.deliveryProductId;
+  if (!feeProduct) return null;
+  const goods = await q<{ ship_address_id: string | null; promised_on: string | null }>(c, `
+    select pl.ship_address_id, pl.promised_on::text from pos_line pl join sales_order_line l on l.id = pl.sales_order_line_id join product p on p.id = l.product_id
+     where pl.entity_id = $1 and pl.sales_order_id = $2 and pl.fulfillment = 'delivery' and l.line_status <> 'cancelled' and p.kind in ('stock','configurable','special_order','kit')
+     order by l.seq limit 1`, [ctx.entityId, ctx.orderId]);
+  if (!goods.length) return null;
+  const has = await q(c, `select l.id from sales_order_line l where l.entity_id = $1 and l.sales_order_id = $2 and l.product_id = $3`, [ctx.entityId, ctx.orderId, feeProduct]);
+  if (has.length) return null;
+  const fee = await deliveryFeeFor(c, ctx.entityId, goods[0].ship_address_id);
+  if (fee.feeMinor <= 0n) return null;
+  const p = (await q<{ sku: string; name: string; taxable: boolean }>(c, `select sku, name, taxable from product where id = $1 and entity_id = $2`, [feeProduct, ctx.entityId]))[0];
+  if (!p) return null;
+  const tax = p.taxable && !ctx.exempt ? bps(fee.feeMinor, ctx.taxRate) : 0n;
+  const seq = (await one<{ s: number }>(c, `select coalesce(max(seq),0)::int + 1 s from sales_order_line where entity_id = $1 and sales_order_id = $2`, [ctx.entityId, ctx.orderId])).s;
+  const row = await one<{ id: string }>(c, `insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, config)
+    values ($1,$2,$3,$4,$5,$6,1,$7,$8,$9) returning id`, [ctx.entityId, ctx.orderId, seq, feeProduct, p.sku, fee.zone ? `${p.name} (zone ${fee.zone})` : p.name,
+    fee.feeMinor.toString(), tax.toString(), JSON.stringify({ auto: "delivery_fee", zone: fee.zone })]);
+  await c.query(`insert into pos_line (sales_order_line_id, entity_id, sales_order_id, fulfillment, promised_on, ship_address_id, list_price_minor)
+    values ($1,$2,$3,'delivery',$4,$5,$6)`, [row.id, ctx.entityId, ctx.orderId, goods[0].promised_on, goods[0].ship_address_id, fee.feeMinor.toString()]);
+  return { lineId: row.id, feeMinor: fee.feeMinor, zone: fee.zone };
 }
 
 /** The order header follows its lines: delivery if any line is delivered, the earliest promise, the totals. */
@@ -389,9 +477,10 @@ export async function createOrder(c: Client, scope: Scope, roles: Set<string>, e
     defaultAddress: addr, defaultPromised: e.promisedOn ?? null, actorId: scope.actor.id!, kind: e.kind,
     managerReason: isManager && String(e.overrideReason ?? "").trim() ? String(e.overrideReason).trim() : null };
   const r = await insertLines(c, scope, ctx, e.lines);
+  const fee = await ensureDeliveryFee(c, ctx);
   await refreshHeader(c, scope.entityId, so.id);
   await audit(c, scope, { table: "sales_order", rowId: so.id, action: "insert", after: { number, kind: e.kind, lines: r.lineIds.length, exemptRef }, sourceRef: "pos" });
-  return { id: so.id, number, pendingOverrides: r.pendingOverrides };
+  return { id: so.id, number, pendingOverrides: r.pendingOverrides, deliveryFeeMinor: fee?.feeMinor ?? 0n };
 }
 
 async function ctxFor(c: Client, scope: Scope, roles: Set<string>, o: OrderRow, reason?: string): Promise<Ctx> {
@@ -405,16 +494,30 @@ async function ctxFor(c: Client, scope: Scope, roles: Set<string>, o: OrderRow, 
 export async function addLines(c: Client, scope: Scope, roles: Set<string>, orderId: string, lines: LineIn[], overrideReason?: string) {
   const o = await orderOf(c, scope.entityId, orderId);
   need(o.status === "draft", `${o.number} has been placed; lines change on a draft or a quote only`);
-  const r = await insertLines(c, scope, await ctxFor(c, scope, roles, o, overrideReason), lines);
+  const ctx = await ctxFor(c, scope, roles, o, overrideReason);
+  const r = await insertLines(c, scope, ctx, lines);
+  await ensureDeliveryFee(c, ctx);
   await refreshHeader(c, scope.entityId, orderId);
   await audit(c, scope, { table: "sales_order", rowId: orderId, action: "update", after: { added: r.lineIds.length }, sourceRef: "pos" });
   return r;
 }
 
-export async function voidLine(c: Client, scope: Scope, orderId: string, lineId: string, reason: string) {
+export async function voidLine(c: Client, scope: Scope, orderId: string, lineId: string, reason: string, roles: Set<string> = new Set()) {
   const o = await orderOf(c, scope.entityId, orderId);
   need(o.status === "draft", `${o.number} has been placed; cancel the order or return the goods instead`);
   need(String(reason ?? "").trim(), "say why the line comes off");
+  const set = await settings(c, scope.entityId);
+  const fee = await q<{ id: string }>(c, `select l.id from sales_order_line l where l.id = $1 and l.entity_id = $2 and l.sales_order_id = $3 and l.product_id = $4`,
+    [lineId, scope.entityId, orderId, set.deliveryProductId]);
+  if (fee.length) {
+    const still = await q(c, `select 1 from pos_line pl join sales_order_line l on l.id = pl.sales_order_line_id join product p on p.id = l.product_id
+      where pl.entity_id = $1 and pl.sales_order_id = $2 and pl.fulfillment = 'delivery' and l.line_status <> 'cancelled' and p.kind <> 'fee' limit 1`, [scope.entityId, orderId]);
+    if (still.length) {
+      need(MANAGERS.some((r) => roles.has(r)), "waiving the delivery fee on a delivery needs a store manager");
+      await c.query(`insert into pos_override (entity_id, sales_order_id, sales_order_line_id, kind, detail, approved_by, reason) values ($1,$2,$3,'discount','delivery fee waived',$4,$5)`,
+        [scope.entityId, orderId, lineId, scope.actor.id, reason.trim()]);
+    }
+  }
   const r = await q<{ sku: string }>(c, `update sales_order_line set line_status = 'cancelled' where id = $1 and entity_id = $2 and sales_order_id = $3
       and line_status <> 'cancelled' returning sku`, [lineId, scope.entityId, orderId]);
   need(r.length, "no such line on this order");
@@ -732,9 +835,11 @@ export async function returnGoods(c: Client, scope: Scope, originalId: string, e
     const code = l.kind === "fee" || l.kind === "service" ? "4030" : l.kind === "warranty" ? "4040" : "4900";
     revByCode.set(code, (revByCode.get(code) ?? 0n) + lineNet);
     if (STOCKED.includes(l.kind ?? "") && l.product_id) {
-      cost += BigInt(Math.round(qty * Number(l.cost_minor ?? 0)));
-      if (r.disposition === "restock") await restock(c, scope.entityId, l.product_id, loc, qty, { lineIds: [l.id], by: scope.actor.id });
-      else await returnToDamage(c, scope, { productId: l.product_id, locationId: loc, qty, lineIds: [l.id],
+      // Back at today's average cost: what 1300 gets is exactly what the stock's cost pool gets.
+      const unit = await unitCost(c, scope.entityId, l.product_id);
+      cost += BigInt(Math.round(qty * Number(unit)));
+      if (r.disposition === "restock") await restock(c, scope.entityId, l.product_id, loc, qty, { lineIds: [l.id], by: scope.actor.id, unitCostMinor: unit });
+      else await returnToDamage(c, scope, { productId: l.product_id, locationId: loc, qty, lineIds: [l.id], unitCostMinor: unit,
         description: `Customer return on ${o.number}: ${r.reason.replace(/_/g, " ")}${r.note ? ` — ${r.note}` : ""}` });
     }
   }
@@ -757,12 +862,44 @@ export async function returnGoods(c: Client, scope: Scope, originalId: string, e
     { code: "5000", credit: cost, profitObjectId: po },
   ] });
   const ret = await orderOf(c, scope.entityId, ro.id);
-  const t = await takeTenders(c, scope, ret, s.id, e.tenders ?? [], true);
+  // No tenders named: refund the way the customer paid (the web order's card, most recent first).
+  const tenders = e.tenders?.length ? e.tenders : await refundToOriginal(c, scope.entityId, originalId, refund);
+  const t = await takeTenders(c, scope, ret, s.id, tenders, true);
   await c.query(`update sales_order set status = 'closed' where id = $1 and entity_id = $2`, [ro.id, scope.entityId]);
   await accrueCommissions(c, scope, { orderId: ro.id });  // the return charges back its commission
   await audit(c, scope, { table: "sales_order", rowId: originalId, action: "transition", after: { returnedOn: number, refund: refund.toString() }, sourceRef: "pos return" });
   await audit(c, scope, { table: "sales_order", rowId: ro.id, action: "insert", after: { kind: "return", against: o.number, refund: refund.toString() }, sourceRef: "pos return" });
   return { id: ro.id, number, refundMinor: refund, taxMinor: tax, costMinor: cost, journalEntryId: je, receipts: t.receipts };
+}
+
+/** Split a refund back over the original order's receipts, newest first, net of what earlier returns already refunded to each. */
+async function refundToOriginal(c: Client, entityId: string, originalId: string, refund: bigint): Promise<Tender[]> {
+  const paid = await q<{ method: string; reference: string | null; amount_minor: string }>(c, `
+    select method, reference, amount_minor::text from customer_receipt where entity_id = $1 and sales_order_id = $2 and voided_at is null and amount_minor > 0
+     order by received_at desc`, [entityId, originalId]);
+  need(paid.length, "nothing was paid on the original order; name how the refund goes");
+  const back = await q<{ method: string; reference: string | null; s: string }>(c, `
+    select r.method, r.reference, (-sum(r.amount_minor))::text s from customer_receipt r join pos_order po on po.sales_order_id = r.sales_order_id
+     where r.entity_id = $1 and po.original_order_id = $2 and r.voided_at is null and r.amount_minor < 0 group by r.method, r.reference`, [entityId, originalId]);
+  const used = new Map(back.map((b) => [`${b.method}|${b.reference ?? ""}`, BigInt(b.s)]));
+  let left = refund;
+  const out: Tender[] = [];
+  for (const p of paid) {
+    if (left <= 0n) break;
+    const key = `${p.method}|${p.reference ?? ""}`;
+    let room = BigInt(p.amount_minor);
+    const u = used.get(key) ?? 0n;
+    const take0 = u >= room ? room : u;
+    used.set(key, u - take0);
+    room -= take0;
+    if (room <= 0n) continue;
+    const take = room < left ? room : left;
+    need((TENDERS as readonly string[]).includes(p.method), `the original was paid by ${p.method}; name how the refund goes`);
+    out.push({ method: p.method, amountMinor: take, reference: p.method === "card" && p.reference && !/^\d{4}$/.test(p.reference) ? p.reference.replace(/\D/g, "").slice(-4) || null : p.reference });
+    left -= take;
+  }
+  need(left <= 0n, `only ${usd(refund - left)} of the ${usd(refund)} refund can go back the way it was paid; name the rest`);
+  return out;
 }
 
 // ==================================================================== views
@@ -771,13 +908,13 @@ export async function orderView(c: Client, entityId: string, id: string) {
   const h = await q<Record<string, unknown>>(c, `
     select so.id, so.number, so.status, so.channel, so.fulfillment, so.promised_on::text, so.subtotal_minor::text, so.discount_minor::text, so.tax_minor::text,
            so.total_minor::text, so.paid_minor::text, (so.total_minor - so.paid_minor)::text balance_minor, so.ordered_at, so.notes,
-           po.kind, po.quote_expires_on::text, po.layaway_schedule, po.paid_off_at, po.tax_exempt_ref, po.signature_data_url, po.signed_name, po.signed_at,
+           coalesce(po.kind, 'sale') kind, po.quote_expires_on::text, coalesce(po.layaway_schedule, '[]'::jsonb) layaway_schedule, po.paid_off_at, po.tax_exempt_ref, po.signature_data_url, po.signed_name, po.signed_at,
            po.original_order_id, oo.number original_number, po.register_session_id, po.return_note,
            so.customer_id, cu.name customer, cu.phone customer_phone, cu.email customer_email, cu.number customer_number,
            so.location_id, l.name location, l.address location_address, l.tax_rate_bps,
            a.line1 ship_line1, a.city ship_city, a.state ship_state, a.postal ship_postal, so.ship_address_id,
            e.name company, mk.name created_by
-      from sales_order so join pos_order po on po.sales_order_id = so.id
+      from sales_order so left join pos_order po on po.sales_order_id = so.id
       join location l on l.id = so.location_id join entity e on e.id = so.entity_id
       left join customer cu on cu.id = so.customer_id left join customer_address a on a.id = so.ship_address_id
       left join sales_order oo on oo.id = po.original_order_id left join app_user mk on mk.id = po.created_by
@@ -786,12 +923,13 @@ export async function orderView(c: Client, entityId: string, id: string) {
   const lines = await q(c, `
     select l.id, l.seq, l.sku, l.description, l.qty::text, l.unit_price_minor::text, l.discount_minor::text, l.tax_minor::text,
            (round(l.qty * l.unit_price_minor) - l.discount_minor)::bigint::text net_minor, l.line_status, l.config, fl.name fulfil_from,
-           pl.fulfillment, pl.promised_on::text, pl.needs_override, pl.package_sku, pl.return_reason, pl.return_disposition, pl.role, p.kind,
+           coalesce(pl.fulfillment, so.fulfillment) fulfillment, coalesce(pl.promised_on, so.promised_on)::text promised_on, pl.needs_override, pl.package_sku,
+           pl.return_reason, pl.return_disposition, coalesce(pl.role, 'item') role, p.kind,
            ov.reason override_reason, ou.name override_by,
            (select coalesce(-sum(x.qty),0) from pos_line rp join sales_order_line x on x.id = rp.sales_order_line_id
              where rp.entity_id = l.entity_id and rp.original_line_id = l.id and rp.role = 'item')::text returned_qty
-      from sales_order_line l join pos_line pl on pl.sales_order_line_id = l.id left join product p on p.id = l.product_id
-      left join location fl on fl.id = l.fulfil_from_id left join pos_override ov on ov.id = pl.override_id left join app_user ou on ou.id = ov.approved_by
+      from sales_order_line l join sales_order so on so.id = l.sales_order_id left join pos_line pl on pl.sales_order_line_id = l.id
+      left join product p on p.id = l.product_id left join location fl on fl.id = l.fulfil_from_id left join pos_override ov on ov.id = pl.override_id left join app_user ou on ou.id = ov.approved_by
      where l.entity_id = $1 and l.sales_order_id = $2 order by l.seq`, [entityId, id]);
   const receipts = await q(c, `select r.id, r.number, r.method, r.amount_minor::text, r.reference, r.received_at, u.name received_by, r.voided_at
       from customer_receipt r left join app_user u on u.id = r.received_by where r.entity_id = $1 and r.sales_order_id = $2 order by r.received_at`, [entityId, id]);
@@ -810,12 +948,12 @@ export async function orderView(c: Client, entityId: string, id: string) {
 
 export async function listOrders(c: Client, entityId: string, f: { kind?: string; status?: string; q?: string; locationId?: string | null }) {
   return q(c, `
-    select so.id, so.number, so.status, po.kind, so.total_minor::text, so.paid_minor::text, (so.total_minor - so.paid_minor)::text balance_minor,
+    select so.id, so.number, so.status, coalesce(po.kind, 'sale') kind, so.channel, so.total_minor::text, so.paid_minor::text, (so.total_minor - so.paid_minor)::text balance_minor,
            so.ordered_at, so.promised_on::text, so.fulfillment, cu.name customer, l.name location, po.quote_expires_on::text,
            (select count(*) from pos_line pl where pl.sales_order_id = so.id and pl.entity_id = so.entity_id and pl.needs_override is not null)::int overrides_waiting
-      from sales_order so join pos_order po on po.sales_order_id = so.id join location l on l.id = so.location_id
+      from sales_order so left join pos_order po on po.sales_order_id = so.id join location l on l.id = so.location_id
       left join customer cu on cu.id = so.customer_id
-     where so.entity_id = $1 and ($2 = '' or po.kind = $2)
+     where so.entity_id = $1 and ($2 = '' or coalesce(po.kind, 'sale') = $2)
        and ($3 = '' or ($3 = 'active' and so.status in ('draft','open','fulfilling')) or so.status = $3)
        and ($4 = '' or so.number ilike '%' || $4 || '%' or cu.name ilike '%' || $4 || '%' or cu.phone ilike '%' || $4 || '%')
        and ($5::uuid is null or so.location_id = $5)
