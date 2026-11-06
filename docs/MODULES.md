@@ -31,6 +31,21 @@ New roles: `store_manager, sales, cashier, buyer, warehouse, dispatcher,
 driver, ar_clerk, hr, web_admin` (alongside `owner, controller, ap_clerk,
 approver, viewer`). Owner passes every role check.
 
+## Cross-module contract functions (keep these signatures)
+
+| Function | File | Called by |
+|---|---|---|
+| `priceConfigured(c, entityId, productId, choices)` | `packages/core/pricing.ts` (catalog owns) | POS, shop, quotes |
+| `reserveOrder(c, entityId, orderId)` | `packages/core/inventory.ts` (inventory owns) | POS, shop |
+| `fulfilLines(c, entityId, orderId, lineIds)` → cost | `packages/core/inventory.ts` | POS carry-out, pickup, fleet delivery |
+| `releaseLines`, `restock` | `packages/core/inventory.ts` | POS returns/cancels |
+| `postReceipt(c, scope, receiptId)` | `packages/core/ar.ts` (A/R owns) | POS, shop, A/R payments |
+| `invoiceFulfilment(c, scope, orderId, lineIds, cost)` | `packages/core/ar.ts` | POS, fleet delivery, pickup |
+| `post(c, scope, {date, sourceType, sourceId, description, lines})` | `packages/core/posting.ts` | anyone posting to the GL |
+
+A special order or a backorder is a sales order line in `line_status = 'on_order'`.
+Purchasing turns those lines into vendor POs. POS never builds POs itself.
+
 ## Ground rules (same as the finance core; read README.md "The decisions")
 
 1. Money is `bigint` minor units. Use `minor()` and `bps()` from `server/modules/kit.ts`. Never floats.

@@ -38,6 +38,15 @@ alter table location add column geo point;           -- (lng, lat) for routing
 alter table location add column tax_rate_bps integer not null default 0
   check (tax_rate_bps between 0 and 2000);           -- 825 = 8.25%
 
+
+-- Retail postings name their own source, so a trial-balance line drills to
+-- the sale, the receipt, the stock move or the commission behind it.
+alter table journal_entry drop constraint journal_entry_source_type_check;
+alter table journal_entry add constraint journal_entry_source_type_check
+  check (source_type in ('invoice','payment','payroll','depreciation','accrual',
+                         'intercompany','manual','reversal','opening','transfer','deposit',
+                         'sale','receipt','refund','inventory','commission','ar','fleet','finance'));
+
 -- ---------------------------------------------------------- numbering --
 
 create table doc_sequence (
