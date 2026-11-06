@@ -241,8 +241,8 @@ export async function runFeeds(t: T) {
     ($1,$2,2,'http://img.ashley.example/plain.jpg'), ($1,$2,3,'https://img.ashley.example/page.html'), ($1,$2,4,'https://img.ashley.example/huge.jpg'),
     ($1,$2,5,'https://10.0.0.5/inside.jpg')`, [ENTITY, b31Id]));
   const viaRoute = async (seq: number) => {
-    try { return { ok: true, r: await cr.get<{ dataUrl: string; cached: boolean; bytes: number } | null>("/catalog/image/:id/([0-9]{1,2})", "", [b31Id, String(seq)] as never) }; }
-    catch (e) { return { ok: false, r: null, msg: (e as Error).message }; }
+    const r = await cr.get<{ dataUrl: string | null; cached: boolean; bytes: number; problem?: string } | null>("/catalog/image/:id/([0-9]{1,2})", "", [b31Id, String(seq)] as never);
+    return r && r.dataUrl === null ? { ok: false, r: null, msg: r.problem } : { ok: true, r };
   };
   const p1 = await viaRoute(1), p1b = await viaRoute(1);
   t.ok("photos: the stored https photo comes back from our own origin as a data URL", p1.ok && !!p1.r?.dataUrl.startsWith("data:image/jpeg;base64,") && p1.r?.bytes === JPEG.length && p1.r?.cached === false);

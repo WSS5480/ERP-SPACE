@@ -199,7 +199,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
   async function openEdit(x) {
     const fo = await form();
     const p = x ? x.product : { kind: 'stock', ship_class: 'delivery', taxable: true };
-    const d = openDialog(x ? `Edit ${p.name}` : 'New product', x ? p.sku : 'It starts as a draft; set it active when it is priced.', { wide: true });
+    const d = openDialog(x ? `Edit ${p.name}` : 'New product', x ? p.sku : 'A draft until it is priced, or active straight away', { wide: true });
     const f = {
       name: input({ value: p.name || '', maxlength: '200' }), sku: input({ value: p.sku || '', class: 'upper', maxlength: '40', placeholder: 'ASH-2930338' }),
       kind: select(fo.kinds.map((k) => [k, KIND[k] || k]), p.kind), vendor: select([['', 'No vendor'], ...fo.vendors.map((v) => [v.id, v.name])], p.vendor_id),
@@ -212,6 +212,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
       description: el('textarea', { maxlength: '4000', value: p.description || '' }),
       taxable: el('input', { type: 'checkbox', checked: p.taxable !== false }), serialized: el('input', { type: 'checkbox', checked: !!p.serialized }),
       webVisible: el('input', { type: 'checkbox', checked: !!p.web_visible }),
+      status: select([['draft', 'Draft (not for sale yet)'], ['active', 'Active (selling now)']], 'draft'),
     };
     const err = el('div');
     const save = el('button', { class: 'btn primary', type: 'button', onclick: () => {
@@ -220,6 +221,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
         price: f.price.value || '0', cost: f.cost.value || '0', map: f.map.value || null, msrp: f.msrp.value || null, barcode: f.barcode.value,
         shipClass: f.shipClass.value, cubicFt: f.cubicFt.value || null, weightLb: f.weightLb.value || null, description: f.description.value,
         taxable: f.taxable.checked, serialized: f.serialized.checked, webVisible: f.webVisible.checked };
+      if (!x) b.status = f.status.value;
       act(save, async () => {
         const r = x ? await post(`/catalog/products/${p.id}`, b) : await post('/catalog/products', b);
         d.close();
@@ -230,7 +232,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     d.body.append(
       el('datalist', { id: 'pc-cats' }, fo.categories.map((c) => el('option', { value: c.category }))),
       el('div', { class: 'form-grid' },
-        field('Name', f.name, null, true), field('SKU', f.sku), field('Kind', f.kind), field('Vendor', f.vendor), field('Vendor model', f.vendorSku),
+        field('Name', f.name, null, true), field('SKU', f.sku), field('Kind', f.kind), x ? null : field('Starts as', f.status, 'Active needs a price'), field('Vendor', f.vendor), field('Vendor model', f.vendorSku),
         field('Brand', f.brand), field('Category', f.category), field('Subcategory', f.subcategory), field('Collection', f.collection), field('Color', f.color),
         el('div', { class: 'form-sec', text: 'Price' }),
         field('Ticket price', f.price), field('Cost', f.cost, 'What the vendor charges us, each'), field('MAP', f.map, 'Minimum advertised price; blank if none'), field('MSRP', f.msrp),
