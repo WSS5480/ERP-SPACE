@@ -17,13 +17,14 @@ export const module: ErpModule = {
     coGet("/setup/modules", async (c, co) => ({ modules: await enabledModules(c, co.id) }));
 
     coGet("/setup/business", async (c, co) => {
-      const [applied, settings, locations, reasons, imports] = await Promise.all([
-        q(c, `select pack, applied_at, applied_by, summary from pack_application where entity_id = $1 order by applied_at desc limit 10`, [co.id]),
-        q(c, `select key, value, set_by, set_at, from_pack from entity_setting where entity_id = $1 order by key`, [co.id]),
-        q(c, `select id, code, name, kind, state, tax_rate_bps, address, geo[0] lng, geo[1] lat, status
+      // One client runs one query at a time, so these go in sequence.
+      const [applied, settings, locations, reasons, imports] = await (async (qs) => { const out = []; for (const f of qs) out.push(await f()); return out; })([
+        () => q(c, `select pack, applied_at, applied_by, summary from pack_application where entity_id = $1 order by applied_at desc limit 10`, [co.id]),
+        () => q(c, `select key, value, set_by, set_at, from_pack from entity_setting where entity_id = $1 order by key`, [co.id]),
+        () => q(c, `select id, code, name, kind, state, tax_rate_bps, address, geo[0] lng, geo[1] lat, status
                 from location where entity_id = $1 order by kind, code`, [co.id]),
-        q(c, `select kind, code, label, restock, active from reason_code where entity_id = $1 order by kind, label`, [co.id]),
-        q(c, `select kind, filename, rows_seen, rows_added, rows_updated, rows_refused, problems, run_by, run_at
+        () => q(c, `select kind, code, label, restock, active from reason_code where entity_id = $1 order by kind, label`, [co.id]),
+        () => q(c, `select kind, filename, rows_seen, rows_added, rows_updated, rows_refused, problems, run_by, run_at
                 from import_run where entity_id = $1 order by run_at desc limit 10`, [co.id]),
       ]);
       return {
