@@ -1,0 +1,89 @@
+# Retail modules — the contract
+
+Pentex ERP is becoming an out-of-the-box **retail furniture ERP** that any
+business can switch on: a furniture or appliance retailer, a general retailer,
+a rent-to-own chain, or a trucking company. All of them share the finance
+core in migrations 0001–0014 (GL, AP, banking, reconciliation, payroll), and
+the retail modules below sit on top.
+
+Sources we model features on: ERPNext (open source, used as a blueprint only;
+no code is copied), STORIS, NetSuite, Furniture Wizard, Retail Vantage,
+Renaissance, and our own CATALOG-APP (vendor feed import and mapping, freight
+per store, budgeted order forms). See `docs/RESEARCH.md`.
+
+## The shared spine (migration 0015, do not fork it)
+
+| Table | What it is | Who writes it |
+|---|---|---|
+| `customer`, `customer_address` | one customer across every channel | POS, shop, A/R |
+| `product` | one sellable SKU | catalog |
+| `product_option_group`, `product_option` | customization (fabric, finish, size) | catalog |
+| `sales_order`, `sales_order_line` | **the one order every channel writes** (`channel` = pos/web/phone/marketplace/b2b) | POS, shop |
+| `customer_receipt` | every dollar received, any door (refund = negative) | POS, shop, A/R |
+| `stock_level` / view `product_availability` | on hand, reserved, on order per product per location | **inventory only** |
+| `doc_sequence` / `next_doc_no(entity, kind, prefix)` | gapless numbers | everyone |
+| `sales_order_retotal(order)` | recompute order totals from lines | anyone who changes lines |
+
+The `location.kind` column says store, warehouse, outlet, yard, office or web.
+`location.geo` and `customer_address.geo` are `point(lng, lat)` for routing.
+
+New roles: `store_manager, sales, cashier, buyer, warehouse, dispatcher,
+driver, ar_clerk, hr, web_admin` (alongside `owner, controller, ap_clerk,
+approver, viewer`). Owner passes every role check.
+
+## Ground rules (same as the finance core; read README.md "The decisions")
+
+1. Money is `bigint` minor units. Use `minor()` and `bps()` from `server/modules/kit.ts`. Never floats.
+2. Every query names `entity_id = $n` (or says `/* unscoped: why */`). Pass SQL through `guard()` when you build it dynamically.
+3. Nothing is deleted. Corrections are reversals, voids with reasons, or status changes.
+4. The database enforces the rules that cost money if broken (check constraints and triggers), and the code says them in plain words too.
+5. Errors a person will read are sentences. Throw `ModuleError` (via `need()`), which comes back as a 422 with the message as-is.
+6. A module never writes another module's tables except through that module's exported functions in `packages/core/<module>.ts`. `stock_level` especially: only `packages/core/inventory.ts` changes it.
+7. Postings to the GL go through the existing ledger (`journal_entry` / `journal_line`, see `packages/core/invoice.ts` `postToLedger` for the pattern). Revenue, COGS, deposits, A/R, inventory and freight each post to a GL account resolved by code from the tenant's chart, never a hard-coded id.
+8. Phone first. Every screen must work on a phone: no sideways-scrolling tables for primary data. Wrap rows into cards on narrow screens and use pickers and dropdowns. Table headers align with their columns: numbers right, text left.
+
+## A module is four files and a slot
+
+| Piece | Path |
+|---|---|
+| schema | `db/migrations/00NN_<id>.sql` (your number below; forward-only) |
+| demo data | `db/seed/00NN_<id>.sql` (loaded only with `ERP_SEED=placeholder`) |
+| rules | `packages/core/<id>.ts` (pure functions taking a `Client`) |
+| API | `server/modules/<id>.ts`, `register(kit)` using `kit.coGet` / `kit.coPost` / `kit.publicRoute` |
+| screens | `server/ui/<id>.js`, uses `window.ERP` helpers and `ERP.register(...)` |
+| checks | `scripts/modules/<id>.ts`, exports `run(t)` (see `scripts/modules/harness.ts`) |
+
+Routes: `kit.coGet('/pos/tickets', fn)` serves `GET /api/c/<company>/pos/tickets`.
+`kit.coPost` runs in one transaction as the acting person; use
+`requireRole(c, co, a, ['cashier'], 'ringing a sale')`. `kit.publicRoute`
+is **only** for the web store: no auth, and POSTs must carry `x-erp-shop: 1`.
+
+Screens: `ERP.register('pos', 'Point of sale', 'cash', async (sub) => node, 'Retail')`.
+Groups shown in the nav are `Back office` (existing), `Retail`,
+`Operations` and `Setup`. Use `ERP.coApi(path)`, `ERP.post(path, body)`,
+`ERP.el`, `ERP.section`, `ERP.head`, `ERP.tbl`, `ERP.item`, `ERP.tile`,
+`ERP.openDialog`, `ERP.act`, `ERP.money` (minor units in, "$1,234.00" out).
+Data is placed with textContent only, never innerHTML.
+
+## Slots
+
+| Module | Migration | Seed | Nav group |
+|---|---|---|---|
+| setup (industry packs, store/warehouse setup) | 0016 | 0010 | Setup |
+| catalog | 0017 | 0011 | Retail |
+| purchasing (owner buying program) | 0018 | 0012 | Retail |
+| inventory (warehousing and tracking) | 0019 | 0013 | Operations |
+| pos | 0020 | 0014 | Retail |
+| ar (complete receivables) | 0021 | 0015 | Back office |
+| workforce (time clock, commissions → payroll) | 0022 | 0016 | Back office |
+| fleet (vehicles, delivery routing) | 0023 | 0017 | Operations |
+| shop (omnichannel web store + customizer) | 0024 | 0018 | Retail |
+
+## Running it
+
+```bash
+export PGDATABASE=erp PGUSER=root PGHOST=/var/run/postgresql
+./db/apply.sh --reset --seed
+npm run smoke            # the finance core, 139 checks, must stay green
+npm run smoke:modules    # the retail modules
+```

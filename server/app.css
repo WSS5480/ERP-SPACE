@@ -373,3 +373,6 @@ dialog.sheet{margin:auto auto 0;width:100%;max-width:520px;border-radius:16px 16
 }
 @media (prefers-reduced-motion:reduce){.spin{animation-duration:2.4s}.chip .chev{transition:none}}
 .nw{white-space:nowrap}
+
+/* module nav groups */
+.side nav .nav-group{padding:14px 21px 4px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--bar-muted);opacity:.75}

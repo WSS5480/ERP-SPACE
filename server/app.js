@@ -303,8 +303,13 @@ function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + 
 function renderNav() {
   const cur = S.route.screen;
   const badge = (name) => (name === 'approvals' && badgeCount ? el('span', { class: 'badge', text: String(badgeCount), 'aria-label': `${badgeCount} waiting on you` }) : null);
-  $('#nav').replaceChildren(...SCREENS.map(([name, label, ic]) =>
-    el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null, 'aria-current': cur === name ? 'page' : null }, icon(ic), label, badge(name))));
+  const navKids = []; let lastGroup = null;
+  for (const [name, label, ic, group] of SCREENS) {
+    const g = group || 'Back office';
+    if (g !== lastGroup) { navKids.push(el('div', { class: 'nav-group', text: g })); lastGroup = g; }
+    navKids.push(el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null, 'aria-current': cur === name ? 'page' : null }, icon(ic), label, badge(name)));
+  }
+  $('#nav').replaceChildren(...navKids);
   $('#tabbar').replaceChildren(
     ...TABS.map((name) => { const [, label, ic] = SCREENS.find((s) => s[0] === name);
       return el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null }, icon(ic), label === 'Payables' ? 'Bills' : label, badge(name)); }),
@@ -1922,6 +1927,23 @@ function openUpload(targets, id, accounts) {
 
 const RENDER = { home: screenHome, approvals: screenApprovals, payables: screenPayables, payroll: screenPayroll, books: screenBooks, cash: screenCash, recon: screenRecon, feeds: screenFeeds, setup: screenSetup };
 
+// ========================================================== module screens
+// Retail modules (server/ui/*.js) add screens here before boot. They get the
+// same helpers this file uses, so every screen looks and behaves alike.
+window.ERP = {
+  S, $, el, frag, icon, ICONS, chip, money, dayLabel, shortDay, plural, cap, sentence, human, ago, size, todayIso, isoDay,
+  api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
+  head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render,
+  /** register('pos', 'Point of sale', 'cash', screenFn, 'Retail', {icon: 'M..'}) */
+  register(name, label, ic, fn, group, opts = {}) {
+    if (opts.icon) ICONS[ic] = opts.icon;
+    const i = SCREENS.findIndex((x) => x[0] === name);
+    const row = [name, label, ic, group || 'Retail'];
+    if (i >= 0) SCREENS[i] = row; else SCREENS.push(row);
+    RENDER[name] = fn;
+  },
+};
+
 // ================================================================ sign in
 function showSignIn(msg) {
   show('signin');
@@ -1991,6 +2013,5 @@ function wire() {
     else if (S.co && hiddenAt && Date.now() - hiddenAt > 60000 && !document.querySelector('dialog[open]')) render();
   });
 }
-wire();
-boot();
+document.addEventListener('DOMContentLoaded', () => { wire(); boot(); }, { once: true });
 })();

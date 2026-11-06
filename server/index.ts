@@ -63,6 +63,8 @@ import * as views from "./views.ts";
 import * as act from "./actions.ts";
 import { ActionError, type Actor } from "./actions.ts";
 import { loadSampleActivity } from "./sample.ts";
+import { MODULES } from "./modules/index.ts";
+import { ModuleError } from "./modules/kit.ts";
 
 const PORT = Number(process.env.PORT ?? 10000);
 const TOKEN = process.env.ERP_API_TOKEN ?? "";
@@ -406,6 +408,31 @@ const param = (url: URL, k: string) => url.searchParams.get(k) ?? "";
 const monthStart = () => new Date().toISOString().slice(0, 8) + "01";
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
+// --------------------------------------------------------- retail modules
+// Each module registers through the same coGet/coPost doors, so every rule
+// above applies to it. Public routes (the web store) get their own door that
+// carries no token and no session, and can only reach what the module exposes.
+const publicRoute = (method: "GET" | "POST", path: RegExp,
+  fn: (req: http.IncomingMessage, url: URL, m: RegExpMatchArray, body: Record<string, unknown>) => Promise<[number, unknown]>) =>
+  route(method, path, "none", async (req, url, m) => {
+    let body: Record<string, unknown> = {};
+    if (method === "POST") {
+      if (req.headers["x-erp-shop"] !== "1") throw new HttpError(403, "this request did not come from the store's own page");
+      body = await readJson(req);
+    }
+    return fn(req, url, m, body);
+  });
+for (const mod of MODULES) mod.register({ coGet, coPost, publicRoute });
+
+// Module screens: server/ui/<id>.js, read once at start like app.js.
+const UI_JS = new Map<string, string>();
+for (const mod of MODULES) { const t = readHere(join("ui", `${mod.id}.js`)); if (t) UI_JS.set(mod.id, t); }
+route("GET", /^\/ui\/([a-z]+)\.js$/, "none", async (_req, _url, m) => {
+  const t = UI_JS.get(m[1]);
+  if (!t) throw new HttpError(404, "not found");
+  return [200, new Asset(t, "text/javascript; charset=utf-8")];
+});
+
 // Liveness. No business data, ever.
 route("GET", /^\/health$/, "none", async () => {
   let db = false;
@@ -422,7 +449,8 @@ route("GET", /^\/health$/, "none", async () => {
 // The app. A shell with no data in it; everything it shows comes from /api
 // once someone has signed in.
 route("GET", /^\/$/, "none", async () => [200, new Html(
-  APP && APP_JS && APP_CSS ? APP.replaceAll("__VERSION__", ASSET_VERSION) : MISSING_PAGE)]);
+  APP && APP_JS && APP_CSS ? APP.replaceAll("__VERSION__", ASSET_VERSION).replace("<!--MODULE_SCRIPTS-->",
+    MODULES.map((x) => `<script src="/ui/${x.id}.js?v=${ASSET_VERSION}" defer></script>`).join("\n")) : MISSING_PAGE)]);
 route("GET", /^\/app\.js$/, "none", async () => {
   if (!APP_JS) throw new HttpError(404, "not found");
   return [200, new Asset(APP_JS, "text/javascript; charset=utf-8")];
@@ -795,7 +823,7 @@ route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
 // ------------------------------------------------------------------- server
 
 // The engine's refusals are written for people; pass them on as they are.
-const REFUSALS = [ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
+const REFUSALS = [ModuleError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
 
 function refusal(e: unknown): string | null {
   if (REFUSALS.some((K) => e instanceof K)) return (e as Error).message;

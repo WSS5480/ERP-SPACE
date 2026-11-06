@@ -164,7 +164,7 @@ export async function newBill(c: Client, co: Company, a: Actor, input: Record<st
 }
 
 /** The roles a person holds in this company: their own grants for it, or client-wide ones. */
-async function rolesOf(c: Client, co: Company, personId: string): Promise<Set<string>> {
+export async function rolesOf(c: Client, co: Company, personId: string): Promise<Set<string>> {
   const r = await q<{ role: string }>(c, `
     select distinct g.role from role_grant g join app_user u on u.id = g.app_user_id
      where g.app_user_id = $2 and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $3))`,
