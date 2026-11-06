@@ -1,4 +1,4 @@
-# Pentex ERP — session one
+# ERP — session one
 
 Foundation, vendor master, accounts payable, banking and payroll.
 TypeScript, Postgres, no framework. This is the schema and the core rules,
@@ -43,7 +43,7 @@ db/migrations/   0001 foundation   tenants, entities, dimensions, chart, periods
                  0011 reconciliation the POS feed, the statement, and what matched what
                  0012 connections  how data gets in and out: sources, channels, files, health
                  0013 statement intake statements in four dialects, de-duplicated and traced
-db/seed/         0001 placeholder Pentex data
+db/seed/         0001 placeholder demo-company data
                  0002 its company banks, pay group, employees and deductions
                  0003 a second client in another industry, so isolation is tested
                  0004 a deposit account per store at three different banks, and their sweep rules
@@ -249,7 +249,7 @@ tables read as Truck and Settlements rather than Store and Back balances.
 
 ## Placeholders to replace before anything real is posted
 
-- `db/seed/0001_pentex.sql` — the entity, the three locations and the
+- `db/seed/0001_demo_company.sql` — the entity, the three locations and the
   34-account chart are a starting point, not your records
 - approval thresholds are set at $1,000 and $10,000 as an example
 - `tin_ref` and `account_ref` are keys into a secrets store that does not

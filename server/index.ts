@@ -125,7 +125,7 @@ const safeEqual = (a: string, b: string): boolean =>
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** credential_ref "secret://sftp/first-valley/pentex" -> env ERP_SECRET_SFTP_FIRST_VALLEY_PENTEX */
+/** credential_ref "secret://sftp/first-valley/demo" -> env ERP_SECRET_SFTP_FIRST_VALLEY_DEMO */
 export function secretEnvName(ref: string): string {
   return "ERP_SECRET_" + ref.replace(/^secret:\/\//i, "").toUpperCase()
     .replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
@@ -202,7 +202,7 @@ function bearer(req: http.IncomingMessage): string {
 
 // A separate key for signing sessions, derived from the token, so the token
 // itself never signs anything a browser holds.
-const sessionKey = () => createHmac("sha256", TOKEN).update("pentex-erp/session/v1").digest();
+const sessionKey = () => createHmac("sha256", TOKEN).update("erp/session/v1").digest();
 
 function cleanName(v: unknown): string {
   return String(v ?? "").replace(/[\u0000-\u001f\u007f<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 60);
@@ -280,9 +280,9 @@ const APP_JS = readHere("app.js");
 const APP_CSS = readHere("app.css");
 const ASSET_VERSION = `${VERSION}-${Date.parse(STARTED).toString(36)}`;
 
-const MISSING_PAGE = `<!doctype html><meta charset="utf-8"><title>Pentex ERP</title>
+const MISSING_PAGE = `<!doctype html><meta charset="utf-8"><title>ERP</title>
 <style nonce="__NONCE__">body{font:16px/1.5 system-ui,sans-serif;margin:3rem auto;max-width:36rem;padding:0 1rem}</style>
-<h1>Pentex ERP</h1><p>The service is running, but the app files (<code>server/app.html</code>, <code>app.js</code> and
+<h1>ERP</h1><p>The service is running, but the app files (<code>server/app.html</code>, <code>app.js</code> and
 <code>app.css</code>) are not all in this deploy. Add them to the repository's <code>server</code> folder and deploy again.</p>`;
 
 // ------------------------------------------------------------------ helpers
@@ -316,7 +316,7 @@ async function companyOr404(c: Client, id: string): Promise<views.Company> {
 }
 
 const actingId = (req: http.IncomingMessage): string | null => {
-  const v = String(req.headers["x-pentex-as"] ?? "").trim();
+  const v = String(req.headers["x-erp-as"] ?? "").trim();
   return UUID.test(v) ? v : null;
 };
 
@@ -360,7 +360,7 @@ const route = (method: string, path: RegExp, auth: "none" | "token" | "own", fn:
 
 /** A browser request that changes something must carry the page's header. */
 function requirePageHeader(req: http.IncomingMessage): void {
-  if (req.headers["x-pentex-erp"] !== "1") {
+  if (req.headers["x-erp-page"] !== "1") {
     throw new HttpError(403, "this request did not come from the ERP's own page");
   }
 }
@@ -867,7 +867,7 @@ export async function start(): Promise<http.Server> {
   if (!process.env.DATABASE_URL && !process.env.PGHOST) {
     throw new Error(
       "DATABASE_URL is not set, so there is no database to connect to. On Render: " +
-      "pentex-erp-api -> Environment -> add DATABASE_URL with the database's Internal Database URL.");
+      "ERP-api -> Environment -> add DATABASE_URL with the database's Internal Database URL.");
   }
   if (!APP || !APP_JS || !APP_CSS) console.warn("the app files are not all in server/; the root address will say so");
   const applied = await migrate({ seed: TRIAL });
@@ -880,7 +880,7 @@ export async function start(): Promise<http.Server> {
   }
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(PORT, "0.0.0.0", resolve));
-  console.log(`pentex-erp ${VERSION} listening on ${PORT}`);
+  console.log(`erp-api ${VERSION} listening on ${PORT}`);
   const stop = () => server.close(() => pool.end().then(() => process.exit(0)));
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
@@ -889,7 +889,7 @@ export async function start(): Promise<http.Server> {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   start().catch((e) => {
-    console.error(`pentex-erp could not start: ${describeError(e)}`);
+    console.error(`erp-api could not start: ${describeError(e)}`);
     process.exit(1);
   });
 }

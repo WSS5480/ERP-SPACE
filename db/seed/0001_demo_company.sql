@@ -1,4 +1,4 @@
--- 0001_pentex.sql
+-- 0001_demo_company.sql
 -- Seed data. PLACEHOLDERS, not your records -- replace the entity, the
 -- locations and the chart of accounts with the real ones before anything
 -- is posted in anger. Everything here exists so the schema can be exercised.
@@ -9,12 +9,12 @@ begin;
 
 insert into tenant (id, name, vertical, location_label, profit_object_label, aging_label)
 values ('11111111-1111-1111-1111-111111111111',
-        'Pentex', 'rto', 'Store', 'Store', 'Back balances');
+        'Demo Furniture Co', 'rto', 'Store', 'Store', 'Back balances');
 
 insert into entity (id, tenant_id, name, legal_name, fiscal_year_end_month)
 values ('22222222-2222-2222-2222-222222222222',
         '11111111-1111-1111-1111-111111111111',
-        'Pentex, LLC', 'Pentex, LLC', 12);
+        'Demo Furniture Co, LLC', 'Demo Furniture Co, LLC', 12);
 
 insert into location (id, entity_id, code, name, state) values
   ('33333333-0000-0000-0000-000000000001','22222222-2222-2222-2222-222222222222','ENL','Enola','PA'),

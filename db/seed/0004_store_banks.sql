@@ -23,17 +23,17 @@ insert into bank_account (tenant_id, entity_id, location_id, name, purpose, bank
 values
   ('11111111-1111-1111-1111-111111111111','22222222-2222-2222-2222-222222222222',
    '33333333-0000-0000-0000-000000000001','Enola deposits','deposit','First Valley Bank',
-   '4021','2210','vault://pentex/enola-deposit',
+   '4021','2210','vault://demo/enola-deposit',
    (select id from gl_account where tenant_id='11111111-1111-1111-1111-111111111111' and code='1010'),
    false, false, true, true, '2019-04-01'),
   ('11111111-1111-1111-1111-111111111111','22222222-2222-2222-2222-222222222222',
    '33333333-0000-0000-0000-000000000002','Palestine deposits','deposit','Pineywoods State Bank',
-   '1177','8043','vault://pentex/palestine-deposit',
+   '1177','8043','vault://demo/palestine-deposit',
    (select id from gl_account where tenant_id='11111111-1111-1111-1111-111111111111' and code='1010'),
    false, false, true, true, '2021-06-14'),
   ('11111111-1111-1111-1111-111111111111','22222222-2222-2222-2222-222222222222',
    '33333333-0000-0000-0000-000000000003','Socorro deposits','deposit','Rio Commerce Bank',
-   '6630','5512','vault://pentex/socorro-deposit',
+   '6630','5512','vault://demo/socorro-deposit',
    (select id from gl_account where tenant_id='11111111-1111-1111-1111-111111111111' and code='1010'),
    false, false, true, true, '2026-02-02');
 

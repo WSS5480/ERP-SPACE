@@ -31,7 +31,7 @@ import pg from "pg";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
-const LOCK = 7_406_311; // any constant; identifies "pentex-erp migrations"
+const LOCK = 7_406_311; // any constant; identifies "erp migrations"
 
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 

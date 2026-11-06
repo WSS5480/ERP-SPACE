@@ -1,4 +1,4 @@
-// Pentex ERP -- the app. Every figure comes from /api; every piece of data is
+// ERP -- the app. Every figure comes from /api; every piece of data is
 // placed with textContent. Nothing here decides a rule: the server and the
 // engine behind it refuse what is not allowed, and this page shows why.
 (() => {
@@ -127,8 +127,8 @@ function friendly(e) {
   return sentence(e && e.message ? e.message : String(e));
 }
 async function api(path, opts = {}) {
-  const headers = { 'x-pentex-erp': '1' };
-  if (S.person) headers['x-pentex-as'] = S.person.id;
+  const headers = { 'x-erp-page': '1' };
+  if (S.person) headers['x-erp-as'] = S.person.id;
   let body = opts.body;
   if (body !== undefined && !(body instanceof Blob)) { headers['content-type'] = 'application/json'; body = JSON.stringify(body); }
   const res = await fetch(path, { method: opts.method || 'GET', credentials: 'same-origin', cache: 'no-store', headers, body });
@@ -1855,7 +1855,7 @@ function sampleWeek(target, accounts) {
   const days = lastWeekdays(5);
   const next = parseDay(days[days.length - 1]); next.setDate(next.getDate() + 1);
   const fileDay = isoDay(next);
-  const recs = [`01,FIRSTVALLEY,PENTEX,${yymmdd(fileDay)},0600,${yymmdd(fileDay)}01,,,2/`];
+  const recs = [`01,FIRSTVALLEY,DEMOCO,${yymmdd(fileDay)},0600,${yymmdd(fileDay)}01,,,2/`];
   let open = cents(rng(`${target.account_last4}|${days[0]}|open`), 150000, 210000), fileTotal = 0;
   for (const day of days) {
     const r = rng(`${target.account_last4}|${day}|upload`); const dow = parseDay(day).getDay(); const lines = [];
@@ -1868,7 +1868,7 @@ function sampleWeek(target, accounts) {
     const close = open + net; const acct = [`03,000000${target.account_last4},USD,010,${open},,,015,${close},,/`]; let control = open + close;
     lines.forEach((l, i) => { acct.push(`16,${l[0]},${l[1]},0,U${yymmdd(day)}${String(i + 1).padStart(2, '0')},,${l[2]}/`); if (l[3]) acct.push(`88,${l[3]}/`); control += l[1]; });
     acct.push(`49,${control},${acct.length + 1}/`);
-    const group = [`02,PENTEX,FIRSTVALLEY,1,${yymmdd(day)},2400,USD,2/`, ...acct]; group.push(`98,${control},1,${group.length + 1}/`);
+    const group = [`02,DEMOCO,FIRSTVALLEY,1,${yymmdd(day)},2400,USD,2/`, ...acct]; group.push(`98,${control},1,${group.length + 1}/`);
     recs.push(...group); fileTotal += control; open = close;
   }
   recs.push(`99,${fileTotal},${days.length},${recs.length + 1}/`);
@@ -1939,7 +1939,7 @@ async function signIn(ev) {
   const go = $('#si-go');
   busy(go, true, 'Signing in…'); err.hidden = true;
   try {
-    const res = await fetch('/session', { method: 'POST', credentials: 'same-origin', headers: { 'x-pentex-erp': '1', 'content-type': 'application/json' }, body: JSON.stringify({ name, key }) });
+    const res = await fetch('/session', { method: 'POST', credentials: 'same-origin', headers: { 'x-erp-page': '1', 'content-type': 'application/json' }, body: JSON.stringify({ name, key }) });
     const body = await res.json().catch(() => null);
     if (!res.ok) throw new Error((body && body.error) || `The service answered ${res.status}`);
     $('#si-key').value = '';
@@ -1949,7 +1949,7 @@ async function signIn(ev) {
   finally { busy(go, false); }
 }
 async function signOut() {
-  try { await fetch('/session/end', { method: 'POST', credentials: 'same-origin', headers: { 'x-pentex-erp': '1' } }); } catch (_) { /* gone anyway */ }
+  try { await fetch('/session/end', { method: 'POST', credentials: 'same-origin', headers: { 'x-erp-page': '1' } }); } catch (_) { /* gone anyway */ }
   S.me = null; S.co = null;
   showSignIn('Signed out.');
 }
