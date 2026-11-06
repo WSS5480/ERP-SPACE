@@ -152,7 +152,10 @@ export async function run(t0: T) {
   // reserve the seeded delivery orders, as POS would
   await t.as(P.STEVE, async (c) => { for (let k = 1; k <= 9; k++) await reserveOrder(c, ENTITY, SO(k)); });
   const queue = await get("/fleet/queue", P.RAY);
-  t.ok("the delivery queue lists the reserved delivery orders, each in a zone", queue.length === 9 && queue.every((o: any) => o.zone_id), `${queue.length} orders`);
+  { // other modules' demo data may add delivery orders of their own; these nine are fleet's
+    const mine = new Set(Array.from({ length: 9 }, (_, k) => SO(k + 1)));
+    const ours = queue.filter((o: any) => mine.has(o.id ?? o.sales_order_id));
+    t.ok("the delivery queue lists the reserved delivery orders, each in a zone", ours.length === 9 && ours.every((o: any) => o.zone_id), `${ours.length} of ${queue.length} orders`); }
 
   // the first Wednesday or Saturday after today: every seeded zone delivers then
   const today = (await one<{ d: string }>(`select (now() at time zone 'America/New_York')::date::text d /* unscoped: clock */`)).d;
