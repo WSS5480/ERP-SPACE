@@ -10,11 +10,12 @@ import { InventoryError } from "../../packages/core/inventory.ts";
 import { PostingError } from "../../packages/core/posting.ts";
 import { PricingError, priceConfigured, type Choice } from "../../packages/core/pricing.ts";
 import { ArError } from "../../packages/core/ar.ts";
+import { ShopError } from "../../packages/core/shop.ts";
 
 const ID = "([0-9a-fA-F-]{36})";
 
 export function refusal(e: unknown): unknown {
-  if (e instanceof pos.PosError || e instanceof InventoryError || e instanceof PostingError || e instanceof PricingError || e instanceof ArError)
+  if (e instanceof pos.PosError || e instanceof InventoryError || e instanceof PostingError || e instanceof PricingError || e instanceof ArError || e instanceof ShopError)
     return new ModuleError(e.message);
   return e;
 }
@@ -235,7 +236,7 @@ export const module: ErpModule = {
     }));
     coPost(`/pos/orders/${ID}/fulfil`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, [...TILL, "sales", "warehouse"], "handing goods over");
-      return pos.fulfilAtCounter(c, sc(co, a), m[2], (Array.isArray(b.lineIds) ? b.lineIds : []).map(uuid).filter(Boolean) as string[]);
+      return pos.fulfilAtCounter(c, sc(co, a), m[2], (Array.isArray(b.lineIds) ? b.lineIds : []).map(uuid).filter(Boolean) as string[], { sessionId: uuid(b.sessionId) });
     }));
     coPost(`/pos/orders/${ID}/cancel`, safe(async (c, co, a, b, m) => {
       const st = await q<{ status: string }>(c, `select status from sales_order where id = $1 and entity_id = $2`, [m[2], co.id]);

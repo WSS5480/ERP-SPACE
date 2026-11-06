@@ -747,9 +747,8 @@ export async function createTransfer(c: Client, scope: Scope, e: { fromId: strin
   const number = await nextNo(c, scope.entityId, "transfer", "TR-");
   const t = await one<{ id: string }>(c, `insert into inv_transfer (entity_id, number, from_location_id, to_location_id, note, created_by)
     values ($1,$2,$3,$4,$5,$6) returning id`, [scope.entityId, number, e.fromId, e.toId, e.note ?? null, scope.actor.id || null]);
-  for (const l of e.lines) {
-    if (l.salesOrderLineId) {
-      const sl = await lineOf(c, scope.entityId, l.salesOrderLineId);
+  const addCustomerLine = async (lineId: string) => {
+      const sl = await lineOf(c, scope.entityId, lineId);
       need(sl.product_id, "that order line has no product to move");
       need(["reserved", "ready"].includes(sl.line_status), `${sl.number}'s line is ${sl.line_status.replace("_", " ")}; only reserved goods move for a customer`);
       need(sl.fulfil_from_id === e.fromId, `${sl.number}'s goods are not reserved at the origin`);
@@ -759,21 +758,49 @@ export async function createTransfer(c: Client, scope: Scope, e: { fromId: strin
       if (p.serialized) need(units.length === Number(sl.qty), `${sl.number}: ${units.length} of ${Number(sl.qty)} pieces are allocated; allocate them before moving the order`);
       await c.query(`insert into inv_transfer_line (entity_id, transfer_id, product_id, qty, unit_ids, cost_minor, sales_order_line_id) values ($1,$2,$3,$4,$5,0,$6)`,
         [scope.entityId, t.id, p.id, sl.qty, units, sl.id]);
-      continue;
-    }
+      return Number(sl.qty);
+  };
+  for (const l of e.lines) {
+    if (l.salesOrderLineId) { await addCustomerLine(l.salesOrderLineId); continue; }
     const p = await productOf(c, scope.entityId, l.productId ?? "");
-    need(Number(l.qty) > 0, "transfer a positive quantity");
-    need(!p.serialized || Number.isInteger(Number(l.qty)), `${p.name} moves in whole units`);
+    let want = Number(l.qty);
+    need(want > 0, "transfer a positive quantity");
+    need(!p.serialized || Number.isInteger(want), `${p.name} moves in whole units`);
     let units: string[] = [];
     if (l.labels?.length) {
       need(p.serialized, `${p.name} is not tracked by label`);
-      const r = await q<{ unit_id: string }>(c, `select distinct unit_id from inv_piece where entity_id = $1 and product_id = $2 and label = any($3)`,
-        [scope.entityId, p.id, l.labels]);
-      units = r.map((x) => x.unit_id);
-      need(units.length === Number(l.qty), `the labels name ${units.length} unit${units.length === 1 ? "" : "s"} of ${p.name}, not ${l.qty}`);
+      const r = await q<{ unit_id: string; line_id: string | null; status: string; number: string | null }>(c, `
+        select distinct pc.unit_id, pc.sales_order_line_id line_id, pc.status, so.number from inv_piece pc
+          left join sales_order_line sl on sl.id = pc.sales_order_line_id left join sales_order so on so.id = sl.sales_order_id
+         where pc.entity_id = $1 and pc.product_id = $2 and upper(pc.label) = any($3)`, [scope.entityId, p.id, l.labels.map((x) => x.toUpperCase())]);
+      need(new Set(r.map((x) => x.unit_id)).size === want, `the labels name ${new Set(r.map((x) => x.unit_id)).size} unit${r.length === 1 ? "" : "s"} of ${p.name}, not ${want}`);
+      // Pieces reserved for a customer travel as that customer's order line, reservation and all.
+      const byLine = new Map<string, string[]>();
+      for (const x of r) if (x.line_id && ["reserved", "picked"].includes(x.status)) byLine.set(x.line_id, [...(byLine.get(x.line_id) ?? []), x.unit_id]);
+      for (const [lineId, us] of byLine) {
+        const sl = await lineOf(c, scope.entityId, lineId);
+        need(us.length === Number(sl.qty), `those labels are part of ${sl.number}'s order; move its whole line`);
+        want -= await addCustomerLine(lineId);
+      }
+      units = r.filter((x) => !(x.line_id && byLine.has(x.line_id))).map((x) => x.unit_id);
+    } else {
+      // Not enough free stock here? A customer's goods reserved here for pickup at the destination are what is moving.
+      const free = (await level(c, scope.entityId, p.id, e.fromId)).available;
+      if (free < want) {
+        const cust = await q<{ id: string; qty: string }>(c, `
+          select l.id, l.qty from sales_order_line l join sales_order so on so.id = l.sales_order_id
+            left join pos_line pl on pl.sales_order_line_id = l.id and pl.entity_id = l.entity_id
+           where l.entity_id = $1 and l.product_id = $2 and l.fulfil_from_id = $3 and so.location_id = $4 and l.line_status in ('reserved','ready')
+             and coalesce(pl.fulfillment, so.fulfillment) in ('pickup','carry') order by so.ordered_at, l.seq`, [scope.entityId, p.id, e.fromId, e.toId]);
+        for (const sl of cust) {
+          if (want - Math.max(free, 0) <= 0) break;
+          if (Number(sl.qty) > want) continue;
+          want -= await addCustomerLine(sl.id);
+        }
+      }
     }
-    await c.query(`insert into inv_transfer_line (entity_id, transfer_id, product_id, qty, unit_ids, cost_minor) values ($1,$2,$3,$4,$5,0)`,
-      [scope.entityId, t.id, p.id, l.qty, units]);
+    if (want > 0) await c.query(`insert into inv_transfer_line (entity_id, transfer_id, product_id, qty, unit_ids, cost_minor) values ($1,$2,$3,$4,$5,0)`,
+      [scope.entityId, t.id, p.id, want, units]);
   }
   return { id: t.id, number };
 }

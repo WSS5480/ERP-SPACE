@@ -345,7 +345,7 @@
     const d = openDialog(`Hand over from ${o.number}`, 'Pickup at the counter');
     const picked = new Set(lines.map((l) => l.id));
     const out = outBox();
-    const b = el('button', { class: 'btn primary', type: 'button', onclick: () => run(b, out, () => post(`/pos/orders/${o.id}/fulfil`, { lineIds: [...picked] }),
+    const b = el('button', { class: 'btn primary', type: 'button', onclick: () => run(b, out, () => post(`/pos/orders/${o.id}/fulfil`, { lineIds: [...picked], sessionId: getSess() }),
       (r) => `${plural(r.handedOver, 'line')} handed over.`, async () => { await after(); d.close(); E.render(); }) }, 'Hand them over');
     d.body.append(el('div', { class: 'panel' }, lines.map((l) => item({ pick: el('input', { type: 'checkbox', checked: true, 'aria-label': l.description,
       onchange: (e) => { if (e.target.checked) picked.add(l.id); else picked.delete(l.id); } }), title: l.description, detail: `${Number(l.qty)} · ${words(l.line_status)}` }))),

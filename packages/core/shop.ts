@@ -663,6 +663,8 @@ export interface PaymentProvider {
   authorize(a: { amountMinor: bigint; token: string; reference: string }): Promise<AuthResult>;
   capture(authRef: string, amountMinor: bigint): Promise<void>;
   void(authRef: string): Promise<void>;
+  /** Give money back on a captured charge (a return); the processor's refund reference comes back. */
+  refund(authRef: string, amountMinor: bigint): Promise<{ refundRef: string }>;
 }
 
 /** Approves test tokens like tok_test_visa_4242; tok_test_decline is declined. Nothing real is charged. */
@@ -678,6 +680,16 @@ export const TestProvider: PaymentProvider = {
   },
   async capture() { /* the test processor captures instantly */ },
   async void() { /* nothing was charged */ },
+  async refund(_authRef, amountMinor) {
+    if (amountMinor <= 0n) throw new ShopError("There is nothing to refund.");
+    return { refundRef: `test_refund_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}` };
+  },
+};
+
+/** The processor a past payment went through, by the name recorded on it (POS refunds web orders this way). */
+export const providerNamed = (name: string): PaymentProvider => {
+  if (name === "test") return TestProvider;
+  throw new ShopError(`The ${name} card processor is not set up here.`);
 };
 
 export const providerFor = (site: Site): PaymentProvider => {
