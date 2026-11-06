@@ -13,7 +13,7 @@
 import { pool, tx } from "../packages/core/db.ts";
 import { ingest, loadConnection } from "../packages/core/connections.ts";
 import "../packages/core/statements.ts";
-import { runConnection, liveEnv, type FeedEnv } from "../packages/core/vendor_feeds.ts";
+import { runFeed, feedDue, liveEnv, type FeedEnv } from "../packages/core/vendor_feeds.ts";
 
 /** Does a five-field cron expression match this minute (UTC)? */
 export function cronMatches(expr: string, d: Date): boolean {
@@ -50,22 +50,26 @@ export function isDue(expr: string, since: Date | null, now: Date): boolean {
 }
 
 /**
- * Vendor connections (catalog, availability and freight pulls) keep their own
- * schedules too. Each due one runs in its own transaction as the scheduler;
- * a failure is recorded on that connection and its run log, never thrown.
+ * Vendor feeds (products, prices, quantities, freight, photos,
+ * acknowledgments) keep their own schedules: a cron, or every N hours. Each
+ * due feed runs in its own transaction as the scheduler; a failure is
+ * recorded on that feed and its run log, never thrown, and never stops the
+ * vendor's other feeds.
  */
-export async function runDueVendorConnections(now: Date, env: FeedEnv = liveEnv(), only?: { entityId: string }) {
-  const rows = await pool.query<{ id: string; name: string; entity_id: string; tenant_id: string; schedule_cron: string; last_run_at: Date | null }>(
-    `select k.id, k.name, k.entity_id, e.tenant_id, k.schedule_cron, k.last_run_at
-       from vendor_connection k join entity e on e.id = k.entity_id
-      where k.active and k.kind = 'api' and k.schedule_cron is not null and ($1::uuid is null or k.entity_id = $1)
-      /* unscoped: the scheduler walks every company's connections */`, [only?.entityId ?? null]);
+export async function runDueVendorFeeds(now: Date, env: FeedEnv = liveEnv(), only?: { entityId: string }) {
+  const rows = await pool.query<{ id: string; name: string; entity_id: string; tenant_id: string; schedule_cron: string | null; every_hours: number | null; last_run_at: Date | null }>(
+    `select f.id, f.name, f.entity_id, e.tenant_id, f.schedule_cron, f.every_hours, f.last_run_at
+       from vendor_feed f join entity e on e.id = f.entity_id
+      where f.active and f.kind = 'api' and f.purpose <> 'orders' and (f.schedule_cron is not null or f.every_hours is not null)
+        and ($1::uuid is null or f.entity_id = $1)
+      order by f.entity_id, f.vendor_id, array_position(array['products','pricing','images','quantities','freight','acknowledgments'], f.purpose)
+      /* unscoped: the scheduler walks every company's feeds */`, [only?.entityId ?? null]);
   const out: { name: string; ok: boolean; note: string }[] = [];
   for (const row of rows.rows) {
-    if (!isDue(row.schedule_cron, row.last_run_at, now)) continue;
+    if (!feedDue(row, now, isDue)) continue;
     try {
       const r = await tx({ kind: "system", label: "scheduler" }, (cl) =>
-        runConnection(cl, { tenantId: row.tenant_id, entityId: row.entity_id, actor: { kind: "system", label: "scheduler" } }, row.id, env, "schedule"));
+        runFeed(cl, { tenantId: row.tenant_id, entityId: row.entity_id, actor: { kind: "system", label: "scheduler" } }, row.id, env, "schedule"));
       out.push({ name: row.name, ok: r.ok, note: r.note });
     } catch (e) {
       out.push({ name: row.name, ok: false, note: (e as Error).message });
@@ -73,6 +77,8 @@ export async function runDueVendorConnections(now: Date, env: FeedEnv = liveEnv(
   }
   return { due: out.length, of: rows.rows.length, runs: out };
 }
+/** The name the earlier scheduler used. */
+export const runDueVendorConnections = runDueVendorFeeds;
 
 async function main() {
   const now = new Date();
@@ -100,9 +106,9 @@ async function main() {
     }
   }
   console.log(`${ran} of ${due.rows.length} scheduled connections were due`);
-  const vendors = await runDueVendorConnections(now);
+  const vendors = await runDueVendorFeeds(now);
   for (const r of vendors.runs) console.log(`${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
-  console.log(`${vendors.due} of ${vendors.of} scheduled vendor connections were due`);
+  console.log(`${vendors.due} of ${vendors.of} scheduled vendor feeds were due`);
   await pool.end();
 }
 

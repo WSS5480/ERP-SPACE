@@ -262,7 +262,10 @@ async function vendors(c: Client, co: Company) {
     select v.id, coalesce(v.dba, v.legal_name) as name, vp.order_email, vp.account_no, vp.sku_prefix, coalesce(vp.lead_days, 30) lead_days,
            coalesce(vp.freight_min_minor, 0) freight_min_minor, coalesce(vp.freight_min_qty, 0) freight_min_qty, vp.notes,
            (select count(*) from product p where p.entity_id = ve.entity_id and p.vendor_id = v.id) products,
-           (select max(created_at) from catalog_import_run r where r.entity_id = ve.entity_id and r.vendor_id = v.id) last_import
+           (select max(created_at) from catalog_import_run r where r.entity_id = ve.entity_id and r.vendor_id = v.id) last_import,
+           (select count(*) from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id) feeds,
+           (select count(*) from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id and f.active and f.last_ok = false) feeds_failing,
+           (select max(last_run_at) from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id) feeds_last_run
       from vendor_entity ve join vendor v on v.id = ve.vendor_id
       left join vendor_profile vp on vp.entity_id = ve.entity_id and vp.vendor_id = v.id
      where ve.entity_id = $1 and ve.status = 'active' order by 2`, [co.id]);
@@ -429,34 +432,86 @@ export const module: ErpModule = {
       return { ok: true };
     });
 
-    // ---- vendor connections: API pulls of catalog, availability and freight
-    coGet("/catalog/connections", async (c, co) => {
-      const conns = await q(c, `
-        select k.id, k.vendor_id, coalesce(v.dba, v.legal_name) vendor, k.kind, k.adapter, k.name, k.config, k.credential_ref, k.schedule_cron,
-               k.mapping, k.active, k.last_run_at, k.last_ok, k.last_note, k.consecutive_failures,
-               (select count(*) from vendor_availability a where a.entity_id = k.entity_id and a.vendor_id = k.vendor_id) availability_rows,
-               (select max(as_of) from vendor_availability a where a.entity_id = k.entity_id and a.vendor_id = k.vendor_id) availability_as_of
-          from vendor_connection k join vendor v on v.id = k.vendor_id where k.entity_id = $1 order by 3, k.kind`, [co.id]);
-      return { connections: conns.map((k) => ({ ...k, credential_set: !!(k.credential_ref && feedEnv().secret(String(k.credential_ref))),
-        credential_env: k.credential_ref ? feeds.secretEnvName(String(k.credential_ref)) : null })), fields: cat.IMPORT_FIELDS };
+    // ---- vendor API setup: per-purpose feeds
+    const feedOut = async (c: Client, co: Company, f: Record<string, unknown>) => ({
+      ...f,
+      body_template: f.body_template ?? (f.template === "ashley_atp" ? feeds.ASHLEY_ATP_TEMPLATE : null),
+      secrets: await feeds.secretStatus(c, co.id, String(f.id)),
+      credential_env: f.credential_ref ? feeds.secretEnvName(String(f.credential_ref)) : null,
+      credential_set: !!(f.credential_ref && feedEnv().secret(String(f.credential_ref))),
+      running: !!f.running,
+      transport_note: f.kind === "sftp" ? "SFTP pulls are not built in this version yet; these settings are kept for when they are."
+        : f.kind === "email" ? "Email-in is not built in this version yet; these settings are kept for when it is." : null,
     });
-    coGet(`/catalog/connections/${ID}/runs`, async (c, co, _u, m) => ({
-      runs: await q(c, `select r.id, r.trigger, r.started_at, r.finished_at, r.outcome, r.rows, r.atp_rows, r.freight_rows, r.note, r.import_run_id, u.name run_by
+    coGet(`/catalog/vendors/${ID}/feeds`, async (c, co, _u, m) => {
+      const v = (await q<{ id: string; name: string }>(c, `select v.id, coalesce(v.dba, v.legal_name) as name from vendor_entity ve join vendor v on v.id = ve.vendor_id
+                                                           where ve.entity_id = $1 and ve.vendor_id = $2`, [co.id, m[2]]))[0];
+      if (!v) return null;
+      const rows = await q(c, `select f.*, exists (select 1 from vendor_feed_run r where r.entity_id = f.entity_id and r.feed_id = f.id and r.finished_at is null) running
+                                 from vendor_feed f where f.entity_id = $1 and f.vendor_id = $2 order by array_position(array['products','pricing','quantities','freight','images','orders','acknowledgments'], f.purpose), f.name`, [co.id, m[2]]);
+      const out = [];
+      for (const r of rows) out.push(await feedOut(c, co, r));
+      const locations = await q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' order by kind <> 'warehouse', name`, [co.id]);
+      return { vendor: v, feeds: out, locations, photos: await feeds.photoTally(c, co.id, m[2]), secretKeySet: !!feedEnv().secretKey,
+        purposes: feeds.PURPOSES, fields: feeds.PURPOSE_FIELDS, templates: [["ashley", "Ashley (products, prices, ATP quantities, freight, orders)"],
+          ["generic_json", "Generic REST / JSON"], ["csv_https", "CSV over HTTPS"], ["blank", "Blank"]] };
+    });
+    coGet(`/catalog/vendors/${ID}/feed-templates`, async (c, co, url, m) => {
+      const v = (await q<{ name: string }>(c, `select coalesce(v.dba, v.legal_name) as name from vendor_entity ve join vendor v on v.id = ve.vendor_id
+                                               where ve.entity_id = $1 and ve.vendor_id = $2`, [co.id, m[2]]))[0];
+      if (!v) return null;
+      return { drafts: feeds.feedTemplates(str(url.searchParams.get("template"), 20) || "blank", v.name).map((d) => ({ ...d, vendor_id: m[2] })) };
+    });
+    coGet(`/catalog/feeds/${ID}/runs`, async (c, co, _u, m) => ({
+      runs: await q(c, `select r.id, r.trigger, r.started_at, r.finished_at, r.outcome, r.rows, r.added, r.changed, r.note, r.import_run_id, u.name run_by
                           from vendor_feed_run r left join app_user u on u.id = r.run_by
-                         where r.entity_id = $1 and r.connection_id = $2 order by r.started_at desc limit 30`, [co.id, m[2]]),
+                         where r.entity_id = $1 and r.feed_id = $2 order by r.started_at desc limit 30`, [co.id, m[2]]),
     }));
-    coPost("/catalog/connections", async (c, co, a, b) => {
-      await requireRole(c, co, a, EDIT, "connecting a vendor");
-      const v = uuid(b.vendorId); need(v, "pick the vendor");
-      const mapping: Record<string, string> = {};
-      for (const [k, val] of Object.entries((b.mapping ?? {}) as Record<string, unknown>)) if (typeof val === "string" && val) mapping[k] = val;
-      return { id: await refuse(() => feeds.saveConnection(c, sc(co, a), { vendorId: v!, kind: str(b.kind, 10), adapter: str(b.adapter, 20) || "generic",
-        name: str(b.name, 120), config: (b.config && typeof b.config === "object" ? b.config : {}) as Record<string, unknown>,
-        credentialRef: str(b.credentialRef, 120) || null, scheduleCron: str(b.scheduleCron, 60) || null, mapping, active: b.active !== false })) };
+    const draftIn = (b: Record<string, unknown>): feeds.FeedDraft & { secrets?: Record<string, string | null> } => {
+      const d = (b.feed && typeof b.feed === "object" ? b.feed : b) as Record<string, unknown>;
+      const out: Record<string, unknown> = { ...d };
+      out.id = uuid(d.id); out.vendor_id = uuid(d.vendor_id ?? d.vendorId) ?? "";
+      out.secrets_from_feed_id = uuid(d.secrets_from_feed_id);
+      if (b.secrets && typeof b.secrets === "object") {
+        const sec: Record<string, string | null> = {};
+        for (const [k, val] of Object.entries(b.secrets as Record<string, unknown>)) sec[k] = val === null ? null : String(val ?? "");
+        out.secrets = sec;
+      }
+      return out as feeds.FeedDraft & { secrets?: Record<string, string | null> };
+    };
+    coPost("/catalog/feeds", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "setting up a vendor API");
+      return { id: await refuse(() => feeds.saveFeed(c, sc(co, a), draftIn(b), feedEnv())) };
     });
-    coPost(`/catalog/connections/${ID}/run`, async (c, co, a, _b, m) => {
-      await requireRole(c, co, a, EDIT, "pulling a vendor feed");
-      return refuse(() => feeds.runConnection(c, sc(co, a), m[2], feedEnv(), "manual"));
+    coPost("/catalog/feeds/test", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "testing a vendor API");
+      return refuse(() => feeds.testFeed(c, sc(co, a), feedEnv(), draftIn(b)));
+    });
+    coPost(`/catalog/feeds/${ID}/run`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, EDIT, "running a vendor feed");
+      return refuse(() => feeds.runFeed(c, sc(co, a), m[2], feedEnv(), "manual"));
+    });
+    coPost(`/catalog/feeds/${ID}/stop`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, EDIT, "stopping a vendor feed");
+      return refuse(() => feeds.requestStop(c, sc(co, a), m[2]));
+    });
+    coPost(`/catalog/feeds/${ID}/secrets`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "changing a feed's keys");
+      const sec: Record<string, string | null> = {};
+      for (const [k, val] of Object.entries(b)) sec[k] = val === null ? null : String(val ?? "");
+      await refuse(() => feeds.setFeedSecrets(c, sc(co, a), feedEnv(), m[2], sec));
+      return { secrets: await feeds.secretStatus(c, co.id, m[2]) };
+    });
+    // One-time hand-over from CATALOG-APP: its saved source (feed settings, keys, mapping) becomes this vendor's feeds.
+    coPost("/vendor-api/import/catalog-app", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "bringing vendor API settings over from the catalog app");
+      const source = (b.source && typeof b.source === "object" ? b.source : null) as feeds.CatalogAppSource | null;
+      need(source, "send the catalog app's source as { source: { name, vendor_label, mapping, feed } }");
+      return refuse(() => feeds.importCatalogAppSource(c, sc(co, a), feedEnv(), { vendorId: uuid(b.vendorId), vendorName: str(b.vendorName, 200) || null, source: source! }));
+    });
+    coPost(`/catalog/vendors/${ID}/host-photos`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, EDIT, "hosting a vendor's photos");
+      return refuse(() => feeds.hostPhotos(c, sc(co, a), m[2], { ...feedEnv(), imageFetch }));
     });
 
     // ---- vendor feed import: columns -> preview -> apply

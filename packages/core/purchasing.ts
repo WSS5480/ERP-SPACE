@@ -12,7 +12,7 @@ import { addOnOrder } from "./inventory.ts";
 import { priceConfigured, PricingError, type Choice } from "./pricing.ts";
 import { profitObjectFor } from "./posting.ts";
 import { parseCsv, csvCell } from "./catalog.ts";
-import { credentialsOf, authHeaders, type FeedEnv } from "./vendor_feeds.ts";
+import { orderFeedRequest, call, FeedError, type FeedEnv } from "./vendor_feeds.ts";
 
 export class PurchasingError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new PurchasingError(msg); };
@@ -619,34 +619,41 @@ export async function sendPO(c: Client, s: Scope, poId: string, method: SendMeth
       return log("failed", file.orderEmail, `the mail service refused it: ${((e as Error).message || "").slice(0, 160)}`);
     }
   }
-  // api: the vendor's order service, through the vendor's connection
-  const conn = (await q<{ adapter: string; config: Record<string, unknown>; credential_ref: string | null }>(c,
-    `select adapter, config, credential_ref from vendor_connection where entity_id = $1 and vendor_id = $2 and kind = 'api' and active`, [s.entityId, po.vendor_id]))[0];
-  if (!conn) return log("failed", null, "this vendor has no API connection; send by email or file");
-  const url = String(conn.config.poUrl ?? "");
-  if (!/^https?:\/\//i.test(url)) return log("failed", null, "the vendor's connection has no order service address (poUrl)");
+  // api: the vendor's order service, through the vendor's order feed (Vendors → API setup)
+  let req;
+  try { req = await orderFeedRequest(c, s.entityId, env, po.vendor_id); }
+  catch (e) { if (e instanceof FeedError) return log("failed", null, e.message); throw e; }
+  if (!req) return log("failed", null, "this vendor has no order feed; add one under Catalog, Vendors, API setup, or send by email or file");
+  const url = req.url;
   const lines = await q<{ seq: number; vendor_sku: string | null; qty: string; unit: string; config: Record<string, { vendorCode?: string }[]>; agreement_ref: string | null; expected_on: string | null }>(c, `
     select pol.seq, pol.vendor_sku, (pol.quantity - pol.cancelled_qty)::text qty, pol.unit_price_minor::text unit, pol.config, pol.agreement_ref, pol.expected_on::text
       from purchase_order_line pol where pol.entity_id = $1 and pol.purchase_order_id = $2 and pol.quantity > pol.cancelled_qty order by pol.seq`, [s.entityId, poId]);
+  const opts = req.feed.options ?? {};
   const hdr = (await q<{ ordered_on: string; expected_on: string | null; code: string; ship_to: string | null }>(c, `
     select po.ordered_on::text, po.expected_on::text, l.code, $3::jsonb ->> l.id::text ship_to
       from purchase_order po join location l on l.id = po.ship_to_location_id where po.id = $1 and po.entity_id = $2`,
-    [poId, s.entityId, JSON.stringify(conn.config.shipTos ?? {})]))[0];
+    [poId, s.entityId, JSON.stringify(opts.shipTos ?? {})]))[0];
   const body = {
-    purchaseOrderNumber: po.number, orderDate: hdr.ordered_on, requestedDate: hdr.expected_on, customer: conn.config.customer ?? null,
+    purchaseOrderNumber: po.number, orderDate: hdr.ordered_on, requestedDate: hdr.expected_on, customer: opts.customer ?? null,
     shipTo: hdr.ship_to ?? hdr.code, orderType: po.kind === "special" ? "SpecialOrder" : "Stock",
     lines: lines.map((l) => ({ lineNumber: l.seq, sku: l.vendor_sku, quantity: Number(l.qty), unitCost: Number(l.unit) / 100,
       options: Object.values(l.config ?? {}).flat().map((o) => o?.vendorCode).filter(Boolean), customerOrder: l.agreement_ref })),
   };
+  const shown = req.mask(url);
   try {
-    const headers = { ...(await authHeaders(env, conn.config, credentialsOf(env, conn.credential_ref))), "content-type": "application/json" };
-    const r = await env.fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
-    const text = await r.text();
-    if (r.status !== 200 && r.status !== 201 && r.status !== 202) return log("failed", url, `the vendor's order service answered ${r.status}${text ? `: ${text.slice(0, 160)}` : ""}`);
+    const r = await call(env, url, { method: "POST", headers: { ...req.headers, "content-type": "application/json" }, body: JSON.stringify(body) },
+      req.feed.timeout_ms, "the vendor's order service", 1);
+    if (r.status !== 200 && r.status !== 201 && r.status !== 202) return log("failed", shown, `the vendor's order service answered ${r.status}${r.text ? `: ${req.mask(r.text.slice(0, 160))}` : ""}`);
     let ref: string | null = null;
-    try { const j = JSON.parse(text) as Record<string, unknown>; ref = String(j.orderNumber ?? j.confirmationNumber ?? j.id ?? "") || null; } catch { /* no body */ }
-    return log("sent", url, `accepted by the vendor${ref ? ` as ${ref}` : ""}`, ref);
+    try {
+      const j = JSON.parse(r.text) as Record<string, unknown>;
+      const path = req.feed.mapping?.vendor_ref;
+      const at = path ? path.split(".").reduce<unknown>((o, k) => (o && typeof o === "object" ? (o as Record<string, unknown>)[k] : undefined), j) : undefined;
+      ref = String(at ?? j.orderNumber ?? j.confirmationNumber ?? j.id ?? "") || null;
+    } catch { /* no body */ }
+    return log("sent", shown, `accepted by the vendor${ref ? ` as ${ref}` : ""}`, ref);
   } catch (e) {
-    return log("failed", url, `could not reach the vendor's order service: ${((e as Error).message || "").slice(0, 160)}`);
+    if (!(e instanceof FeedError)) throw e;
+    return log("failed", shown, req.mask(e.message));
   }
 }

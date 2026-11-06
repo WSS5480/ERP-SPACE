@@ -195,9 +195,10 @@ type Existing = {
 const DIFF_KEYS = ["name", "cost_minor", "price_minor", "map_minor", "msrp_minor", "brand", "category", "subcategory", "collection",
   "color", "description", "barcode", "cubic_ft", "weight_lb", "image_url", "pieces", "status"] as const;
 
-function diff(cur: Existing, f: Fields): Record<string, [unknown, unknown]> {
+function diff(cur: Existing, f: Fields, keep: string[] = []): Record<string, [unknown, unknown]> {
   const ch: Record<string, [unknown, unknown]> = {};
   for (const k of DIFF_KEYS) {
+    if (keep.includes(k)) continue;      // owned by another feed (a vendor's pricing feed owns cost, MAP and MSRP)
     const nv = (f as Record<string, unknown>)[k];
     if (nv == null) continue;
     let ov: unknown = (cur as Record<string, unknown>)[k];
@@ -234,7 +235,13 @@ const skuPrefix = (v: { name: string; sku_prefix: string | null }) =>
  * Read a vendor file against a mapping and record what building it would do,
  * row by row. Nothing in the catalog changes until the run is applied.
  */
-export async function previewImport(c: Client, s: Scope, a: { vendorId: string; csv: string; filename?: string; mapping: Record<string, string> }) {
+/**
+ * keep: fields this import must not change on products already on file (a
+ * pricing feed owns cost, MAP and MSRP). costOptional: new products may
+ * arrive without a cost, as drafts, because another feed brings it.
+ */
+export async function previewImport(c: Client, s: Scope, a: { vendorId: string; csv: string; filename?: string; mapping: Record<string, string>;
+  keep?: string[]; costOptional?: boolean }) {
   const vendor = await vendorOf(c, s.entityId, a.vendorId);
   const rows = parseCsv(a.csv);
   need(rows.length >= 2, "the file has no rows under its heading line");
@@ -248,15 +255,19 @@ export async function previewImport(c: Client, s: Scope, a: { vendorId: string; 
     need(idx.has(h), `the file has no column called ${h}`);
     mapping[f.name] = h;
   }
-  const miss = missingRequired(mapping);
+  const miss = missingRequired(mapping).filter((f) => !(a.costOptional && f === "cost"));
   need(!miss.length, `pick a column for ${miss.join(", ")} before previewing`);
+  const keep = (a.keep ?? []).filter((k) => ["cost_minor", "map_minor", "msrp_minor", "price_minor"].includes(k));
+  const stored: Record<string, string> = { ...mapping };
+  if (keep.length) stored._keep = keep.join(",");
+  if (a.costOptional) stored._costOptional = "1";
 
   const existing = new Map((await q<Existing & { vendor_sku: string }>(c, EXISTING_SQL, [s.entityId, a.vendorId]))
     .map((e) => [String(e.vendor_sku).toUpperCase(), e]));
   const run = await one<{ id: string }>(c, `
     insert into catalog_import_run (entity_id, vendor_id, filename, mapping, created_by)
     values ($1,$2,$3,$4,$5) returning id`,
-    [s.entityId, a.vendorId, (a.filename ?? "").slice(0, 200) || null, JSON.stringify(mapping), s.actor.id || null]);
+    [s.entityId, a.vendorId, (a.filename ?? "").slice(0, 200) || null, JSON.stringify(stored), s.actor.id || null]);
 
   const seen = new Map<string, number>();
   const counts = { add: 0, change: 0, same: 0, skip: 0 };
@@ -271,11 +282,11 @@ export async function previewImport(c: Client, s: Scope, a: { vendorId: string; 
       const cur = existing.get(fields.vendor_sku);
       if (cur) {
         productId = cur.id;
-        changes = diff(cur, fields);
+        changes = diff(cur, fields, keep);
         action = Object.keys(changes).length ? "change" : "same";
       } else {
         need(fields.name, "a new product needs a name");
-        need(fields.cost_minor != null, "a new product needs a cost");
+        need(fields.cost_minor != null || a.costOptional, "a new product needs a cost");
         action = "add";
         if (fields.price_minor == null || fields.price_minor === "0") message = "arrives as a draft: no retail price in the file";
       }
@@ -298,9 +309,10 @@ export async function previewImport(c: Client, s: Scope, a: { vendorId: string; 
 
 /** Build a previewed run: upsert by vendor and model number, against the catalog as it is now. */
 export async function applyImport(c: Client, s: Scope, runId: string) {
-  const run = (await q<{ id: string; vendor_id: string; status: string }>(c,
-    `select id, vendor_id, status from catalog_import_run where id = $1 and entity_id = $2 for update`, [runId, s.entityId]))[0];
+  const run = (await q<{ id: string; vendor_id: string; status: string; mapping: Record<string, string> }>(c,
+    `select id, vendor_id, status, mapping from catalog_import_run where id = $1 and entity_id = $2 for update`, [runId, s.entityId]))[0];
   need(run, "no such import");
+  const keep = String(run.mapping?._keep ?? "").split(",").filter(Boolean);
   need(run.status === "previewed", `that import is already ${run.status}`);
   const vendor = await vendorOf(c, s.entityId, run.vendor_id);
   const prefix = skuPrefix(vendor);
@@ -317,7 +329,7 @@ export async function applyImport(c: Client, s: Scope, runId: string) {
     let productId: string | null = cur?.id ?? null, message: string | null = null;
     let changes: Record<string, [unknown, unknown]> = {};
     if (cur) {
-      changes = diff(cur, f);
+      changes = diff(cur, f, keep);
       action = Object.keys(changes).length ? "change" : "same";
       if (action === "change") await applyChanges(c, s.entityId, cur.id, changes);
     } else {
