@@ -76,7 +76,10 @@ import { WorkforceError } from "../packages/core/workforce.ts";
 const PORT = Number(process.env.PORT ?? 10000);
 const TOKEN = process.env.ERP_API_TOKEN ?? "";
 const EMAIL_TOKEN = process.env.ERP_EMAIL_INBOUND_TOKEN ?? "";
-const ENTITY = process.env.ERP_ENTITY_ID ?? "22222222-2222-2222-2222-222222222222";
+// The company the install-wide feed screens (connections, quarantine,
+// statement intake) open on: ERP_ENTITY_ID if set, otherwise the first
+// company created here -- never a hard-coded demo company.
+let ENTITY = (process.env.ERP_ENTITY_ID ?? "").trim();
 const TRIAL = process.env.ERP_SEED === "placeholder";
 const TRIAL_ENDS = process.env.ERP_TRIAL_ENDS ?? "";
 const VERSION = (process.env.RENDER_GIT_COMMIT ?? "").slice(0, 7) || "dev";
@@ -942,6 +945,10 @@ export async function start(): Promise<http.Server> {
   if (!APP || !APP_JS || !APP_CSS) console.warn("the app files are not all in server/; the root address will say so");
   const applied = await migrate({ seed: TRIAL });
   console.log(applied.length ? `migrations: applied ${applied.length}` : "migrations: up to date");
+  if (!ENTITY) {
+    const first = await pool.query<{ id: string }>("select id from entity where status = 'active' order by created_at, name limit 1");
+    ENTITY = first.rows[0]?.id ?? "00000000-0000-0000-0000-000000000000";
+  }
   if (TRIAL) {
     // Placeholder activity for the trial's placeholder company. Never allowed
     // to stop the service starting.

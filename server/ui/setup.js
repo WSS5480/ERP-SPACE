@@ -47,7 +47,8 @@
       title: `${l.name} (${l.code})`,
       detail: [KIND_LABEL[l.kind] || l.kind, [l.address && l.address.city, l.state].filter(Boolean).join(', '),
         l.kind === 'web' ? null : `tax ${pct(l.tax_rate_bps)}`, l.lat != null ? 'on the map' : 'no map point — routing cannot use it'].filter(Boolean).join(' · '),
-      badge: l.status === 'active' ? null : chip('neutral', 'pause', 'Closed'),
+      badge: l.status !== 'active' ? chip('neutral', 'pause', 'Closed')
+        : (['store', 'outlet'].includes(l.kind) && !Number(l.tax_rate_bps)) ? chip('warning', 'warn', 'No sales tax set') : null,
       acts: owner ? [el('button', { class: 'btn small', type: 'button', onclick: () => openLocation(l) }, 'Edit')] : null,
     })) : empty('No stores or warehouses yet.', null, true));
 
@@ -68,6 +69,8 @@
 
     return frag(
       head('Business setup', owner ? [el('button', { class: 'btn', type: 'button', onclick: () => openLocation(null) }, 'Add a store or warehouse')] : null, 'Setup'),
+      d.locations.some((l) => l.status === 'active' && ['store', 'outlet'].includes(l.kind) && !Number(l.tax_rate_bps))
+        ? E.resultBox('warning', 'warn', 'A store has no sales tax rate', 'Sales there are rung up with no tax until you set its rate. Edit the store below; a rate of 0% only belongs where no sales tax is due.') : null,
       el('p', { class: 'lead', text: last
         ? `Set up as ${(d.packs.find((p) => p.id === last.pack) || {}).name || last.pack} by ${last.applied_by}, ${ago(last.applied_at)}. Applying a setup only adds; it never removes an account, a setting you changed, or any data.`
         : 'Pick the kind of business this company is. That turns on the right modules and adds the accounts, pick lists and defaults they need. You can change any of it afterwards.' }),
