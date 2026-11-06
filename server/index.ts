@@ -64,7 +64,7 @@ import * as act from "./actions.ts";
 import { ActionError, type Actor } from "./actions.ts";
 import { loadSampleActivity } from "./sample.ts";
 import { MODULES } from "./modules/index.ts";
-import { ModuleError } from "./modules/kit.ts";
+import { ModuleError, PublicPage, PublicAsset } from "./modules/kit.ts";
 import { InventoryError } from "../packages/core/inventory.ts";
 import { ArError } from "../packages/core/ar.ts";
 import { PostingError } from "../packages/core/posting.ts";
@@ -445,7 +445,11 @@ const publicRoute = (method: "GET" | "POST", path: RegExp,
       if (req.headers["x-erp-shop"] !== "1") throw new HttpError(403, "this request did not come from the store's own page");
       body = await readJson(req);
     }
-    return fn(req, url, m, body);
+    const [s, out] = await fn(req, url, m, body);
+    // A page or asset goes out through the app's own responses, with every header and the CSP.
+    if (out instanceof PublicPage) return [s, new Html(out.text)];
+    if (out instanceof PublicAsset) return [s, new Asset(out.text, out.type)];
+    return [s, out];
   });
 for (const mod of MODULES) mod.register({ coGet, coPost, publicRoute });
 

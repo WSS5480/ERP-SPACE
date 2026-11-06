@@ -30,6 +30,23 @@ export type PublicRoute = (
   fn: (req: http.IncomingMessage, url: URL, m: RegExpMatchArray, body: Record<string, unknown>) => Promise<[number, unknown]>,
 ) => void;
 
+/**
+ * What a public handler returns instead of JSON when the store needs a page or
+ * a script. index.ts turns these into its own Html / Asset responses, so the
+ * same security headers and Content-Security-Policy apply (script-src 'self',
+ * a per-response style nonce that replaces __NONCE__ in the page).
+ */
+export class PublicPage {
+  text: string;
+  constructor(text: string) { this.text = text; }
+}
+/** A script or stylesheet for a public page. Only JavaScript and CSS are allowed. */
+export class PublicAsset {
+  text: string;
+  type: "text/javascript; charset=utf-8" | "text/css; charset=utf-8";
+  constructor(text: string, type: PublicAsset["type"]) { this.text = text; this.type = type; }
+}
+
 export type ModuleKit = {
   coGet: CoGet;
   coPost: CoPost;
