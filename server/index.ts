@@ -266,6 +266,26 @@ function noteSignInFailure(): void {
 }
 const signInThrottled = () => Date.now() - failWindow <= 10 * 60_000 && failCount >= 30;
 
+// Named developer logins: ERP_LOGINS="steve:5480,hunter:1234" in Render's
+// environment, never in the repository. Each is a name and its own key, and
+// a person signing in that way is recorded by that name. A short key is easy
+// to guess, so each login locks for 15 minutes after 5 wrong keys.
+const LOGINS = new Map<string, string>(
+  (process.env.ERP_LOGINS ?? "").split(",").map((x) => x.trim()).filter(Boolean).map((x) => {
+    const i = x.indexOf(":");
+    return [x.slice(0, i).trim().toLowerCase(), x.slice(i + 1).trim()] as [string, string];
+  }).filter(([n, k]) => n && k));
+const loginFails = new Map<string, { n: number; since: number }>();
+const loginLocked = (name: string) => {
+  const f = loginFails.get(name);
+  return !!f && f.n >= 5 && Date.now() - f.since < 15 * 60_000;
+};
+const noteLoginFailure = (name: string) => {
+  const f = loginFails.get(name);
+  if (!f || Date.now() - f.since >= 15 * 60_000) loginFails.set(name, { n: 1, since: Date.now() });
+  else f.n++;
+};
+
 // --------------------------------------------------------------------- page
 
 const readHere = (name: string): string | null => {
@@ -441,7 +461,18 @@ route("POST", /^\/session$/, "none", async (req) => {
   const key = String(body.key ?? "");
   const name = cleanName(body.name);
   if (!name) throw new HttpError(400, "put your name in, so what you do here is recorded against it");
-  if (!key || !safeEqual(key, TOKEN)) {
+  const login = name.toLowerCase();
+  if (LOGINS.has(login)) {
+    if (loginLocked(login)) throw new HttpError(429, "too many wrong keys for that name; wait 15 minutes and try again");
+    if (!key || !safeEqual(key, LOGINS.get(login)!)) {
+      noteLoginFailure(login);
+      noteSignInFailure();
+      await sleep(700);
+      console.log(`sign-in refused for ${login}`);
+      throw new HttpError(401, "that access key did not match");
+    }
+    loginFails.delete(login);
+  } else if (!key || !safeEqual(key, TOKEN)) {
     noteSignInFailure();
     await sleep(700);
     console.log("sign-in refused");

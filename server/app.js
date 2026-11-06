@@ -1925,7 +1925,7 @@ const RENDER = { home: screenHome, approvals: screenApprovals, payables: screenP
 // ================================================================ sign in
 function showSignIn(msg) {
   show('signin');
-  $('#si-msg').textContent = msg || 'Use the operator access key.';
+  $('#si-msg').textContent = msg || 'Sign in with your name and your access key.';
   $('#si-err').hidden = true;
   for (const dl of document.querySelectorAll('dialog[open]')) dl.close();
   ($('#si-name').value ? $('#si-key') : $('#si-name')).focus();
