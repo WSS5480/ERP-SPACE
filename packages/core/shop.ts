@@ -428,6 +428,16 @@ async function priceLines(c: Client, site: Site, lines: LineIn[], locs: Map<stri
   return out;
 }
 
+/** Furniture a protection plan can cover: stocked or made-to-order pieces that are delivered. */
+const coverable = (p: { kind: string; shipClass: string }) => ["stock", "configurable", "special_order"].includes(p.kind) && p.shipClass === "delivery";
+export const WARRANTY_ALONE = "A protection plan is sold with the furniture it covers. Add the furniture, or remove the plan (one plan per piece).";
+/** Protection plans only ride along with furniture in the same cart, no more plans than pieces. */
+function warrantyCovered(lines: { kind: string; shipClass: string; qty: number }[]): void {
+  const plans = lines.filter((l) => l.kind === "warranty").reduce((a, l) => a + l.qty, 0);
+  const pieces = lines.filter(coverable).reduce((a, l) => a + l.qty, 0);
+  need(plans <= pieces, WARRANTY_ALONE);
+}
+
 const pubLine = (p: Priced) => ({
   productId: p.productId, sku: p.sku, name: p.name, description: p.description, kind: p.kind, shipClass: p.shipClass,
   qty: p.qty, unitPriceMinor: p.unitPriceMinor.toString(), lineMinor: (p.unitPriceMinor * BigInt(p.qty)).toString(),
@@ -455,6 +465,14 @@ export async function saveCart(c: Client, site: Site, cartId: string, rawLines: 
       if (!SHOP_REFUSALS.some((K) => e instanceof K)) throw e;
       problems.push({ productId: l.productId, error: (e as Error).message });
     }
+  }
+  // Plans beyond the furniture they cover come back as a problem, so checkout cannot be reached with them.
+  let room = out.filter(coverable).reduce((a, l) => a + l.qty, 0);
+  for (let i = 0; i < out.length; i++) {
+    if (out[i].kind !== "warranty") continue;
+    if (out[i].qty <= room) { room -= out[i].qty; continue; }
+    problems.push({ productId: out[i].productId, error: WARRANTY_ALONE });
+    out.splice(i--, 1);
   }
   const sub = out.reduce((a, l) => a + BigInt(l.lineMinor), 0n);
   const em = typeof email === "string" && EMAIL.test(email.trim()) ? email.trim().toLowerCase() : null;
@@ -496,16 +514,25 @@ function luhn(d: string): boolean {
   return sum % 10 === 0;
 }
 
-/** Anything that looks like a card number anywhere in a request is refused outright. */
-export function refuseCardNumbers(v: unknown, depth = 0): void {
-  if (depth > 6) return;
-  if (typeof v === "string") {
-    const text = v.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, " ");
-    for (const m of text.match(/\d(?:[ -]?\d){12,18}/g) ?? []) {
-      need(!luhn(m.replace(/[^0-9]/g, "")), "Card numbers are never sent to the store. Use the card form to pay.");
-    }
-  } else if (Array.isArray(v)) v.forEach((x) => refuseCardNumbers(x, depth + 1));
-  else if (v && typeof v === "object") Object.values(v).forEach((x) => refuseCardNumbers(x, depth + 1));
+/**
+ * A card number pasted into a free-text field: 13 to 19 digits (spaces or
+ * dashes allowed between them), starting 3, 4, 5 or 6, and Luhn-valid. Only
+ * free text is looked at -- never emails, phones, ids or option codes, where
+ * a long digit run is something else (a timestamp in an email, a SKU).
+ */
+export function looksLikeCard(text: string): boolean {
+  for (const m of text.match(/(?<![\d])\d(?:[ -]?\d){12,18}(?![\d])/g) ?? []) {
+    const d = m.replace(/[^0-9]/g, "");
+    if (d.length >= 13 && d.length <= 19 && /^[3-6]/.test(d) && luhn(d)) return true;
+  }
+  return false;
+}
+/** The free-text fields of a checkout where a card number could be pasted. */
+export function refuseCardNumbers(b: Record<string, unknown>): void {
+  const a = (b.address ?? {}) as Record<string, unknown>;
+  for (const v of [b.notes, b.name, a.line1, a.line2, a.city]) {
+    need(!(typeof v === "string" && looksLikeCard(v)), "Card numbers are never sent to the store. Use the card form to pay.");
+  }
 }
 
 export function parseCheckout(b: Record<string, unknown>, quoteOnly = false): CheckoutIn {
@@ -559,6 +586,7 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn): Promise<Built
   if (inp.fulfillment === "pickup") need(inp.pickupLocationId && site.pickup_location_ids.includes(inp.pickupLocationId) && locs.has(inp.pickupLocationId),
     "Choose one of the store's pickup locations.");
   const priced = await priceLines(c, site, inp.lines, locs);
+  warrantyCovered(priced);
   if (inp.fulfillment === "ship") {
     const bulky = priced.find((p) => !["parcel", "carry", "none"].includes(p.shipClass));
     need(!bulky, `${bulky?.name ?? "An item"} is too large to ship by parcel. Choose delivery or pickup.`);

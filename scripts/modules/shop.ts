@@ -19,6 +19,7 @@ const SOFA = "77777777-0000-0000-0000-000000000001";
 const PILLOW = "77777777-0000-0000-0000-000000000040";
 const NIGHTSTAND = "77777777-0000-0000-0000-000000000041";   // seeded unpublished
 const FEE = "77777777-0000-0000-0000-000000000011";
+const PLAN = "77777777-0000-0000-0000-000000000012";   // 5-year protection plan (warranty)
 const DC = "33333333-0000-0000-0000-0000000000dc";
 const WEBADMIN = "55555555-0000-0000-0000-000000000019";
 const SALES = "55555555-0000-0000-0000-000000000011";
@@ -159,11 +160,37 @@ export async function run(t: T) {
     await c.query(`update product set status = 'draft' where id = $1 and entity_id = $2`, [SOFA, ENTITY]);
     return shop.placeWebOrder(c, site, checkout({ lines: [{ productId: SOFA, qty: 1 }] }), scope);
   }), /no longer sold online/);
-  await t.throws("a card number anywhere in the request is refused", async () => shop.parseCheckout({ ...checkout({}), notes: "my card 4111 1111 1111 1111" } as never), /Card numbers are never sent/);
-  t.ok("ids that look numeric are not mistaken for card numbers", (() => { try { shop.refuseCardNumbers({ id: HUDSON, phone: "7175550142" }); return true; } catch { return false; } })());
+  await t.throws("a card number pasted into checkout notes is refused", async () => shop.parseCheckout({ ...checkout({}), cartId: "x-card-0001", lines: [{ productId: LAMP, qty: 1 }], notes: "my card 4111 1111 1111 1111" } as never), /Card numbers are never sent/);
+  for (const [label, body] of [
+    ["a card number in the street address", { address: { line1: "4242-4242-4242-4242", city: "Camp Hill" } }],
+    ["a card number in the name", { name: "Pat 5555555555554444" }],
+    ["an Amex number in the notes", { notes: "use 3782 822463 10005" }],
+  ] as const) {
+    t.ok(`${label} is refused`, (() => { try { shop.refuseCardNumbers(body as Record<string, unknown>); return false; } catch (e) { return /Card numbers/.test((e as Error).message); } })());
+  }
+  for (const [label, body] of [
+    ["a 13-digit timestamp in an email", { email: "buyer1730918400123@example.com", notes: "ref 1730918400123" }],
+    ["a Luhn-valid card-shaped run inside an email", { email: "x4111111111111111@example.com" }],
+    ["phone numbers and ids", { phone: "+1 717 555 0142 0000", productId: HUDSON, cartId: "4111111111111111" }],
+    ["a digit run that fails Luhn", { notes: "4111 1111 1111 1112" }],
+    ["a long number with no card prefix", { notes: "PO 7992739871300000" }],
+  ] as const) {
+    t.ok(`${label} is not mistaken for a card number`, (() => { try { shop.refuseCardNumbers(body as Record<string, unknown>); return true; } catch { return false; } })());
+  }
+  const tsBuyer = await inTx((c) => shop.placeWebOrder(c, site, checkout({ cartId: "checks-ts-0001", email: "buyer.4111111111111111@example.com" }), scope));
+  t.ok("a checkout whose email holds a long number goes through", !tsBuyer.duplicate && !!tsBuyer.order.number);
+
+  // protection plans ride along with furniture only
+  await t.throws("a protection plan cannot be bought on its own", () => inTx((c) => shop.placeWebOrder(c, site, checkout({ lines: [{ productId: PLAN, qty: 1 }] }), scope)), /sold with the furniture/);
+  await t.throws("a protection plan does not cover a lamp", () => inTx((c) => shop.placeWebOrder(c, site, checkout({ lines: [{ productId: LAMP, qty: 1 }, { productId: PLAN, qty: 1 }] }), scope)), /sold with the furniture/);
+  await t.throws("no more plans than pieces they cover", () => inTx((c) => shop.placeWebOrder(c, site, checkout({ lines: [{ productId: SOFA, qty: 1 }, { productId: PLAN, qty: 2 }] }), scope)), /sold with the furniture/);
+  const withPlan = await inTx((c) => shop.placeWebOrder(c, site, checkout({ cartId: "checks-plan-001", lines: [{ productId: SOFA, qty: 2 }, { productId: PLAN, qty: 2 }] }), scope));
+  t.ok("a plan bought with the furniture it covers goes through", withPlan.order.lines.some((l) => /protection/i.test(l.description)));
+  const planCart = await inTx((c) => shop.saveCart(c, site, "plan-cart-0001", [{ productId: PLAN, qty: 1 }]));
+  t.ok("a cart with a plan and no furniture shows the plan as a problem", planCart.lines.length === 0 && planCart.problems[0]?.error === shop.WARRANTY_ALONE);
   await t.throws("a sofa cannot ship by parcel", () => inTx((c) => shop.placeWebOrder(c, site, checkout({ fulfillment: "ship", lines: [{ productId: SOFA, qty: 1 }] }), scope)), /too large to ship/);
   await t.throws("pickup must be at one of the site's stores", () => inTx((c) => shop.placeWebOrder(c, site, checkout({ fulfillment: "pickup", pickupLocationId: DC }), scope)), /pickup locations/);
-  t.ok("refused checkouts leave no order behind", (await countOrders()) === before);
+  t.ok("refused checkouts leave no order behind", (await countOrders()) === before + 2);   // + the long-number email and the plan-with-sofa orders
 
   // ------------------------------------------------- pickup, parcel, free delivery
   const pickup = await inTx((c) => shop.placeWebOrder(c, site, checkout({ fulfillment: "pickup", pickupLocationId: LOC.PALESTINE, lines: [{ productId: LAMP, qty: 1 }] }), scope));
