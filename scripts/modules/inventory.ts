@@ -4,6 +4,7 @@
 import type { T } from "./harness.ts";
 import { ENTITY, RIO_ENTITY, LOC, PEOPLE } from "./harness.ts";
 import { tx, pool, q, type Client, type Scope } from "../../packages/core/db.ts";
+export { tx };
 import * as inv from "../../packages/core/inventory.ts";
 import { module } from "../../server/modules/inventory.ts";
 import type { Company, Actor } from "../../server/modules/kit.ts";
@@ -84,6 +85,10 @@ export async function run(t: T) {
          or s.held <> (select count(distinct unit_id) from inv_piece x where x.entity_id = s.entity_id and x.product_id = s.product_id
                          and x.location_id = s.location_id and x.status = any($3)))`, [ENTITY, inv.ON_HAND, inv.HELD]);
     t.ok(`pieces match stock_level ${what}`, bad[0].n === "0", `${bad[0].n} product/location rows disagree`);
+    // And stock at cost ties to the ledger: valuation (+ in transit) = GL 1300 (+ 1310), quantity costed = quantity on hand.
+    const tie = await inv.tieOut(c0, ENTITY);
+    t.ok(`tie-out: stock at cost equals GL 1300 + 1310 ${what}`, tie.ties && tie.quantityOutOfStep.length === 0,
+      `stock ${tie.stockMinor} + transit ${tie.inTransitMinor} vs 1300 ${tie.gl1300Minor} + 1310 ${tie.gl1310Minor}; ${tie.quantityOutOfStep.length} out of step`);
   };
   const glBalanced = async (what: string) => {
     const r = await read<{ n: string }>(`select count(*) n from (select je.id from journal_entry je join journal_line jl on jl.journal_entry_id = je.id
@@ -132,9 +137,19 @@ export async function run(t: T) {
     t.ok("receiving: a unit that arrives damaged opens a damage record", dmgRcv[0].n === "1");
     const inRcv = await read<{ n: string }>(`select count(*) n from inv_piece where entity_id = $1 and label = any($2) and bin_id = $3`, [ENTITY, r1.lines[0].labels, BIN.RCV]);
     t.ok("receiving: good pieces land in the dock's receiving bin", Number(inRcv[0].n) >= 2);
+    const jeR1 = await lastJe(r1.receiptId);
+    t.ok("receiving: posts Dr 1300 Cr 2050 received-not-invoiced at PO cost", sideOf(jeR1, "1300") === 115500n && sideOf(jeR1, "2050") === -115500n);
     await consistent("after a partial receipt");
+    // Purchasing spread $50 of freight over the 10 mattresses: each lands at $5 more.
+    const hasLanded = (await read<{ n: string }>(`select count(*) n from information_schema.columns where table_name = 'purchase_order_line' and column_name = 'landed_minor' /* unscoped: schema */`))[0].n === "1";
+    if (hasLanded) await tx({ kind: "system", label: "test" }, (c) => c.query(`update purchase_order_line set landed_minor = 5000 where id = $1 /* unscoped: test fixture on a seeded PO line */`, [POL.MAT]));
+    const mat0 = (await read<{ qty: string; value_minor: string }>(`select qty, value_minor from inv_cost where entity_id = $1 and product_id = $2`, [ENTITY, P.MATTRESS]))[0];
     const r2 = await R.post(t, DEE, "/inventory/receiving", { purchaseOrderId: PO, locationId: DC,
-      lines: [{ poLineId: POL.SOFA, qty: 3 }, { poLineId: POL.BED, qty: 4 }, { poLineId: POL.MAT, qty: 10 }] }) as { poStatus: string };
+      lines: [{ poLineId: POL.SOFA, qty: 3 }, { poLineId: POL.BED, qty: 4 }, { poLineId: POL.MAT, qty: 10 }] }) as { poStatus: string; receiptId: string; valueMinor: bigint };
+    const matUnit = hasLanded ? 36500n : 36000n;
+    t.ok("receiving: landed cost is part of what the goods cost", BigInt(r2.valueMinor) === 3n * 38500n + 4n * 26000n + 10n * matUnit, String(r2.valueMinor));
+    const mat1 = (await read<{ qty: string; value_minor: string }>(`select qty, value_minor from inv_cost where entity_id = $1 and product_id = $2`, [ENTITY, P.MATTRESS]))[0];
+    t.ok("average cost: the mattress pool takes 10 more at the landed cost", Number(mat1.qty) === Number(mat0.qty) + 10 && BigInt(mat1.value_minor) === BigInt(mat0.value_minor) + 10n * matUnit);
     t.ok("receiving: the last of every line closes the PO", r2.poStatus === "received");
     await t.throws("receiving: a received PO takes nothing more", () => R.post(t, DEE, "/inventory/receiving",
       { purchaseOrderId: PO, locationId: DC, lines: [{ poLineId: POL.SOFA, qty: 1 }] }), /is received, not open/);
@@ -207,12 +222,25 @@ export async function run(t: T) {
     await R.post(t, DEE, `/inventory/pieces/${label}/load`);
     const s2 = await inv.scan(c0, ENTITY, label);
     t.ok("scan: pick then load moves the piece along and logs both", s2.piece.status === "loaded" && s2.history.filter((h) => ["pick", "load"].includes(h.kind)).length === 2);
-    await asPerson(PEOPLE.STEVE, (c) => inv.fulfilLines(c, ENTITY, order.id, [order.line]));
+    const pool0 = (await read<{ v: string }>(`select value_minor::text v from inv_cost where entity_id = $1 and product_id = $2`, [ENTITY, P.DRESSER]))[0].v;
+    const ful = await asPerson(PEOPLE.STEVE, (c) => inv.fulfilLines(c, ENTITY, order.id, [order.line]));
+    const pool1 = (await read<{ v: string }>(`select value_minor::text v from inv_cost where entity_id = $1 and product_id = $2`, [ENTITY, P.DRESSER]))[0].v;
+    t.ok("fulfil: the cost handed to COGS is exactly what the stock's value loses", ful.costMinor === BigInt(pool0) - BigInt(pool1) && ful.costMinor === 24000n, String(ful.costMinor));
+    // fulfilLines leaves posting to A/R; post its cost here the way invoiceFulfilment does, so the books keep tying.
+    await asPerson(PEOPLE.STEVE, async (c, co, a) => { const { post } = await import("../../packages/core/posting.ts");
+      await post(c, { tenantId: co.tenantId, entityId: ENTITY, actor: { kind: "user", id: a.personId, label: a.label } }, { date: new Date().toISOString().slice(0, 10),
+        sourceType: "sale", sourceId: order.id, description: "test COGS", lines: [{ code: "5000", debit: ful.costMinor }, { code: "1300", credit: ful.costMinor }] }); });
     const dr1 = await level(P.DRESSER, DC);
     const s3 = await inv.scan(c0, ENTITY, label);
     t.ok("fulfil: on hand and reserved both down one, the piece delivered", dr1.onHand === dr0.onHand - 1 && dr1.reserved === dr0.reserved - 1 && s3.piece.status === "delivered");
     await consistent("after delivery");
-    await asPerson(PEOPLE.STEVE, (c) => inv.restock(c, ENTITY, P.DRESSER, DC, 1, { lineIds: [order.line], binId: BIN.A011 }));
+    await asPerson(PEOPLE.STEVE, async (c, co, a) => {
+      const unit = await inv.unitCost(c, ENTITY, P.DRESSER);
+      await inv.restock(c, ENTITY, P.DRESSER, DC, 1, { lineIds: [order.line], binId: BIN.A011, unitCostMinor: unit });
+      const { post } = await import("../../packages/core/posting.ts");   // the caller (POS) posts the goods back at the same cost
+      await post(c, { tenantId: co.tenantId, entityId: ENTITY, actor: { kind: "user", id: a.personId, label: a.label } }, { date: new Date().toISOString().slice(0, 10),
+        sourceType: "refund", sourceId: order.id, description: "test return at cost", lines: [{ code: "1300", debit: unit }, { code: "5000", credit: unit }] });
+    });
     const s4 = await inv.scan(c0, ENTITY, label);
     t.ok("restock: the same labelled piece comes back to stock", s4.piece.status === "in_stock" && s4.piece.bin === "A-01-1");
     t.ok("restock: on hand back up", (await level(P.DRESSER, DC)).onHand === dr0.onHand);
@@ -310,8 +338,28 @@ export async function run(t: T) {
 
     // ---------------------------------------------------------------- valuation
     const val = await R.get(t, "/inventory/valuation") as { totalMinor: bigint };
-    const direct = await read<{ v: string }>(`select sum(round(s.on_hand * p.cost_minor))::bigint::text v from stock_level s join product p on p.id = s.product_id where s.entity_id = $1`, [ENTITY]);
-    t.ok("valuation: by location and category adds up to on hand at cost", BigInt(val.totalMinor) === BigInt(direct[0].v));
+    const direct = await read<{ v: string }>(`select sum(value_minor)::text v from inv_cost where entity_id = $1`, [ENTITY]);
+    t.ok("valuation: the total is the average-cost pool", BigInt(val.totalMinor) === BigInt(direct[0].v));
+    const tieRoute = await R.get(t, "/inventory/tie-out") as { ties: boolean };
+    t.ok("tie-out: the endpoint says it ties", tieRoute.ties === true);
+    const ov = await R.get(t, "/inventory/overview") as { tie: { ties: boolean } };
+    t.ok("tie-out: the warehouse screen's tile has it", ov.tie.ties === true);
+
+    // ------------------------------------------------------------ back orders
+    const bo = await asPerson(PEOPLE.STEVE, async (c) => {
+      const so = (await t.q<{ id: string }>(c, `insert into sales_order (entity_id, number, channel, location_id, customer_id, status, fulfillment)
+        values ($1, 'INVTEST-BO', 'phone', $2, '88888888-0000-0000-0000-000000000002', 'open', 'pickup') returning id`, [ENTITY, LOC.ENOLA]))[0];
+      const ln = (await t.q<{ id: string }>(c, `insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, fulfil_from_id)
+        values ($1,$2,1,$3,'ACC-LAMP-01','Ceramic table lamp',40,5999,$4) returning id`, [ENTITY, so.id, P.LAMP, LOC.ENOLA]))[0];
+      await inv.reserveOrder(c, ENTITY, so.id);
+      return { id: so.id, line: ln.id };
+    });
+    const boStatus = async () => (await read<{ line_status: string }>(`select line_status from sales_order_line where entity_id = $1 and id = $2`, [ENTITY, bo.line]))[0].line_status;
+    t.ok("back order: more than the store has goes on order", (await boStatus()) === "on_order");
+    await R.post(t, MGR, "/inventory/adjustments", { locationId: LOC.ENOLA, productId: P.LAMP, qty: 40, reasonCode: "found", note: "Pallet found in the back room" });
+    const rc = await R.post(t, DEE, "/inventory/backorders/recheck") as { reserved: number };
+    t.ok("back order: re-checking picks it up once stock is there", rc.reserved >= 1 && (await boStatus()) === "reserved");
+    await consistent("after a back order is covered");
     await glBalanced("");
 
     // -------------------------------------------------------------- immutability

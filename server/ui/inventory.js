@@ -85,6 +85,8 @@
     return frag(
       tilesRow(
         tile({ label: 'Stock at cost', value: money(ov.valueMinor), ic: 'book', text: Number(ov.inTransitMinor) ? `${money(ov.inTransitMinor)} more in transit` : 'Nothing in transit' }),
+        tile({ label: 'Ties to the ledger', value: ov.tie.ties ? 'Yes' : money(ov.tie.differenceMinor), word: ov.tie.ties, tone: ov.tie.ties ? 'good' : 'critical', ic: ov.tie.ties ? 'ok' : 'fail',
+          text: `1300 ${money(ov.tie.gl1300Minor)}${Number(ov.tie.gl1310Minor) ? ` + 1310 ${money(ov.tie.gl1310Minor)}` : ''}`, onClick: () => openTie(ov.tie) }),
         tile({ label: 'Damage open', value: String(ov.openDamage), tone: ov.openDamage ? 'warning' : 'good', ic: ov.openDamage ? 'warn' : 'ok', text: 'Repair, claim or write off', onClick: () => go('inventory', 'damage') }),
         tile({ label: 'Counts to approve', value: String(ov.countsToApprove), tone: ov.countsToApprove ? 'warning' : 'good', ic: 'check', text: 'A manager who did not count', onClick: () => go('inventory', 'counts') }),
         tile({ label: 'Deliveries due', value: String(ov.receivingThisWeek), ic: 'clock', text: 'Booked at the dock this week', onClick: () => go('inventory', 'receive') })),
@@ -94,6 +96,16 @@
         byLoc.size ? [...byLoc.entries()].map(([name, x]) => item({ title: name, amount: money(x.value),
           detail: x.cats.map((c) => `${c.category} ${money(c.value_minor)}`).join(' · '), badge: el('span', { class: 'sub', text: `${qty(x.units)} units` }) }))
           : empty('No stock on hand.', null, true))));
+  }
+
+  function openTie(t) {
+    const d = openDialog('Inventory tie-out', 'Stock at cost against the ledger');
+    d.body.append(el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Stock at cost', money(t.stockMinor)), fact('In transit', money(t.inTransitMinor)),
+      fact('GL 1300 inventory', money(t.gl1300Minor)), fact('GL 1310 in transit', money(t.gl1310Minor)), fact('Difference', money(t.differenceMinor)),
+      fact('Ties', t.ties ? 'Yes' : 'No'))),
+      t.quantityOutOfStep.length ? section('Quantities out of step', 'cost pool vs stock on hand', null, el('div', { class: 'panel' },
+        t.quantityOutOfStep.map((x) => item({ title: x.sku, detail: `costed ${qty(x.pool)} · on hand ${qty(x.stock)}` })))) : null,
+      el('p', { class: 'sub', text: 'Receipts post Dr 1300 Cr 2050; sales, returns, transfers, counts and write-offs post the same value their stock moves at average cost.' }));
   }
 
   function openAtp(productId) {
@@ -273,7 +285,10 @@
     const out = outBox();
     const b = el('button', { class: 'btn primary', type: 'button', onclick: () => run(b, out, () => post('/inventory/receiving', { purchaseOrderId: po.po_id, locationId: loc.value,
       binId: bin.value || null, note: note.value, lines: rows.filter((x) => Number(x.n.value) > 0).map((x) => ({ poLineId: x.l.line_id, qty: x.n.value, damagedQty: x.dmg.value })) }),
-      (res) => `Received ${res.lines.reduce((a, x) => a + x.qty, 0)} units; ${res.lines.reduce((a, x) => a + x.labels.length, 0)} labels to print${res.poStatus === 'received' ? '. The PO is complete.' : '.'}`,
+      (res) => { const forOrders = res.lines.flatMap((x) => x.reservedFor || []);
+        return `Received ${res.lines.reduce((a, x) => a + x.qty, 0)} units at ${money(res.valueMinor)}; ${res.lines.reduce((a, x) => a + x.labels.length, 0)} labels to print${res.poStatus === 'received' ? '. The PO is complete.' : '.'}`
+          + (forOrders.length ? ` Reserved for customer order${forOrders.length > 1 ? 's' : ''} ${forOrders.join(', ')}.` : '')
+          + (res.backordersReserved ? ` ${plural(res.backordersReserved, 'back order')} now covered.` : ''); },
       (res) => { const labels = res.lines.flatMap((x) => x.labels); if (labels.length) out.append(el('div', { class: 'panel' }, item({ title: 'Labels', detail: labels.join(' ') }))); E.render(); }) }, 'Receive');
     d.body.append(el('div', { class: 'form-grid' }, field('Receiving at', loc), field('Put in', bin), field('Note', note, { wide: true })),
       el('div', { class: 'panel' }, rows.map((x) => x.node)), el('div', { class: 'dlg-acts' }, b, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Close')), out);
@@ -296,15 +311,19 @@
 
   // ------------------------------------------------------------ transfers
   async function transfersTab() {
-    const [list, L] = await Promise.all([coApi('/inventory/transfers'), layout()]);
-    return section('Transfers', 'ship, then receive at the other end', [el('button', { class: 'btn small primary', type: 'button', onclick: () => newTransfer(L) }, 'New transfer')],
-      el('div', { class: 'panel' }, list.length ? list.map((t) => item({ title: `${t.number} · ${t.from_name} → ${t.to_name}`, amount: money(t.value_minor), badge: statusChip(t.status),
+    const [list, L, toMove] = await Promise.all([coApi('/inventory/transfers'), layout(), coApi('/inventory/orders-to-move')]);
+    return frag(toMove.length ? section('Customer orders to send to their store', 'reserved here, picked up there', null, el('div', { class: 'panel' }, toMove.map((x) => item({
+      title: `${x.number}${x.customer ? ' · ' + x.customer : ''}`, detail: `${x.description} × ${qty(x.qty)} · at ${x.from_name}, picked up at ${x.to_name}`,
+      acts: [el('button', { class: 'btn small primary', type: 'button', onclick: (e) => run(e.currentTarget, null, () => post('/inventory/transfers',
+        { fromId: x.from_id, toId: x.to_id, lines: [{ salesOrderLineId: x.line_id }] }), (r) => `${r.number} drafted; ship it when the truck leaves.`, () => E.render()) }, `Transfer to ${x.to_name}`)] })))) : null,
+      section('Transfers', 'ship, then receive at the other end', [el('button', { class: 'btn small primary', type: 'button', onclick: () => newTransfer(L) }, 'New transfer')],
+      el('div', { class: 'panel' }, list.length ? list.map((t) => item({ title: `${t.number} · ${t.from_name} → ${t.to_name}`, amount: t.status === 'draft' ? null : money(t.value_minor), badge: statusChip(t.status),
         detail: (t.lines || []).map((l) => `${l.name} × ${qty(l.qty)}`).join(' · '),
         acts: t.status === 'draft' ? [
           el('button', { class: 'btn small primary', type: 'button', onclick: (e) => run(e.currentTarget, null, () => post(`/inventory/transfers/${t.id}/ship`), 'Shipped; the stock is in transit.', () => E.render()) }, 'Ship'),
           el('button', { class: 'btn small', type: 'button', onclick: (e) => run(e.currentTarget, null, () => post(`/inventory/transfers/${t.id}/cancel`), 'Cancelled.', () => E.render()) }, 'Cancel')]
           : t.status === 'in_transit' ? [el('button', { class: 'btn small primary', type: 'button', onclick: () => receiveTransfer(t, L) }, 'Receive')] : [] }))
-        : empty('No transfers.', null, true)));
+        : empty('No transfers.', null, true))));
   }
   function newTransfer(L) {
     const d = openDialog('New transfer', 'Stock moving between locations', { wide: true });

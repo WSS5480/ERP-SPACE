@@ -36,18 +36,17 @@ async function locations(c: Client, co: Company) {
 }
 
 async function overview(c: Client, co: Company) {
-  const [locs, val, dmg, counts, transfers, appts, pieces] = await Promise.all([
-    locations(c, co),
-    inv.valuation(c, co.id),
-    q<{ n: string }>(c, `select count(*) n from inv_damage where entity_id = $1 and status <> 'resolved'`, [co.id]),
-    q<{ n: string }>(c, `select count(*) n from inv_count where entity_id = $1 and status = 'submitted'`, [co.id]),
-    q<{ n: string }>(c, `select count(*) n from inv_transfer where entity_id = $1 and status = 'in_transit'`, [co.id]),
-    q<{ n: string }>(c, `select count(*) n from inv_receiving_appt where entity_id = $1 and status = 'booked' and day between current_date and current_date + 7`, [co.id]),
-    q<{ status: string; n: string }>(c, `select status, count(*) n from inv_piece where entity_id = $1 group by status`, [co.id]),
-  ]);
+  // One client: ask in turn.
+  const locs = await locations(c, co);
+  const val = await inv.valuation(c, co.id);
+  const dmg = await q<{ n: string }>(c, `select count(*) n from inv_damage where entity_id = $1 and status <> 'resolved'`, [co.id]);
+  const counts = await q<{ n: string }>(c, `select count(*) n from inv_count where entity_id = $1 and status = 'submitted'`, [co.id]);
+  const transfers = await q<{ n: string }>(c, `select count(*) n from inv_transfer where entity_id = $1 and status = 'in_transit'`, [co.id]);
+  const appts = await q<{ n: string }>(c, `select count(*) n from inv_receiving_appt where entity_id = $1 and status = 'booked' and day between current_date and current_date + 7`, [co.id]);
+  const pieces = await q<{ status: string; n: string }>(c, `select status, count(*) n from inv_piece where entity_id = $1 group by status`, [co.id]);
   return { locations: locs, valueMinor: val.totalMinor, inTransitMinor: val.inTransitMinor, openDamage: Number(dmg[0].n),
     countsToApprove: Number(counts[0].n), transfersInTransit: Number(transfers[0].n), receivingThisWeek: Number(appts[0].n),
-    pieces: Object.fromEntries(pieces.map((p) => [p.status, Number(p.n)])) };
+    pieces: Object.fromEntries(pieces.map((p) => [p.status, Number(p.n)])), tie: await inv.tieOut(c, co.id) };
 }
 
 async function layout(c: Client, co: Company) {
@@ -157,6 +156,18 @@ async function ordersToPick(c: Client, co: Company) {
      group by so.id, cu.name order by so.promised_on nulls last, so.number limit 100`, [co.id]);
 }
 
+/** Customer goods reserved somewhere other than the store they are picked up from: special orders received at the DC, mostly. */
+async function ordersToMove(c: Client, co: Company) {
+  return q(c, `
+    select l.id line_id, so.number, cu.name customer, l.description, l.qty::text, fl.name from_name, l.fulfil_from_id from_id, so.location_id to_id, tl.name to_name
+      from sales_order_line l join sales_order so on so.id = l.sales_order_id join location fl on fl.id = l.fulfil_from_id join location tl on tl.id = so.location_id
+      left join customer cu on cu.id = so.customer_id left join pos_line pl on pl.sales_order_line_id = l.id and pl.entity_id = l.entity_id
+     where l.entity_id = $1 and l.line_status = 'reserved' and l.fulfil_from_id <> so.location_id
+       and coalesce(pl.fulfillment, so.fulfillment) in ('pickup','carry') and so.status in ('open','fulfilling')
+       and not exists (select 1 from inv_transfer_line x join inv_transfer t on t.id = x.transfer_id where x.entity_id = l.entity_id and x.sales_order_line_id = l.id and t.status = 'draft')
+     order by so.ordered_at limit 50`, [co.id]);
+}
+
 async function moves(c: Client, co: Company, url: URL) {
   const pid = uuid(url.searchParams.get("productId"));
   return q(c, `select m.at, m.kind, m.qty::text, m.from_status, m.to_status, p.sku, p.name, pc.label, fl.name from_loc, tl.name to_loc,
@@ -177,9 +188,11 @@ export const module: ErpModule = {
     coGet("/inventory/stock", safe((c, co, url) => stock(c, co, url)));
     coGet(`/inventory/atp/${ID}`, safe((c, co, _u, m) => inv.availableToPromise(c, co.id, m[2])));
     coGet("/inventory/valuation", safe((c, co) => inv.valuation(c, co.id)));
+    coGet("/inventory/tie-out", safe((c, co) => inv.tieOut(c, co.id)));
     coGet(`/inventory/scan/${LABEL}`, safe((c, co, _u, m) => inv.scan(c, co.id, m[2])));
     coGet("/inventory/receiving", safe((c, co) => receiving(c, co)));
     coGet("/inventory/transfers", safe((c, co) => transfers(c, co)));
+    coGet("/inventory/orders-to-move", safe((c, co) => ordersToMove(c, co)));
     coGet("/inventory/damage", safe((c, co) => damage(c, co)));
     coGet("/inventory/counts", safe((c, co) => counts(c, co)));
     coGet(`/inventory/counts/${ID}`, safe((c, co, _u, m) => countDetail(c, co, m[2])));
@@ -245,7 +258,8 @@ export const module: ErpModule = {
     // ---- transfers
     coPost("/inventory/transfers", safe(async (c, co, a, b) => {
       await requireRole(c, co, a, WAREHOUSE, "starting a transfer");
-      const lines = (Array.isArray(b.lines) ? b.lines : []).map((l: Record<string, unknown>) => ({ productId: uuid(l.productId) ?? "", qty: num(l.qty), labels: labels(l.labels) }));
+      const lines = (Array.isArray(b.lines) ? b.lines : []).map((l: Record<string, unknown>) => ({ productId: uuid(l.productId) ?? "", qty: num(l.qty), labels: labels(l.labels),
+        salesOrderLineId: uuid(l.salesOrderLineId) }));
       return inv.createTransfer(c, sc(co, a), { fromId: uuid(b.fromId) ?? "", toId: uuid(b.toId) ?? "", lines, note: str(b.note) || undefined });
     }));
     coPost(`/inventory/transfers/${ID}/ship`, safe(async (c, co, a, _b, m) => {
@@ -260,6 +274,11 @@ export const module: ErpModule = {
       await requireRole(c, co, a, WAREHOUSE, "cancelling a transfer");
       await inv.cancelTransfer(c, sc(co, a), m[2]);
       return { ok: true };
+    }));
+
+    coPost("/inventory/backorders/recheck", safe(async (c, co, a) => {
+      await requireRole(c, co, a, [...WAREHOUSE, "sales", "buyer"], "re-checking back orders");
+      return inv.recheckBackorders(c, co.id, {});
     }));
 
     // ---- allocation and pick lists
