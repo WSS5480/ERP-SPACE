@@ -285,6 +285,24 @@ function errorBox(e, retry) {
   return el('div', { class: 'alert', role: 'alert' }, icon('fail'),
     el('div', {}, el('div', { text: friendly(e) }), retry ? el('button', { class: 'linkbtn', type: 'button', onclick: retry }, 'Try again') : null));
 }
+/**
+ * A screen that belongs to other roles is not an error: say whose it is and
+ * offer to switch who you are acting as, rather than a red failure box.
+ */
+function notYoursBox(e) {
+  const m = /^(.*?) needs one of: (.+?)\.?$/.exec(friendly(e));
+  if (!m) return null;
+  const row = SCREENS.find((r) => r[0] === S.route.screen);
+  const who = S.person ? S.person.name : 'nobody';
+  const theirs = S.person && S.person.roles.length ? ` (${roles(S.person.roles)})` : '';
+  return el('div', { class: 'block' }, el('div', { class: 'panel notyours' },
+    el('h2', { text: row ? row[1] : cap(m[1]) }),
+    el('p', { class: 'lead', text: `${cap(m[1])} is for: ${m[2]}.` }),
+    el('p', { text: `You're acting as ${who}${theirs}, who doesn't hold any of those roles in ${S.co.name}.` }),
+    el('div', { class: 'dlg-acts' },
+      el('button', { class: 'btn primary', type: 'button', onclick: openPersonPicker }, icon('user'), 'Switch who I\u2019m acting as'),
+      el('button', { class: 'btn', type: 'button', onclick: () => go('home') }, icon('home'), 'Home'))));
+}
 function trialBanner() {
   if (!S.me || !S.me.trial) return null;
   const ends = S.me.trialEnds ? ` Render deletes this database on ${fmtDate.format(parseDay(S.me.trialEnds))}.` : '';
@@ -306,11 +324,21 @@ const visibleScreens = () => SCREENS.filter((r) => !r[4] || !S.modules || S.modu
 function renderNav() {
   const cur = S.route.screen;
   const badge = (name) => (name === 'approvals' && badgeCount ? el('span', { class: 'badge', text: String(badgeCount), 'aria-label': `${badgeCount} waiting on you` }) : null);
-  const navKids = []; let lastGroup = null;
-  for (const [name, label, ic, group] of visibleScreens()) {
-    const g = group || 'Back office';
-    if (g !== lastGroup) { navKids.push(el('div', { class: 'nav-group', text: g })); lastGroup = g; }
-    navKids.push(el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null, 'aria-current': cur === name ? 'page' : null }, icon(ic), label, badge(name)));
+  // Each group once, in a fixed order; screens keep their registration order inside it.
+  const GROUP_ORDER = ['Back office', 'Retail', 'Operations', 'Setup'];
+  const byGroup = new Map();
+  for (const row of visibleScreens()) {
+    const g = row[3] || 'Back office';
+    if (!byGroup.has(g)) byGroup.set(g, []);
+    byGroup.get(g).push(row);
+  }
+  const groups = [...byGroup.keys()].sort((a, b) => (GROUP_ORDER.indexOf(a) + 1 || 99) - (GROUP_ORDER.indexOf(b) + 1 || 99));
+  const navKids = [];
+  for (const g of groups) {
+    navKids.push(el('div', { class: 'nav-group', text: g }));
+    for (const [name, label, ic] of byGroup.get(g)) {
+      navKids.push(el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null, 'aria-current': cur === name ? 'page' : null }, icon(ic), label, badge(name)));
+    }
   }
   $('#nav').replaceChildren(...navKids);
   $('#tabbar').replaceChildren(
@@ -414,7 +442,7 @@ async function render() {
       el('span', { text: 'Times are in your time zone' })));
   } catch (e) {
     if (e instanceof Stop || seq !== S.seq) return;
-    main.replaceChildren(errorBox(e, () => render()));
+    main.replaceChildren(notYoursBox(e) || errorBox(e, () => render()));
   }
   refreshBadge();
 }

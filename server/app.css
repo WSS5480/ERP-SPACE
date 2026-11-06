@@ -385,3 +385,6 @@ dialog.sheet{margin:auto auto 0;width:100%;max-width:520px;border-radius:16px 16
 .li.check-row{display:grid;grid-template-columns:auto 1fr;column-gap:12px;align-items:start;cursor:pointer}
 .li.check-row input{margin-top:3px}
 .li.check-row .d{grid-column:2}
+
+.panel.notyours{padding:22px 22px 18px;max-width:640px}
+.panel.notyours h2{margin:0 0 6px;font-size:19px}
