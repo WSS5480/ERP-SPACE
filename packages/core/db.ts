@@ -29,10 +29,18 @@ const ssl =
     ? { rejectUnauthorized: false }
     : undefined;
 
+// ERP_DB_SCHEMA lets the ERP live in its own schema inside a database it
+// shares with another app (Nov 2026: APPS-db, beside ServeTrack). Every
+// connection then sees only that schema first, and nothing here names a
+// schema, so the two apps' tables never meet.
+export const SCHEMA = (process.env.ERP_DB_SCHEMA ?? "").trim();
+if (SCHEMA && !/^[a-z_][a-z0-9_]{0,40}$/.test(SCHEMA)) throw new Error("ERP_DB_SCHEMA must be a plain lower-case name");
+const schemaOpt = SCHEMA ? { options: `-c search_path=${SCHEMA},public` } : {};
+
 export const pool = new pg.Pool(
   process.env.DATABASE_URL
-    ? { connectionString: process.env.DATABASE_URL, ssl, max: Number(process.env.PG_POOL_MAX ?? 5) }
-    : { ssl } // falls back to PGHOST / PGUSER / PGDATABASE
+    ? { connectionString: process.env.DATABASE_URL, ssl, max: Number(process.env.PG_POOL_MAX ?? 5), ...schemaOpt }
+    : { ssl, ...schemaOpt } // falls back to PGHOST / PGUSER / PGDATABASE
 );
 
 export type Client = pg.PoolClient;

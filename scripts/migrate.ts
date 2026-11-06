@@ -40,9 +40,11 @@ export function poolConfig(): pg.PoolConfig {
     process.env.PGSSLMODE === "require" || process.env.DATABASE_SSL === "require"
       ? { rejectUnauthorized: false }
       : undefined;
+  const schema = (process.env.ERP_DB_SCHEMA ?? "").trim();
+  const opt = schema ? { options: `-c search_path=${schema},public` } : {};
   return process.env.DATABASE_URL
-    ? { connectionString: process.env.DATABASE_URL, ssl }
-    : { ssl };
+    ? { connectionString: process.env.DATABASE_URL, ssl, ...opt }
+    : { ssl, ...opt };
 }
 
 export async function migrate(opts: { seed?: boolean; log?: (s: string) => void } = {}) {
@@ -53,6 +55,11 @@ export async function migrate(opts: { seed?: boolean; log?: (s: string) => void 
 
   try {
     await client.query("select pg_advisory_lock($1)", [LOCK]);
+    const schema = (process.env.ERP_DB_SCHEMA ?? "").trim();
+    if (schema) {
+      if (!/^[a-z_][a-z0-9_]{0,40}$/.test(schema)) throw new Error("ERP_DB_SCHEMA must be a plain lower-case name");
+      await client.query(`create schema if not exists ${schema}`);
+    }
 
     await client.query(`
       create table if not exists schema_migration (
