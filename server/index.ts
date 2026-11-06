@@ -65,6 +65,11 @@ import { ActionError, type Actor } from "./actions.ts";
 import { loadSampleActivity } from "./sample.ts";
 import { MODULES } from "./modules/index.ts";
 import { ModuleError } from "./modules/kit.ts";
+import { InventoryError } from "../packages/core/inventory.ts";
+import { ArError } from "../packages/core/ar.ts";
+import { PostingError } from "../packages/core/posting.ts";
+import { PricingError } from "../packages/core/pricing.ts";
+import { SetupError } from "../packages/core/setup.ts";
 
 const PORT = Number(process.env.PORT ?? 10000);
 const TOKEN = process.env.ERP_API_TOKEN ?? "";
@@ -854,7 +859,7 @@ route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
 // ------------------------------------------------------------------- server
 
 // The engine's refusals are written for people; pass them on as they are.
-const REFUSALS = [ModuleError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
+const REFUSALS = [ModuleError, InventoryError, ArError, PostingError, PricingError, SetupError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
 
 function refusal(e: unknown): string | null {
   if (REFUSALS.some((K) => e instanceof K)) return (e as Error).message;

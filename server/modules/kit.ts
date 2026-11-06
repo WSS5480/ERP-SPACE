@@ -42,7 +42,7 @@ export type ErpModule = {
   register: (kit: ModuleKit) => void;
 };
 
-/** A refusal written for a person. The server returns it as a 422 with the message as-is. */
+/** A refusal written for a person. The server returns it as a 409 with the message as-is. */
 export class ModuleError extends Error {}
 
 export function need(cond: unknown, message: string): asserts cond {

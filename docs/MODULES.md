@@ -52,7 +52,7 @@ Purchasing turns those lines into vendor POs. POS never builds POs itself.
 2. Every query names `entity_id = $n` (or says `/* unscoped: why */`). Pass SQL through `guard()` when you build it dynamically.
 3. Nothing is deleted. Corrections are reversals, voids with reasons, or status changes.
 4. The database enforces the rules that cost money if broken (check constraints and triggers), and the code says them in plain words too.
-5. Errors a person will read are sentences. Throw `ModuleError` (via `need()`), which comes back as a 422 with the message as-is.
+5. Errors a person will read are sentences. Throw `ModuleError` (via `need()`), which comes back as a 409 with the message as-is.
 6. A module never writes another module's tables except through that module's exported functions in `packages/core/<module>.ts`. `stock_level` especially: only `packages/core/inventory.ts` changes it.
 7. Postings to the GL go through the existing ledger (`journal_entry` / `journal_line`, see `packages/core/invoice.ts` `postToLedger` for the pattern). Revenue, COGS, deposits, A/R, inventory and freight each post to a GL account resolved by code from the tenant's chart, never a hard-coded id.
 8. Phone first. Every screen must work on a phone: no sideways-scrolling tables for primary data. Wrap rows into cards on narrow screens and use pickers and dropdowns. Table headers align with their columns: numbers right, text left.
