@@ -287,7 +287,11 @@ export const module: ErpModule = {
       return r;
     }));
     // Photos come through our own origin: the page's policy allows no outside images.
-    coGet(`/catalog/image/${ID}/([0-9]{1,2})`, (c, co, _u, m) => refuse(() => cat.productImage(c, co.id, m[2], Number(m[3]), imageFetch)));
+    // A photo that cannot be fetched is not an error for the screen: it gets no photo and the reason.
+    coGet(`/catalog/image/${ID}/([0-9]{1,2})`, async (c, co, _u, m) => {
+      try { return await cat.productImage(c, co.id, m[2], Number(m[3]), imageFetch); }
+      catch (e) { if (e instanceof cat.CatalogError) return { dataUrl: null, problem: e.message }; throw e; }
+    });
     coGet("/catalog/margins", (c, co, url) => margins(c, co, url));
     coGet("/catalog/labels", (c, co, url) => refuse(() => labels(c, co, url)));
     coGet("/catalog/vendors", (c, co) => vendors(c, co));
@@ -334,7 +338,7 @@ export const module: ErpModule = {
     // ---- writes
     coPost("/catalog/products", async (c, co, a, b) => {
       await requireRole(c, co, a, EDIT, "adding a product");
-      return { id: await refuse(() => cat.createProduct(c, sc(co, a), productIn(b))) };
+      return { id: await refuse(() => cat.createProduct(c, sc(co, a), productIn(b), { status: str(b.status, 20) || null, note: str(b.statusNote, 300) || null })) };
     });
     coPost(`/catalog/products/${ID}`, async (c, co, a, b, m) => {
       await requireRole(c, co, a, EDIT, "changing a product");

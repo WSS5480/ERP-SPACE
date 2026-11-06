@@ -426,15 +426,21 @@ const plain = (x: unknown): unknown => JSON.parse(JSON.stringify(x, (_k, v) => (
 
 const val = (v: unknown) => (typeof v === "bigint" ? v.toString() : v === undefined ? null : v);
 
-export async function createProduct(c: Client, s: Scope, p: ProductInput): Promise<string> {
+/** A new product, as a draft unless a status is asked for; the status rules are the same as setStatus's. */
+export async function createProduct(c: Client, s: Scope, p: ProductInput, status: { status?: string | null; note?: string | null } = {}): Promise<string> {
   need(p.sku && p.name, "a new product needs a SKU and a name");
   await checkProductInput(c, s.entityId, p, null);
+  const st = status.status || "draft";
+  need((STATUSES as readonly string[]).includes(st), `status must be one of ${STATUSES.join(", ").replace(/_/g, " ")}`);
+  const note = status.note?.trim() || null;
+  if (st === "active") need((p.priceMinor ?? 0n) > 0n || SELLS_WITH_NO_PRICE.has(p.kind ?? "stock"), `${p.name} needs a price before it can be active`);
+  if (["floor_sample", "drop", "discontinued"].includes(st)) need(note, `say why ${p.name} is ${st.replace("_", " ")}`);
   const cols = COLS.filter(([k]) => p[k] !== undefined);
   const r = await one<{ id: string }>(c, `
-    insert into product (entity_id, status, ${cols.map(([, col]) => col).join(", ")})
-    values ($1, 'draft', ${cols.map((_, i) => `$${i + 2}`).join(", ")}) returning id`,
-    [s.entityId, ...cols.map(([k]) => val(p[k]))]);
-  await audit(c, s, { table: "product", rowId: r.id, action: "insert", after: { sku: p.sku, name: p.name } });
+    insert into product (entity_id, status, status_note, ${cols.map(([, col]) => col).join(", ")})
+    values ($1, $2, $3, ${cols.map((_, i) => `$${i + 4}`).join(", ")}) returning id`,
+    [s.entityId, st, note, ...cols.map(([k]) => val(p[k]))]);
+  await audit(c, s, { table: "product", rowId: r.id, action: "insert", after: { sku: p.sku, name: p.name, status: st } });
   return r.id;
 }
 

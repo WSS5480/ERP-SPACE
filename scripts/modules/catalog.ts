@@ -159,6 +159,15 @@ export async function run(t: T) {
   await t.throws("status: a floor sample says why", () => r.post("/catalog/products/:id/status", STORE_MGR, { status: "floor_sample" }, made.id), /say why/);
   await r.post("/catalog/products/:id/status", STORE_MGR, { status: "floor_sample", note: "Enola showroom model" }, made.id);
   await t.throws("status: an AP clerk cannot change it", () => r.post("/catalog/products/:id/status", PEOPLE.CLERK, { status: "active" }, made.id), /needs one of/);
+  const live = await r.post<{ id: string }>("/catalog/products", BUYER, { sku: "GLB-CHK-03", name: "Check glider", vendorId: V.GLOBAL, price: "349", cost: "150", status: "active" });
+  const liveDet = await r.get<{ product: Record<string, unknown> }>("/catalog/products/:id", "", live.id);
+  t.ok("products: a new product asked to be active is created active", liveDet.product.status === "active");
+  await t.throws("products: a new product cannot start active without a price", () => r.post("/catalog/products", BUYER, { sku: "GLB-CHK-04", name: "Unpriced", cost: "10", status: "active" }), /needs a price before it can be active/);
+  await t.throws("products: a new floor sample says why", () => r.post("/catalog/products", BUYER, { sku: "GLB-CHK-05", name: "Showroom", price: "100", status: "floor_sample" }), /say why/);
+  await t.throws("products: an unknown starting status is refused", () => r.post("/catalog/products", BUYER, { sku: "GLB-CHK-06", name: "Odd", price: "100", status: "selling" }), /status must be one of/);
+  const plainNew = await r.post<{ id: string }>("/catalog/products", BUYER, { sku: "GLB-CHK-07", name: "Check rocker", vendorId: V.GLOBAL, price: "299", cost: "120" });
+  const plainDet = await r.get<{ product: Record<string, unknown> }>("/catalog/products/:id", "", plainNew.id);
+  t.ok("products: with no status asked for, a new product is still a draft", plainDet.product.status === "draft");
   const list = await r.get<{ items: { id: string; status: string }[]; total: number }>("/catalog/products", `?vendor=${V.GLOBAL}&status=floor_sample`);
   t.ok("products: search by vendor and status finds it", list.items.some((x) => x.id === made.id) && list.items.every((x) => x.status === "floor_sample"));
   const search = await r.get<{ items: { sku: string }[] }>("/catalog/products", "?q=willowton&category=Bedroom");
