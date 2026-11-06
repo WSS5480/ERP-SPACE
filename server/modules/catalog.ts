@@ -1,9 +1,483 @@
 // catalog module -- see docs/MODULES.md for the contract.
-import type { ErpModule } from "./kit.ts";
+// Product master, options and special-order templates, packages, cartons,
+// images, price lists, promotions, margins, price tags with barcodes, vendor
+// ordering facts and freight, and the vendor feed import.
+import type { ErpModule, Client, Company, Actor } from "./kit.ts";
+import { ModuleError, need, requireRole, str, uuid, int, minor } from "./kit.ts";
+import { q } from "../../packages/core/db.ts";
+import { scopeOf } from "../actions.ts";
+import * as cat from "../../packages/core/catalog.ts";
+import { priceConfigured, PricingError, type Choice } from "../../packages/core/pricing.ts";
+import * as feeds from "../../packages/core/vendor_feeds.ts";
+
+/** The network the vendor connections use: the real one, unless checks hand in a fake. */
+let feedEnv: () => feeds.FeedEnv = feeds.liveEnv;
+export const useFeedEnv = (fn: () => feeds.FeedEnv) => { feedEnv = fn; };
+export const currentFeedEnv = () => feedEnv();
+
+const ID = "([0-9a-fA-F-]{36})";
+const EDIT = ["buyer"];
+const FLOOR = ["buyer", "store_manager"];
+
+/** Core refusals are sentences already; hand them on as module refusals (422). */
+async function refuse<T>(fn: () => Promise<T>): Promise<T> {
+  try { return await fn(); }
+  catch (e) {
+    if (e instanceof cat.CatalogError || e instanceof PricingError || e instanceof feeds.FeedError) throw new ModuleError(e.message);
+    throw e;
+  }
+}
+
+const has = (b: Record<string, unknown>, k: string) => Object.prototype.hasOwnProperty.call(b, k);
+const optStr = (b: Record<string, unknown>, k: string, max = 200) => (has(b, k) ? (str(b[k], max) || null) : undefined);
+const optMoney = (b: Record<string, unknown>, k: string) => (has(b, k) ? (b[k] === null || b[k] === "" ? null : minor(b[k])) : undefined);
+const optNum = (b: Record<string, unknown>, k: string) => {
+  if (!has(b, k)) return undefined;
+  if (b[k] === null || b[k] === "") return null;
+  const n = Number(b[k]);
+  need(Number.isFinite(n) && n >= 0, `${k.replace(/([A-Z])/g, " $1").toLowerCase()} must be a positive number`);
+  return n;
+};
+const optBool = (b: Record<string, unknown>, k: string) => (has(b, k) ? b[k] === true || b[k] === "true" : undefined);
+
+function productIn(b: Record<string, unknown>): cat.ProductInput {
+  const p: cat.ProductInput = {};
+  if (has(b, "sku")) p.sku = str(b.sku, 40).toUpperCase();
+  if (has(b, "name")) p.name = str(b.name, 200);
+  if (has(b, "kind")) p.kind = str(b.kind, 20);
+  if (has(b, "vendorId")) p.vendorId = b.vendorId ? uuid(b.vendorId) : null;
+  if (has(b, "vendorId") && b.vendorId && !p.vendorId) throw new ModuleError("that vendor is not set up for this company");
+  p.vendorSku = optStr(b, "vendorSku", 60)?.toUpperCase() ?? (has(b, "vendorSku") ? null : undefined);
+  for (const k of ["brand", "category", "subcategory", "collection", "color"] as const) p[k] = optStr(b, k, 80);
+  p.description = optStr(b, "description", 4000);
+  p.barcode = optStr(b, "barcode", 40);
+  const price = optMoney(b, "price"); if (price !== undefined) { need(price !== null, "a product needs a price, even if it is 0"); p.priceMinor = price; }
+  const cost = optMoney(b, "cost"); if (cost !== undefined) { need(cost !== null, "a product needs a cost, even if it is 0"); p.costMinor = cost; }
+  p.mapMinor = optMoney(b, "map");
+  p.msrpMinor = optMoney(b, "msrp");
+  p.taxable = optBool(b, "taxable"); p.serialized = optBool(b, "serialized"); p.webVisible = optBool(b, "webVisible");
+  if (has(b, "shipClass")) p.shipClass = str(b.shipClass, 20);
+  p.cubicFt = optNum(b, "cubicFt"); p.weightLb = optNum(b, "weightLb");
+  for (const k of Object.keys(p) as (keyof cat.ProductInput)[]) if (p[k] === undefined) delete p[k];
+  return p;
+}
+
+function groupIn(g: Record<string, unknown>): cat.GroupIn {
+  const opts = Array.isArray(g.options) ? g.options as Record<string, unknown>[] : [];
+  return {
+    code: str(g.code, 40).toLowerCase(), label: str(g.label, 80), required: g.required !== false, multi: g.multi === true, seq: int(g.seq, 0),
+    options: opts.map((o) => ({
+      code: str(o.code, 40).toLowerCase(), label: str(o.label, 120),
+      priceDeltaMinor: o.priceDelta == null || o.priceDelta === "" ? 0n : minor(o.priceDelta),
+      costDeltaMinor: o.costDelta == null || o.costDelta === "" ? 0n : minor(o.costDelta),
+      leadDays: o.leadDays == null || o.leadDays === "" ? 0 : int(o.leadDays, -1), swatch: str(o.swatch, 200) || null, vendorCode: str(o.vendorCode, 40) || null,
+    })),
+  };
+}
+
+/** One client runs one query at a time; run these in turn. */
+async function inOrder(fns: (() => Promise<Record<string, unknown>[]>)[]): Promise<Record<string, unknown>[][]> {
+  const out: Record<string, unknown>[][] = [];
+  for (const f of fns) out.push(await f());
+  return out;
+}
+
+const choicesParam = (url: URL): Choice[] => {
+  const raw = url.searchParams.get("choices");
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    if (Array.isArray(v)) return v as Choice[];
+    return Object.entries(v as Record<string, string | string[]>).map(([group, option]) => ({ group, option }));
+  } catch { throw new ModuleError("choices must be JSON, like {\"fabric\":\"velvet-navy\"}"); }
+};
+
+// ----------------------------------------------------------------- reads
+
+async function listProducts(c: Client, co: Company, url: URL) {
+  const p = url.searchParams;
+  const term = str(p.get("q"), 80);
+  const vendor = uuid(p.get("vendor"));
+  const category = str(p.get("category"), 80) || null;
+  const status = str(p.get("status"), 20) || null;
+  const kind = str(p.get("kind"), 20) || null;
+  const limit = Math.min(Math.max(int(p.get("limit") || 50, 50), 1), 200);
+  const offset = Math.max(int(p.get("offset"), 0), 0);
+  const where = `p.entity_id = $1
+    and ($2 = '' or p.name ilike '%' || $2 || '%' or p.sku ilike '%' || $2 || '%' or p.vendor_sku ilike '%' || $2 || '%'
+         or p.barcode = $2 or coalesce(p.collection,'') ilike '%' || $2 || '%')
+    and ($3::uuid is null or p.vendor_id = $3) and ($4::text is null or p.category = $4)
+    and ($5::text is null or p.status = $5) and ($6::text is null or p.kind = $6)`;
+  const args = [co.id, term, vendor, category, status, kind];
+  const items = await q(c, `
+    select p.id, p.sku, p.name, p.kind, p.status, p.status_note, p.vendor_id, coalesce(v.dba, v.legal_name) vendor, p.vendor_sku,
+           p.category, p.subcategory, p.collection, p.color, p.price_minor, p.cost_minor, p.map_minor, p.web_visible,
+           case when p.price_minor > 0 then ((p.price_minor - p.cost_minor) * 10000 / p.price_minor)::int end margin_bps,
+           (p.map_minor is not null and p.price_minor < p.map_minor) below_map,
+           (select url from product_image i where i.entity_id = p.entity_id and i.product_id = p.id order by seq limit 1) image,
+           (select coalesce(sum(a.on_hand), 0) from product_availability a where a.entity_id = p.entity_id and a.product_id = p.id) on_hand,
+           (select coalesce(sum(a.available), 0) from product_availability a where a.entity_id = p.entity_id and a.product_id = p.id) available,
+           (select count(*) from product_piece x where x.entity_id = p.entity_id and x.product_id = p.id) pieces
+      from product p left join vendor v on v.id = p.vendor_id
+     where ${where} order by p.name, p.sku limit ${limit} offset ${offset}`, args);
+  const total = (await q<{ n: string }>(c, `select count(*) n from product p where ${where}`, args))[0].n;
+  const statuses = await q(c, `select status, count(*) n from product where entity_id = $1 group by status order by status`, [co.id]);
+  return { items, total: Number(total), limit, offset, statuses };
+}
+
+async function formOptions(c: Client, co: Company) {
+  const [vendors, categories, locations, templates, priceLists] = await inOrder([
+    () => q(c, `select v.id, coalesce(v.dba, v.legal_name) as name, vp.sku_prefix from vendor_entity ve join vendor v on v.id = ve.vendor_id
+            left join vendor_profile vp on vp.entity_id = ve.entity_id and vp.vendor_id = v.id
+           where ve.entity_id = $1 and ve.status = 'active' order by 2`, [co.id]),
+    () => q(c, `select category, array_agg(distinct subcategory) filter (where subcategory is not null) subs, count(*) n
+            from product where entity_id = $1 and category is not null group by category order by category`, [co.id]),
+    () => q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' order by kind <> 'warehouse', name`, [co.id]),
+    () => q(c, `select t.id, t.name, t.vendor_id, t.category from option_template t where t.entity_id = $1 and t.active order by t.name`, [co.id]),
+    () => q(c, `select id, code, name from price_list where entity_id = $1 and active order by code`, [co.id]),
+  ]);
+  return { vendors, categories, locations, templates, priceLists, kinds: cat.KINDS, statuses: cat.STATUSES, shipClasses: cat.SHIP_CLASSES };
+}
+
+async function productDetail(c: Client, co: Company, id: string) {
+  const p = (await q<Record<string, unknown>>(c, `
+    select p.*, coalesce(v.dba, v.legal_name) vendor from product p left join vendor v on v.id = p.vendor_id
+     where p.id = $1 and p.entity_id = $2`, [id, co.id]))[0];
+  if (!p) return null;
+  const [images, pieces, kit, groups, options, lists, promos, stock, applied, templates, freight, usedIn] = await inOrder([
+    () => q(c, `select seq, url, alt from product_image where entity_id = $1 and product_id = $2 order by seq`, [co.id, id]),
+    () => q(c, `select seq, label, cubic_ft, weight_lb from product_piece where entity_id = $1 and product_id = $2 order by seq`, [co.id, id]),
+    () => q(c, `select k.component_id id, x.sku, x.name, k.qty, x.price_minor, x.cost_minor from product_kit_component k
+            join product x on x.id = k.component_id and x.entity_id = k.entity_id where k.entity_id = $1 and k.kit_id = $2 order by k.seq`, [co.id, id]),
+    () => q(c, `select id, code, label, required, multi, seq from product_option_group where entity_id = $1 and product_id = $2 order by seq, code`, [co.id, id]),
+    () => q(c, `select o.group_id, o.code, o.label, o.price_delta_minor, o.cost_delta_minor, o.lead_days, o.swatch, o.vendor_code, o.active, o.seq
+            from product_option o where o.entity_id = $1
+             and o.group_id in (select id from product_option_group where entity_id = $1 and product_id = $2) order by o.seq`, [co.id, id]),
+    () => q(c, `select l.id, l.code, l.name, i.price_minor from price_list_item i join price_list l on l.id = i.price_list_id
+           where i.entity_id = $1 and i.product_id = $2 order by l.code`, [co.id, id]),
+    () => q(c, `select id, name, kind, pct_bps, amount_minor, starts_on::text, ends_on::text, respect_map,
+                 case when product_id is not null then 'this product' when vendor_id is not null and category is not null then 'vendor and category'
+                      when vendor_id is not null then 'vendor' else 'category' end reach
+            from promotion where entity_id = $1 and active and ends_on >= current_date
+             and (product_id = $2 or (product_id is null and (vendor_id is null or vendor_id = $3) and (category is null or category = $4)))
+           order by starts_on`, [co.id, id, p.vendor_id, p.category]),
+    () => q(c, `select a.location_id, l.name location, a.location_kind, a.on_hand, a.reserved, a.available, a.on_order
+            from product_availability a join location l on l.id = a.location_id where a.entity_id = $1 and a.product_id = $2 order by l.name`, [co.id, id]),
+    () => q(c, `select t.id, t.name, a.applied_at from product_template_applied a join option_template t on t.id = a.template_id
+           where a.entity_id = $1 and a.product_id = $2`, [co.id, id]),
+    () => q(c, `select id, name from option_template where entity_id = $1 and active
+             and (vendor_id is null or vendor_id = $2) and (category is null or category = $3) order by name`, [co.id, p.vendor_id, p.category]),
+    () => q(c, `select f.location_id, l.name location, f.freight_bps, f.per_unit_minor from vendor_freight f join location l on l.id = f.location_id
+           where f.entity_id = $1 and f.vendor_id = $2 order by l.name`, [co.id, p.vendor_id]),
+    () => q(c, `select k.kit_id id, x.sku, x.name, k.qty from product_kit_component k join product x on x.id = k.kit_id
+           where k.entity_id = $1 and k.component_id = $2`, [co.id, id]),
+  ]);
+  let price: unknown = null, priceProblem: string | null = null;
+  try { price = await priceConfigured(c, co.id, id, []); }
+  catch (e) { if (e instanceof PricingError) priceProblem = e.message; else throw e; }
+  const cost = BigInt(String(p.cost_minor));
+  return {
+    product: p, images, pieces, kit, usedIn, lists, promos, stock, applied, templates,
+    groups: groups.map((g) => ({ ...g, options: options.filter((o) => o.group_id === g.id) })),
+    freight: freight.map((f) => ({ ...f, landed_minor: (cost + cat.freightOn(cost, f as { freight_bps: number; per_unit_minor: string })).toString() })),
+    marginBps: cat.marginBps(BigInt(String(p.price_minor)), cost), price, priceProblem,
+  };
+}
+
+async function margins(c: Client, co: Company, url: URL) {
+  const vendor = uuid(url.searchParams.get("vendor"));
+  const category = str(url.searchParams.get("category"), 80) || null;
+  let loc = uuid(url.searchParams.get("location"));
+  if (!loc) loc = (await q<{ id: string }>(c, `select id from location where entity_id = $1 and status = 'active' order by kind <> 'warehouse', name limit 1`, [co.id]))[0]?.id ?? null;
+  const rows = await q<{ id: string; sku: string; name: string; status: string; vendor: string | null; category: string | null; price_minor: string; cost_minor: string;
+    map_minor: string | null; freight_bps: number | null; per_unit_minor: string | null }>(c, `
+    select p.id, p.sku, p.name, p.status, coalesce(v.dba, v.legal_name) vendor, p.category, p.price_minor, p.cost_minor, p.map_minor,
+           f.freight_bps, f.per_unit_minor
+      from product p left join vendor v on v.id = p.vendor_id
+      left join vendor_freight f on f.entity_id = p.entity_id and f.vendor_id = p.vendor_id and f.location_id = $4
+     where p.entity_id = $1 and p.kind in ('stock','configurable','special_order','kit') and p.status <> 'discontinued'
+       and ($2::uuid is null or p.vendor_id = $2) and ($3::text is null or p.category = $3)
+     order by p.category nulls last, p.name limit 500`, [co.id, vendor, category, loc]);
+  const out = [];
+  let sumPrice = 0n, sumLanded = 0n;
+  for (const r of rows) {
+    let promo: { unitPriceMinor: bigint; promotion?: { name: string } | null } | null = null;
+    try {
+      const pc = await priceConfigured(c, co.id, r.id, []);
+      if (pc.promotion) promo = pc;
+    } catch (e) { if (!(e instanceof PricingError)) throw e; }
+    const price = BigInt(r.price_minor), cost = BigInt(r.cost_minor);
+    const freight = cat.freightOn(cost, r.freight_bps == null ? null : { freight_bps: r.freight_bps, per_unit_minor: r.per_unit_minor ?? "0" });
+    const landed = cost + freight;
+    if (price > 0n) { sumPrice += price; sumLanded += landed; }
+    out.push({
+      id: r.id, sku: r.sku, name: r.name, status: r.status, vendor: r.vendor, category: r.category,
+      price_minor: r.price_minor, cost_minor: r.cost_minor, freight_minor: freight.toString(), landed_minor: landed.toString(),
+      map_minor: r.map_minor, margin_bps: cat.marginBps(price, landed),
+      promo_minor: promo?.unitPriceMinor.toString() ?? null, promo_name: promo?.promotion?.name ?? null,
+      promo_margin_bps: promo ? cat.marginBps(promo.unitPriceMinor, landed) : null,
+      below_map: r.map_minor != null && price < BigInt(r.map_minor),
+    });
+  }
+  return { locationId: loc, items: out, blendedBps: cat.marginBps(sumPrice, sumLanded) };
+}
+
+async function labels(c: Client, co: Company, url: URL) {
+  const ids = (url.searchParams.get("ids") ?? "").split(",").map((x) => uuid(x.trim())).filter(Boolean) as string[];
+  const vendor = uuid(url.searchParams.get("vendor"));
+  const category = str(url.searchParams.get("category"), 80) || null;
+  const list = str(url.searchParams.get("list"), 24) || null;
+  const rows = await q<{ id: string; sku: string; name: string; brand: string | null; collection: string | null; color: string | null;
+    barcode: string | null; msrp_minor: string | null; status: string; kind: string; pieces: string; dims: string | null }>(c, `
+    select p.id, p.sku, p.name, p.brand, p.collection, p.color, p.barcode, p.msrp_minor, p.status, p.kind,
+           (select count(*) from product_piece x where x.entity_id = p.entity_id and x.product_id = p.id) pieces, p.attributes->>'dimensions' dims
+      from product p
+     where p.entity_id = $1 and p.status in ('active','floor_sample','drop')
+       and p.kind not in ('service','fee','warranty','gift_card')
+       and (cardinality($2::uuid[]) = 0 or p.id = any($2)) and ($3::uuid is null or p.vendor_id = $3) and ($4::text is null or p.category = $4)
+     order by p.category, p.name limit 200`, [co.id, ids, vendor, category]);
+  const out = [];
+  for (const r of rows) {
+    let pc;
+    try { pc = await priceConfigured(c, co.id, r.id, [], { priceList: list }); }
+    catch (e) { if (e instanceof PricingError) continue; throw e; }
+    const code = r.barcode && /^[\x20-\x7e]+$/.test(r.barcode) ? r.barcode : r.sku;
+    out.push({
+      id: r.id, sku: r.sku, name: r.name, brand: r.brand, collection: r.collection, color: r.color, status: r.status, pieces: Number(r.pieces),
+      ticket_minor: pc.ticketMinor?.toString(), price_minor: pc.unitPriceMinor.toString(), msrp_minor: r.msrp_minor,
+      promotion: pc.promotion ? { name: pc.promotion.name, savings_minor: pc.promotion.savingsMinor.toString() } : null,
+      price_list: pc.priceList, from_options: r.kind === "configurable" || r.kind === "special_order",
+      kit: pc.kit ? { component_total_minor: pc.kit.componentTotalMinor.toString(), pieces: pc.kit.components.map((k) => `${k.qty} × ${k.name}`) } : null,
+      barcode: { text: code, bars: cat.code128(code) },
+    });
+  }
+  return { items: out };
+}
+
+async function vendors(c: Client, co: Company) {
+  const rows = await q(c, `
+    select v.id, coalesce(v.dba, v.legal_name) as name, vp.order_email, vp.account_no, vp.sku_prefix, coalesce(vp.lead_days, 30) lead_days,
+           coalesce(vp.freight_min_minor, 0) freight_min_minor, coalesce(vp.freight_min_qty, 0) freight_min_qty, vp.notes,
+           (select count(*) from product p where p.entity_id = ve.entity_id and p.vendor_id = v.id) products,
+           (select max(created_at) from catalog_import_run r where r.entity_id = ve.entity_id and r.vendor_id = v.id) last_import
+      from vendor_entity ve join vendor v on v.id = ve.vendor_id
+      left join vendor_profile vp on vp.entity_id = ve.entity_id and vp.vendor_id = v.id
+     where ve.entity_id = $1 and ve.status = 'active' order by 2`, [co.id]);
+  const freight = await q(c, `select f.vendor_id, f.location_id, l.name location, f.freight_bps, f.per_unit_minor
+                                from vendor_freight f join location l on l.id = f.location_id where f.entity_id = $1 order by l.name`, [co.id]);
+  return { vendors: rows.map((v) => ({ ...v, freight: freight.filter((f) => f.vendor_id === v.id) })) };
+}
+
+// --------------------------------------------------------------- module
 
 export const module: ErpModule = {
   id: "catalog",
-  register(_kit) {
-    // routes go here
+  register(kit) {
+    const { coGet, coPost } = kit;
+    const sc = (co: Company, a: Actor) => scopeOf(co, a);
+
+    coGet("/catalog/products", (c, co, url) => listProducts(c, co, url));
+    coGet("/catalog/form", (c, co) => formOptions(c, co));
+    coGet(`/catalog/products/${ID}`, (c, co, _u, m) => productDetail(c, co, m[2]));
+    coGet(`/catalog/price/${ID}`, (c, co, url, m) => refuse(async () => {
+      const r = await priceConfigured(c, co.id, m[2], choicesParam(url), { priceList: url.searchParams.get("list"), on: url.searchParams.get("on") });
+      return r;
+    }));
+    coGet("/catalog/margins", (c, co, url) => margins(c, co, url));
+    coGet("/catalog/labels", (c, co, url) => refuse(() => labels(c, co, url)));
+    coGet("/catalog/vendors", (c, co) => vendors(c, co));
+    coGet("/catalog/templates", async (c, co) => {
+      const ts = await q(c, `select t.id, t.name, t.vendor_id, coalesce(v.dba, v.legal_name) vendor, t.category, t.active,
+                                    (select count(*) from product_template_applied a where a.entity_id = t.entity_id and a.template_id = t.id) used
+                               from option_template t left join vendor v on v.id = t.vendor_id where t.entity_id = $1 order by t.name`, [co.id]);
+      const gs = await q(c, `select id, template_id, code, label, required, multi, seq from option_template_group where entity_id = $1 order by seq`, [co.id]);
+      const os = await q(c, `select group_id, code, label, price_delta_minor, cost_delta_minor, lead_days, swatch, vendor_code, active, seq
+                               from option_template_option where entity_id = $1 order by seq`, [co.id]);
+      return { templates: ts.map((t) => ({ ...t, groups: gs.filter((g) => g.template_id === t.id).map((g) => ({ ...g, options: os.filter((o) => o.group_id === g.id) })) })) };
+    });
+    coGet("/catalog/price-lists", async (c, co) => {
+      const ls = await q(c, `select id, code, name, starts_on::text, ends_on::text, active from price_list where entity_id = $1 order by code`, [co.id]);
+      const items = await q(c, `select i.price_list_id, i.product_id, p.sku, p.name, p.price_minor ticket_minor, i.price_minor
+                                  from price_list_item i join product p on p.id = i.product_id where i.entity_id = $1 order by p.name`, [co.id]);
+      return { lists: ls.map((l) => ({ ...l, items: items.filter((i) => i.price_list_id === l.id) })) };
+    });
+    coGet("/catalog/promotions", async (c, co) => ({
+      promotions: await q(c, `
+        select pr.id, pr.name, pr.kind, pr.pct_bps, pr.amount_minor, pr.starts_on::text, pr.ends_on::text, pr.respect_map, pr.active,
+               pr.category, p.sku, p.name product, coalesce(v.dba, v.legal_name) vendor,
+               case when not pr.active then 'ended' when pr.ends_on < current_date then 'over' when pr.starts_on > current_date then 'scheduled' else 'live' end state
+          from promotion pr left join product p on p.id = pr.product_id left join vendor v on v.id = pr.vendor_id
+         where pr.entity_id = $1 order by pr.active desc, pr.ends_on >= current_date desc, pr.starts_on`, [co.id]),
+    }));
+    coGet("/catalog/import/fields", async () => ({ fields: cat.IMPORT_FIELDS }));
+    coGet("/catalog/import/runs", async (c, co) => ({
+      runs: await q(c, `select r.id, r.filename, r.status, r.rows, r.added, r.changed, r.unchanged, r.skipped, r.created_at, r.applied_at,
+                               coalesce(v.dba, v.legal_name) vendor, u.name created_by
+                          from catalog_import_run r join vendor v on v.id = r.vendor_id left join app_user u on u.id = r.created_by
+                         where r.entity_id = $1 order by r.created_at desc limit 50`, [co.id]),
+    }));
+    coGet(`/catalog/import/runs/${ID}`, async (c, co, url, m) => {
+      const run = (await q(c, `select r.*, coalesce(v.dba, v.legal_name) vendor from catalog_import_run r join vendor v on v.id = r.vendor_id
+                                where r.id = $1 and r.entity_id = $2`, [m[2], co.id]))[0];
+      if (!run) return null;
+      const action = str(url.searchParams.get("action"), 10) || null;
+      const rows = await q(c, `select row_no, vendor_sku, action, product_id, fields, changes, message from catalog_import_row
+                                where run_id = $1 and entity_id = $2 and ($3::text is null or action = $3) order by row_no limit 300`, [m[2], co.id, action]);
+      return { run, rows };
+    });
+
+    // ---- writes
+    coPost("/catalog/products", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "adding a product");
+      return { id: await refuse(() => cat.createProduct(c, sc(co, a), productIn(b))) };
+    });
+    coPost(`/catalog/products/${ID}`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "changing a product");
+      await refuse(() => cat.updateProduct(c, sc(co, a), m[2], productIn(b)));
+      return { ok: true };
+    });
+    coPost(`/catalog/products/${ID}/status`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, FLOOR, "changing a product's status");
+      await refuse(() => cat.setStatus(c, sc(co, a), m[2], str(b.status, 20), str(b.note, 300) || null));
+      return { ok: true };
+    });
+    coPost(`/catalog/products/${ID}/pieces`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "changing a product's cartons");
+      const ps = Array.isArray(b.pieces) ? b.pieces as Record<string, unknown>[] : [];
+      await refuse(() => cat.setPieces(c, sc(co, a), m[2], ps.map((x) => ({ label: str(x.label, 80), cubicFt: optNum(x, "cubicFt") ?? null, weightLb: optNum(x, "weightLb") ?? null }))));
+      return { ok: true };
+    });
+    coPost(`/catalog/products/${ID}/images`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "changing a product's images");
+      const im = Array.isArray(b.images) ? b.images as Record<string, unknown>[] : [];
+      await refuse(() => cat.setImages(c, sc(co, a), m[2], im.map((x) => ({ url: str(x.url, 1000), alt: str(x.alt, 200) || null }))));
+      return { ok: true };
+    });
+    coPost(`/catalog/products/${ID}/kit`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "changing a package");
+      const cs = Array.isArray(b.components) ? b.components as Record<string, unknown>[] : [];
+      await refuse(() => cat.setKit(c, sc(co, a), m[2], cs.map((x) => {
+        const id = uuid(x.productId); need(id, "a component is not a product of this company");
+        return { productId: id!, qty: Number(x.qty ?? 1) };
+      })));
+      return { ok: true };
+    });
+    coPost(`/catalog/products/${ID}/options`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "changing a product's options");
+      return { groupId: await refuse(() => cat.saveOptionGroup(c, sc(co, a), m[2], groupIn(b))) };
+    });
+    coPost(`/catalog/products/${ID}/apply-template`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "applying a template");
+      const t = uuid(b.templateId); need(t, "pick a template");
+      return refuse(() => cat.applyTemplate(c, sc(co, a), t!, m[2]));
+    });
+    coPost("/catalog/templates", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "changing special-order templates");
+      const gs = Array.isArray(b.groups) ? (b.groups as Record<string, unknown>[]).map(groupIn) : [];
+      return { id: await refuse(() => cat.saveTemplate(c, sc(co, a), { id: uuid(b.id), name: str(b.name, 120), vendorId: uuid(b.vendorId), category: str(b.category, 80) || null, groups: gs })) };
+    });
+    coPost("/catalog/price-lists", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "changing price lists");
+      return { id: await refuse(() => cat.savePriceList(c, sc(co, a), { code: str(b.code, 24), name: str(b.name, 120),
+        startsOn: str(b.startsOn, 10) || null, endsOn: str(b.endsOn, 10) || null, active: b.active !== false })) };
+    });
+    coPost(`/catalog/price-lists/${ID}/items`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "changing price lists");
+      const its = Array.isArray(b.items) ? b.items as Record<string, unknown>[] : [];
+      await refuse(() => cat.setListPrices(c, sc(co, a), m[2], its.map((x) => {
+        const id = uuid(x.productId); need(id, "a line is not a product of this company");
+        return { productId: id!, priceMinor: x.price === null || x.price === "" ? null : minor(x.price) };
+      })));
+      return { ok: true };
+    });
+    coPost("/catalog/promotions", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "setting up a promotion");
+      const kind = str(b.kind, 20);
+      const pct = b.pct == null || b.pct === "" ? null : Math.round(Number(b.pct) * 100);
+      return { id: await refuse(() => cat.createPromotion(c, sc(co, a), {
+        name: str(b.name, 120), kind, pctBps: kind === "percent" ? pct : null,
+        amountMinor: kind === "percent" || b.amount == null || b.amount === "" ? null : minor(b.amount),
+        productId: uuid(b.productId), vendorId: uuid(b.vendorId), category: str(b.category, 80) || null,
+        startsOn: str(b.startsOn, 10), endsOn: str(b.endsOn, 10), respectMap: b.respectMap !== false })) };
+    });
+    coPost(`/catalog/promotions/${ID}/end`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "ending a promotion");
+      await refuse(() => cat.endPromotion(c, sc(co, a), m[2], str(b.reason, 300)));
+      return { ok: true };
+    });
+    coPost(`/catalog/vendors/${ID}`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "changing a vendor's ordering details");
+      await refuse(() => cat.saveVendorProfile(c, sc(co, a), m[2], {
+        orderEmail: optStr(b, "orderEmail", 200), accountNo: optStr(b, "accountNo", 60), skuPrefix: optStr(b, "skuPrefix", 8)?.toUpperCase() ?? optStr(b, "skuPrefix", 8),
+        leadDays: has(b, "leadDays") ? int(b.leadDays, -1) : undefined, freightMinMinor: has(b, "freightMin") ? minor(b.freightMin || "0") : undefined,
+        freightMinQty: has(b, "freightMinQty") ? int(b.freightMinQty, -1) : undefined, notes: optStr(b, "notes", 500) }));
+      return { ok: true };
+    });
+    coPost(`/catalog/vendors/${ID}/freight`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, EDIT, "changing freight");
+      const loc = uuid(b.locationId); need(loc, "pick a store or warehouse");
+      await refuse(() => cat.setFreight(c, sc(co, a), m[2], loc!, Math.round(Number(b.pct ?? 0) * 100), minor(b.perUnit || "0")));
+      return { ok: true };
+    });
+
+    // ---- vendor connections: API pulls of catalog, availability and freight
+    coGet("/catalog/connections", async (c, co) => {
+      const conns = await q(c, `
+        select k.id, k.vendor_id, coalesce(v.dba, v.legal_name) vendor, k.kind, k.adapter, k.name, k.config, k.credential_ref, k.schedule_cron,
+               k.mapping, k.active, k.last_run_at, k.last_ok, k.last_note, k.consecutive_failures,
+               (select count(*) from vendor_availability a where a.entity_id = k.entity_id and a.vendor_id = k.vendor_id) availability_rows,
+               (select max(as_of) from vendor_availability a where a.entity_id = k.entity_id and a.vendor_id = k.vendor_id) availability_as_of
+          from vendor_connection k join vendor v on v.id = k.vendor_id where k.entity_id = $1 order by 3, k.kind`, [co.id]);
+      return { connections: conns.map((k) => ({ ...k, credential_set: !!(k.credential_ref && feedEnv().secret(String(k.credential_ref))),
+        credential_env: k.credential_ref ? feeds.secretEnvName(String(k.credential_ref)) : null })), fields: cat.IMPORT_FIELDS };
+    });
+    coGet(`/catalog/connections/${ID}/runs`, async (c, co, _u, m) => ({
+      runs: await q(c, `select r.id, r.trigger, r.started_at, r.finished_at, r.outcome, r.rows, r.atp_rows, r.freight_rows, r.note, r.import_run_id, u.name run_by
+                          from vendor_feed_run r left join app_user u on u.id = r.run_by
+                         where r.entity_id = $1 and r.connection_id = $2 order by r.started_at desc limit 30`, [co.id, m[2]]),
+    }));
+    coPost("/catalog/connections", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "connecting a vendor");
+      const v = uuid(b.vendorId); need(v, "pick the vendor");
+      const mapping: Record<string, string> = {};
+      for (const [k, val] of Object.entries((b.mapping ?? {}) as Record<string, unknown>)) if (typeof val === "string" && val) mapping[k] = val;
+      return { id: await refuse(() => feeds.saveConnection(c, sc(co, a), { vendorId: v!, kind: str(b.kind, 10), adapter: str(b.adapter, 20) || "generic",
+        name: str(b.name, 120), config: (b.config && typeof b.config === "object" ? b.config : {}) as Record<string, unknown>,
+        credentialRef: str(b.credentialRef, 120) || null, scheduleCron: str(b.scheduleCron, 60) || null, mapping, active: b.active !== false })) };
+    });
+    coPost(`/catalog/connections/${ID}/run`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, EDIT, "pulling a vendor feed");
+      return refuse(() => feeds.runConnection(c, sc(co, a), m[2], feedEnv(), "manual"));
+    });
+
+    // ---- vendor feed import: columns -> preview -> apply
+    coPost("/catalog/import/columns", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "importing a vendor catalog");
+      const csv = typeof b.csv === "string" ? b.csv : "";
+      need(csv.trim(), "choose a CSV file first");
+      const rows = await refuse(async () => cat.parseCsv(csv.slice(0, 200000)));
+      need(rows.length >= 1, "the file is empty");
+      const headers = rows[0].map((h) => h.trim()).filter(Boolean);
+      const mapping = cat.automap(headers);
+      return { headers, mapping, missing: cat.missingRequired(mapping), sample: rows.slice(1, 4), fields: cat.IMPORT_FIELDS };
+    });
+    coPost("/catalog/import/preview", async (c, co, a, b) => {
+      await requireRole(c, co, a, EDIT, "importing a vendor catalog");
+      const v = uuid(b.vendorId); need(v, "pick the vendor this file is from");
+      const mapping: Record<string, string> = {};
+      for (const [k, val] of Object.entries((b.mapping ?? {}) as Record<string, unknown>)) if (typeof val === "string" && val) mapping[k] = val;
+      need(typeof b.csv === "string" && b.csv.length <= 8_000_000, "the file is larger than 8 MB; split it");
+      return refuse(() => cat.previewImport(c, sc(co, a), { vendorId: v!, csv: b.csv as string, filename: str(b.filename, 200), mapping }));
+    });
+    coPost(`/catalog/import/runs/${ID}/apply`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, EDIT, "importing a vendor catalog");
+      return refuse(() => cat.applyImport(c, sc(co, a), m[2]));
+    });
+    coPost(`/catalog/import/runs/${ID}/abandon`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, EDIT, "importing a vendor catalog");
+      const r = await q(c, `update catalog_import_run set status = 'abandoned' where id = $1 and entity_id = $2 and status = 'previewed' returning id`, [m[2], co.id]);
+      need(r.length, "only a previewed import can be set aside");
+      return { ok: true };
+    });
   },
 };
