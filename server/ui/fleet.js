@@ -116,18 +116,46 @@
       flagged.length ? section('Flagged for the warehouse', String(flagged.length), null, panel(capped(flagged, 6, 'items'))) : null);
   }
 
+  // ------------------------------------------------- map point for an address
+  // A stop with no point is never routed. Find it with the map service, or
+  // type the latitude and longitude (from any map app: long-press the house).
+  function mapFixActs(addressId, label) {
+    return [
+      btn('Find on map', (e) => act(e.currentTarget, () => post(`/fleet/addresses/${addressId}/locate`), (r) => `Found: ${r.lat.toFixed(5)}, ${r.lng.toFixed(5)}`), { small: true }),
+      btn('Enter position', () => placeDialog(addressId, label), { small: true }),
+    ];
+  }
+  function placeDialog(addressId, label) {
+    const d = openDialog('Put it on the map', label || '');
+    const err = errSlot();
+    const both = input({ placeholder: '40.2601, -76.9336', inputmode: 'decimal', autocomplete: 'off' });
+    d.body.append(el('p', { class: 'lead', text: 'In a map app, press and hold on the house; copy the two numbers it shows (latitude, longitude) and paste them here.' }),
+      field('Latitude, longitude', both),
+      el('div', { class: 'dlg-acts' }, btn('Save', (e) => {
+        const m = /^\s*(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)\s*$/.exec(both.value);
+        if (!m) { err.replaceChildren(resultBox('warning', 'warn', 'Two numbers', 'Latitude first, then longitude, separated by a comma.')); return; }
+        act(e.currentTarget, () => post(`/fleet/addresses/${addressId}/place`, { lat: m[1], lng: m[2] }), 'Saved on the map', { close: d.close, errorInto: showErr(err) });
+      }, { primary: true }), btn('Cancel', d.close)), err);
+    both.focus();
+  }
+  const noPointChip = () => chip('critical', 'warn', 'No map point');
+
   // ---------------------------------------------------------- schedule
   async function scheduleScreen() {
     const [queue, stops] = await Promise.all([coApi('/fleet/queue'), coApi(`/fleet/stops?day=${st.day}`)]);
     const q = queue.map((o) => item({
       title: `${o.number} · ${o.customer}`, amount: money(o.balance_minor),
-      badge: o.zone_name ? chip('neutral', 'info', o.zone_name) : chip('critical', 'warn', 'No zone'),
+      badge: !o.zone_name ? chip('critical', 'warn', 'No zone') : !o.has_geo && o.geo_error ? noPointChip() : chip('neutral', 'info', o.zone_name),
+      why: !o.has_geo && o.geo_error ? `Not on the map yet: ${o.geo_error}.` : null,
       detail: [`${o.city} ${o.postal}`, plural(o.pieces, 'piece'), `${Math.round(o.cube_ft)} cu ft`, o.waiting_lines ? `${o.waiting_lines} line(s) not in yet` : null, o.promised_on ? `promised ${dayLabel(o.promised_on)}` : null].filter(Boolean).join(' · '),
-      acts: [btn('Book', () => bookDialog(o), { small: true, primary: true }), btn('Send link', (e) => sendLink(e.currentTarget, o), { small: true })] }));
+      acts: [btn('Book', () => bookDialog(o), { small: true, primary: true }), btn('Send link', (e) => sendLink(e.currentTarget, o), { small: true }),
+        ...(!o.has_geo && o.geo_error ? mapFixActs(o.address_id, `${o.customer} · ${o.line1}, ${o.city}`) : [])] }));
     const s = stops.map((x) => item({
-      title: `${x.number} · ${x.customer || ''}`, badge: stopChip(x.status),
+      title: `${x.number} · ${x.customer || ''}`, badge: x.address_id && !x.has_geo && x.status === 'scheduled' ? noPointChip() : stopChip(x.status),
+      why: x.address_id && !x.has_geo ? `Not on the map${x.geo_error ? ': ' + x.geo_error : ''}. It cannot be routed until it is.` : null,
       detail: [KIND[x.kind], x.window_label, x.zone_name, x.city, x.route_number ? `${x.route_number} #${x.seq}` : 'not routed', x.over_capacity_ok ? 'over capacity (override)' : null].filter(Boolean).join(' · '),
-      acts: x.status === 'scheduled' && x.kind !== 'will_call' ? [btn('Move', () => rescheduleDialog(x), { small: true }), btn('Cancel…', () => cancelStop(x), { small: true })] : null }));
+      acts: x.status === 'scheduled' && x.kind !== 'will_call' ? [btn('Move', () => rescheduleDialog(x), { small: true }), btn('Cancel…', () => cancelStop(x), { small: true }),
+        ...(x.address_id && !x.has_geo ? mapFixActs(x.address_id, `${x.customer || ''} · ${x.line1 || ''}, ${x.city || ''}`) : [])] : null }));
     return frag(
       section('Ready to schedule', queue.length ? plural(queue.length, 'order') : null,
         [btn('Service call', () => adhocDialog('service'), { small: true, ic: 'plus' }), btn('Pickup', () => adhocDialog('pickup'), { small: true, ic: 'plus' })],
@@ -259,7 +287,8 @@
         (x) => `${plural(x.routes.length, 'route')} built${x.unassigned.length ? `, ${x.unassigned.length} stop(s) left over` : ''}`, { errorInto: showErr(err) });
       if (r && r.unassigned.length) {
         const d = openDialog('Stops left over', 'They need a person to decide');
-        d.body.append(panel(r.unassigned.map((u) => item({ title: u.number || 'Stop', detail: cap(u.reason) }))), el('div', { class: 'dlg-acts' }, btn('Close', d.close)));
+        d.body.append(panel(r.unassigned.map((u) => item({ title: u.number || 'Stop', detail: cap(u.reason),
+          acts: u.noMapPoint && u.addressId ? mapFixActs(u.addressId, u.number) : null }))), el('div', { class: 'dlg-acts' }, btn('Close', d.close)));
       }
     }, { primary: true });
     const addTruck = btn('Add a truck', () => {
@@ -272,7 +301,9 @@
     return frag(
       el('div', { class: 'toolbar' }, dayPicker(), dcPicker(o), el('span', { class: 'grow' }), addTruck, build), err,
       section('Routes', routes.length ? plural(routes.length, 'route') : null, null, routes.length ? panel(cards) : empty('No routes yet', 'Build them from the day\'s booked stops.', true)),
-      loose.length ? section('Not on a route', String(loose.length), null, panel(loose.map((s) => item({ title: `${s.number} · ${s.customer || ''}`, detail: [KIND[s.kind], s.window_label, s.city].join(' · ') })))) : null);
+      loose.length ? section('Not on a route', String(loose.length), null, panel(loose.map((s) => item({ title: `${s.number} · ${s.customer || ''}`,
+        badge: s.has_geo ? null : noPointChip(), detail: [KIND[s.kind], s.window_label, s.line1, s.city].filter(Boolean).join(' · '),
+        acts: s.has_geo ? null : mapFixActs(s.address_id, `${s.customer || ''} · ${s.line1 || ''}, ${s.city || ''}`) })))) : null);
   }
 
   async function routeScreen(o, id) {

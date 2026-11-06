@@ -7,10 +7,20 @@ import { type T, ENTITY, RIO_ENTITY, PEOPLE } from "./harness.ts";
 import { tx, type Client } from "../../packages/core/db.ts";
 import * as R from "../../packages/core/routing.ts";
 import * as F from "../../packages/core/fleet.ts";
-import { reserveOrder } from "../../packages/core/inventory.ts";
+import { reserveOrder, releaseLines } from "../../packages/core/inventory.ts";
 import { module as fleetModule } from "../../server/modules/fleet.ts";
 import type { Company, Actor } from "../../server/modules/kit.ts";
 import { loadCompany } from "../../server/views.ts";
+import { censusGeocoder, setGeocoder, geocoder, CENSUS_URL, type FetchLike } from "../../packages/core/geocode.ts";
+
+// A real US Census Geocoder answer (onelineaddress, Public_AR_Current, format=json), for the
+// Census Bureau's own address. The workspace has no internet, so tests feed it through a fake fetch.
+const CENSUS_HIT = {"result":{"input":{"address":{"address":"4600 Silver Hill Rd, Washington, DC 20233"},"benchmark":{"isDefault":true,"benchmarkDescription":"Public Address Ranges - Current Benchmark","id":"4","benchmarkName":"Public_AR_Current"}},
+  "addressMatches":[{"tigerLine":{"side":"L","tigerLineId":"76355984"},"coordinates":{"x":-76.92748724230096,"y":38.84601622386617},
+    "addressComponents":{"zip":"20233","streetName":"SILVER HILL","preType":"","city":"WASHINGTON","preDirection":"","suffixDirection":"","fromAddress":"4600","state":"DC","suffixType":"RD","toAddress":"4700","suffixQualifier":"","preQualifier":""},
+    "matchedAddress":"4600 SILVER HILL RD, WASHINGTON, DC, 20233"}]}};
+const CENSUS_MISS = {"result":{"input":{"address":{"address":"77 Unknown Rd, Lemoyne, PA 17043"},"benchmark":{"isDefault":true,"benchmarkDescription":"Public Address Ranges - Current Benchmark","id":"4","benchmarkName":"Public_AR_Current"}},"addressMatches":[]}};
+const reply = (status: number, body: unknown) => Promise.resolve({ ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) });
 
 const DC = "33333333-0000-0000-0000-0000000000dc";
 const P = {
@@ -110,6 +120,19 @@ export async function run(t0: T) {
   const om = R.optimise({ lng: 0, lat: 0 }, line, { distance: matrix });
   t.ok("an injected distance matrix drives the order", om.map((s) => s.id).join() === order.join(), om.map((s) => s.id).join());
 
+  // ===================================================== geocoder (fake fetch, real Census JSON)
+  let seenUrl = "";
+  const g1 = censusGeocoder(((url: string) => { seenUrl = url; return reply(200, CENSUS_HIT); }) as FetchLike);
+  const hit = await g1.locate("4600 Silver Hill Rd, Washington, DC 20233");
+  t.ok("the Census answer is read into a point (x is longitude, y latitude)", !!hit && Math.abs(hit.lng + 76.9275) < 0.001 && Math.abs(hit.lat - 38.846) < 0.001
+    && hit.matched.startsWith("4600 SILVER HILL"), hit ? `${hit.lat}, ${hit.lng}` : "none");
+  t.ok("the lookup asks the Census one-line endpoint, current benchmark, JSON, address encoded",
+    seenUrl.startsWith(CENSUS_URL + "?address=4600%20Silver%20Hill%20Rd%2C%20Washington%2C%20DC%2020233") && seenUrl.includes("benchmark=Public_AR_Current") && seenUrl.includes("format=json"));
+  t.ok("no match is an answer, not a point", (await censusGeocoder((() => reply(200, CENSUS_MISS)) as FetchLike).locate("77 Unknown Rd")) === null);
+  await t.throws("a server error from the map service is reported, not guessed", () => censusGeocoder((() => reply(503, {})) as FetchLike).locate("x"), /answered 503/);
+  await t.throws("no network is reported in words", () => censusGeocoder((() => Promise.reject(new TypeError("fetch failed"))) as FetchLike).locate("x"), /could not be reached \(fetch failed\)/);
+  await t.throws("a map service that hangs is given up on", () => censusGeocoder((() => new Promise(() => {})) as unknown as FetchLike, 60).locate("x"), /did not answer within/);
+
   // ===================================================== against the database
   const H: Handler[] = [];
   fleetModule.register({
@@ -189,6 +212,20 @@ export async function run(t0: T) {
       { orderId: SO(1), day: D, windowId: am.windowId, override: "customer moving out that afternoon" });
     throw new Error(r.id ? "override booked (rolled back)" : "no");
   }), /override booked/);
+
+  // a window that has already ended today cannot be booked, even by a dispatcher (rolled back)
+  let endedHidden = false;
+  await t.throws("today's window that has already ended is refused", () => t.as(P.RAY, async (c, co, a) => {
+    await c.query(`update delivery_zone set days = '{0,1,2,3,4,5,6}' where entity_id = $1 and code = 'WSH'`, [ENTITY]);
+    const w = await t.q<{ id: string }>(c, `insert into delivery_window (entity_id, zone_id, label, starts, ends)
+      select entity_id, id, 'Midnight', '00:00', '00:01' from delivery_zone where entity_id = $1 and code = 'WSH' returning id`, [ENTITY]);
+    const zid = (await t.q<{ id: string }>(c, `select id from delivery_zone where entity_id = $1 and code = 'WSH'`, [ENTITY]))[0].id;
+    endedHidden = !(await F.availability(c, ENTITY, zid, today, 1)).some((x) => x.windowId === w[0].id);
+    await F.bookStop(c, { tenantId: co.tenantId, entityId: ENTITY, actor: { kind: "user", id: a.personId, label: a.label } },
+      { orderId: SO(5), day: today, windowId: w[0].id, allowToday: true });
+    throw new Error("booked (rolled back)");
+  }), /today's Midnight window has already ended/);
+  t.ok("availability does not offer a window that has already ended today", endedHidden);
 
   // the day's bookings
   const booked: Record<number, string> = {};
@@ -270,6 +307,20 @@ export async function run(t0: T) {
   await t.throws("an expired licence cannot be put on a route", () => post(P.RAY, `/fleet/routes/${RB.id}/crew`, { driverId: P.KIM }), /licence expired/);
   await t.throws("a helper is not put behind the wheel", () => post(P.RAY, `/fleet/routes/${RB.id}/crew`, { driverId: P.SAM }), /helper, not a licensed driver/);
   await post(P.RAY, `/fleet/routes/${RB.id}/crew`, { driverId: P.TONY, helperId: P.SAM });
+  await t.throws("a truck already on another route is refused, naming the route", () => post(P.RAY, `/fleet/routes/${RB.id}/crew`, { vehicleId: V.T101 }),
+    new RegExp(`unit T-101 is already on route ${RA.number} that day`));
+  await t.throws("a second route for a busy truck is refused the same way", () => post(P.RAY, "/fleet/routes", { day: D, dcId: DC, vehicleId: V.T101 }),
+    new RegExp(`unit T-101 is already on route ${RA.number}`));
+  await t.throws("a driver already on another route is refused, naming the route", () => post(P.RAY, `/fleet/routes/${RB.id}/crew`, { driverId: P.MARCO }),
+    new RegExp(`Marco \\(driver\\) is already on route ${RA.number}`));
+  await t.throws("a helper already riding elsewhere is refused too", () => post(P.RAY, `/fleet/routes/${RB.id}/crew`, { helperId: P.JO }),
+    new RegExp(`Jo \\(helper\\) is already on route ${RA.number}`));
+  await t.throws("a second vehicle with the same unit number is refused in words", () => post(P.RAY, "/fleet/vehicles",
+    { unitNo: "t-101", vinLast6: "ABC123", kind: "van", homeLocationId: DC, cubeFt: 300, maxWeightLb: 3000 }), /already a vehicle numbered t-101/);
+  await t.throws("a second zone with the same code is refused in words", () => post(P.RAY, "/fleet/zones",
+    { code: "wsh", name: "Dup", dcLocationId: DC, postalCodes: "17999", fee: "0" }), /already a zone with the code WSH/);
+  await t.throws("a second window at the same start is refused in words", () => post(P.RAY, `/fleet/zones/a2a2a2a2-0000-0000-0000-000000000001/windows`,
+    { starts: "08:00", ends: "11:00" }), /already has a window starting at 08:00 \(8–12\)/);
   const rb = await get(`/fleet/routes/${RB.id}`, P.RAY);
   t.ok("the stops moved to the second truck with ETAs", rb.stops.length === 3 && rb.stops.every((s: any) => s.eta_min != null));
 
@@ -440,6 +491,84 @@ export async function run(t0: T) {
   const rebooked = await one<{ n: number; d: string }>(`select count(*)::int n, min(sl.description) d from delivery_stop s join delivery_stop_line sl on sl.stop_id = s.id
      where s.entity_id = $1 and s.number = $2`, [ENTITY, rp.number]);
   t.ok("the new stop carries only the chairs that were not delivered", rebooked.n === 1 && rebooked.d.includes("Chair"), rp.number);
+
+  // ===================================================== new customers, no seeded map point
+  const prevGeocoder = geocoder();
+  let failNext = false;
+  setGeocoder(censusGeocoder(((url: string) => {
+    if (failNext) return Promise.reject(new TypeError("fetch failed"));
+    if (decodeURIComponent(url).includes("Unknown Rd")) return reply(200, CENSUS_MISS);
+    // a Census answer for the newcomer's street in Camp Hill
+    const h = structuredClone(CENSUS_HIT);
+    h.result.addressMatches[0].coordinates = { x: -76.9195, y: 40.2422 };
+    h.result.addressMatches[0].matchedAddress = "5 MARKET ST, CAMP HILL, PA, 17011";
+    return reply(200, h);
+  }) as FetchLike));
+  try {
+    let D2 = D;
+    do { const d = new Date(D2 + "T12:00:00Z"); d.setUTCDate(d.getUTCDate() + 1); D2 = d.toISOString().slice(0, 10); }
+    while (![3, 6].includes(new Date(D2 + "T12:00:00Z").getUTCDay()));
+    const newbies = await t.as(P.STEVE, async (c) => {
+      const out: Record<string, { order: string; address: string }> = {};
+      for (const [key, name, line1, city, postal] of [["nina", "Nina Newcomer", "5 Market St", "Camp Hill", "17011"], ["oscar", "Oscar Nowhere", "77 Unknown Rd", "Lemoyne", "17043"]]) {
+        const cu = (await t.q<{ id: string }>(c, `insert into customer (entity_id, number, name, phone) values ($1, $2, $3, '717-555-0190') returning id`,
+          [ENTITY, "C-G" + key.toUpperCase(), name]))[0].id;
+        const ad = (await t.q<{ id: string }>(c, `insert into customer_address (entity_id, customer_id, line1, city, state, postal, is_default)
+          values ($1,$2,$3,$4,'PA',$5,true) returning id`, [ENTITY, cu, line1, city, postal]))[0].id;
+        const so = (await t.q<{ id: string }>(c, `insert into sales_order (entity_id, number, channel, location_id, customer_id, status, fulfillment, ship_address_id)
+          values ($1, next_doc_no($1,'order','SO-'), 'pos', '33333333-0000-0000-0000-000000000001', $2, 'open', 'delivery', $3) returning id`, [ENTITY, cu, ad]))[0].id;
+        await c.query(`insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, fulfil_from_id)
+          select $1, $2, 1, id, sku, name, 1, price_minor, $3 from product where entity_id = $1 and sku = 'ACC-LAMP-01'`, [ENTITY, so, DC]);
+        await c.query(`select sales_order_retotal($1) /* unscoped: function on one order */`, [so]);
+        await reserveOrder(c, ENTITY, so);
+        out[key] = { order: so, address: ad };
+      }
+      return out;
+    });
+    const wsh = (await get(`/fleet/availability?order=${newbies.nina.order}&day=${D2}&days=1`, P.RAY)).slots.find((x: any) => x.label === "8–12").windowId;
+    await post(P.RAY, "/fleet/stops", { orderId: newbies.nina.order, day: D2, windowId: wsh });
+    const ng = await one<{ lat: number; lng: number; geo_source: string }>(`select geo[1] lat, geo[0] lng, geo_source from customer_address where entity_id = $1 and id = $2`, [ENTITY, newbies.nina.address]);
+    t.ok("booking a new customer's delivery finds the address on the map and keeps it", ng.geo_source === "census" && Math.abs(ng.lat - 40.2422) < 1e-6 && Math.abs(ng.lng + 76.9195) < 1e-6);
+    const os = await post(P.RAY, "/fleet/stops", { orderId: newbies.oscar.order, day: D2, windowId: wsh });
+    const og = await one<{ geo: string | null; geo_error: string | null }>(`select geo::text geo, geo_error from customer_address where entity_id = $1 and id = $2`, [ENTITY, newbies.oscar.address]);
+    t.ok("an address the map service cannot find is still booked, with the reason kept and no made-up point", !!os.id && og.geo === null && /found no such address/.test(og.geo_error ?? ""));
+    const sched = await get(`/fleet/stops?day=${D2}`, P.RAY);
+    t.ok("the schedule shows which stop is not on the map", sched.find((x: any) => x.id === os.id)?.has_geo === false && sched.find((x: any) => x.number && x.customer === "Nina Newcomer")?.has_geo === true);
+    const b2 = await post(P.RAY, "/fleet/routes/build", { day: D2, dcId: DC });
+    const left = b2.unassigned.find((u: any) => u.id === os.id);
+    t.ok("the builder routes the new customer and leaves the unplaced one over, naming customer and address",
+      b2.routes.length === 1 && b2.routes[0].stops === 1 && b2.routes[0].miles < 40 && left?.noMapPoint && left.addressId === newbies.oscar.address
+      && /Oscar Nowhere at 77 Unknown Rd, Lemoyne has no map point/.test(left.reason), `${b2.routes[0]?.miles} mi · ${left?.reason}`);
+    await t.throws("a stop with no map point cannot be put on a route by hand either", () => post(P.RAY, `/fleet/stops/${os.id}/assign`, { routeId: b2.routes[0].routeId }),
+      /stop D-\d+ for Oscar Nowhere at 77 Unknown Rd, Lemoyne has no map point/);
+    await t.throws("the database refuses 0,0 as a point", () => t.as(P.RAY, async (c) => {
+      await c.query(`update customer_address set geo = point(0,0) where entity_id = $1 and id = $2`, [ENTITY, newbies.oscar.address]);
+    }), /customer_address_geo_range/);
+    failNext = true;
+    await t.throws("Find on map with the service down says so and offers the manual way", () => post(P.RAY, `/fleet/addresses/${newbies.oscar.address}/locate`),
+      /could not place Oscar Nowhere at 77 Unknown Rd, Lemoyne on the map: the map service could not be reached .*Enter its latitude and longitude/);
+    failNext = false;
+    await t.throws("a manual point must be a real place", () => post(P.RAY, `/fleet/addresses/${newbies.oscar.address}/place`, { lat: "0", lng: "0" }), /real latitude and longitude/);
+    await t.throws("a manual point must be two numbers", () => post(P.RAY, `/fleet/addresses/${newbies.oscar.address}/place`, { lat: "abc", lng: "" }), /real latitude and longitude/);
+    await t.throws("a driver cannot move an address on the map", () => post(P.TONY, `/fleet/addresses/${newbies.oscar.address}/place`, { lat: 40.2412, lng: -76.8975 }), /needs one of/);
+    await post(P.RAY, `/fleet/addresses/${newbies.oscar.address}/place`, { lat: 40.2412, lng: -76.8975 });
+    const placed = await one<{ geo_source: string }>(`select geo_source from customer_address where entity_id = $1 and id = $2`, [ENTITY, newbies.oscar.address]);
+    const b3 = await post(P.RAY, "/fleet/routes/build", { day: D2, dcId: DC });
+    t.ok("placed by hand, the stop is routed on the next build, and the route stays local", placed.geo_source === "manual" && b3.unassigned.length === 0
+      && b3.routes[0].stops === 2 && b3.routes[0].miles < 40, `${b3.routes[0].miles} mi`);
+    // leave the shared demo stock as it was: these two test orders are cancelled and their lamps released
+    await t.as(P.RAY, async (c, co, a) => {
+      const sc = { tenantId: co.tenantId, entityId: ENTITY, actor: { kind: "user" as const, id: a.personId, label: a.label } };
+      await c.query(`update delivery_route set status = 'cancelled' where entity_id = $1 and route_on = $2 and status = 'draft'`, [ENTITY, D2]);
+      for (const k of Object.values(newbies)) {
+        const st = await t.q<{ id: string }>(c, `select id from delivery_stop where entity_id = $1 and sales_order_id = $2 and status = 'scheduled'`, [ENTITY, k.order]);
+        for (const x of st) await F.cancelStop(c, sc, x.id, "test order, cleared");
+        await releaseLines(c, ENTITY, k.order, "all");
+        await c.query(`update sales_order_line set line_status = 'cancelled' where entity_id = $1 and sales_order_id = $2`, [ENTITY, k.order]);
+        await c.query(`update sales_order set status = 'cancelled' where entity_id = $1 and id = $2`, [ENTITY, k.order]);
+      }
+    });
+  } finally { setGeocoder(prevGeocoder); }
 
   // trial balance still balances
   const tb = await one<{ d: string; c: string }>(`select sum(jl.debit_minor)::text d, sum(jl.credit_minor)::text c from journal_line jl

@@ -13,6 +13,7 @@ import * as inventory from "./inventory.ts";
 import { postReceipt, invoiceFulfilment } from "./ar.ts";
 import { accrueCommissions } from "./workforce.ts";
 import * as R from "./routing.ts";
+import { geocodeAddress, setManualGeo, GeocodeError } from "./geocode.ts";
 
 export class FleetError extends Error {}
 function need(cond: unknown, message: string): asserts cond {
@@ -42,7 +43,7 @@ export async function settings(c: Client, entityId: string): Promise<Settings> {
            booking_lead_days, link_valid_days
       from fleet_setting where entity_id = $1`, [entityId]);
   const x = r[0];
-  if (!x) return { tz: "America/New_York", avgMph: 30, roadFactor: 1.3, startMin: 450, endMin: 1110, baseMin: 10,
+  if (!x) return { tz: "America/Chicago", avgMph: 30, roadFactor: 1.3, startMin: 450, endMin: 1110, baseMin: 10,
     perPieceMin: 4, perStairPieceMin: 3, laborHourMinor: 2200n, fuelPriceMinor: 389n, leadDays: 1, linkDays: 14 };
   return { tz: String(x.time_zone), avgMph: n(x.avg_mph), roadFactor: n(x.road_factor), startMin: n(x.start_min),
     endMin: n(x.end_min), baseMin: n(x.base_service_min), perPieceMin: n(x.per_piece_min),
@@ -79,6 +80,22 @@ async function companyName(c: Client, entityId: string): Promise<string> {
 }
 
 // ------------------------------------------------------------- vehicles --
+
+/** Is this truck or person already on another live route that day? Returns that route's number. */
+async function busyElsewhere(c: Client, entityId: string, day: string, exceptRouteId: string | null,
+  who: { vehicleId?: string | null; personId?: string | null }): Promise<string | null> {
+  if (!who.vehicleId && !who.personId) return null;
+  const r = await q<{ number: string }>(c, `
+    select number from delivery_route
+     where entity_id = $1 and route_on = $2 and status <> 'cancelled' and ($3::uuid is null or id <> $3)
+       and (($4::uuid is not null and vehicle_id = $4) or ($5::uuid is not null and (driver_id = $5 or helper_id = $5)))
+     order by number limit 1`, [entityId, day, exceptRouteId, who.vehicleId ?? null, who.personId ?? null]);
+  return r[0]?.number ?? null;
+}
+
+/** "Alicia Gomez at 12 Oak Ln, Camp Hill" -- how a stop without a map point is named to a person. */
+const whereWords = (x: { customer?: string | null; line1?: string | null; city?: string | null }) =>
+  `${x.customer ?? "the customer"} at ${x.line1 ?? "an address"}${x.city ? ", " + x.city : ""}`;
 
 export const VEHICLE_KINDS = ["box_truck", "van", "pickup", "straight_truck", "tractor", "trailer"];
 
@@ -136,6 +153,13 @@ export async function addVehicle(c: Client, scope: Scope, b: Record<string, unkn
   need(isId(b.homeLocationId), "pick the vehicle's home location");
   const home = await q(c, `select id from location where entity_id = $1 and id = $2`, [scope.entityId, b.homeLocationId]);
   need(home.length, "that location is not one of this company's");
+  const dupUnit = await q(c, `select 1 from vehicle where entity_id = $1 and lower(unit_no) = lower($2)`, [scope.entityId, unit]);
+  need(!dupUnit.length, `there is already a vehicle numbered ${unit}`);
+  const gt = String(b.geotabDeviceId ?? "").trim();
+  if (gt) {
+    const dupG = await q<{ unit_no: string }>(c, `select unit_no from vehicle where entity_id = $1 and geotab_device_id = $2`, [scope.entityId, gt]);
+    need(!dupG.length, `Geotab device ${gt} is already on unit ${dupG[0]?.unit_no}`);
+  }
   const cube = n(b.cubeFt), wt = n(b.maxWeightLb);
   need(cube > 0, "give the cargo space in cubic feet");
   need(wt > 0, "give the most weight it can carry, in pounds");
@@ -385,6 +409,9 @@ export async function saveZone(c: Client, scope: Scope, b: Record<string, unknow
   need(days.length, "pick at least one delivery day");
   const fee = BigInt(String(b.feeMinor ?? 0));
   need(fee >= 0n, "a delivery fee is not negative");
+  const dupZ = await q(c, `select 1 from delivery_zone where entity_id = $1 and code = $2 and ($3::uuid is null or id <> $3)`,
+    [scope.entityId, code, b.id && isId(b.id) ? b.id : null]);
+  need(!dupZ.length, `there is already a zone with the code ${code}`);
   if (b.id) {
     need(isId(b.id), "no such zone");
     const r = await q(c, `update delivery_zone set code=$3, name=$4, dc_location_id=$5, postal_codes=$6, days=$7, fee_minor=$8, active=$9
@@ -406,6 +433,9 @@ export async function saveWindow(c: Client, scope: Scope, zoneId: string, b: Rec
   need(String(b.ends).padStart(5, "0") > String(b.starts).padStart(5, "0"), "a window ends after it starts");
   const cap = (v: unknown) => (v === null || v === undefined || v === "" ? null : Math.max(0, n(v)));
   const label = String(b.label ?? "").trim() || `${b.starts}–${b.ends}`;
+  const dupW = await q<{ label: string }>(c, `select label from delivery_window where entity_id = $1 and zone_id = $2 and starts = $3::time and ($4::uuid is null or id <> $4)`,
+    [scope.entityId, zoneId, b.starts, b.id && isId(b.id) ? b.id : null]);
+  need(!dupW.length, `this zone already has a window starting at ${b.starts} (${dupW[0]?.label}); change that one instead`);
   if (b.id) {
     need(isId(b.id), "no such window");
     const r = await q(c, `update delivery_window set label=$4, starts=$5, ends=$6, stops_cap=$7, pieces_cap=$8, cube_cap=$9, labor_min_cap=$10, active=$11
@@ -464,7 +494,8 @@ export async function availability(c: Client, entityId: string, zoneId: string, 
      where w.entity_id = $1 and w.zone_id = $2 and w.active
      order by d.day, w.starts`, [entityId, zoneId, from, Math.min(Math.max(days, 1), 60)]);
   const zd = z[0].days.map(Number);
-  return rows.filter((r) => !r.blackout && zd.includes(dow(String(r.day)))).map((r) => {
+  const now = await localNow(c, (await settings(c, entityId)).tz);
+  return rows.filter((r) => !r.blackout && zd.includes(dow(String(r.day))) && !(String(r.day) === now.day && n(r.end_min) <= now.min)).map((r) => {
     const caps = { stops: r.stops_cap as number | null, pieces: r.pieces_cap as number | null, cube: r.cube_cap as number | null, labor: r.labor_min_cap as number | null };
     const used = { stops: n(r.n), pieces: n(r.pcs), cube: n(r.cube), labor: n(r.lab) };
     const fits = (caps.stops == null || used.stops + 1 <= caps.stops) && (caps.pieces == null || used.pieces + size.pieces <= caps.pieces)
@@ -482,6 +513,7 @@ export async function deliveryQueue(c: Client, entityId: string) {
     select so.id, so.number, so.status, so.promised_on::text promised_on, so.total_minor, so.paid_minor,
            (so.total_minor - so.paid_minor)::text balance_minor,
            cu.id customer_id, cu.name customer, cu.phone, a.id address_id, a.line1, a.city, a.state, a.postal, a.stairs,
+           (a.geo is not null) has_geo, a.geo_source, a.geo_error,
            z.id zone_id, z.name zone_name,
            count(*) filter (where l.line_status in ('reserved','ready'))::int ready_lines,
            count(*) filter (where l.line_status in ('open','on_order'))::int waiting_lines,
@@ -529,11 +561,14 @@ export type BookInput = {
 async function checkSlot(c: Client, entityId: string, s: Settings, zone: { id: string; days: number[] }, day: string, windowId: string, allowToday: boolean) {
   need(DAY.test(day), "pick a delivery day");
   need(isId(windowId), "pick a delivery window");
-  const w = await q(c, `select id from delivery_window where entity_id = $1 and id = $2 and zone_id = $3 and active`, [entityId, windowId, zone.id]);
+  const w = await q<{ id: string; label: string; end_min: number }>(c, `
+    select id, label, (extract(hour from ends)*60 + extract(minute from ends))::int end_min
+      from delivery_window where entity_id = $1 and id = $2 and zone_id = $3 and active`, [entityId, windowId, zone.id]);
   need(w.length, "that window is not one this address's zone offers");
   const now = await localNow(c, s.tz);
   const first = addDays(now.day, allowToday ? 0 : s.leadDays);
   need(day >= first, allowToday ? "that day has passed" : `the first day that can be booked is ${dayWords(first)}`);
+  need(day !== now.day || w[0].end_min > now.min, `today's ${w[0].label} window has already ended; pick a later one`);
   need(zone.days.map(Number).includes(dow(day)), `this zone does not get deliveries on ${new Date(day + "T12:00:00Z").toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" })}s`);
   const bo = await q<{ reason: string }>(c, `select reason from delivery_blackout where entity_id = $1 and day = $2 and (zone_id is null or zone_id = $3)`,
     [entityId, day, zone.id]);
@@ -583,6 +618,7 @@ export async function bookStop(c: Client, scope: Scope, b: BookInput) {
       [scope.entityId, addressId, customerId]);
     need(a.length, "that address is not this customer's");
     stairs = a[0].stairs;
+    await geocodeAddress(c, scope.entityId, addressId);   // caches the point; a miss is remembered and shown to the dispatcher
     zone = await zoneForPostal(c, scope.entityId, a[0].postal);
     need(zone, `postal code ${a[0].postal} is outside every delivery zone; add it to a zone, or book a will-call`);
     need(b.day && b.windowId, "pick a day and a window");
@@ -684,7 +720,8 @@ export async function stops(c: Client, entityId: string, day: string, dcId?: str
   return q(c, `
     select s.id, s.number, s.kind, s.status, s.scheduled_on::text scheduled_on, w.label window_label, z.name zone_name,
            s.pieces, s.cube_ft::float cube_ft, s.service_min, s.route_id, r.number route_number, s.seq, s.eta_min,
-           cu.name customer, a.city, a.postal, so.number order_number, s.over_capacity_ok
+           cu.name customer, a.id address_id, a.line1, a.city, a.postal, so.number order_number, s.over_capacity_ok,
+           (a.geo is not null) has_geo, a.geo_source, a.geo_error, a.geo[1] lat, a.geo[0] lng
       from delivery_stop s
       left join delivery_window w on w.id = s.window_id
       left join delivery_zone z on z.id = s.zone_id
@@ -851,14 +888,17 @@ type GeoStop = R.RStop & { number: string };
 
 async function routeStops(c: Client, entityId: string, routeId: string): Promise<GeoStop[]> {
   const rows = await q<{ id: string; number: string; lng: number | null; lat: number | null; pieces: number; cube: number; weight: number;
-    stairs: number; ws: number | null; we: number | null; service_min: number }>(c, `
+    stairs: number; ws: number | null; we: number | null; service_min: number; customer: string | null; line1: string | null; city: string | null }>(c, `
     select s.id, s.number, a.geo[0] lng, a.geo[1] lat, s.pieces, s.cube_ft::float cube, s.weight_lb::float weight, coalesce(a.stairs,0) stairs,
+           (select cu.name from customer cu where cu.id = s.customer_id) customer, a.line1, a.city,
            (extract(hour from w.starts)*60 + extract(minute from w.starts))::int ws, (extract(hour from w.ends)*60 + extract(minute from w.ends))::int we,
            s.service_min
       from delivery_stop s left join customer_address a on a.id = s.address_id left join delivery_window w on w.id = s.window_id
      where s.entity_id = $1 and s.route_id = $2 and s.status <> 'cancelled'
      order by s.seq nulls last, s.number`, [entityId, routeId]);
-  return rows.map((r) => ({ id: r.id, number: r.number, at: { lng: n(r.lng), lat: n(r.lat) }, pieces: r.pieces, cube: r.cube, weight: r.weight,
+  const lost = rows.find((r) => r.lng == null || r.lat == null);
+  need(!lost, lost ? `stop ${lost.number} for ${whereWords(lost)} has no map point; use Find on map or enter its position before routing it` : "");
+  return rows.map((r) => ({ id: r.id, number: r.number, at: { lng: Number(r.lng), lat: Number(r.lat) }, pieces: r.pieces, cube: r.cube, weight: r.weight,
     stairs: r.stairs, windowStart: r.ws ?? undefined, windowEnd: r.we ?? undefined, serviceMin: r.service_min }));
 }
 
@@ -927,22 +967,32 @@ export async function buildRoutes(c: Client, scope: Scope, day: string, dcId: st
     await c.query(`update delivery_route set driver_id = null, helper_id = null where entity_id = $1 and id = any($2)`,
       [scope.entityId, drafts.map((r) => r.id)]);
   }
+  // find any missing map points before planning (bounded, so one build cannot wait on dozens of lookups)
+  const missing = await q<{ address_id: string }>(c, `
+    select distinct s.address_id from delivery_stop s join customer_address a on a.id = s.address_id
+     where s.entity_id = $1 and s.scheduled_on = $2 and s.dc_location_id = $3 and s.status = 'scheduled' and s.route_id is null and a.geo is null
+     limit 25`, [scope.entityId, day, dcId]);
+  for (const m of missing) await geocodeAddress(c, scope.entityId, m.address_id);
   const todo = await q<{ id: string; number: string; lng: number | null; lat: number | null; pieces: number; cube: number; weight: number;
-    stairs: number; ws: number; we: number; service_min: number }>(c, `
+    stairs: number; ws: number; we: number; service_min: number; customer: string; line1: string; city: string; geo_error: string | null; address_id: string }>(c, `
     select s.id, s.number, a.geo[0] lng, a.geo[1] lat, s.pieces, s.cube_ft::float cube, s.weight_lb::float weight, a.stairs,
+           (select cu.name from customer cu where cu.id = s.customer_id) customer, a.line1, a.city, a.geo_error, s.address_id,
            (extract(hour from w.starts)*60 + extract(minute from w.starts))::int ws, (extract(hour from w.ends)*60 + extract(minute from w.ends))::int we,
            s.service_min
       from delivery_stop s join customer_address a on a.id = s.address_id join delivery_window w on w.id = s.window_id
      where s.entity_id = $1 and s.scheduled_on = $2 and s.dc_location_id = $3 and s.status = 'scheduled' and s.route_id is null
        and s.kind in ('delivery','pickup','service')
      order by s.number`, [scope.entityId, day, dcId]);
-  const busyVehicles = existing.filter((r) => r.status !== "draft").map((r) => r.vehicle_id);
+  // trucks already on a live route that day -- here or out of another warehouse -- are not planned again
+  const busyVehicles = (await q<{ vehicle_id: string }>(c, `
+    select vehicle_id from delivery_route where entity_id = $1 and route_on = $2 and status <> 'cancelled' and vehicle_id is not null
+       and not (id = any($3::uuid[]))`, [scope.entityId, day, drafts.map((d) => d.id)])).map((r) => r.vehicle_id);
   const fleet = await q<{ id: string; unit_no: string; cube: number; weight: number; max_stops: number; crew_size: number; requires_cdl: boolean }>(c, `
     select id, unit_no, cube_ft::float cube, max_weight_lb::float weight, max_stops, crew_size, requires_cdl from vehicle
      where entity_id = $1 and home_location_id = $2 and status = 'active' and not (id = any($3::uuid[]))
      order by cube_ft desc, unit_no`, [scope.entityId, dcId, busyVehicles.filter(Boolean)]);
   const noGeo = todo.filter((t) => t.lng == null);
-  const rstops: R.RStop[] = todo.filter((t) => t.lng != null).map((t) => ({ id: t.id, at: { lng: n(t.lng), lat: n(t.lat) }, cube: t.cube,
+  const rstops: R.RStop[] = todo.filter((t) => t.lng != null).map((t) => ({ id: t.id, at: { lng: Number(t.lng), lat: Number(t.lat) }, cube: t.cube,
     weight: t.weight, pieces: t.pieces, stairs: t.stairs, windowStart: t.ws, windowEnd: t.we, serviceMin: t.service_min }));
   const plan = R.assign(depot, rstops, fleet.map((v) => ({ id: v.id, cube: v.cube, weight: v.weight, maxStops: v.max_stops, startMin: s.startMin, endMin: s.endMin })), cfgOf(s));
 
@@ -951,9 +1001,9 @@ export async function buildRoutes(c: Client, scope: Scope, day: string, dcId: st
     select p.app_user_id id, u.name, p.kind, p.license_class, p.default_helper_id
       from driver_profile p join app_user u on u.id = p.app_user_id
      where p.entity_id = $1 and p.active and u.status = 'active' and (p.kind = 'helper' or p.license_expires >= $2::date)
-       and not exists (select 1 from delivery_route r where r.entity_id = $1 and r.route_on = $2 and r.status not in ('cancelled','draft')
-                        and (r.driver_id = p.app_user_id or r.helper_id = p.app_user_id))
-     order by u.name`, [scope.entityId, day]);
+       and not exists (select 1 from delivery_route r where r.entity_id = $1 and r.route_on = $2 and r.status <> 'cancelled'
+                        and not (r.id = any($3::uuid[])) and (r.driver_id = p.app_user_id or r.helper_id = p.app_user_id))
+     order by u.name`, [scope.entityId, day, drafts.map((d) => d.id)]);
   const used = new Set<string>();
   const out: { routeId: string; number: string; vehicle: string; stops: number; miles: number }[] = [];
   const keep = new Set<string>();
@@ -997,7 +1047,8 @@ export async function buildRoutes(c: Client, scope: Scope, day: string, dcId: st
   const numbers = new Map(todo.map((t) => [t.id, t.number]));
   return {
     routes: out,
-    unassigned: [...noGeo.map((t) => ({ id: t.id, number: t.number, reason: "the address has no map point yet" })),
+    unassigned: [...noGeo.map((t) => ({ id: t.id, number: t.number, addressId: t.address_id, noMapPoint: true,
+      reason: `${whereWords(t)} has no map point${t.geo_error ? ` (${t.geo_error})` : ""}; use Find on map or enter its position` })),
       ...plan.unassigned.map((u) => ({ ...u, number: numbers.get(u.id) }))],
     trucks: fleet.length,
   };
@@ -1095,6 +1146,10 @@ export async function assignStop(c: Client, scope: Scope, stopId: string, routeI
     need(rt.status === "draft", `route ${rt.number} is locked; unlock it first`);
     need(rt.route_on === st.scheduled_on, `stop ${st.number} is booked for another day`);
     need(rt.dc_location_id === st.dc_location_id, `stop ${st.number} ships from another warehouse`);
+    const g = await q<{ ok: boolean; customer: string | null; line1: string | null; city: string | null }>(c, `
+      select a.geo is not null ok, cu.name customer, a.line1, a.city from delivery_stop s join customer_address a on a.id = s.address_id
+        left join customer cu on cu.id = s.customer_id where s.entity_id = $1 and s.id = $2`, [scope.entityId, stopId]);
+    need(g[0]?.ok, `stop ${st.number} for ${whereWords(g[0] ?? {})} has no map point; use Find on map or enter its position before routing it`);
     const last = await one<{ m: number }>(c, `select coalesce(max(seq),0)::int m from delivery_stop where entity_id = $1 and route_id = $2`, [scope.entityId, routeId]);
     await c.query(`update delivery_stop set route_id = $3, seq = $4 where entity_id = $1 and id = $2`, [scope.entityId, stopId, routeId, last.m + 1]);
     await replan(c, scope.entityId, routeId);
@@ -1110,6 +1165,10 @@ export async function addRoute(c: Client, scope: Scope, day: string, dcId: strin
   need(DAY.test(day), "pick the day");
   need(isId(dcId) && isId(vehicleId), "pick the warehouse and the truck");
   const s = await settings(c, scope.entityId);
+  const v = await q<{ unit_no: string }>(c, `select unit_no from vehicle where entity_id = $1 and id = $2`, [scope.entityId, vehicleId]);
+  need(v.length, "that vehicle belongs to another company");
+  const on = await busyElsewhere(c, scope.entityId, day, null, { vehicleId });
+  need(!on, `unit ${v[0].unit_no} is already on route ${on} that day`);
   const number = await nextNo(c, scope.entityId, "route", "RT-");
   return one(c, `insert into delivery_route (entity_id, number, route_on, dc_location_id, vehicle_id, start_min) values ($1,$2,$3,$4,$5,$6) returning id, number`,
     [scope.entityId, number, day, dcId, vehicleId, s.startMin]);
@@ -1123,6 +1182,18 @@ export async function setCrew(c: Client, scope: Scope, routeId: string, b: { veh
   const d = b.driverId === undefined ? rt.driver_id : b.driverId || null;
   const h = b.helperId === undefined ? rt.helper_id : b.helperId || null;
   need(!d || d !== h, "the driver and the helper are two people");
+  if (v && v !== rt.vehicle_id) {
+    const on = await busyElsewhere(c, scope.entityId, rt.route_on, rt.id, { vehicleId: v });
+    const u = await q<{ unit_no: string }>(c, `select unit_no from vehicle where entity_id = $1 and id = $2`, [scope.entityId, v]);
+    need(u.length, "that vehicle belongs to another company");
+    need(!on, `unit ${u[0].unit_no} is already on route ${on} that day; take it off there first`);
+  }
+  for (const [pid, role] of [[d, "driver"], [h, "helper"]] as [string | null, string][]) {
+    if (!pid || pid === (role === "driver" ? rt.driver_id : rt.helper_id)) continue;
+    const on = await busyElsewhere(c, scope.entityId, rt.route_on, rt.id, { personId: pid });
+    const nm = await q<{ name: string }>(c, `select u.name from app_user u join driver_profile p on p.app_user_id = u.id and p.entity_id = $1 where u.id = $2`, [scope.entityId, pid]);
+    need(!on, `${nm[0]?.name ?? "that person"} is already on route ${on} that day`);
+  }
   const start = b.startMin != null ? Math.max(0, Math.min(1439, Math.round(b.startMin))) : null;
   await c.query(`update delivery_route set vehicle_id = $3, driver_id = $4, helper_id = $5, start_min = coalesce($6, start_min)
                   where entity_id = $1 and id = $2`, [scope.entityId, routeId, v, d, h, start]);
@@ -1459,4 +1530,35 @@ export async function orderBooking(c: Client, entityId: string, orderId: string)
     labor: Math.round(R.serviceMinutes({ id: "", at: { lng: 0, lat: 0 }, pieces, stairs: so[0].stairs ?? 0 }, cfgOf(s))) };
   const zone = so[0].postal ? await zoneForPostal(c, entityId, so[0].postal) : null;
   return { order: so[0], zone, lines, size };
+}
+
+
+/** "Find on map": look the address up again now, whatever happened before. */
+export async function locateAddress(c: Client, scope: Scope, addressId: string) {
+  need(isId(addressId), "no such address");
+  const a = await q<{ customer: string | null; line1: string; city: string }>(c, `
+    select cu.name customer, a.line1, a.city from customer_address a left join customer cu on cu.id = a.customer_id
+     where a.entity_id = $1 and a.id = $2`, [scope.entityId, addressId]);
+  need(a.length, "no such address");
+  const r = await geocodeAddress(c, scope.entityId, addressId, true);
+  need(r.ok, `could not place ${whereWords(a[0])} on the map: ${r.ok ? "" : r.reason}. Enter its latitude and longitude instead`);
+  await replanRoutesAt(c, scope.entityId, addressId);
+  return r;
+}
+
+/** A dispatcher puts the address on the map by hand. */
+export async function placeAddress(c: Client, scope: Scope, addressId: string, lat: number, lng: number) {
+  need(isId(addressId), "no such address");
+  try { await setManualGeo(c, scope.entityId, addressId, lat, lng); }
+  catch (e) { if (e instanceof GeocodeError) throw new FleetError(e.message); throw e; }
+  await replanRoutesAt(c, scope.entityId, addressId);
+  return { ok: true, lat, lng, source: "manual" };
+}
+
+/** A point moved: refresh the ETAs of any draft route that visits it. */
+async function replanRoutesAt(c: Client, entityId: string, addressId: string) {
+  const rs = await q<{ route_id: string }>(c, `
+    select distinct s.route_id from delivery_stop s join delivery_route r on r.id = s.route_id
+     where s.entity_id = $1 and s.address_id = $2 and r.status = 'draft' and s.status = 'scheduled'`, [entityId, addressId]);
+  for (const r of rs) await replan(c, entityId, r.route_id);
 }

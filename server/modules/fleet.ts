@@ -240,6 +240,16 @@ export const module: ErpModule = {
       await requireRole(c, co, a, BOOK, "cancelling a stop");
       return plain(() => F.cancelStop(c, scopeOf(co, a), m[2], str(b.reason)));
     });
+    // where an address is on the map: look it up again, or place it by hand
+    coPost(`/fleet/addresses/${ID}/locate`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, BOOK, "finding an address on the map");
+      return plain(() => F.locateAddress(c, scopeOf(co, a), m[2]));
+    });
+    coPost(`/fleet/addresses/${ID}/place`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, BOOK, "placing an address on the map");
+      const num = (v: unknown) => (v === null || v === undefined || v === "" ? NaN : Number(v));
+      return plain(() => F.placeAddress(c, scopeOf(co, a), m[2], num(b.lat), num(b.lng)));
+    });
     coPost(`/fleet/orders/${ID}/link`, async (c, co, a, _b, m) => {
       await requireRole(c, co, a, BOOK, "sending a self-scheduling link");
       return plain(() => F.createLink(c, scopeOf(co, a), m[2], publicBase()));
