@@ -1,4 +1,20 @@
-# Pentex ERP — session one
+# Pentex ERP
+
+An out-of-the-box ERP for furniture and home-furnishings retail, and through
+setup packs for appliance dealers, general retail, rent-to-own and trucking.
+The finance core (GL, AP, banking, reconciliation, payroll) is below; the
+retail modules -- catalog, purchasing, warehouse, POS, receivables, time and
+commissions, fleet and delivery routing, and the omnichannel web store with
+its product customizer -- are described in `docs/MODULES.md`, built to the
+feature map in `docs/RESEARCH.md` (ERPNext, STORIS, NetSuite, Furniture
+Wizard, RetailVantage, Renaissance; ERPNext is used as a blueprint only).
+
+```bash
+npm run smoke            # finance core
+npm run smoke:modules    # retail modules
+```
+
+## The finance core — session one
 
 Foundation, vendor master, accounts payable, banking and payroll.
 TypeScript, Postgres, no framework. This is the schema and the core rules,
