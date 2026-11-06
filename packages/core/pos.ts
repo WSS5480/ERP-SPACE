@@ -17,6 +17,7 @@ import { post, profitObjectFor } from "./posting.ts";
 import { priceConfigured, type Choice } from "./pricing.ts";
 import { reserveOrder, fulfilLines, releaseLines, restock, returnToDamage, unitCost } from "./inventory.ts";
 import { postReceipt, invoiceFulfilment, chargeRoom } from "./ar.ts";
+import { providerNamed } from "./shop.ts";
 import { accrueCommissions } from "./workforce.ts";
 
 export class PosError extends Error {}
@@ -720,18 +721,29 @@ export async function pay(c: Client, scope: Scope, orderId: string, e: { session
 }
 
 /** Hand pickup (or late take-with) lines over at the counter. Layaway goods wait until paid in full. */
-export async function fulfilAtCounter(c: Client, scope: Scope, orderId: string, lineIds: string[]) {
+export async function fulfilAtCounter(c: Client, scope: Scope, orderId: string, lineIds: string[], e: { sessionId?: string | null } = {}) {
   const o = await orderOf(c, scope.entityId, orderId);
+  // The counter is the register's store when one is named, else the store the order belongs to.
+  const here = e.sessionId ? (await sessionOf(c, scope.entityId, e.sessionId)).location_id : o.location_id;
+  const hereName = (await locationOf(c, scope.entityId, here)).name;
   need(["open", "fulfilling"].includes(o.status), `${o.number} is ${o.status}`);
   need(lineIds.length, "pick the lines being handed over");
   if (o.kind === "layaway") need(BigInt(o.paid_minor) >= BigInt(o.total_minor), `layaway ${o.number} is not paid in full; ${usd(BigInt(o.total_minor) - BigInt(o.paid_minor))} is still owed`);
-  const ls = await q<{ id: string; sku: string; fulfillment: string; line_status: string; kind: string | null }>(c, `
-    select l.id, l.sku, pl.fulfillment, l.line_status, p.kind from sales_order_line l join pos_line pl on pl.sales_order_line_id = l.id
-      left join product p on p.id = l.product_id where l.entity_id = $1 and l.sales_order_id = $2 and l.id = any($3)`, [scope.entityId, orderId, lineIds]);
+  const ls = await q<{ id: string; sku: string; fulfillment: string; line_status: string; kind: string | null; fulfil_from_id: string | null; at: string | null; moving: boolean }>(c, `
+    select l.id, l.sku, pl.fulfillment, l.line_status, p.kind, l.fulfil_from_id, fl.name at,
+           exists (select 1 from inv_piece x where x.entity_id = l.entity_id and x.sales_order_line_id = l.id and x.status = 'in_transit') moving
+      from sales_order_line l join pos_line pl on pl.sales_order_line_id = l.id
+      left join product p on p.id = l.product_id left join location fl on fl.id = l.fulfil_from_id
+     where l.entity_id = $1 and l.sales_order_id = $2 and l.id = any($3)`, [scope.entityId, orderId, lineIds]);
   need(ls.length === lineIds.length, "a line named is not on this order");
   for (const l of ls) {
     need(["pickup", "carry"].includes(l.fulfillment), `${l.sku} goes by ${l.fulfillment}; the fleet hands it over`);
-    if (STOCKED.includes(l.kind ?? "")) need(["reserved", "ready"].includes(l.line_status), `${l.sku} is ${l.line_status.replace("_", " ")}, not ready to hand over`);
+    if (STOCKED.includes(l.kind ?? "")) {
+      need(!l.moving, `${l.sku} is on a transfer to the store; receive the transfer before handing it over`);
+      need(["reserved", "ready"].includes(l.line_status), `${l.sku} is ${l.line_status.replace("_", " ")}, not ready to hand over`);
+      need(!l.fulfil_from_id || l.fulfil_from_id === here,
+        `${l.sku} is reserved at ${l.at}, not here at ${hereName}; send it over first (Warehouse → Transfers → customer orders to send to their store) and hand it over once the transfer is received`);
+    }
     else need(["open", "reserved", "ready"].includes(l.line_status), `${l.sku} is ${l.line_status}`);
   }
   const owedAfter = (await grossOf(c, scope.entityId, orderId, `(l.line_status = 'fulfilled' or l.id = any($3))`, [lineIds])) - BigInt(o.paid_minor);
@@ -864,12 +876,74 @@ export async function returnGoods(c: Client, scope: Scope, originalId: string, e
   const ret = await orderOf(c, scope.entityId, ro.id);
   // No tenders named: refund the way the customer paid (the web order's card, most recent first).
   const tenders = e.tenders?.length ? e.tenders : await refundToOriginal(c, scope.entityId, originalId, refund);
-  const t = await takeTenders(c, scope, ret, s.id, tenders, true);
+  // Card money a web order took goes back through the web's card processor, off the register's batch.
+  const { web, rest } = await splitWebCard(c, scope.entityId, originalId, tenders);
+  const webDone: { receiptId: string; refundId: string; paymentId: string; amount: bigint }[] = [];
+  for (const w of web) webDone.push(await recordWebRefund(c, scope, ret, w.payment, w.amount));
+  const fresh = await orderOf(c, scope.entityId, ro.id);
+  const t = rest.length ? await takeTenders(c, scope, fresh, s.id, rest, true) : { receipts: [], changeMinor: 0n };
+  const still = BigInt(fresh.paid_minor) - BigInt(fresh.total_minor) - t.receipts.reduce((a, r) => a - r.amountMinor, 0n);
+  need(still === 0n, `the refund is ${usd(refund)}; the tenders add up to ${usd(refund - still)}`);
+  // Only now, with everything else written, ask the processor; a refusal rolls the whole return back.
+  for (const w of webDone) await callProcessorRefund(c, scope.entityId, w);
   await c.query(`update sales_order set status = 'closed' where id = $1 and entity_id = $2`, [ro.id, scope.entityId]);
   await accrueCommissions(c, scope, { orderId: ro.id });  // the return charges back its commission
   await audit(c, scope, { table: "sales_order", rowId: originalId, action: "transition", after: { returnedOn: number, refund: refund.toString() }, sourceRef: "pos return" });
   await audit(c, scope, { table: "sales_order", rowId: ro.id, action: "insert", after: { kind: "return", against: o.number, refund: refund.toString() }, sourceRef: "pos return" });
-  return { id: ro.id, number, refundMinor: refund, taxMinor: tax, costMinor: cost, journalEntryId: je, receipts: t.receipts };
+  return { id: ro.id, number, refundMinor: refund, taxMinor: tax, costMinor: cost, journalEntryId: je, receipts: t.receipts,
+    webRefunds: webDone.map((w) => ({ receiptId: w.receiptId, amountMinor: w.amount })) };
+}
+
+type WebPayment = { id: string; provider: string; auth_ref: string; brand: string | null; last4: string | null; amount_minor: string; left: string };
+
+/** Card tenders that match a web payment on the original order (by last four, or any card when none is given) are refunded through the web processor. */
+async function splitWebCard(c: Client, entityId: string, originalId: string, tenders: Tender[]) {
+  const web: { payment: WebPayment; amount: bigint }[] = [];
+  if (!(await hasRelation(c, "shop_payment")) || !tenders.some((x) => x.method === "card")) return { web, rest: tenders };
+  const pays = await q<WebPayment>(c, `
+    select sp.id, sp.provider, sp.auth_ref, sp.brand, sp.last4, sp.amount_minor::text,
+           (sp.amount_minor - coalesce((select sum(r.amount_minor) from pos_card_refund r where r.entity_id = sp.entity_id and r.shop_payment_id = sp.id), 0))::text "left"
+      from shop_payment sp where sp.entity_id = $1 and sp.sales_order_id = $2 and sp.status in ('captured','refunded') order by sp.created_at for update`, [entityId, originalId]);
+  if (!pays.length) return { web, rest: tenders };
+  const left = new Map(pays.map((p) => [p.id, BigInt(p.left)]));
+  const rest: Tender[] = [];
+  for (const t of tenders) {
+    if (t.method !== "card") { rest.push(t); continue; }
+    let amt = t.amountMinor;
+    for (const p of pays) {
+      if (amt <= 0n) break;
+      if (t.reference && p.last4 && String(t.reference).trim() !== p.last4) continue;
+      const room = left.get(p.id) ?? 0n;
+      if (room <= 0n) continue;
+      const take = room < amt ? room : amt;
+      web.push({ payment: p, amount: take });
+      left.set(p.id, room - take);
+      amt -= take;
+    }
+    if (amt > 0n) rest.push({ ...t, amountMinor: amt });
+  }
+  return { web, rest };
+}
+
+/** The negative receipt (channel 'web', no register session) and the refund row; the processor is called last. */
+async function recordWebRefund(c: Client, scope: Scope, ret: OrderRow, p: WebPayment, amount: bigint) {
+  const number = await nextNo(c, scope.entityId, "receipt", "R-");
+  const r = await one<{ id: string }>(c, `insert into customer_receipt (entity_id, number, customer_id, sales_order_id, location_id, channel, method, amount_minor, reference, received_by)
+    values ($1,$2,$3,$4,$5,'web','card',$6,$7,$8) returning id`, [scope.entityId, number, ret.customer_id, ret.id, ret.location_id, (-amount).toString(),
+    `${p.brand ?? "Card"} ending ${p.last4 ?? "----"}, ${p.provider} refund`, scope.actor.id]);
+  await postReceipt(c, scope, r.id);
+  const f = await one<{ id: string }>(c, `insert into pos_card_refund (entity_id, shop_payment_id, return_order_id, receipt_id, provider, refund_ref, amount_minor, refunded_by)
+    values ($1,$2,$3,$4,$5,'pending',$6,$7) returning id`, [scope.entityId, p.id, ret.id, r.id, p.provider, amount.toString(), scope.actor.id]);
+  return { receiptId: r.id, refundId: f.id, paymentId: p.id, amount };
+}
+
+async function callProcessorRefund(c: Client, entityId: string, w: { receiptId: string; refundId: string; paymentId: string; amount: bigint }) {
+  const p = (await q<{ provider: string; auth_ref: string; amount_minor: string }>(c, `select provider, auth_ref, amount_minor::text from shop_payment where id = $1 and entity_id = $2`,
+    [w.paymentId, entityId]))[0];
+  const { refundRef } = await providerNamed(p.provider).refund(p.auth_ref, w.amount);
+  await c.query(`update pos_card_refund set refund_ref = $3 where id = $1 and entity_id = $2`, [w.refundId, entityId, refundRef]);
+  await c.query(`update shop_payment sp set status = 'refunded' where sp.id = $1 and sp.entity_id = $2
+      and (select coalesce(sum(r.amount_minor),0) from pos_card_refund r where r.entity_id = sp.entity_id and r.shop_payment_id = sp.id) >= sp.amount_minor`, [w.paymentId, entityId]);
 }
 
 /** Split a refund back over the original order's receipts, newest first, net of what earlier returns already refunded to each. */
@@ -881,12 +955,15 @@ async function refundToOriginal(c: Client, entityId: string, originalId: string,
   const back = await q<{ method: string; reference: string | null; s: string }>(c, `
     select r.method, r.reference, (-sum(r.amount_minor))::text s from customer_receipt r join pos_order po on po.sales_order_id = r.sales_order_id
      where r.entity_id = $1 and po.original_order_id = $2 and r.voided_at is null and r.amount_minor < 0 group by r.method, r.reference`, [entityId, originalId]);
-  const used = new Map(back.map((b) => [`${b.method}|${b.reference ?? ""}`, BigInt(b.s)]));
+  // A card is known by its last four, however the receipt wrote it ("Visa ending 4242, test …" on the web, "4242" at the counter).
+  const norm = (method: string, ref: string | null) => method !== "card" || !ref ? ref : (/ending (\d{4})/.exec(ref)?.[1] ?? (ref.replace(/\D/g, "").slice(-4) || null));
+  const used = new Map<string, bigint>();
+  for (const b of back) { const k = `${b.method}|${norm(b.method, b.reference) ?? ""}`; used.set(k, (used.get(k) ?? 0n) + BigInt(b.s)); }
   let left = refund;
   const out: Tender[] = [];
   for (const p of paid) {
     if (left <= 0n) break;
-    const key = `${p.method}|${p.reference ?? ""}`;
+    const key = `${p.method}|${norm(p.method, p.reference) ?? ""}`;
     let room = BigInt(p.amount_minor);
     const u = used.get(key) ?? 0n;
     const take0 = u >= room ? room : u;
@@ -895,7 +972,7 @@ async function refundToOriginal(c: Client, entityId: string, originalId: string,
     if (room <= 0n) continue;
     const take = room < left ? room : left;
     need((TENDERS as readonly string[]).includes(p.method), `the original was paid by ${p.method}; name how the refund goes`);
-    out.push({ method: p.method, amountMinor: take, reference: p.method === "card" && p.reference && !/^\d{4}$/.test(p.reference) ? p.reference.replace(/\D/g, "").slice(-4) || null : p.reference });
+    out.push({ method: p.method, amountMinor: take, reference: norm(p.method, p.reference) });
     left -= take;
   }
   need(left <= 0n, `only ${usd(refund - left)} of the ${usd(refund)} refund can go back the way it was paid; name the rest`);

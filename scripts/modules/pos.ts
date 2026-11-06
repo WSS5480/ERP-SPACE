@@ -278,8 +278,13 @@ export async function run(t: T) {
     t.ok("special order: the receipt posts Dr 1300 Cr 2050 at the PO's cost", net(recvJe, "1300") === BigInt(rcv.valueMinor) && net(recvJe, "2050") === -BigInt(rcv.valueMinor)
       && BigInt(rcv.valueMinor) === BigInt(pol.unit) + BigInt(Math.round(Number(pol.landed ?? 0) / Number(pol.qty))));
     const soHand0 = await R.post(t, LUIS, `/pos/orders/${so.id}/fulfil`, { lineIds: [soLine.id] }).then(() => null, (e: Error) => e.message);
-    t.ok("special order: not handed over while the balance is owed", /goods leave paid for/.test(soHand0 ?? ""), soHand0 ?? "handed over");
-    const tr = await RI.post(t, DEE, "/inventory/transfers", { fromId: DC, toId: LOC.ENOLA, lines: [{ salesOrderLineId: soLine.id }] }) as { id: string };
+    t.ok("special order: not handed over at Enola while it sits at the DC; the refusal says where it is", /reserved at Distribution center, not here at Enola/.test(soHand0 ?? ""), soHand0 ?? "handed over");
+    const moveList = await RI.get(t, "/inventory/orders-to-move") as { line_id: string }[];
+    t.ok("special order: it shows on the warehouse's list of customer orders to send to their store", moveList.some((x) => x.line_id === soLine.id));
+    // Moved by scanning its labels: the pieces are the customer's, so the transfer carries the customer's line.
+    const tr = await RI.post(t, DEE, "/inventory/transfers", { fromId: DC, toId: LOC.ENOLA, lines: [{ productId: P.HUDSON, qty: 1, labels: rcv.lines[0].labels }] }) as { id: string };
+    const trl = await read<{ sales_order_line_id: string | null }>(`select sales_order_line_id from inv_transfer_line where entity_id = $1 and transfer_id = $2`, [ENTITY, tr.id]);
+    t.ok("transfer by label: the customer's reserved pieces travel as their order line", trl.length === 1 && trl[0].sales_order_line_id === soLine.id);
     await RI.post(t, DEE, `/inventory/transfers/${tr.id}/ship`);
     const inTransit = (await view(so.id)).lines as { line_status: string }[];
     t.ok("special order: on its way to the store the line waits on the transfer", inTransit[0].line_status === "on_order");
@@ -300,16 +305,51 @@ export async function run(t: T) {
     const tie2 = await inv.tieOut(c0, ENTITY);
     t.ok("tie-out: after the special order's whole life, the books still tie", tie2.ties && tie2.quantityOutOfStep.length === 0, `diff ${tie2.differenceMinor}`);
 
+    // ------------- pickup sold at Enola but sourced from the DC: the review's repro (flow2t)
+    const dp = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.BRIAN, promisedOn: plus(40),
+      lines: [{ productId: P.HUDSON, qty: 1, fulfillment: "pickup", fulfilFromId: DC, choices: { size: "96", fabric: "velvet-navy", legs: "brass" } }] }) as { id: string; number: string };
+    await R.post(t, MARIA, `/pos/orders/${dp.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "cash", amount: "500.00" }] });
+    const dpLine = ((await view(dp.id)).lines as { id: string }[])[0].id;
+    const dpPlaced = await RP.post(t, MGR, "/purchasing/special-orders", { lineIds: [dpLine] }) as { placed: { poId: string }[] };
+    const dpPol = (await read<{ id: string; ship_to: string }>(`select pol.id, po.ship_to_location_id ship_to from purchase_order_line pol join purchase_order po on po.id = pol.purchase_order_id
+      where pol.entity_id = $1 and pol.purchase_order_id = $2`, [ENTITY, dpPlaced.placed[0].poId]))[0];
+    t.ok("DC pickup: the special order's PO ships to the DC it is sourced from", dpPol.ship_to === DC);
+    await RI.post(t, DEE, "/inventory/receiving", { purchaseOrderId: dpPlaced.placed[0].poId, lines: [{ poLineId: dpPol.id, qty: 1 }] });
+    t.ok("DC pickup: received at the DC and reserved there for the customer", ((await view(dp.id)).lines as { line_status: string; fulfil_from: string }[])[0].fulfil_from === "Distribution center");
+    t.ok("DC pickup: it shows on the list of customer orders to send to their store", ((await RI.get(t, "/inventory/orders-to-move")) as { line_id: string }[]).some((x) => x.line_id === dpLine));
+    const owedDp = BigInt((await view(dp.id)).balance_minor as string);
+    await R.post(t, LUIS, `/pos/orders/${dp.id}/pay`, { sessionId: ses.id, tenders: [{ method: "card", amount: String(Number(owedDp) / 100), reference: "1111" }] });
+    const early = await R.post(t, LUIS, `/pos/orders/${dp.id}/fulfil`, { lineIds: [dpLine], sessionId: ses.id }).then(() => "handed over", (e: Error) => e.message);
+    t.ok("DC pickup: paid in full but still at the DC, the Enola counter refuses and says to transfer it", /reserved at Distribution center, not here at Enola; send it over first/.test(early), early);
+    const delivered = await read<{ n: string }>(`select count(*) n from inv_piece where entity_id = $1 and sales_order_line_id = $2 and status = 'delivered'`, [ENTITY, dpLine]);
+    t.ok("DC pickup: no piece is marked delivered while it sits at the DC", delivered[0].n === "0");
+    // The warehouse moves it the plain way: product and quantity, DC → Enola.
+    const dpTr = await RI.post(t, DEE, "/inventory/transfers", { fromId: DC, toId: LOC.ENOLA, lines: [{ productId: P.HUDSON, qty: 1 }] }) as { id: string };
+    const shipped = await RI.post(t, DEE, `/inventory/transfers/${dpTr.id}/ship`).then(() => "shipped", (e: Error) => e.message);
+    t.ok("DC pickup: a transfer of the reserved sofa ships, carrying the customer's line", shipped === "shipped", shipped);
+    const transitTry = await R.post(t, LUIS, `/pos/orders/${dp.id}/fulfil`, { lineIds: [dpLine], sessionId: ses.id }).then(() => "handed over", (e: Error) => e.message);
+    t.ok("DC pickup: not handed over while on the truck", /on a transfer to the store|not ready to hand over/.test(transitTry), transitTry);
+    await RI.post(t, DEE, `/inventory/transfers/${dpTr.id}/receive`);
+    const hEn = await level(P.HUDSON, LOC.ENOLA);
+    t.ok("DC pickup: it lands at Enola reserved for the customer", ((await view(dp.id)).lines as { line_status: string; fulfil_from: string }[])[0].fulfil_from === "Enola" && hEn.reserved >= 1);
+    await R.post(t, LUIS, `/pos/orders/${dp.id}/fulfil`, { lineIds: [dpLine], sessionId: ses.id });
+    t.ok("DC pickup: handed over at Enola once it is there", (await view(dp.id)).status === "fulfilled");
+    const tie3 = await inv.tieOut(c0, ENTITY);
+    t.ok("tie-out: after the DC-sourced pickup, the books still tie", tie3.ties && tie3.quantityOutOfStep.length === 0, `diff ${tie3.differenceMinor}`);
+
     // ------------------------------------------------- a web order at the counter
     const web = await tx({ kind: "system", label: "test" }, async (c) => {
       const o = (await t.q<{ id: string }>(c, `insert into sales_order (entity_id, number, channel, location_id, customer_id, status, fulfillment)
         values ($1,'WEB-TEST-1','web',$2,$3,'open','pickup') returning id`, [ENTITY, LOC.ENOLA, CUST.BRIAN]))[0];
       const l = (await t.q<{ id: string }>(c, `insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, fulfil_from_id)
-        values ($1,$2,1,$3,'ACC-LAMP-01','Ceramic table lamp',1,5999,360,$4) returning id`, [ENTITY, o.id, P.LAMP, LOC.ENOLA]))[0];
+        values ($1,$2,1,$3,'ACC-LAMP-01','Ceramic table lamp',2,5999,720,$4) returning id`, [ENTITY, o.id, P.LAMP, LOC.ENOLA]))[0];
       await c.query(`select sales_order_retotal($1) /* unscoped: test order */`, [o.id]);
       await inv.reserveOrder(c, ENTITY, o.id);
       const r = (await t.q<{ id: string }>(c, `insert into customer_receipt (entity_id, number, customer_id, sales_order_id, location_id, channel, method, amount_minor, reference)
-        values ($1,'R-WEB-1',$2,$3,$4,'web','card',6359,'9911') returning id`, [ENTITY, CUST.BRIAN, o.id, LOC.ENOLA]))[0];
+        values ($1,'R-WEB-1',$2,$3,$4,'web','card',12718,'Visa ending 9911, test test_auth_webtest1') returning id`, [ENTITY, CUST.BRIAN, o.id, LOC.ENOLA]))[0];
+      // What the web store's checkout writes beside the receipt: the processor's capture.
+      await c.query(`insert into shop_payment (entity_id, site_id, sales_order_id, receipt_id, provider, token_ref, brand, last4, auth_ref, amount_minor, status)
+        select $1, s.id, $2, $3, 'test', 'tok_test_visa_9911', 'Visa', '9911', 'test_auth_webtest1', 12718, 'captured' from shop_site s where s.entity_id = $1 limit 1`, [ENTITY, o.id, r.id]);
       const co = await companyOf();
       const { postReceipt } = await import("../../packages/core/ar.ts");
       await postReceipt(c, { tenantId: co.tenantId, entityId: ENTITY, actor: { kind: "system", label: "web" } }, r.id);
@@ -319,12 +359,27 @@ export async function run(t: T) {
     t.ok("web order: POS can find it", webList.length === 1 && webList[0].channel === "web");
     await R.post(t, LUIS, `/pos/orders/${web.id}/fulfil`, { lineIds: [web.line] });
     t.ok("web order: a web pickup is handed over at the counter", (await view(web.id)).status === "fulfilled" && (await je(web.id, "sale")).length > 0);
+    const zCard = async () => ((await pos.zReport(c0, ENTITY, ses.id)).tenders.find((x) => x.method === "card")?.refunded ?? "0");
+    const zCard0 = await zCard();
     const wret = await R.post(t, LUIS, `/pos/orders/${web.id}/return`, { sessionId: ses.id, lines: [{ lineId: web.line, qty: 1, reason: "changed_mind", disposition: "restock" }] }) as
-      { refundMinor: bigint; receipts: { method: string; amountMinor: bigint }[] };
-    const wr = await read<{ method: string; amount_minor: string; reference: string }>(`select r.method, r.amount_minor::text, r.reference from customer_receipt r
-      join pos_order po on po.sales_order_id = r.sales_order_id where r.entity_id = $1 and po.original_order_id = $2`, [ENTITY, web.id]);
-    t.ok("web order: returned at the register, refunded to the card it was paid with", wret.refundMinor === 6359n && wr.length === 1 && wr[0].method === "card"
-      && wr[0].amount_minor === "-6359" && wr[0].reference === "9911");
+      { refundMinor: bigint; webRefunds: { amountMinor: bigint }[] };
+    const wret2 = await R.post(t, LUIS, `/pos/orders/${web.id}/return`, { sessionId: ses.id, lines: [{ lineId: web.line, qty: 1, reason: "changed_mind", disposition: "restock" }],
+      tenders: [{ method: "card", amount: "63.59", reference: "9911" }] }) as { refundMinor: bigint; webRefunds: { amountMinor: bigint }[] };
+    const wr = await read<{ method: string; amount_minor: string; channel: string; register_session_id: string | null; reference: string }>(`
+      select r.method, r.amount_minor::text, r.channel, r.register_session_id, r.reference from customer_receipt r
+        join pos_order po on po.sales_order_id = r.sales_order_id where r.entity_id = $1 and po.original_order_id = $2`, [ENTITY, web.id]);
+    t.ok("web return: refunded to the card it was paid with, with or without the tender named", wret.refundMinor === 6359n && wret2.refundMinor === 6359n
+      && wret.webRefunds.length === 1 && wret2.webRefunds.length === 1 && wr.length === 2 && wr.every((x) => x.method === "card" && x.amount_minor === "-6359" && /ending 9911/.test(x.reference)));
+    t.ok("web return: the refund is a web receipt, kept out of the register's card batch", wr.every((x) => x.channel === "web" && x.register_session_id === null)
+      && (await zCard()) === zCard0);
+    const refs = await read<{ refund_ref: string; amount_minor: string }>(`select cr.refund_ref, cr.amount_minor::text from pos_card_refund cr join shop_payment sp on sp.id = cr.shop_payment_id
+      where cr.entity_id = $1 and sp.sales_order_id = $2`, [ENTITY, web.id]);
+    const sp = (await read<{ status: string }>(`select status from shop_payment where entity_id = $1 and sales_order_id = $2`, [ENTITY, web.id]))[0];
+    t.ok("web return: the card processor refunded each, recorded against the web payment", refs.length === 2 && refs.every((x) => /^test_refund_/.test(x.refund_ref))
+      && sp.status === "refunded");
+    const wbad = await R.post(t, LUIS, `/pos/orders/${web.id}/return`, { sessionId: ses.id, lines: [{ lineId: web.line, qty: 1, reason: "changed_mind", disposition: "restock" }] })
+      .then(() => "accepted", (e: Error) => e.message);
+    t.ok("web return: nothing more comes back than was sold", /0 can still come back/.test(wbad), wbad);
 
     // ----------------------------------------------------- delivery fee, defaults
     const df = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.ALICIA, promisedOn: plus(6),
@@ -353,7 +408,7 @@ export async function run(t: T) {
     await t.throws("drawer: a paid out needs a note", () => R.post(t, LUIS, `/pos/sessions/${ses.id}/cash`, { kind: "paid_out", amount: "5" }), /say what the cash was for/);
     const z0 = await R.get(t, `/pos/sessions/${ses.id}/z`) as Awaited<ReturnType<typeof pos.zReport>>;
     const expected = z0.cash.expectedMinor;
-    t.ok("Z: expected cash is float + cash taken − refunds − drops", expected === 20000n + 12718n + 12000n - 6359n - 10000n, String(expected));
+    t.ok("Z: expected cash is float + cash taken (incl. the DC pickup deposit) − refunds − drops", expected === 20000n + 12718n + 12000n - 6359n - 10000n + 50000n, String(expected));
     t.ok("Z: tenders are broken out by method", z0.tenders.some((x) => x.method === "card") && z0.tenders.some((x) => x.method === "store_credit"));
     // Count $5 short.
     let left = expected - 500n;
