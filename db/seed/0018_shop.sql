@@ -14,12 +14,12 @@ insert into role_grant (app_user_id, entity_id, role) values
 -- A parcel item (ships by carrier) and an unpublished one.
 insert into product (id, entity_id, sku, name, kind, vendor_id, vendor_sku, brand, category, subcategory,
                      collection, color, description, price_minor, cost_minor, ship_class, cubic_ft, weight_lb, web_visible) values
-  ('77777777-0000-0000-0000-000000000020','22222222-2222-2222-2222-222222222222','ACC-PILLOW-VV2','Velvet throw pillows (2-pack)','stock',
+  ('77777777-0000-0000-0000-000000000040','22222222-2222-2222-2222-222222222222','ACC-PILLOW-VV2','Velvet throw pillows (2-pack)','stock',
    '66666666-0000-0000-0000-0000000000a2','905511','Coaster','Accents','Pillows',null,'Navy',
    'Two 20" square velvet pillows with feather-blend inserts.',4999,1600,'parcel',1.5,4,true),
-  ('77777777-0000-0000-0000-000000000021','22222222-2222-2222-2222-222222222222','ASH-B192-92','Willowton Nightstand','stock',
-   '66666666-0000-0000-0000-0000000000a1','B192-92','Ashley','Bedroom','Nightstands','Willowton','Whitewash',
-   'Two-drawer nightstand to match the Willowton bed and dresser.',18999,8000,'delivery',6,45,false);
+  ('77777777-0000-0000-0000-000000000041','22222222-2222-2222-2222-222222222222','ASH-B192-36','Willowton Bedroom Mirror','stock',
+   '66666666-0000-0000-0000-0000000000a1','B192-36','Ashley','Bedroom','Mirrors','Willowton','Whitewash',
+   'Beveled mirror to match the Willowton dresser.',18999,8000,'delivery',6,45,false);
 
 update product set description = case sku
   when 'ASH-2930338' then 'Deep seats and pillow-top arms in a soft cobblestone weave.'
@@ -33,7 +33,7 @@ insert into stock_level (entity_id, product_id, location_id, on_hand)
 select '22222222-2222-2222-2222-222222222222', p.id, l.id,
        case when l.kind = 'warehouse' then 20 else 4 end
   from product p cross join location l
- where p.id in ('77777777-0000-0000-0000-000000000020','77777777-0000-0000-0000-000000000021')
+ where p.id in ('77777777-0000-0000-0000-000000000040','77777777-0000-0000-0000-000000000041')
    and l.entity_id = '22222222-2222-2222-2222-222222222222' and l.kind in ('warehouse','store');
 
 insert into shop_site (id, entity_id, slug, display_name, tagline, brand_primary, brand_accent,
