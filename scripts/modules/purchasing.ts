@@ -77,7 +77,7 @@ export async function run(t: T) {
     && det.lines.every((l) => l.ack_status === "pending") && det.po.ship_to_location_id === DC);
   const glOk = await read(t, async (c) => (await q<{ code: string }>(c, `select g.code from purchase_order_line pol join gl_account g on g.id = pol.gl_account_id
                                                                          where pol.entity_id = $1 and pol.purchase_order_id = $2 limit 1`, [ENTITY, dcAsh.poId]))[0]?.code);
-  t.ok("POs: merchandise lines code to the vendor's default account (inventory)", glOk === "1300");
+  t.ok("POs: merchandise lines code to the vendor's default account (received, not invoiced)", glOk === "2050");
 
   // --------------------------------------------------------- over budget
   const coaMonth = day(14).slice(0, 8) + "01";

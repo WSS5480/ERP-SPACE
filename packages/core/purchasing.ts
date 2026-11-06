@@ -37,9 +37,10 @@ async function vendorFor(c: Client, s: Scope, vendorId: string): Promise<Vendor>
      where ve.entity_id = $1 and ve.vendor_id = $2 and ve.status = 'active' and v.status = 'active'`, [s.entityId, vendorId]))[0];
   need(v, "that vendor is not active for this company");
   if (!v.gl) {
-    // Merchandise lands in inventory unless the vendor says otherwise.
-    const g = (await q<{ id: string }>(c, `select id from gl_account where tenant_id = $1 and code = '1300' /* unscoped: chart is tenant-wide */`, [s.tenantId]))[0];
-    need(g, "the chart of accounts has no 1300 inventory account; add it in Setup");
+    // Receiving puts merchandise in inventory (Dr 1300 / Cr 2050); the vendor's
+    // bill then clears 2050, so a PO line codes to 2050 unless the vendor says otherwise.
+    const g = (await q<{ id: string }>(c, `select id from gl_account where tenant_id = $1 and code = '2050' /* unscoped: chart is tenant-wide */`, [s.tenantId]))[0];
+    need(g, "the chart of accounts has no 2050 received-not-invoiced account; apply a setup pack in Business setup");
     v.gl = g.id;
   }
   return v;

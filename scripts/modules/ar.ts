@@ -96,7 +96,7 @@ export async function run(t: T) {
   const chen1 = await as(LUIS, async (c, co, a) => {
     const o = await order(c, CUST.CHEN, LOC.ENOLA, [{ product: 1, price: 79999, tax: 4800 }]);
     await H.pay(c, co, a, CUST.CHEN, { amount: "200.00", method: "card", salesOrderId: o.id, locationId: LOC.ENOLA });
-    const r = await ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 38500n);
+    const r = await ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 0n);
     return { ...r, orderId: o.id };
   });
   t.ok("handing over a sold sofa writes a customer invoice", !!chen1.invoiceId && chen1.invoiceNumber.startsWith("INV-"), chen1.invoiceNumber);
@@ -111,13 +111,13 @@ export async function run(t: T) {
   // ------------------------------------------------------- credit limit --
   const big = await as(LUIS, (c) => order(c, CUST.CHEN, LOC.ENOLA, [{ product: 10, price: 259900, tax: 15594 }]));
   await t.throws("a charge past the house account's credit limit is refused",
-    () => as(LUIS, (c) => ar.invoiceFulfilment(c, s(c, LUIS), big.id, "all", 62000n)), /over its \$3,000\.00 limit/);
+    () => as(LUIS, (c) => ar.invoiceFulfilment(c, s(c, LUIS), big.id, "all", 0n)), /over its \$3,000\.00 limit/);
   await t.throws("a salesperson cannot approve a charge past the limit",
     () => as(MARIA, (c, co, a) => H.override(c, co, a, CUST.CHEN, { upTo: "3000", reason: "long-time customer", salesOrderId: big.id })), /needs one of: controller/);
   await t.throws("an override needs a reason",
     () => as(PEOPLE.CONTROLLER, (c, co, a) => H.override(c, co, a, CUST.CHEN, { upTo: "3000", reason: "ok", salesOrderId: big.id })), /reason/);
   await as(PEOPLE.CONTROLLER, (c, co, a) => H.override(c, co, a, CUST.CHEN, { upTo: "3000", reason: "Ten-year customer; limit review booked", salesOrderId: big.id }));
-  const chen2 = await as(LUIS, (c) => ar.invoiceFulfilment(c, s(c, LUIS), big.id, "all", 62000n));
+  const chen2 = await as(LUIS, (c) => ar.invoiceFulfilment(c, s(c, LUIS), big.id, "all", 0n));
   t.ok("with the controller's override the charge goes through", chen2.toArMinor === 275494n);
   const used = await as(JEN, (c) => q<{ used_at: string | null }>(c, `select used_at from ar_credit_override where entity_id = $1 and sales_order_id = $2`, [ENTITY, big.id]));
   t.ok("the override is used once and says so", used.length === 1 && used[0].used_at !== null);
@@ -127,13 +127,13 @@ export async function run(t: T) {
   await as(PEOPLE.CONTROLLER, (c, co, a) => H.setAccount(c, co, a, CUST.BRIAN, { status: "hold" }));
   const brianOrder = await as(LUIS, (c) => order(c, CUST.BRIAN, LOC.ENOLA, [{ product: 9, price: 5999, tax: 360 }]));
   await t.throws("nothing new is charged to an account on hold",
-    () => as(LUIS, (c) => ar.invoiceFulfilment(c, s(c, LUIS), brianOrder.id, "all", 1900n)), /on hold/);
+    () => as(LUIS, (c) => ar.invoiceFulfilment(c, s(c, LUIS), brianOrder.id, "all", 0n)), /on hold/);
   await as(PEOPLE.CONTROLLER, (c, co, a) => H.setAccount(c, co, a, CUST.BRIAN, { status: "active" }));
 
   // A walk-in with a balance due at delivery (no house account) is invoiced, due now.
   const alicia = await as(LUIS, async (c) => {
     const o = await order(c, CUST.ALICIA, LOC.ENOLA, [{ product: 7, price: 64999, tax: 3900 }, { product: 12, price: 14999, tax: 900 }]);
-    return ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 32000n);
+    return ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 0n);
   });
   t.ok("a balance due on delivery is invoiced and due the same day", alicia.toArMinor === 84798n);
   const cc = await as(JEN, (c, co) => H.creditCheck(c, co, CUST.ALICIA, "10", null));
@@ -158,7 +158,7 @@ export async function run(t: T) {
   t.ok("money with no invoice to take it stays on the account as unapplied cash", pR.unappliedMinor === 25000n);
   const riv = await as(LUIS, async (c) => {
     const o = await order(c, CUST.RIVERSIDE, LOC.ENOLA, [{ product: 3, qty: 2, price: 59999, tax: 7200 }]);
-    return ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 52000n);
+    return ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 0n);
   });
   const ap = await as(JEN, (c, co, a) => H.applyCredits(c, co, a, CUST.RIVERSIDE, {}));
   t.ok("unapplied cash is applied to the next invoice", ap.appliedMinor === 25000n);
@@ -238,7 +238,7 @@ export async function run(t: T) {
   console.log("  -- write-offs and recoveries");
   const brian = await as(LUIS, async (c) => {
     await c.query(`update ar_account set house_account = false where customer_id = $1 and entity_id = $2`, [CUST.BRIAN, ENTITY]);
-    return ar.invoiceFulfilment(c, s(c, LUIS), brianOrder.id, "all", 1900n);
+    return ar.invoiceFulfilment(c, s(c, LUIS), brianOrder.id, "all", 0n);
   });
   await t.throws("a write-off cannot be for more than is open",
     () => as(JEN, (c, co, a) => H.requestWriteoff(c, co, a, { invoiceId: brian.invoiceId, amount: "100", reason: "Moved away, no forwarding address" })), /open to write off/);
@@ -252,7 +252,7 @@ export async function run(t: T) {
   t.ok("a paid invoice has nothing to write off", wo2 === null);
   const wo3 = await as(PEOPLE.CONTROLLER, async (c, co, a) => {
     const o = await order(c, CUST.DANA, LOC.PALESTINE, [{ product: 9, price: 5999, tax: 495 }]);
-    const inv = await ar.invoiceFulfilment(c, scopeOf(co, a), o.id, "all", 1900n);
+    const inv = await ar.invoiceFulfilment(c, scopeOf(co, a), o.id, "all", 0n);
     return { inv, w: await H.requestWriteoff(c, co, a, { invoiceId: inv.invoiceId, amount: "64.94", reason: "Disputed, settled with customer", method: "direct" }) };
   });
   await t.throws("whoever asked for a write-off cannot approve it",
@@ -285,7 +285,7 @@ export async function run(t: T) {
 
   const danaSale = await as(LUIS, async (c) => {
     const o = await order(c, CUST.DANA, LOC.PALESTINE, [{ product: 5, price: 44999, tax: 3712 }, { product: 6, qty: 2, price: 19999, tax: 3300 }]);
-    return ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 35400n);
+    return ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 0n);
   });
   await t.throws("a cashier cannot open an installment contract",
     () => as(LUIS, (c, co, a) => H.openContract(c, co, a, { invoiceId: danaSale.invoiceId, apr: 19.99, termMonths: 12 })), /needs one of/);
@@ -325,7 +325,7 @@ export async function run(t: T) {
 
   const ed = await as(LUIS, async (c) => {
     const o = await order(c, CUST.ED, LOC.SOCORRO, [{ product: 8, price: 89999, tax: 7425 }]);
-    return ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 36000n);
+    return ar.invoiceFulfilment(c, s(c, LUIS), o.id, "all", 0n);
   });
   const k2 = await as(JEN, (c, co, a) => H.openContract(c, co, a, { invoiceId: ed.invoiceId, apr: 24, termMonths: 6 }));
   await t.throws("goods are not taken back on a contract in good standing",

@@ -146,7 +146,7 @@ export async function run(t: T) {
   await as(PEOPLE.CONTROLLER, (c, co, a) => H.accrue(c, co, a, {}));
   const o1 = await as(MARIA, async (c) => {
     const o = await order(c, MARIA, [{ product: 1, price: 79999, tax: 4800 }, { product: 12, price: 14999, tax: 900 }]);
-    await ar.invoiceFulfilment(c, scope(MARIA), o.id, "all", 41500n);
+    await ar.invoiceFulfilment(c, scope(MARIA), o.id, "all", 0n);
     return o;
   });
   const o2 = await as(MARIA, (c) => order(c, MARIA, [{ product: 8, price: 89999, tax: 5400 }, { product: 7, price: 64999, tax: 3900 }]));
@@ -155,7 +155,7 @@ export async function run(t: T) {
   await t.throws("an A/R clerk cannot split a sale",
     () => as(JEN, (c, co, a) => H.setSplits(c, co, a, { orderId: o2.id, splits: [{ appUserId: MARIA, pct: 100 }] })), /needs one of/);
   await as(MARIA, (c, co, a) => H.setSplits(c, co, a, { orderId: o2.id, splits: [{ appUserId: MARIA, pct: 60 }, { appUserId: MGR, pct: 40 }] }));
-  await as(MARIA, (c) => ar.invoiceFulfilment(c, scope(MARIA), o2.id, "all", 65000n));
+  await as(MARIA, (c) => ar.invoiceFulfilment(c, scope(MARIA), o2.id, "all", 0n));
   const o3 = await as(MARIA, (c) => order(c, MARIA, [{ product: 3, price: 59999, tax: 3600 }], false));
 
   await t.throws("a salesperson cannot accrue commissions", () => as(MARIA, (c, co, a) => H.accrue(c, co, a, {})), /needs one of: controller, hr/);
