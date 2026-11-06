@@ -13,14 +13,10 @@ import * as ar from "../../packages/core/ar.ts";
 import { H } from "../../server/modules/ar.ts";
 import { scopeOf } from "../../server/actions.ts";
 
-const CUST = {
-  ALICIA: "88888888-0000-0000-0000-000000000001",
-  BRIAN: "88888888-0000-0000-0000-000000000002",
-  CHEN: "88888888-0000-0000-0000-000000000003",      // house account, $3,000 limit, net 30
-  DANA: "88888888-0000-0000-0000-000000000004",
-  RIVERSIDE: "88888888-0000-0000-0000-000000000005", // house account, late fees off
-  ED: "88888888-0000-0000-0000-000000000006",
-};
+// The checks' own customers, made fresh each run, so other modules' sales to
+// the demo customers never move these numbers (the company-wide tie-outs below
+// still cover everyone).
+let CUST = { ALICIA: "", BRIAN: "", CHEN: "", DANA: "", RIVERSIDE: "", ED: "" };
 const P = (n: number) => `77777777-0000-0000-0000-0000000000${String(n).padStart(2, "0")}`;
 const JEN = "55555555-0000-0000-0000-000000000017";      // ar_clerk
 const MARIA = "55555555-0000-0000-0000-000000000011";    // sales
@@ -72,7 +68,27 @@ const tb = async (c: Client) => {
   return B(r.d) === B(r.k);
 };
 
+async function makeCustomers() {
+  const tag = Math.random().toString(36).slice(2, 7);
+  const mk = [["ALICIA", "Alicia Gomez", LOC.ENOLA], ["BRIAN", "Brian Kelly", LOC.ENOLA], ["CHEN", "Chen Family", LOC.ENOLA],
+    ["DANA", "Dana Wright", LOC.PALESTINE], ["RIVERSIDE", "Riverside Apartments", LOC.ENOLA], ["ED", "Ed Martinez", LOC.SOCORRO]] as const;
+  const out = { ...CUST };
+  await as(PEOPLE.CONTROLLER, async (c, co, a) => {
+    let i = 0;
+    for (const [k, name, loc] of mk) {
+      i++;
+      const r = await one<{ id: string }>(c, `insert into customer (entity_id, number, name, email, phone, home_location_id)
+        values ($1,$2,$3,$4,$5,$6) returning id`, [ENTITY, `AR-${tag}-${i}`, `${name} (A/R check)`, `ar-${tag}-${i}@example.com`, `717-555-01${String(60 + i)}`, loc]);
+      out[k] = r.id;
+    }
+    await H.setAccount(c, co, a, out.CHEN, { houseAccount: true, creditLimit: "3000", termsDays: 30 });
+    await H.setAccount(c, co, a, out.RIVERSIDE, { houseAccount: true, creditLimit: "25000", termsDays: 30, lateFees: false });
+  });
+  CUST = out;
+}
+
 export async function run(t: T) {
+  await makeCustomers();
   const s = (c: Client, person: string) => ({ tenantId: "11111111-1111-1111-1111-111111111111", entityId: ENTITY, actor: { kind: "user" as const, id: person, label: "check" } });
 
   // ------------------------------------------------ invoice on fulfilment --
@@ -178,18 +194,21 @@ export async function run(t: T) {
   console.log("  -- late fees");
   await t.throws("a cashier cannot charge late fees",
     () => as(LUIS, (c, co, a) => H.lateFees(c, co, a, {})), /needs one of/);
+  const fees4020Before = await as(JEN, (c) => ar.glBalance(c, ENTITY, "4020"));
   const lf = await as(JEN, (c, co, a) => H.lateFees(c, co, a, {}));
-  t.ok("a late fee is charged on the overdue invoice past grace, at the minimum when the rate is less", lf.charged === 1 && lf.fees[0].feeMinor === 500n,
-    lf.fees.map((f) => `${f.invoice} ${f.feeMinor}`).join(", "));
+  const mineFees = lf.fees.filter((f) => f.customer.endsWith("(A/R check)"));
+  t.ok("a late fee is charged on the overdue invoice past grace, at the minimum when the rate is less", mineFees.length === 1 && mineFees[0].feeMinor === 500n,
+    lf.fees.map((f) => `${f.customer} ${f.invoice} ${f.feeMinor}`).join(", "));
   t.ok("an account with late fees turned off is not charged", !lf.fees.some((f) => f.customer.startsWith("Riverside")));
   const lf2 = await as(JEN, (c, co, a) => H.lateFees(c, co, a, {}));
   t.ok("running late fees twice in a month charges nothing more", lf2.charged === 0);
   const fees4020 = await as(JEN, (c) => ar.glBalance(c, ENTITY, "4020"));
-  t.ok("late fees post to 4020", fees4020 === -500n, String(fees4020));
+  t.ok("late fees post to 4020", fees4020 - fees4020Before === -lf.totalMinor, String(fees4020 - fees4020Before));
 
   // ------------------------------------------------------------ collections --
   console.log("  -- collections");
-  const list1 = await as(JEN, (c, co) => H.callList(c, co, today()));
+  const mineOnly = (l: { customerId: string }[]) => l.filter((x) => Object.values(CUST).includes(x.customerId));
+  const list1 = await as(JEN, (c, co) => H.callList(c, co, today())).then((r) => ({ ...r, list: mineOnly(r.list) }));
   t.ok("the call list holds everyone past due, longest and largest first",
     list1.list.length === 2 && list1.list[0].customerId === CUST.RIVERSIDE && list1.list[1].customerId === CUST.CHEN,
     list1.list.map((x) => `${x.name} ${x.maxDaysPastDue}d`).join("; "));
@@ -200,15 +219,15 @@ export async function run(t: T) {
   const tomorrow = ar.addDays(today(), 1);
   await as(JEN, (c, co, a) => H.logAction(c, co, a, CUST.CHEN, { kind: "call", outcome: "promised", notes: "Will pay Friday", promise: { on: tomorrow, amount: "147.99" } }));
   await as(JEN, (c, co, a) => H.logAction(c, co, a, CUST.RIVERSIDE, { kind: "call", outcome: "callback", notes: "AP clerk out, call back", callbackAt: new Date(Date.now() - 60000).toISOString() }));
-  const list2 = await as(JEN, (c, co) => H.callList(c, co, today()));
+  const list2 = await as(JEN, (c, co) => H.callList(c, co, today())).then((r) => ({ ...r, list: mineOnly(r.list) }));
   t.ok("a customer with a promise not yet due drops off the list", !list2.list.some((x) => x.customerId === CUST.CHEN));
   t.ok("a callback that has come due keeps the customer on the list even after today's call",
     list2.list.some((x) => x.customerId === CUST.RIVERSIDE && x.tier === 2), list2.list.map((x) => x.reason).join("; "));
   await as(PEOPLE.CONTROLLER, (c) => c.query(`update ar_promise set promised_on = current_date - 1 where entity_id = $1 and customer_id = $2 and status = 'open'`, [ENTITY, CUST.CHEN]));
-  const list3 = await as(JEN, (c, co) => H.callList(c, co, today()));
+  const list3 = await as(JEN, (c, co) => H.callList(c, co, today())).then((r) => ({ ...r, list: mineOnly(r.list) }));
   t.ok("a broken promise brings the customer back to the top", list3.list[0]?.customerId === CUST.CHEN && /broken/i.test(list3.list[0].reason), list3.list[0]?.reason);
   const rp = await as(JEN, (c, co, a) => H.refreshPromises(c, co, a));
-  t.ok("the broken promise is marked broken", rp.broken === 1);
+  t.ok("the broken promise is marked broken", rp.broken >= 1);
   const sms = await as(JEN, (c, co, a) => H.send(c, co, a, CUST.CHEN, { template: "reminder-sms" }));
   t.ok("a text is filled from the template and recorded as sent, through the provider seam",
     /Chen Family/.test(sms.body) && /\$147\.99/.test(sms.body) && /record only/.test(sms.provider), sms.body.slice(0, 60));
@@ -225,6 +244,7 @@ export async function run(t: T) {
     () => as(JEN, (c, co, a) => H.requestWriteoff(c, co, a, { invoiceId: brian.invoiceId, amount: "100", reason: "Moved away, no forwarding address" })), /open to write off/);
   await t.throws("a write-off needs a reason",
     () => as(JEN, (c, co, a) => H.requestWriteoff(c, co, a, { invoiceId: brian.invoiceId, amount: "63.59", reason: "bad" })), /reason/);
+  const allow0 = await as(JEN, (c) => ar.glBalance(c, ENTITY, "1190"));
   const wo = await as(JEN, (c, co, a) => H.requestWriteoff(c, co, a, { invoiceId: brian.invoiceId, amount: "63.59", reason: "Moved away, no forwarding address" }));
   await t.throws("an A/R clerk cannot approve a write-off",
     () => as(JEN, (c, co, a) => H.decideWriteoff(c, co, a, wo.writeoffId, { decision: "approved" })), /needs one of: controller/);
@@ -242,7 +262,7 @@ export async function run(t: T) {
   t.ok("a second person approves and the write-off posts", d1.status === "posted" && !!d1.journalEntryId);
   const bInv = await as(JEN, (c, co) => H.invoice(c, co, brian.invoiceId));
   const allow = await as(JEN, (c) => ar.glBalance(c, ENTITY, "1190"));
-  t.ok("the invoice is written off against the allowance (Dr 1190, Cr 1100)", bInv.invoice.status === "written_off" && bInv.openMinor === 0n && allow === 6359n,
+  t.ok("the invoice is written off against the allowance (Dr 1190, Cr 1100)", bInv.invoice.status === "written_off" && bInv.openMinor === 0n && allow - allow0 === 6359n,
     `1190 ${allow}`);
   await t.throws("a recovery cannot exceed what was written off",
     () => as(JEN, (c, co, a) => H.recover(c, co, a, wo.writeoffId, { amount: "70", method: "cash", locationId: LOC.ENOLA })), /can still be recovered/);
@@ -250,7 +270,7 @@ export async function run(t: T) {
   const allow2 = await as(JEN, (c) => ar.glBalance(c, ENTITY, "1190"));
   const bAfter = await as(JEN, (c) => ar.customerBalance(c, ENTITY, CUST.BRIAN));
   t.ok("a recovery reinstates and collects: the allowance is credited back, the account stays at zero",
-    !!rec.receiptId && allow2 === 2359n && bAfter === 0n, `1190 ${allow2}, Brian ${bAfter}`);
+    !!rec.receiptId && allow2 - allow0 === 2359n && bAfter === 0n, `1190 ${allow2}, Brian ${bAfter}`);
 
   // --------------------------------------------------- installment contracts --
   console.log("  -- installment contracts");
@@ -321,6 +341,7 @@ export async function run(t: T) {
 
   // ------------------------------------------------ third-party finance --
   console.log("  -- finance companies");
+  const gl1110Before = await as(JEN, (c) => ar.glBalance(c, ENTITY, "1110"));
   const fin = await as(LUIS, async (c, co, a) => {
     const o = await order(c, CUST.ED, LOC.SOCORRO, [{ product: 1, price: 79999, tax: 6600 }, { product: 2, price: 69999, tax: 5775 }], false);
     const cas0 = await ar.lenderCascade(c, ENTITY, 162373n, o.id);
@@ -339,7 +360,7 @@ export async function run(t: T) {
   const fs = await as(LUIS, (c, co, a) => H.financedSale(c, co, a, { receiptId: fin.r.receiptId, planId: planL18.id }));
   t.ok("a financed sale expects the plan's fee", fs.expectedFeeMinor === 19485n, String(fs.expectedFeeMinor));
   const gl1110 = await as(JEN, (c) => ar.glBalance(c, ENTITY, "1110"));
-  t.ok("the financing receipt is owed by the lender in 1110", gl1110 === 162373n);
+  t.ok("the financing receipt is owed by the lender in 1110", gl1110 - gl1110Before === 162373n, String(gl1110 - gl1110Before));
   await t.throws("a lender sending more than the batch is refused",
     () => as(JEN, (c, co, a) => H.settle(c, co, a, { companyId: SECOND, saleIds: [fs.financedSaleId], funded: "1700", reference: "B-1" })), /more than/);
   await t.throws("a batch for the wrong lender is refused",
@@ -349,7 +370,8 @@ export async function run(t: T) {
     set.feeMinor === 19485n && set.varianceMinor === 0n, `fee ${set.feeMinor}, variance ${set.varianceMinor}`);
   await t.throws("a sale is funded once", () => as(JEN, (c, co, a) => H.settle(c, co, a, { companyId: SECOND, saleIds: [fs.financedSaleId], funded: "1428.88", reference: "B-2" })), /already funded/);
   const fv = await as(JEN, (c, co) => H.finance(c, co));
-  t.ok("what finance companies owe ties to GL 1110", fv.differenceMinor === 0n && fv.gl1110Minor === 0n);
+  t.ok("what finance companies owe ties to GL 1110, and the funding cleared this sale", fv.differenceMinor === 0n && fv.gl1110Minor === gl1110Before,
+    `owed ${fv.owedMinor}, GL ${fv.gl1110Minor}`);
   void planP12;
 
   // ------------------------------------------------------- the tie-out --

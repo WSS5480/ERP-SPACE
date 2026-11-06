@@ -376,14 +376,17 @@ async function splitsOf(c: Client, entityId: string, orderId: string, salesperso
 export async function accrueCommissions(c: Client, scope: Scope, opts: { orderId?: string | null } = {}) {
   const lines = await q<{ line_id: string; order_id: string; salesperson_id: string | null; location_id: string; ordered_on: string; earned_on: string;
     net_minor: string; qty: string; cost_minor: string | null; product_id: string | null; category: string | null; vendor_id: string | null }>(c, `
-    select l.id line_id, so.id order_id, so.salesperson_id, so.location_id, so.ordered_at::date::text ordered_on, i.invoice_date::text earned_on,
-           il.net_minor, l.qty, p.cost_minor, l.product_id, p.category, p.vendor_id
+    select l.id line_id, so.id order_id, so.salesperson_id, so.location_id, so.ordered_at::date::text ordered_on,
+           coalesce(i.invoice_date, so.ordered_at::date)::text earned_on,
+           coalesce(il.net_minor, round(l.qty * l.unit_price_minor)::bigint - l.discount_minor)::text net_minor, l.qty, p.cost_minor, l.product_id, p.category, p.vendor_id
       from sales_order_line l
       join sales_order so on so.id = l.sales_order_id
-      join customer_invoice_line il on il.sales_order_line_id = l.id
-      join customer_invoice i on i.id = il.invoice_id
+      left join customer_invoice_line il on il.sales_order_line_id = l.id
+      left join customer_invoice i on i.id = il.invoice_id
       left join product p on p.id = l.product_id
+     -- invoiced lines earn; a return rung as its own negative line (POS returns, never invoiced) charges back
      where l.entity_id = $1 and l.line_status in ('fulfilled','returned','cancelled')
+       and (il.id is not null or (l.qty < 0 and l.line_status = 'returned' and l.product_id is not null))
        and ($2::uuid is null or so.id = $2)
        and not exists (select 1 from commission_event ev where ev.entity_id = $1 and ev.sales_order_line_id = l.id and ev.kind = 'earned')
      order by i.invoice_date, so.ordered_at, l.seq`, [scope.entityId, opts.orderId ?? null]);

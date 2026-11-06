@@ -180,7 +180,7 @@ async function nextNo(c: Client, entityId: string, kind: string, prefix: string)
   return r.n;
 }
 
-type LedgerKind = "invoice" | "late_fee" | "credit_memo" | "payment" | "unapplied" | "apply" | "to_store_credit" | "writeoff" | "recovery" | "contract";
+type LedgerKind = "opening" | "invoice" | "late_fee" | "credit_memo" | "payment" | "unapplied" | "apply" | "to_store_credit" | "writeoff" | "recovery" | "contract";
 
 async function ledger(c: Client, scope: Scope, e: {
   customerId: string | null; invoiceId?: string | null; contractId?: string | null; receiptId?: string | null;
@@ -324,6 +324,53 @@ export async function creditCheck(c: Client, entityId: string, customerId: strin
      order by (sales_order_id is null), created_at limit 1`, [entityId, customerId, chargeMinor.toString(), orderId]);
   return { ok: false, reason: `${reason}; an owner or controller can approve it with a reason`, overrideId: ov[0]?.id ?? null,
     balanceMinor: bal, limitMinor: limit, availableMinor: available };
+}
+
+/**
+ * How much more can be charged to the account right now, for POS at the
+ * moment of sale: the house account's room under its limit (nothing for an
+ * account on hold or without a house account), plus an unused override for
+ * this order.
+ */
+export async function chargeRoom(c: Client, entityId: string, customerId: string | null, orderId: string | null): Promise<bigint> {
+  if (!customerId) return 0n;
+  const cu = await q<{ status: string; credit_limit_minor: string; house: boolean | null }>(c, `
+    select cu.status, cu.credit_limit_minor, a.house_account house from customer cu left join ar_account a on a.customer_id = cu.id and a.entity_id = $1
+     where cu.id = $2 and cu.entity_id = $1`, [entityId, customerId]);
+  if (!cu.length) return 0n;
+  let room = 0n;
+  if (cu[0].house && cu[0].status !== "hold") {
+    room = B(cu[0].credit_limit_minor) - await customerBalance(c, entityId, customerId);
+    if (room < 0n) room = 0n;
+  }
+  const ov = await q<{ m: string | null }>(c, `select max(up_to_minor)::text m from ar_credit_override where entity_id = $1 and customer_id = $2
+      and used_at is null and (sales_order_id = $3 or sales_order_id is null)`, [entityId, customerId, orderId]);
+  const o = B(ov[0]?.m);
+  return o > room ? o : room;
+}
+
+/**
+ * Balances brought over from the old system (Setup's opening_receivable,
+ * already posted Dr 1100 / Cr 3000) become open invoices of kind 'opening'
+ * with their ledger row on that same entry. Safe to call again: each is
+ * adopted once.
+ */
+export async function adoptOpeningBalances(c: Client, scope: Scope): Promise<number> {
+  const rows = await q<{ id: string; customer_id: string; reference: string; as_of: string; due_on: string | null; amount_minor: string;
+    journal_entry_id: string | null; home: string | null }>(c, `
+    select o.id, o.customer_id, o.reference, o.as_of::text, o.due_on::text, o.amount_minor, o.journal_entry_id, cu.home_location_id home
+      from opening_receivable o join customer cu on cu.id = o.customer_id
+     where o.entity_id = $1 and not exists (select 1 from customer_invoice i where i.entity_id = $1 and i.opening_receivable_id = o.id)`, [scope.entityId]);
+  for (const r of rows) {
+    const inv = await one<{ id: string }>(c, `
+      insert into customer_invoice (entity_id, number, kind, customer_id, journal_entry_id, invoice_date, due_date, subtotal_minor, tax_minor,
+                                    total_minor, deposit_applied_minor, charged_minor, status, memo, opening_receivable_id, location_id, created_by)
+      values ($1,$2,'opening',$3,$4,$5,$6,$7,0,$7,0,$7,'open','Opening balance from the old system',$8,$9,$10) returning id`,
+      [scope.entityId, r.reference, r.customer_id, r.journal_entry_id, r.as_of, r.due_on ?? r.as_of, r.amount_minor, r.id, r.home, scope.actor.id || null]);
+    await ledger(c, scope, { customerId: r.customer_id, invoiceId: inv.id, locationId: r.home, date: r.as_of, kind: "opening",
+      amount: B(r.amount_minor), memo: `opening balance ${r.reference}`, journalEntryId: r.journal_entry_id });
+  }
+  return rows.length;
 }
 
 export async function grantOverride(c: Client, scope: Scope, o: { customerId: string; orderId: string | null; upToMinor: bigint; reason: string; approvedBy: string }) {
@@ -529,7 +576,7 @@ export async function creditToStoreCredit(c: Client, scope: Scope, customerId: s
 // ============================================================== statements
 
 const KIND_WORDS: Record<string, string> = {
-  invoice: "Invoice", late_fee: "Late fee", credit_memo: "Credit memo", payment: "Payment", unapplied: "Payment, on account",
+  opening: "Opening balance", invoice: "Invoice", late_fee: "Late fee", credit_memo: "Credit memo", payment: "Payment", unapplied: "Payment, on account",
   to_store_credit: "Moved to store credit", writeoff: "Written off", recovery: "Reinstated (recovery)",
 };
 
@@ -663,7 +710,7 @@ export async function assessLateFees(c: Client, scope: Scope, asOf = today()) {
       join ar_ledger l on l.invoice_id = i.id and l.entity_id = $1 and l.occurred_on <= $2::date
       join customer cu on cu.id = i.customer_id
       left join ar_account a on a.customer_id = i.customer_id
-     where i.entity_id = $1 and i.kind = 'sale' and i.due_date + $3::int < $2::date and coalesce(a.late_fees, true)
+     where i.entity_id = $1 and i.kind in ('sale','opening') and i.due_date + $3::int < $2::date and coalesce(a.late_fees, true)
        and not exists (select 1 from ar_late_fee f where f.invoice_id = i.id and f.assessed_for = $4)
      group by i.id, cu.name having sum(l.amount_minor) > 0
      order by i.due_date`, [scope.entityId, asOf, s.late_fee_grace_days, month]);
@@ -1005,7 +1052,7 @@ export async function openContract(c: Client, scope: Scope, k: {
     `select id, number, customer_id, location_id, kind from customer_invoice where id = $1 and entity_id = $2 for update`, [k.invoiceId, scope.entityId]);
   need(inv.length, "no such invoice");
   need(inv[0].customer_id, "a contract needs a customer");
-  need(inv[0].kind === "sale", "only a sale can be put on a contract");
+  need(inv[0].kind === "sale" || inv[0].kind === "opening", "only a sale or an opening balance can be put on a contract");
   const open = await openOf(c, scope.entityId, { invoiceId: k.invoiceId });
   const principal = k.principalMinor ?? open;
   need(principal > 0n, `${inv[0].number} has nothing open to finance`);
@@ -1309,13 +1356,22 @@ export async function settleFinanceBatch(c: Client, scope: Scope, s: {
  * taken and never posted, or a posting that did not come from a receipt.
  */
 export async function depositLiability(c: Client, entityId: string) {
-  const orders = await q<{ sales_order_id: string; number: string; customer: string | null; location: string; status: string; paid_minor: string; applied_minor: string }>(c, `
-    select so.id sales_order_id, so.number, cu.name customer, lo.name location, so.status, so.paid_minor,
-           coalesce((select sum(i.deposit_applied_minor) from customer_invoice i where i.entity_id = $1 and i.sales_order_id = so.id), 0)::text applied_minor
-      from sales_order so join location lo on lo.id = so.location_id left join customer cu on cu.id = so.customer_id
-     where so.entity_id = $1
-       and so.paid_minor <> coalesce((select sum(i.deposit_applied_minor) from customer_invoice i where i.entity_id = $1 and i.sales_order_id = so.id), 0)
-     order by so.ordered_at`, [entityId]);
+  // Per order: money taken, less deposits applied to its invoices, plus goods
+  // taken back outside invoicing (a POS return credits the deposit account for
+  // the refund it then pays out: returned lines, never invoiced).
+  const orders = await q<{ sales_order_id: string; number: string; customer: string | null; location: string; status: string; paid_minor: string;
+    applied_minor: string; returned_minor: string }>(c, `
+    with x as (
+      select so.id, so.number, so.customer_id, so.location_id, so.status, so.paid_minor, so.ordered_at,
+             coalesce((select sum(i.deposit_applied_minor) from customer_invoice i where i.entity_id = $1 and i.sales_order_id = so.id), 0) applied,
+             coalesce((select -sum(round(l.qty * l.unit_price_minor) - l.discount_minor + l.tax_minor) from sales_order_line l
+                        where l.entity_id = $1 and l.sales_order_id = so.id and l.qty < 0 and l.line_status = 'returned'
+                          and not exists (select 1 from customer_invoice_line il where il.sales_order_line_id = l.id)), 0)::bigint returned
+        from sales_order so where so.entity_id = $1)
+    select x.id sales_order_id, x.number, cu.name customer, lo.name location, x.status, x.paid_minor, x.applied::text applied_minor, x.returned::text returned_minor
+      from x join location lo on lo.id = x.location_id left join customer cu on cu.id = x.customer_id
+     where x.paid_minor - x.applied + x.returned <> 0
+     order by x.ordered_at`, [entityId]);
   const loose = await q<{ id: string; number: string; customer: string | null; amount_minor: string; received_at: string }>(c, `
     select r.id, r.number, cu.name customer, r.amount_minor, r.received_at::date::text received_at
       from customer_receipt r left join customer cu on cu.id = r.customer_id
@@ -1327,7 +1383,7 @@ export async function depositLiability(c: Client, entityId: string) {
      where r.entity_id = $1 and r.voided_at is null
        and not exists (select 1 from ar_payment p where p.receipt_id = r.id)
        and not exists (select 1 from journal_entry je where je.entity_id = $1 and je.source_id = r.id and je.source_type in ('receipt','refund'))`, [entityId]);
-  const rows = orders.map((o) => ({ ...o, held_minor: (B(o.paid_minor) - B(o.applied_minor)).toString() }));
+  const rows = orders.map((o) => ({ ...o, held_minor: (B(o.paid_minor) - B(o.applied_minor) + B(o.returned_minor)).toString() }));
   const total = rows.reduce((a, o) => a + B(o.held_minor), 0n) + loose.reduce((a, r) => a + B(r.amount_minor), 0n);
   const gl = -(await glBalance(c, entityId, "2300"));
   return { orders: rows, unassigned: loose, unposted, totalMinor: total, glMinor: gl, differenceMinor: total - gl };

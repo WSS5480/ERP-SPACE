@@ -248,7 +248,7 @@ export const H = {
                                      where s.entity_id = $1 order by s.funded_on desc, s.created_at desc limit 50`, [co.id]);
     const unrecorded = await q(c, `select r.id, r.number, r.amount_minor, r.received_at::date::text on_date, cu.name customer
                                      from customer_receipt r left join customer cu on cu.id = r.customer_id
-                                    where r.entity_id = $1 and r.method = 'financing' and r.voided_at is null and r.amount_minor > 0
+                                    where r.entity_id = $1 and r.method = 'financing' and r.voided_at is null
                                       and not exists (select 1 from financed_sale f where f.receipt_id = r.id) order by r.received_at`, [co.id]);
     const owed = awaiting.reduce((a, x) => a + B(x.amount_minor), 0n);
     const gl = await ar.glBalance(c, co.id, "1110");

@@ -11,6 +11,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { q, one, type Client, type Scope } from "./db.ts";
 import * as inventory from "./inventory.ts";
 import { postReceipt, invoiceFulfilment } from "./ar.ts";
+import { accrueCommissions } from "./workforce.ts";
 import * as R from "./routing.ts";
 
 export class FleetError extends Error {}
@@ -1292,6 +1293,7 @@ export async function completeStop(c: Client, scope: Scope, stopId: string, b: C
     costMinor = f.costMinor;
     const inv = await invoiceFulfilment(c, scope, st.sales_order_id, all, f.costMinor);
     journalEntryId = inv.journalEntryId;
+    await accrueCommissions(c, scope, { orderId: st.sales_order_id });   // commission is earned on delivery
     const left = await one<{ n: number }>(c, `select count(*)::int n from sales_order_line where entity_id = $1 and sales_order_id = $2
                                                and line_status in ('open','reserved','ready','on_order') and qty > 0`, [scope.entityId, st.sales_order_id]);
     await c.query(`update sales_order set status = $3 where entity_id = $1 and id = $2 and status in ('open','fulfilling')`,

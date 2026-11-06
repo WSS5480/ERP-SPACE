@@ -3,6 +3,7 @@
 // trucking company. A pack is data -- labels, modules, accounts, reasons and
 // default settings -- applied to one company. It only ever adds.
 
+import { adoptOpeningBalances } from "./ar.ts";
 import { q, one, type Client, type Scope } from "./db.ts";
 import { post } from "./posting.ts";
 
@@ -441,6 +442,8 @@ export async function importOpenAr(c: Client, scope: Scope, csv: string, filenam
        values ($1,$2,$3,$4,$5,$6,$7)`, [scope.entityId, cust[0].id, ref, asOf, due, amt.toString(), je]);
     added++; total += amt;
   }
+  // Receivables picks them up as open invoices, so aging and collections carry them.
+  await adoptOpeningBalances(c, scope);
   await c.query(
     `insert into import_run (entity_id, kind, filename, rows_seen, rows_added, rows_refused, problems, run_by)
      values ($1,'open_ar',$2,$3,$4,$5,$6,$7)`,

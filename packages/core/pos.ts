@@ -16,7 +16,8 @@ import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor } from "./posting.ts";
 import { priceConfigured, type Choice } from "./pricing.ts";
 import { reserveOrder, fulfilLines, releaseLines, restock, returnToDamage } from "./inventory.ts";
-import { postReceipt, invoiceFulfilment } from "./ar.ts";
+import { postReceipt, invoiceFulfilment, chargeRoom } from "./ar.ts";
+import { accrueCommissions } from "./workforce.ts";
 
 export class PosError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new PosError(msg); };
@@ -520,20 +521,16 @@ async function grossOf(c: Client, entityId: string, orderId: string, where: stri
   return BigInt(r[0].g);
 }
 
-async function creditRoom(c: Client, entityId: string, customerId: string | null): Promise<bigint> {
-  if (!customerId) return 0n;
-  const r = await q<{ lim: string; owed: string }>(c, `select cu.credit_limit_minor::text lim,
-      coalesce((select sum(b.balance_minor) from sales_order_balance b where b.entity_id = cu.entity_id and b.customer_id = cu.id), 0)::text owed
-    from customer cu where cu.id = $2 and cu.entity_id = $1`, [entityId, customerId]);
-  if (!r.length) return 0n;
-  const room = BigInt(r[0].lim) - BigInt(r[0].owed);
-  return room > 0n ? room : 0n;
+// What may go on the customer's account at the counter: A/R's house-account room (limit less balance, or an override for this order).
+async function creditRoom(c: Client, entityId: string, customerId: string | null, orderId: string | null = null): Promise<bigint> {
+  return chargeRoom(c, entityId, customerId, orderId);
 }
 
 async function hand(c: Client, scope: Scope, o: OrderRow, lineIds: string[]) {
   if (!lineIds.length) return { lines: 0, costMinor: 0n, journalEntryId: null as string | null };
   const f = await fulfilLines(c, scope.entityId, o.id, lineIds);
   const inv = await invoiceFulfilment(c, scope, o.id, lineIds, f.costMinor);
+  await accrueCommissions(c, scope, { orderId: o.id });   // commission is earned on hand-over
   return { lines: f.lines, costMinor: f.costMinor, journalEntryId: inv.journalEntryId };
 }
 
@@ -592,7 +589,7 @@ export async function checkout(c: Client, scope: Scope, orderId: string, e: { se
     await c.query(`update pos_order set layaway_schedule = $3 where sales_order_id = $1 and entity_id = $2`, [orderId, scope.entityId, JSON.stringify(sched)]);
   } else if (carry.length) {
     const carryGross = await grossOf(c, scope.entityId, orderId, `pl.fulfillment = 'carry' and l.line_status not in ('cancelled','fulfilled')`);
-    const room = await creditRoom(c, scope.entityId, o.customer_id);
+    const room = await creditRoom(c, scope.entityId, o.customer_id, o.id);
     need(paid + room >= carryGross, `take-with goods leave paid for: ${usd(carryGross - paid - room)} more is needed`);
     handed = await hand(c, scope, after, carry.map((l) => l.id));
   }
@@ -635,7 +632,7 @@ export async function fulfilAtCounter(c: Client, scope: Scope, orderId: string, 
     else need(["open", "reserved", "ready"].includes(l.line_status), `${l.sku} is ${l.line_status}`);
   }
   const owedAfter = (await grossOf(c, scope.entityId, orderId, `(l.line_status = 'fulfilled' or l.id = any($3))`, [lineIds])) - BigInt(o.paid_minor);
-  const room = await creditRoom(c, scope.entityId, o.customer_id);
+  const room = await creditRoom(c, scope.entityId, o.customer_id, o.id);
   need(owedAfter <= room, `goods leave paid for: take ${usd(owedAfter - room)} more first`);
   const h = await hand(c, scope, o, lineIds);
   await settleStatus(c, scope, orderId);
@@ -762,6 +759,7 @@ export async function returnGoods(c: Client, scope: Scope, originalId: string, e
   const ret = await orderOf(c, scope.entityId, ro.id);
   const t = await takeTenders(c, scope, ret, s.id, e.tenders ?? [], true);
   await c.query(`update sales_order set status = 'closed' where id = $1 and entity_id = $2`, [ro.id, scope.entityId]);
+  await accrueCommissions(c, scope, { orderId: ro.id });  // the return charges back its commission
   await audit(c, scope, { table: "sales_order", rowId: originalId, action: "transition", after: { returnedOn: number, refund: refund.toString() }, sourceRef: "pos return" });
   await audit(c, scope, { table: "sales_order", rowId: ro.id, action: "insert", after: { kind: "return", against: o.number, refund: refund.toString() }, sourceRef: "pos return" });
   return { id: ro.id, number, refundMinor: refund, taxMinor: tax, costMinor: cost, journalEntryId: je, receipts: t.receipts };
