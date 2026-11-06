@@ -1298,10 +1298,21 @@ export async function importCatalogAppSource(c: Client, s: Scope, env: FeedEnv, 
   const src = x.source ?? {};
   const fd = src.feed ?? {};
   const label = String(x.vendorName ?? src.vendor_label ?? src.name ?? "").trim();
-  const v = (await q<{ id: string; name: string }>(c, `
+  let v = (await q<{ id: string; name: string }>(c, `
     select v.id, coalesce(v.dba, v.legal_name) as name from vendor_entity ve join vendor v on v.id = ve.vendor_id
      where ve.entity_id = $1 and ve.status = 'active' and (v.id = $2::uuid or ($2::uuid is null and (lower(v.legal_name) = lower($3) or lower(coalesce(v.dba,'')) = lower($3))))
      limit 1`, [s.entityId, x.vendorId ?? null, label]))[0];
+  if (!v && !x.vendorId && label) {
+    // The catalog app names a source loosely ("ASHLEY", "Ashley catalog", "PENTEX - ASHLEY CATALOG"):
+    // take the one active vendor whose name's first word appears in the label, if exactly one does.
+    const words = new Set(label.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3));
+    const all = await q<{ id: string; name: string; legal_name: string; dba: string | null }>(c, `
+      select v.id, coalesce(v.dba, v.legal_name) as name, v.legal_name, v.dba from vendor_entity ve join vendor v on v.id = ve.vendor_id
+       where ve.entity_id = $1 and ve.status = 'active'`, [s.entityId]);
+    const first = (n: string | null) => (n ?? "").toLowerCase().split(/[^a-z0-9]+/).find((w) => w.length >= 3) ?? "";
+    const hits = all.filter((r) => words.has(first(r.legal_name)) || (r.dba && words.has(first(r.dba))));
+    if (hits.length === 1) v = hits[0];
+  }
   need(v, x.vendorId ? "that vendor is not set up for this company" : `no vendor called ${label || "(blank)"} is set up for this company; add it, or send its id`);
   need(fd.url || fd.atp_on, "the source has no API address and no quantities to pull; nothing to set up");
 

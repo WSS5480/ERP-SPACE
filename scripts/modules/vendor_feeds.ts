@@ -442,6 +442,9 @@ export async function runFeeds(t: T) {
     && ca.unplaced.some((u) => /DisplayOrder/.test(u)), JSON.stringify(ca.unplaced));
   const ca2 = await cr.post<{ feeds: { action: string }[] }>("/vendor-api/import/catalog-app", BUYER, { vendorId: V.ASHLEY, source: caSource });
   t.ok("catalog app: sending it again updates the same feeds", ca2.feeds.length === 4 && ca2.feeds.every((f) => f.action === "updated"));
+  const ca3 = await cr.post<{ vendorId: string; feeds: { action: string }[] }>("/vendor-api/import/catalog-app", BUYER, { vendorName: "ASHLEY CATALOG W/ QTY", source: caSource });
+  t.ok("catalog app: a loose source label (ASHLEY CATALOG W/ QTY) still finds Ashley Furniture Industries", ca3.vendorId === V.ASHLEY && ca3.feeds.every((f) => f.action === "updated"));
+  await t.throws("catalog app: a label naming no vendor is refused in words", () => cr.post("/vendor-api/import/catalog-app", BUYER, { vendorName: "Nobody Imports", source: caSource }), /no vendor called Nobody Imports/);
   const audits = await read(t, (c) => q<{ after: unknown }>(c, `select after from audit_event where entity_id = $1 and table_name in ('vendor_feed','vendor_feed_secret')`, [ENTITY]));
   t.ok("catalog app and secrets: audited by name, never by value", audits.length > 0 && !JSON.stringify(audits).includes("CA-SUB-KEY-9876") && !JSON.stringify(audits).includes("K-PRODUCTS-1111"));
   await t.throws("catalog app: a buyer of another company cannot reach this vendor", () => rio(t, (c, s) =>
