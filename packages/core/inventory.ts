@@ -97,3 +97,13 @@ export async function restock(c: Client, entityId: string, productId: string, lo
 
 /** Low-level adjust, for the inventory module's own receiving/transfer/count code. */
 export const _bump = bump;
+
+/**
+ * Goods placed on (qty > 0) or taken off (qty < 0) a purchase order for a
+ * location. Purchasing calls this when a PO is placed, cancelled or cut back
+ * by the vendor; receiving lowers it through its own code.
+ */
+export async function addOnOrder(c: Client, entityId: string, productId: string, locationId: string, qty: number): Promise<void> {
+  if (!Number.isFinite(qty) || qty === 0) throw new InventoryError("on-order changes by a non-zero quantity");
+  await bump(c, entityId, productId, locationId, { onOrder: qty });
+}

@@ -42,7 +42,7 @@ export function harness(): { t: T; counts: () => { passed: number; failed: numbe
       const r = await q<Record<string, string>>(c, `
         select e.id, e.tenant_id, e.name, e.legal_name, t.name tenant_name, t.vertical,
                t.location_label, t.profit_object_label, t.aging_label
-          from entity e join tenant t on t.id = e.tenant_id where e.id = $1`, [entityId]);
+          from entity e join tenant t on t.id = e.tenant_id where e.id = $1 /* unscoped: the company itself */`, [entityId]);
       const x = r[0];
       return { id: x.id, tenantId: x.tenant_id, name: x.name, legalName: x.legal_name, tenantName: x.tenant_name,
         vertical: x.vertical, locationLabel: x.location_label, profitObjectLabel: x.profit_object_label,
