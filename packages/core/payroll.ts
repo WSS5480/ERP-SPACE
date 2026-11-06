@@ -241,6 +241,20 @@ export async function buildRun(
       group by t.employee_id, t.worked_on, (t.pay_period_id <> $1)`,
     [input.payPeriodId, scope.entityId, period.pay_group_id, weekFrom, period.starts_on]
   );
+  // Earnings other modules hand payroll for this period (commissions, draws,
+  // bonuses): approved, and not already on a run that still stands.
+  const extraRows = await q<{ employee_id: string; amount: string }>(
+    c,
+    `select pe.employee_id, sum(pe.amount_minor) as amount
+       from payroll_earning pe
+       left join payroll_run pr on pr.id = pe.payroll_run_id
+      where pe.entity_id = $1 and pe.pay_period_id = $2 and pe.status = 'approved'
+        and (pe.payroll_run_id is null or pr.status = 'cancelled')
+      group by pe.employee_id`,
+    [scope.entityId, input.payPeriodId]
+  );
+  const extra = new Map(extraRows.map((x) => [x.employee_id, BigInt(x.amount)]));
+
   const byPerson = new Map<string, { day: string; hours: number; prior: boolean }[]>();
   for (const t of cards) {
     const list = byPerson.get(t.employee_id) ?? [];
@@ -257,15 +271,16 @@ export async function buildRun(
 
     if (r.pay_type === "hourly") {
       const days = byPerson.get(r.employee_id) ?? [];
-      if (!days.some((d) => !d.prior && d.hours > 0)) continue;
+      if (!days.some((d) => !d.prior && d.hours > 0) && !extra.has(r.employee_id)) continue;
       ({ regular, overtime } = splitHours(days, period.frequency, period.starts_on, period.workweek_start_dow, otAfter));
       gross =
         rate * BigInt(Math.round(regular * 100)) / 100n +
         mulBps(rate * BigInt(Math.round(overtime * 100)) / 100n, Math.round(otMult * 10000));
     } else {
       gross = salaryForPeriod(rate, period.frequency, period.starts_on, period.ends_on, r.hired_on, r.terminated_on);
-      if (gross === 0n) continue;
+      if (gross === 0n && !extra.has(r.employee_id)) continue;
     }
+    gross += extra.get(r.employee_id) ?? 0n;
 
     const deds = await q<{
       id: string; kind: string; amount_minor: string | null;
@@ -350,6 +365,16 @@ export async function buildRun(
         `insert into payroll_deduction (payroll_line_id, deduction_type_id, amount_minor, employer_match_minor)
          values ($1,$2,$3,$4)`,
         [line.id, x.typeId, x.amountMinor.toString(), x.employerMatchMinor.toString()]
+      );
+    }
+
+    if (extra.has(d.employeeId)) {
+      await c.query(
+        `update payroll_earning pe set payroll_run_id = $1, payroll_line_id = $2
+          where pe.entity_id = $3 and pe.pay_period_id = $4 and pe.employee_id = $5 and pe.status = 'approved'
+            and (pe.payroll_run_id is null
+                 or exists (select 1 from payroll_run x where x.id = pe.payroll_run_id and x.status = 'cancelled'))`,
+        [run.id, line.id, scope.entityId, input.payPeriodId, d.employeeId]
       );
     }
 
@@ -521,11 +546,35 @@ export async function postRun(c: Client, scope: Scope, runId: string): Promise<s
       group by pl.profit_object_id, pl.department_id`,
     [runId, scope.entityId]
   );
+  // Earnings handed to payroll (commission already accrued to 2160, a draw
+  // to 6130) debit the account they name; wages carry the rest of gross.
+  const earned = await q<{ profit_object_id: string | null; department_id: string | null; debit_code: string; amount: string }>(
+    c,
+    `select pl.profit_object_id, pl.department_id, pe.debit_code, sum(pe.amount_minor) as amount
+       from payroll_earning pe
+       join payroll_line pl on pl.id = pe.payroll_line_id
+      where pe.entity_id = $2 and pe.payroll_run_id = $1
+      group by pl.profit_object_id, pl.department_id, pe.debit_code`,
+    [runId, scope.entityId]
+  );
+  const same = (a: string | null, b: string | null) => (a ?? "") === (b ?? "");
   for (const g of byObject) {
+    const other = earned.filter((x) => same(x.profit_object_id, g.profit_object_id) && same(x.department_id, g.department_id))
+      .reduce((a, x) => a + BigInt(x.amount), 0n);
+    const w = BigInt(g.gross) - other;
+    if (w > 0n) {
+      await c.query(
+        `insert into journal_line (journal_entry_id, seq, gl_account_id, profit_object_id, department_id, debit_minor, memo)
+         values ($1,$2,$3,$4,$5,$6,'gross wages')`,
+        [je.id, seq++, wages, g.profit_object_id, g.department_id, w.toString()]
+      );
+    }
+  }
+  for (const x of earned) {
     await c.query(
       `insert into journal_line (journal_entry_id, seq, gl_account_id, profit_object_id, department_id, debit_minor, memo)
-       values ($1,$2,$3,$4,$5,$6,'gross wages')`,
-      [je.id, seq++, wages, g.profit_object_id, g.department_id, g.gross]
+       values ($1,$2,$3,$4,$5,$6,$7)`,
+      [je.id, seq++, await acct(x.debit_code), x.profit_object_id, x.department_id, x.amount, `earnings paid through payroll (${x.debit_code})`]
     );
   }
 
@@ -563,11 +612,15 @@ export async function postRun(c: Client, scope: Scope, runId: string): Promise<s
      values ($1,$2,$3,$4,'payroll taxes payable')`,
     [je.id, seq++, payrollLiab, (BigInt(run.employee_tax_minor) + BigInt(run.employer_tax_minor)).toString()]
   );
-  await c.query(
-    `insert into journal_line (journal_entry_id, seq, gl_account_id, credit_minor, memo)
-     values ($1,$2,$3,$4,'deductions payable')`,
-    [je.id, seq++, dedPayable, (BigInt(run.deductions_minor) + BigInt(match)).toString()]
-  );
+  // A run with no deductions has no line here; a zero line breaks the ledger's one-side rule.
+  const dedTotal = BigInt(run.deductions_minor) + BigInt(match);
+  if (dedTotal > 0n) {
+    await c.query(
+      `insert into journal_line (journal_entry_id, seq, gl_account_id, credit_minor, memo)
+       values ($1,$2,$3,$4,'deductions payable')`,
+      [je.id, seq++, dedPayable, dedTotal.toString()]
+    );
+  }
 
   await c.query(`update payroll_run set status='posted' where id=$1`, [runId]);
   await c.query(
