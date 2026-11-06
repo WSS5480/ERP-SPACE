@@ -80,6 +80,7 @@ const EMAIL_TOKEN = process.env.ERP_EMAIL_INBOUND_TOKEN ?? "";
 // statement intake) open on: ERP_ENTITY_ID if set, otherwise the first
 // company created here -- never a hard-coded demo company.
 let ENTITY = (process.env.ERP_ENTITY_ID ?? "").trim();
+const NO_COMPANY = "00000000-0000-0000-0000-000000000000";
 const TRIAL = process.env.ERP_SEED === "placeholder";
 const TRIAL_ENDS = process.env.ERP_TRIAL_ENDS ?? "";
 const VERSION = (process.env.RENDER_GIT_COMMIT ?? "").slice(0, 7) || "dev";
@@ -556,7 +557,11 @@ route("GET", /^\/api\/clients$/, "token", async () => {
 route("POST", /^\/api\/companies$/, "token", async (req, _url, _m, who) => {
   const body = await readJson(req);
   const label = who?.via === "session" ? `${who.name} (web)` : "api";
-  return [200, await tx({ kind: "user", label }, (c) => act.createCompany(c, label, body))];
+  const made = await tx({ kind: "user", label }, (c) => act.createCompany(c, label, body));
+  // On a brand-new install the feed screens had no company to open on; the first one made is it.
+  const madeId = (made as { id?: string; entityId?: string } | null)?.entityId ?? (made as { id?: string } | null)?.id;
+  if (ENTITY === NO_COMPANY && typeof madeId === "string") ENTITY = madeId;
+  return [200, made];
 });
 
 coGet("/people", (c, co) => views.people(c, co));
@@ -947,7 +952,7 @@ export async function start(): Promise<http.Server> {
   console.log(applied.length ? `migrations: applied ${applied.length}` : "migrations: up to date");
   if (!ENTITY) {
     const first = await pool.query<{ id: string }>("select id from entity where status = 'active' order by created_at, name limit 1");
-    ENTITY = first.rows[0]?.id ?? "00000000-0000-0000-0000-000000000000";
+    ENTITY = first.rows[0]?.id ?? NO_COMPANY;
   }
   if (TRIAL) {
     // Placeholder activity for the trial's placeholder company. Never allowed

@@ -285,4 +285,25 @@ export async function run(t: T) {
   t.ok("isolation: another company's catalog and import history show none of this company's", rioList.total === 0 && rioRuns.runs.length === 0);
   const rioDet = await r.get("/catalog/products/:id", "", P.DARCY, RIO_ENTITY);
   t.ok("isolation: another company asking for this company's product gets not found", rioDet === null);
+
+  // --------------------------------------------- photo fetcher stays public
+  const priv = ["10.1.2.3", "127.0.0.1", "169.254.169.254", "172.20.0.1", "192.168.1.1", "100.64.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1"];
+  t.ok("photos: every private, loopback, link-local and carrier-NAT address is refused", priv.every((ip) => cat.isPrivateIp(ip)));
+  t.ok("photos: public addresses are allowed", ["8.8.8.8", "151.101.1.69", "2606:4700::1111"].every((ip) => !cat.isPrivateIp(ip)));
+  {
+    const c = await t.pool.connect();
+    try {
+      const prod = (await c.query(`select product_id, seq from product_image where entity_id = $1 limit 1`, [ENTITY])).rows[0];
+      if (prod) {
+        await c.query(`delete from catalog_image_cache where entity_id = $1`, [ENTITY]);
+        const asked: string[] = [];
+        const redirecting: cat.ImageFetch = async (url) => { asked.push(url);
+          return { status: 302, headers: { get: (k: string) => (k === "location" ? "https://169.254.169.254/latest/meta-data" : null) }, arrayBuffer: async () => new ArrayBuffer(0) }; };
+        let msg = "";
+        try { await cat.productImage(c, ENTITY, prod.product_id, prod.seq, redirecting); } catch (e) { msg = (e as Error).message; }
+        t.ok("photos: a redirect to a private address is refused before it is asked", /private networks/.test(msg) && asked.length === 1, msg);
+      } else t.ok("photos: a demo product has a photo to test with", false);
+    } finally { c.release(); }
+  }
+
 }

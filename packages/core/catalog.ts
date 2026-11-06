@@ -855,7 +855,7 @@ export function decode128(widths: number[]): string {
 // in catalog_image_cache so the vendor is asked once a week at most. Served
 // back as a data: URL, which the page's image policy already allows.
 
-export type ImageFetch = (url: string, init: { signal: AbortSignal; redirect: "follow"; headers: Record<string, string> }) =>
+export type ImageFetch = (url: string, init: { signal: AbortSignal; redirect: "manual"; headers: Record<string, string> }) =>
   Promise<{ status: number; url?: string; headers: { get(k: string): string | null }; arrayBuffer(): Promise<ArrayBuffer> }>;
 
 const IMAGE_TYPES = /^image\/(jpeg|png|gif|webp|avif)$/;
@@ -865,15 +865,38 @@ function publicHttps(raw: string): URL {
   let u: URL;
   try { u = new URL(raw); } catch { throw new CatalogError("that photo address is not a web address"); }
   need(u.protocol === "https:", "only https photo addresses are fetched");
-  const h = u.hostname.toLowerCase();
-  const privateHost = h === "localhost" || h.endsWith(".local") || h.endsWith(".internal") || /^\[/.test(h)
-    || /^(127|10|0)\./.test(h) || /^169\.254\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h);
-  need(!privateHost, "photo addresses on private networks are not fetched");
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  need(!(h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal") || isPrivateIp(h)),
+    "photo addresses on private networks are not fetched");
   return u;
 }
 
+/** Loopback, private, link-local, carrier-grade NAT, multicast/reserved, and their IPv6 forms. */
+export function isPrivateIp(ip: string): boolean {
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip.replace(/^::ffff:/i, ""));
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19));
+  }
+  if (ip.includes(":")) {
+    const x = ip.toLowerCase();
+    return x === "::" || x === "::1" || /^f[cd]/.test(x) || /^fe[89ab]/.test(x) || /^ff/.test(x);
+  }
+  return false;
+}
+
+/** Every address a host name resolves to must be public, or nothing is fetched. */
+async function dnsPublic(host: string): Promise<void> {
+  const { lookup } = await import("node:dns/promises");
+  let addrs: { address: string }[];
+  try { addrs = await lookup(host, { all: true, verbatim: true }); }
+  catch { throw new CatalogError("the photo's host could not be reached"); }
+  need(addrs.length && addrs.every((a) => !isPrivateIp(a.address)), "photo addresses on private networks are not fetched");
+}
+
 export async function productImage(c: Client, entityId: string, productId: string, seq: number,
-  fetchImpl: ImageFetch = globalThis.fetch as unknown as ImageFetch, maxAgeDays = 7): Promise<{ contentType: string; dataUrl: string; bytes: number; cached: boolean } | null> {
+  fetchImpl: ImageFetch = globalThis.fetch as unknown as ImageFetch, maxAgeDays = 7, resolveDns = false): Promise<{ contentType: string; dataUrl: string; bytes: number; cached: boolean } | null> {
   const im = (await q<{ url: string }>(c, `select url from product_image where entity_id = $1 and product_id = $2 and seq = $3`, [entityId, productId, seq]))[0];
   if (!im) return null;
   const hit = (await q<{ content_type: string; bytes: Buffer; fresh: boolean }>(c, `
@@ -886,13 +909,28 @@ export async function productImage(c: Client, entityId: string, productId: strin
   const timer = setTimeout(() => ctl.abort(), 8000);
   let type = "", body: Buffer;
   try {
-    let r;
-    try { r = await fetchImpl(u.toString(), { signal: ctl.signal, redirect: "follow", headers: { accept: "image/*" } }); }
-    catch (e) {
-      if (hit) return out(hit.content_type, hit.bytes, true);      // an old copy beats nothing
-      throw new CatalogError(ctl.signal.aborted ? "the photo's host took too long to answer" : "the photo's host could not be reached");
+    // Redirects are followed by hand, at most three, and every hop is checked
+    // -- the name and every address it resolves to -- before it is asked.
+    const live = fetchImpl === (globalThis.fetch as unknown as ImageFetch) || resolveDns;
+    let r, at = u;
+    for (let hop = 0; ; hop++) {
+      if (live) await dnsPublic(at.hostname.replace(/^\[|\]$/g, ""));
+      try { r = await fetchImpl(at.toString(), { signal: ctl.signal, redirect: "manual", headers: { accept: "image/*" } }); }
+      catch (e) {
+        if (e instanceof CatalogError) throw e;
+        if (hit) return out(hit.content_type, hit.bytes, true);      // an old copy beats nothing
+        throw new CatalogError(ctl.signal.aborted ? "the photo's host took too long to answer" : "the photo's host could not be reached");
+      }
+      if (r.status >= 300 && r.status < 400) {
+        need(hop < 3, "that photo address redirects too many times");
+        const loc = r.headers.get("location");
+        need(loc, `the photo's host answered ${r.status} with nowhere to go`);
+        at = publicHttps(new URL(loc!, at).toString());              // a redirect may not leave https or go private
+        continue;
+      }
+      if (r.url) publicHttps(r.url);
+      break;
     }
-    if (r.url) publicHttps(r.url);                                   // a redirect may not leave https or go private
     need(r.status === 200, `the photo's host answered ${r.status}`);
     type = (r.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
     need(IMAGE_TYPES.test(type), `that address is not a photo (${type || "no type"}); JPEG, PNG, GIF, WebP or AVIF only`);
