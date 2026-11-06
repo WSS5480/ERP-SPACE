@@ -8,7 +8,9 @@ import { type T, ENTITY, RIO_ENTITY, LOC } from "./harness.ts";
 import { q, type Client } from "../../packages/core/db.ts";
 import * as feeds from "../../packages/core/vendor_feeds.ts";
 import * as pur from "../../packages/core/purchasing.ts";
-import { module as catalogModule, useFeedEnv } from "../../server/modules/catalog.ts";
+import { module as catalogModule, useFeedEnv, useImageFetch } from "../../server/modules/catalog.ts";
+import type { ImageFetch } from "../../packages/core/catalog.ts";
+import { runDueVendorConnections } from "../run-due.ts";
 import { module as purchasingModule } from "../../server/modules/purchasing.ts";
 import { routes, rio, asPerson, V, BUYER, DC } from "./catalog.ts";
 import { scopeOf } from "../../server/actions.ts";
@@ -214,6 +216,46 @@ export async function runFeeds(t: T) {
   t.ok("failure: a missing secret names the environment variable to set", !nosecret.ok && /ERP_SECRET_VENDOR_ASHLEY is not set/.test(nosecret.note));
   CATALOG[0].price.netPriceBeforeFreight = 289.5;
   useFeedEnv(feeds.liveEnv);
+
+  // ------------------------------------------------------------ scheduler
+  await read(t, (c) => c.query(`update vendor_connection set last_run_at = now() - interval '2 days' where id = $1 and entity_id = $2`, [conn.id, ENTITY]));
+  const due = await runDueVendorConnections(new Date(), net.env(), { entityId: ENTITY });
+  const again = await runDueVendorConnections(new Date(), net.env(), { entityId: ENTITY });
+  const schedRun = await read(t, async (c) => (await q<{ trigger: string; outcome: string }>(c,
+    `select trigger, outcome from vendor_feed_run where entity_id = $1 and connection_id = $2 order by started_at desc limit 1`, [ENTITY, conn.id]))[0]);
+  t.ok("scheduler: a connection whose time has come runs once as the scheduler, then is not due again",
+    due.due === 1 && due.runs[0].ok && again.due === 0 && schedRun.trigger === "schedule" && schedRun.outcome === "ok", JSON.stringify(due.runs));
+
+  // ---------------------------------------------------------- photo proxy
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 0xff, 0xd9]);
+  const asked: string[] = [];
+  const fakeImg: ImageFetch = async (url) => {
+    asked.push(url);
+    const big = url.includes("huge"), html = url.includes("page");
+    return { status: 200, url, headers: { get: (k: string) => (k === "content-type" ? (html ? "text/html" : "image/jpeg") : k === "content-length" ? (big ? String(6 * 1024 * 1024) : String(JPEG.length)) : null) },
+      arrayBuffer: async () => JPEG.buffer.slice(JPEG.byteOffset, JPEG.byteOffset + JPEG.length) as ArrayBuffer };
+  };
+  useImageFetch(fakeImg);
+  const b31Id = await read(t, async (c) => (await q<{ id: string }>(c, `select id from product where entity_id = $1 and sku = 'ASH-B600-31'`, [ENTITY]))[0].id);
+  await read(t, (c) => c.query(`insert into product_image (entity_id, product_id, seq, url) values
+    ($1,$2,2,'http://img.ashley.example/plain.jpg'), ($1,$2,3,'https://img.ashley.example/page.html'), ($1,$2,4,'https://img.ashley.example/huge.jpg'),
+    ($1,$2,5,'https://10.0.0.5/inside.jpg')`, [ENTITY, b31Id]));
+  const viaRoute = async (seq: number) => {
+    try { return { ok: true, r: await cr.get<{ dataUrl: string; cached: boolean; bytes: number } | null>("/catalog/image/:id/([0-9]{1,2})", "", [b31Id, String(seq)] as never) }; }
+    catch (e) { return { ok: false, r: null, msg: (e as Error).message }; }
+  };
+  const p1 = await viaRoute(1), p1b = await viaRoute(1);
+  t.ok("photos: the stored https photo comes back from our own origin as a data URL", p1.ok && !!p1.r?.dataUrl.startsWith("data:image/jpeg;base64,") && p1.r?.bytes === JPEG.length && p1.r?.cached === false);
+  t.ok("photos: the second ask is served from the cache, not the vendor", p1b.r?.cached === true && asked.filter((u) => u.endsWith("b600-31.jpg")).length === 1);
+  const [p2, p3, p4, p5, p9] = [await viaRoute(2), await viaRoute(3), await viaRoute(4), await viaRoute(5), await viaRoute(9)];
+  t.ok("photos: a plain-http address is not fetched", !p2.ok && /only https/.test(p2.msg ?? ""));
+  t.ok("photos: a page that is not an image is refused", !p3.ok && /not a photo \(text\/html\)/.test(p3.msg ?? ""));
+  t.ok("photos: anything over 5 MB is refused", !p4.ok && /larger than 5 MB/.test(p4.msg ?? ""));
+  t.ok("photos: an address on a private network is never fetched", !p5.ok && /private networks/.test(p5.msg ?? "") && !asked.some((u) => u.includes("10.0.0.5")));
+  t.ok("photos: only addresses stored on that product are fetched (no such photo is not found)", p9.ok && p9.r === null);
+  const rioImg = await cr.get("/catalog/image/:id/([0-9]{1,2})", "", [b31Id, "1"] as never, RIO_ENTITY);
+  t.ok("photos: another company cannot fetch this company's photos", rioImg === null);
+  useImageFetch(undefined);
 
   // ------------------------------------------------------------ isolation
   await rio(t, (c, s) => t.throws("isolation: another company cannot run this company's vendor connection", () => feeds.runConnection(c, s, conn.id, net.env()), /no such vendor connection/));

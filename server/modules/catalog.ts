@@ -14,6 +14,9 @@ import * as feeds from "../../packages/core/vendor_feeds.ts";
 let feedEnv: () => feeds.FeedEnv = feeds.liveEnv;
 export const useFeedEnv = (fn: () => feeds.FeedEnv) => { feedEnv = fn; };
 export const currentFeedEnv = () => feedEnv();
+/** How photos are fetched for the image proxy: the real network, unless checks hand in a fake. */
+let imageFetch: cat.ImageFetch | undefined;
+export const useImageFetch = (f: cat.ImageFetch | undefined) => { imageFetch = f; };
 
 const ID = "([0-9a-fA-F-]{36})";
 const EDIT = ["buyer"];
@@ -283,6 +286,8 @@ export const module: ErpModule = {
       const r = await priceConfigured(c, co.id, m[2], choicesParam(url), { priceList: url.searchParams.get("list"), on: url.searchParams.get("on") });
       return r;
     }));
+    // Photos come through our own origin: the page's policy allows no outside images.
+    coGet(`/catalog/image/${ID}/([0-9]{1,2})`, (c, co, _u, m) => refuse(() => cat.productImage(c, co.id, m[2], Number(m[3]), imageFetch)));
     coGet("/catalog/margins", (c, co, url) => margins(c, co, url));
     coGet("/catalog/labels", (c, co, url) => refuse(() => labels(c, co, url)));
     coGet("/catalog/vendors", (c, co) => vendors(c, co));

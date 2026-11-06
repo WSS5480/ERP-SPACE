@@ -22,6 +22,22 @@
     drop: ['serious', 'warn', 'Dropped by vendor'], discontinued: ['critical', 'fail', 'Discontinued'],
   };
   const statusChip = (s) => chip(...(STATUS[s] || ['neutral', 'info', cap(s)]));
+
+  /** A product photo through the app's own image route (outside images are blocked by the page's policy), fetched when it scrolls into view. */
+  const IMG_SEEN = new Map();
+  const proxyImg = (productId, seq, alt, cls) => {
+    const img = el('img', { alt: alt || '', class: cls || null, width: '76', height: '76' });
+    const load = () => {
+      const k = `${productId}/${seq}`;
+      if (!IMG_SEEN.has(k)) IMG_SEEN.set(k, coApi(`/catalog/image/${productId}/${seq}`).then((r) => r.dataUrl).catch(() => null));
+      IMG_SEEN.get(k).then((src) => { if (src) img.src = src; else img.title = 'Photo could not be fetched'; });
+    };
+    if ('IntersectionObserver' in window) {
+      const io = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) { io.disconnect(); load(); } });
+      io.observe(img);
+    } else load();
+    return img;
+  };
   const KIND = { stock: 'Stock', configurable: 'Configurable', special_order: 'Special order', kit: 'Package', service: 'Service', fee: 'Fee', warranty: 'Protection plan', gift_card: 'Gift card' };
 
   function style() {
@@ -167,7 +183,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
             : empty('Ships as one piece.', 'Add cartons when it comes in more than one box; the warehouse scans each.', true))),
         section('Images', x.images.length ? `${x.images.length}` : null,
           [el('button', { class: 'btn small', type: 'button', onclick: () => openImages(x, reopen) }, 'Edit images')],
-          el('div', { class: 'panel' }, x.images.length ? el('div', { class: 'pc-thumbs' }, x.images.map((im) => el('img', { src: im.url, alt: im.alt || p.name, loading: 'lazy', referrerpolicy: 'no-referrer', onerror: (e) => { e.target.title = `Could not show ${im.url}`; } })))
+          el('div', { class: 'panel' }, x.images.length ? el('div', { class: 'pc-thumbs' }, x.images.map((im) => proxyImg(p.id, im.seq, im.alt || p.name)))
             : empty('No images.', null, true))),
         section('Prices and promotions', null, null, el('div', { class: 'panel' }, (() => {
           const rows = [...x.lists.map((l) => item({ title: l.name, detail: `Price list ${l.code}`, amount: money(l.price_minor) })),

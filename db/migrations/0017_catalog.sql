@@ -305,3 +305,14 @@ create table vendor_sku_freight (
   as_of          timestamptz not null default now(),
   primary key (entity_id, vendor_id, vendor_sku, location_id)
 );
+
+-- Product photos fetched once from the vendor's address and served from our
+-- own origin (the page's security policy allows no outside images).
+create table catalog_image_cache (
+  entity_id    uuid not null references entity(id),
+  url          text not null,
+  content_type text not null check (content_type ~ '^image/'),
+  bytes        bytea not null check (octet_length(bytes) <= 5242880),
+  fetched_at   timestamptz not null default now(),
+  primary key (entity_id, url)
+);

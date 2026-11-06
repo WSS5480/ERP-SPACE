@@ -105,8 +105,12 @@ export async function run(t: T) {
     const atp = await R.get(t, `/inventory/atp/${P.SOFA}`) as Awaited<ReturnType<typeof inv.availableToPromise>>;
     t.ok("ATP: Darcy sofa available now across DC and stores", atp.availableNow === 11, `${atp.availableNow}`);
     t.ok("ATP: next purchase order and its ETA", atp.nextPurchaseOrder?.number === "PO-INV-0001" && atp.nextPurchaseOrder.qty === 6 && !!atp.nextPurchaseOrder.expectedOn);
-    const conf = await R.get(t, `/inventory/atp/77777777-0000-0000-0000-000000000010`) as { availableNow: number; nextPurchaseOrder: unknown; promise: string };
-    t.ok("ATP: a made-to-order sofa with no PO says not available, rather than failing", conf.availableNow === 0 && conf.nextPurchaseOrder === null && conf.promise === "not available");
+    // The made-to-order accent chair: purchasing's checks order the Hudson sofa for a customer, so it has a PO by now; nothing orders this one.
+    const conf = await R.get(t, `/inventory/atp/77777777-0000-0000-0000-000000000026`) as { availableNow: number; nextPurchaseOrder: unknown; promise: string };
+    const confPos = await read<{ n: string }>(`select count(*) n from purchase_order_line l join purchase_order po on po.id = l.purchase_order_id
+      where po.entity_id = $1 and po.status = 'open' and l.product_id = $2`, [ENTITY, "77777777-0000-0000-0000-000000000026"]);
+    t.ok("ATP: a made-to-order sofa with no PO says not available, rather than failing",
+      confPos[0].n === "0" && conf.availableNow === 0 && conf.nextPurchaseOrder === null && conf.promise === "not available", JSON.stringify(conf));
 
     // ----------------------------------------------------------------- receiving
     const before = await level(P.SOFA, DC);
@@ -135,7 +139,12 @@ export async function run(t: T) {
     await t.throws("receiving: a received PO takes nothing more", () => R.post(t, DEE, "/inventory/receiving",
       { purchaseOrderId: PO, locationId: DC, lines: [{ poLineId: POL.SOFA, qty: 1 }] }), /is received, not open/);
     const atp2 = await inv.availableToPromise(c0, ENTITY, P.SOFA);
-    t.ok("ATP: once received there is no next PO", atp2.nextPurchaseOrder === null);
+    // Other modules' checks may leave their own open POs for the sofa; the received one must drop out, and any next one is still open with something left.
+    const stillOpen = await read<{ number: string }>(`select po.number from purchase_order po join purchase_order_line l on l.purchase_order_id = po.id
+      where po.entity_id = $1 and po.status = 'open' and l.product_id = $2 and po.id <> $3
+        and l.quantity - coalesce(l.cancelled_qty, 0) > coalesce((select sum(g.quantity) from goods_receipt_line g where g.purchase_order_line_id = l.id), 0)`, [ENTITY, P.SOFA, PO]);
+    t.ok("ATP: once received there is no next PO", atp2.nextPurchaseOrder?.number !== "PO-INV-0001"
+      && (stillOpen.length ? stillOpen.some((x) => x.number === atp2.nextPurchaseOrder?.number) : atp2.nextPurchaseOrder === null), JSON.stringify(atp2.nextPurchaseOrder));
     await consistent("after the PO is fully received");
 
     // ------------------------------------------------------- receiving calendar
