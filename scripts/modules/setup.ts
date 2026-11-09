@@ -13,7 +13,7 @@ export async function run(t: T) {
   } finally { c.release(); }
 
   const r1 = await t.as(PEOPLE.STEVE, (c, co, a) => applyPack(c, scopeOf(co, a), "furniture", "Steve"));
-  t.ok("the furniture pack applies", r1.pack === "furniture" && r1.modulesOn === MODULE_IDS.length, JSON.stringify(r1));
+  t.ok("the furniture pack applies", r1.pack === "furniture" && r1.modulesOn === PACKS.find((p) => p.id === "furniture")!.modules.length, JSON.stringify(r1));
   const r2 = await t.as(PEOPLE.STEVE, (c, co, a) => applyPack(c, scopeOf(co, a), "furniture", "Steve"));
   t.ok("applying it again adds nothing", r2.accountsAdded === 0 && r2.reasonsAdded === 0 && r2.settingsAdded === 0);
 

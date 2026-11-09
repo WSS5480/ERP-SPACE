@@ -99,7 +99,7 @@ const human = (s) => String(s == null ? '' : s)
   .replace(/\b(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat) ([A-Z][a-z]{2}) (\d{1,2}) \d{4} \d{2}:\d{2}:\d{2} GMT[+-]\d{4}(?: \([^)]*\))?/g, (m, mon, day) => `${mon} ${Number(day)}`);
 const ROLE = { owner: 'owner', controller: 'controller', approver: 'approver', ap_clerk: 'A/P clerk', viewer: 'viewer',
   store_manager: 'store manager', sales: 'sales', cashier: 'cashier', buyer: 'buyer', warehouse: 'warehouse', dispatcher: 'dispatcher',
-  driver: 'driver', ar_clerk: 'A/R clerk', hr: 'HR', web_admin: 'web admin', marketing: 'marketing' };
+  driver: 'driver', ar_clerk: 'A/R clerk', hr: 'HR', web_admin: 'web admin', marketing: 'marketing', technician: 'technician' };
 const roles = (list) => (list || []).map((r) => ROLE[r] || r).join(', ');
 const subjTitle = (s) => (s.date && s.kind !== 'bill' ? `${s.title} for ${dayLabel(s.date)}` : s.title);
 // A bill's number never breaks across lines: "Meridian Supply · MS-260907".

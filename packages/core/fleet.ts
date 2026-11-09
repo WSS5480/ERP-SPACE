@@ -338,7 +338,7 @@ export async function drivers(c: Client, entityId: string, tenantId: string, onD
            (p.kind = 'driver' and p.license_expires < coalesce($3::date, current_date)) license_expired,
            (p.kind = 'driver' and p.license_expires between coalesce($3::date, current_date) and coalesce($3::date, current_date) + 30) license_expiring
       from app_user u
-      join role_grant g on g.app_user_id = u.id and g.role = 'driver'
+      join role_grant g on g.app_user_id = u.id and g.role in ('driver','technician')
                        and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $2))
       left join driver_profile p on p.entity_id = $1 and p.app_user_id = u.id
       left join app_user hu on hu.id = p.default_helper_id
@@ -351,7 +351,7 @@ export async function saveDriver(c: Client, scope: Scope, b: Record<string, unkn
   need(isId(b.personId), "pick the person");
   const held = await q(c, `
     select 1 from role_grant g join app_user u on u.id = g.app_user_id
-     where g.app_user_id = $2 and g.role = 'driver' and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $3))`,
+     where g.app_user_id = $2 and g.role in ('driver','technician') and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $3))`,
     [scope.entityId, b.personId, scope.tenantId]);
   need(held.length, "give that person the driver role in Setup first");
   const kind = b.kind === "helper" ? "helper" : "driver";
@@ -863,6 +863,29 @@ async function notify(c: Client, scope: Scope, stopId: string | null, kind: stri
   }
 }
 
+/** A message to a customer about something other than a stop (a service ticket), through the same log and provider. */
+export async function messageCustomer(c: Client, scope: Scope, m: { customerId: string; body: string; orderId?: string | null }) {
+  const cu = await q<{ phone: string | null; email: string | null }>(c, `select phone, email from customer where entity_id = $1 and id = $2`, [scope.entityId, m.customerId]);
+  if (!cu.length) return null;
+  const channel: "sms" | "email" = cu[0].phone ? "sms" : "email";
+  const to = cu[0].phone || cu[0].email || "";
+  const body = `${await companyName(c, scope.entityId)}: ${m.body}`.slice(0, 1000);
+  const row = await one<{ id: string }>(c, `
+    insert into customer_message (entity_id, sales_order_id, customer_id, kind, channel, to_addr, body, provider, status)
+    values ($1,$2,$3,'service_update',$4,$5,$6,$7,$8) returning id`,
+    [scope.entityId, m.orderId ?? null, m.customerId, channel, to || "-", body, provider.name, to ? "queued" : "skipped"]);
+  if (!to) return row.id;
+  try {
+    const r = await provider.send({ channel, to, body, kind: "service_update" });
+    await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end
+                    where entity_id = $1 and id = $2`, [scope.entityId, row.id, r.ok ? "sent" : "failed", r.ref ?? null, r.error ?? null]);
+  } catch (e) {
+    await c.query(`update customer_message set status = 'failed', error = $3 where entity_id = $1 and id = $2`,
+      [scope.entityId, row.id, String((e as Error).message).slice(0, 300)]);
+  }
+  return row.id;
+}
+
 export async function messages(c: Client, entityId: string, filter: { stopId?: string; day?: string }) {
   return q(c, `
     select m.id, m.kind, m.channel, m.to_addr, m.body, m.status, m.provider, m.created_at, s.number stop_number, cu.name customer
@@ -1075,8 +1098,11 @@ export async function route(c: Client, entityId: string, routeId: string) {
            (extract(hour from w.ends)*60 + extract(minute from w.ends))::int window_end,
            cu.name customer, cu.phone, a.line1, a.line2, a.city, a.state, a.postal, a.stairs, a.notes address_notes,
            a.geo[0] lng, a.geo[1] lat, so.id order_id, so.number order_number,
-           greatest(coalesce(b.balance_minor, 0), 0)::text cod_minor
+           greatest(coalesce(b.balance_minor, 0), 0)::text cod_minor,
+           sv.id service_visit_id, sv.kind service_visit_kind, st.id service_ticket_id, st.number service_ticket, st.coverage service_coverage
       from delivery_stop s left join delivery_window w on w.id = s.window_id
+      left join service_visit sv on sv.stop_id = s.id and sv.entity_id = s.entity_id
+      left join service_ticket st on st.id = sv.ticket_id
       left join customer cu on cu.id = s.customer_id left join customer_address a on a.id = s.address_id
       left join sales_order so on so.id = s.sales_order_id
       left join sales_order_balance b on b.sales_order_id = s.sales_order_id and b.entity_id = s.entity_id
@@ -1086,8 +1112,14 @@ export async function route(c: Client, entityId: string, routeId: string) {
     select sl.id, sl.stop_id, sl.sales_order_line_id, sl.description, sl.qty::float qty, sl.pieces, sl.outcome, sl.flagged_for_warehouse, sl.note, ol.sku
       from delivery_stop_line sl join delivery_stop s on s.id = sl.stop_id left join sales_order_line ol on ol.id = sl.sales_order_line_id
      where sl.entity_id = $1 and s.route_id = $2 and sl.outcome <> 'cancelled' order by ol.seq nulls last, sl.description`, [entityId, routeId]);
+  // a service visit shows the parts in hand for its ticket, so the technician can mark what was used
+  const tickets = st.map((x) => x.service_ticket_id).filter(Boolean);
+  const parts = tickets.length ? await q(c, `
+    select sp.id, sp.ticket_id, p.name, sp.qty::float qty, l.line_status, sp.billable
+      from service_part sp join sales_order_line l on l.id = sp.sales_order_line_id join product p on p.id = sp.product_id
+     where sp.entity_id = $1 and sp.ticket_id = any($2) and sp.used_at is null and sp.cancelled_at is null`, [entityId, tickets]) : [];
   return { ...r[0], stops: st.map((x) => ({ ...x, eta: x.eta_min != null ? R.clock(x.eta_min) : null, lines: lines.filter((l) => l.stop_id === x.id),
-    mapsUrl: mapsUrl(x) })) };
+    mapsUrl: mapsUrl(x), serviceParts: x.service_ticket_id ? parts.filter((p) => p.ticket_id === x.service_ticket_id) : [] })) };
 }
 
 export function mapsUrl(x: Record<string, unknown>): string {
@@ -1491,7 +1523,8 @@ export async function dashboard(c: Client, entityId: string, day: string) {
      where s.entity_id = $1 and s.scheduled_on = $2 and (s.status in ('failed','partial'))
      order by s.number`, [entityId, day]);
   const flagged = await q(c, `
-    select sl.id, sl.description, sl.qty::float qty, sl.outcome, sl.note, s.number stop_number, s.kind, s.completed_at
+    select sl.id, sl.description, sl.qty::float qty, sl.outcome, sl.note, s.number stop_number, s.kind, s.completed_at,
+           (select t.number from service_ticket t where t.entity_id = sl.entity_id and t.origin_stop_line_id = sl.id and t.status <> 'cancelled' limit 1) service_ticket
       from delivery_stop_line sl join delivery_stop s on s.id = sl.stop_id
      where sl.entity_id = $1 and sl.flagged_for_warehouse and s.completed_at > now() - interval '14 days'
      order by s.completed_at desc limit 50`, [entityId]);

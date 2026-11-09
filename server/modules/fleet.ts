@@ -24,7 +24,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const DISPATCH = ["dispatcher", "store_manager"];
 const BOOK = ["dispatcher", "store_manager", "sales"];
 const LOAD = ["warehouse", "dispatcher", "store_manager"];
-const CREW = ["driver", "dispatcher", "store_manager"];
+const CREW = ["driver", "technician", "dispatcher", "store_manager"];
 const STAFF = ["owner", "dispatcher", "store_manager", "warehouse"];
 
 const scopeOf = (co: Company, a: Actor): Scope => ({ tenantId: co.tenantId, entityId: co.id, actor: { kind: "user", id: a.personId, label: a.label } });

@@ -101,7 +101,9 @@
     const maint = d.maintenanceDue.map((m) => item({ title: `${m.unit_no} · ${m.task}`, badge: chip(m.state === 'overdue' ? 'critical' : 'warning', 'clock', m.state === 'overdue' ? 'Overdue' : 'Due soon'),
       detail: [m.miles_left != null ? `${m.miles_left} mi left` : null, m.days_left != null ? `${m.days_left} days left` : null].filter(Boolean).join(' · '), onClick: () => go('fleet', 'truck:' + m.vehicle_id) }));
     const flagged = d.flagged.map((f) => item({ title: f.description, amount: `×${f.qty}`, badge: chip(f.outcome === 'picked_up' ? 'neutral' : 'warning', 'warn', f.outcome === 'picked_up' ? 'Returned, check in' : words(f.outcome)),
-      detail: [f.stop_number, f.note].filter(Boolean).join(' · ') }));
+      detail: [f.stop_number, f.note, f.service_ticket ? `service ticket ${f.service_ticket}` : null].filter(Boolean).join(' · '),
+      acts: ['damaged', 'refused'].includes(f.outcome) && !f.service_ticket ? [btn('Open service ticket', (e) => act(e.currentTarget,
+        () => post(`/service/tickets/from-stop/${f.id}`), (r) => `Service ticket ${r.number} opened`), { small: true })] : null }));
     const wc = d.willCalls.map((w) => item({ title: `${w.number} · ${w.customer}`, detail: `Order ${w.order_number || ''} · collect at the warehouse`,
       acts: [btn('Release', () => completeDialog({ id: w.id, number: w.number, kind: 'will_call', lines: [] }, true), { small: true })] }));
     return frag(
@@ -643,7 +645,34 @@
     return { node: el('div', {}, cv, el('div', { class: 'toolbar' }, el('span', { class: 'grow sub', text: 'Customer signs with a finger' }), clear)), value: () => (inked ? cv.toDataURL('image/png') : '') };
   }
 
+  // A service visit on the route: what was found and done, time spent, parts used; the service desk takes it from there.
+  function serviceDialog(s) {
+    const d = openDialog(`Finish visit · ${s.service_ticket}`, `${s.customer || ''} · ${s.service_visit_kind === 'pickup' ? 'Pickup for repair' : 'Service call'}`, { wide: true });
+    const err = errSlot();
+    const pickup = s.service_visit_kind === 'pickup';
+    const outcome = select(pickup ? [['fixed', 'Picked up for the shop'], ['not_home', 'Nobody home'], ['other', 'Could not pick it up']]
+      : [['fixed', 'Fixed'], ['needs_parts', 'Needs parts'], ['needs_return', 'Needs to come back to the shop'], ['no_fault', 'No fault found'], ['not_home', 'Nobody home'], ['other', 'Something else']], 'fixed');
+    const notes = el('textarea', { maxlength: '2000', placeholder: 'What you found and what you did' });
+    const minutes = input({ type: 'number', inputmode: 'numeric', placeholder: '45' });
+    const parts = (s.serviceParts || []).map((p) => {
+      const cb = el('input', { type: 'checkbox', class: 'pickbox', disabled: !['reserved', 'ready'].includes(p.line_status) || null });
+      return { p, cb, node: el('label', { class: 'field inline' }, cb, el('span', { text: `${p.qty}× ${p.name}${['reserved', 'ready'].includes(p.line_status) ? '' : ' (not in hand)'}` })) };
+    });
+    const recipient = input({ placeholder: 'Name of whoever signed' });
+    const sig = signaturePad();
+    const photos = el('textarea', { placeholder: 'Photo links, one per line (https://…)' });
+    d.body.append(field('How did it go', outcome), field('Work notes', notes), field('Time spent (minutes)', minutes),
+      parts.length ? el('div', { class: 'field' }, el('span', { text: 'Parts used' }), parts.map((x) => x.node)) : null,
+      !pickup ? field('Signed by', recipient) : null, !pickup ? el('div', { class: 'field' }, el('span', { text: 'Customer signature' }), sig.node) : null,
+      field('Photos', photos),
+      el('div', { class: 'dlg-acts' }, btn('Finish visit', (e) => act(e.currentTarget, () => post(`/service/visits/${s.service_visit_id}/complete`, {
+        outcome: outcome.value, workNotes: notes.value, minutes: minutes.value, recipient: recipient.value, signature: sig.value() || undefined,
+        partsUsed: parts.filter((x) => x.cb.checked).map((x) => x.p.id), photos: photos.value.split('\n').map((x) => x.trim()).filter(Boolean),
+      }), (r) => `Visit saved; ticket is ${words(r.status)}`, { close: d.close, errorInto: showErr(err) }), { primary: true }), btn('Cancel', d.close)), err);
+  }
+
   function completeDialog(s, willCall) {
+    if (s.service_visit_id && !willCall) return serviceDialog(s);
     const d = openDialog(willCall ? `Release ${s.number}` : `Complete stop ${s.seq}`, `${s.customer || ''}${s.kind ? ' · ' + KIND[s.kind] : ''}`, { wide: true });
     const err = errSlot();
     const pickup = s.kind === 'pickup';
