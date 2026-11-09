@@ -14,6 +14,7 @@ import { pool, tx } from "../packages/core/db.ts";
 import { ingest, loadConnection } from "../packages/core/connections.ts";
 import "../packages/core/statements.ts";
 import { runFeed, feedDue, liveEnv, type FeedEnv } from "../packages/core/vendor_feeds.ts";
+import { processQueue, captureAbandonedCarts } from "../packages/core/crm.ts";
 
 /** Does a five-field cron expression match this minute (UTC)? */
 export function cronMatches(expr: string, d: Date): boolean {
@@ -77,6 +78,35 @@ export async function runDueVendorFeeds(now: Date, env: FeedEnv = liveEnv(), onl
   }
   return { due: out.length, of: rows.rows.length, runs: out };
 }
+/**
+ * Marketing, every 15 minutes: send queued and scheduled campaign messages
+ * whose time has come (consent re-checked at send), and turn web carts left
+ * for two hours into leads. Only companies with the CRM module on.
+ */
+export async function runDueCrm(now: Date) {
+  const cos = await pool.query<{ id: string; tenant_id: string }>(
+    `select e.id, e.tenant_id from entity e
+      where e.status = 'active'
+        and not exists (select 1 from entity_module m where m.entity_id = e.id and m.module = 'crm' and not m.enabled)
+        and (exists (select 1 from entity_module m where m.entity_id = e.id and m.module = 'crm' and m.enabled)
+             or not exists (select 1 from entity_module m where m.entity_id = e.id))
+      /* unscoped: the scheduler walks every company */`);
+  const out: { entityId: string; sent: number; stopped: number; carts: number; note?: string }[] = [];
+  for (const co of cos.rows) {
+    try {
+      const r = await tx({ kind: "system", label: "scheduler" }, async (cl) => {
+        const q = await processQueue(cl, co.id, undefined, now);
+        const carts = await captureAbandonedCarts(cl, co.id);
+        return { ...q, carts: typeof carts === "number" ? carts : Number((carts as { added?: number })?.added ?? 0) };
+      });
+      out.push({ entityId: co.id, ...r });
+    } catch (e) {
+      out.push({ entityId: co.id, sent: 0, stopped: 0, carts: 0, note: (e as Error).message });
+    }
+  }
+  return out;
+}
+
 /** The name the earlier scheduler used. */
 export const runDueVendorConnections = runDueVendorFeeds;
 
@@ -109,6 +139,9 @@ async function main() {
   const vendors = await runDueVendorFeeds(now);
   for (const r of vendors.runs) console.log(`${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
   console.log(`${vendors.due} of ${vendors.of} scheduled vendor feeds were due`);
+  for (const r of await runDueCrm(now)) {
+    if (r.note || r.sent || r.stopped || r.carts) console.log(`marketing ${r.entityId}: ${r.sent} sent, ${r.stopped} held back, ${r.carts} carts to leads${r.note ? ` — ${r.note}` : ""}`);
+  }
   await pool.end();
 }
 
