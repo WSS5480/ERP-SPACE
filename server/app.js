@@ -330,17 +330,17 @@ const ROLE_SCREENS = {
   ap_clerk: ['home', 'payables', 'reports'],
   viewer: ['home', 'books', 'chart', 'reports'],
   hr: ['home', 'payroll', 'workforce'],
-  ar_clerk: ['home', 'ar', 'crm', 'service', 'reports'],
-  buyer: ['home', 'catalog', 'purchasing', 'inventory', 'payables', 'reports'],
-  store_manager: ['home', 'approvals', 'pos', 'aisle', 'crm', 'leads', 'myday', 'catalog', 'purchasing', 'inventory', 'fleet', 'service', 'ar', 'workforce', 'reports'],
-  sales: ['home', 'myday', 'pos', 'aisle', 'crm', 'leads', 'service'],
-  cashier: ['home', 'pos', 'service'],
-  warehouse: ['home', 'inventory', 'fleet'],
-  dispatcher: ['home', 'fleet', 'service', 'inventory'],
-  driver: ['home', 'myroute'],
-  technician: ['home', 'myroute', 'service'],
-  web_admin: ['home', 'shop', 'marketing', 'catalog'],
-  marketing: ['home', 'marketing', 'crm', 'leads', 'reports'],
+  ar_clerk: ['home', 'ar', 'crm', 'service', 'reports', 'workforce'],
+  buyer: ['home', 'purchasing', 'catalog', 'inventory', 'payables', 'reports', 'workforce'],
+  store_manager: ['home', 'pos', 'approvals', 'aisle', 'crm', 'leads', 'myday', 'catalog', 'purchasing', 'inventory', 'fleet', 'service', 'ar', 'workforce', 'reports'],
+  sales: ['home', 'pos', 'myday', 'aisle', 'crm', 'leads', 'service', 'ar', 'workforce'],
+  cashier: ['home', 'pos', 'ar', 'service', 'workforce'],
+  warehouse: ['home', 'inventory', 'fleet', 'pos', 'workforce'],
+  dispatcher: ['home', 'fleet', 'service', 'inventory', 'workforce'],
+  driver: ['home', 'myroute', 'workforce'],
+  technician: ['home', 'myroute', 'service', 'workforce'],
+  web_admin: ['home', 'shop', 'marketing', 'catalog', 'workforce'],
+  marketing: ['home', 'marketing', 'crm', 'leads', 'reports', 'workforce'],
 };
 const BACK_OFFICE = ['owner', 'controller', 'approver', 'ap_clerk', 'viewer'];
 function screensForPerson() {
@@ -357,7 +357,13 @@ const visibleScreens = () => {
 };
 const canSee = (name) => visibleScreens().some(([n]) => n === name);
 // the phone's bottom bar: the usual four for the owner, otherwise the person's own first screens
-const tabsNow = () => (screensForPerson() ? visibleScreens().slice(0, 4).map(([n]) => n) : TABS.filter(canSee));
+const tabsNow = () => {
+  if (!screensForPerson()) return TABS.filter(canSee);
+  const order = [];
+  for (const r of S.person.roles) for (const n of ROLE_SCREENS[r] || []) if (!order.includes(n) && canSee(n)) order.push(n);
+  if (!order.includes('home')) order.unshift('home');
+  return order.slice(0, 4);
+};
 function renderNav() {
   const cur = S.route.screen;
   const badge = (name) => (name === 'approvals' && badgeCount ? el('span', { class: 'badge', text: String(badgeCount), 'aria-label': `${badgeCount} waiting on you` }) : null);
@@ -496,34 +502,34 @@ async function screenHome() {
   if (!backOfficeHome()) return screenRoleHome();
   const d = await coApi('/home');
   const mine = d.approvals.mine;
-  const tiles = tilesRow(
-    tile({ label: 'Cash in the books', value: money(d.cash.total), tone: 'neutral', ic: 'bank', text: `Operating ${money(d.cash.operating)}`, onClick: () => go('cash') }),
-    tile({ label: 'Waiting on you', value: String(mine.length), suffix: 'to decide', tone: mine.length ? 'warning' : 'good', ic: mine.length ? 'clock' : 'ok',
+  const tiles = tilesRow(...[
+    canSee('cash') && tile({ label: 'Cash in the books', value: money(d.cash.total), tone: 'neutral', ic: 'bank', text: `Operating ${money(d.cash.operating)}`, onClick: () => go('cash') }),
+    canSee('approvals') && tile({ label: 'Waiting on you', value: String(mine.length), suffix: 'to decide', tone: mine.length ? 'warning' : 'good', ic: mine.length ? 'clock' : 'ok',
       text: mine.length ? (d.approvals.othersCount ? `${d.approvals.othersCount} more waiting on others` : 'Tap to decide') : (d.approvals.othersCount ? `Nothing for you; ${d.approvals.othersCount} waiting on others` : 'Nothing waiting'),
       onClick: () => go('approvals') }),
-    tile({ label: 'Bills due in 7 days', value: money(d.bills.due7), tone: d.bills.overdue_n ? 'serious' : 'neutral', ic: d.bills.overdue_n ? 'warn' : 'file',
+    canSee('payables') && tile({ label: 'Bills due in 7 days', value: money(d.bills.due7), tone: d.bills.overdue_n ? 'serious' : 'neutral', ic: d.bills.overdue_n ? 'warn' : 'file',
       text: d.bills.overdue_n ? `${plural(d.bills.overdue_n, 'bill')} past due, ${money(d.bills.overdue)}` : plural(d.bills.due7_n, 'bill'), onClick: () => go('payables', 'topay') }),
-    tile({ label: 'Net this month', value: money(d.month.net), tone: 'neutral', ic: 'book',
-      text: `${money(d.month.revenue)} in, ${money(d.month.expenses)} out`, onClick: () => go('books') }));
+    canSee('books') && tile({ label: 'Net this month', value: money(d.month.net), tone: 'neutral', ic: 'book',
+      text: `${money(d.month.revenue)} in, ${money(d.month.expenses)} out`, onClick: () => go('books') })].filter(Boolean));
 
   const items = [];
   for (const a of mine) items.push(item({ title: subjName(a.subject), detail: [`From ${a.maker_name}, ${ago(a.created_at)}`, a.steps > 1 ? `step ${a.step_seq} of ${a.steps}` : null].filter(Boolean).join(' · '),
     amount: a.amount_minor != null ? money(a.amount_minor) : null, badge: chip('warning', 'clock', 'Yours to approve'), onClick: () => openApproval(a) }));
-  for (const b of d.attention) items.push(item({ title: billName(b.vendor, b.reference), detail: sentence(human(b.reason || '')),
+  if (canSee('payables')) for (const b of d.attention) items.push(item({ title: billName(b.vendor, b.reference), detail: sentence(human(b.reason || '')),
     amount: money(b.total_minor), badge: billChip(b.status), onClick: () => openBill(b.id) }));
-  for (const t of d.sweepsOverdue) items.push(item({ title: `Move ${money(t.amount_minor)} in from ${t.from_account}`,
+  if (canSee('cash')) for (const t of d.sweepsOverdue) items.push(item({ title: `Move ${money(t.amount_minor)} in from ${t.from_account}`,
     detail: `Was due ${dayLabel(t.due_on)}${t.owner ? ` · on ${t.owner}’s list` : ''}`, badge: chip('serious', 'warn', 'Sweep late'), onClick: () => go('cash') }));
-  if (d.recon.lines || d.recon.late) items.push(item({ title: 'Money nobody has matched yet',
+  if (canSee('recon') && (d.recon.lines || d.recon.late)) items.push(item({ title: 'Money nobody has matched yet',
     detail: [d.recon.lines ? `${plural(d.recon.lines, 'bank line')} to explain` : null, d.recon.late ? `${plural(d.recon.late, 'store deposit')} late at the bank` : null].filter(Boolean).join(' · '),
     badge: chip('warning', 'warn', 'To look at'), onClick: () => go('recon') }));
   // Each pay group runs on its own schedule; any that needs a hand shows here.
-  const periods = d.payroll || [];
+  const periods = canSee('payroll') ? d.payroll || [] : [];
   for (const p of periods) {
     const next = payrollNext(p);
     if (next) items.push(item({ title: `Payroll · ${p.pay_group}`, detail: `${next} · pays ${dayLabel(p.pay_date)}`,
       badge: chip('neutral', 'clock', 'To run'), onClick: () => go('payroll') }));
   }
-  if (d.feeds.quarantined || d.feeds.failing) items.push(item({ title: 'Feeds', detail: [d.feeds.quarantined ? `${plural(d.feeds.quarantined, 'file')} held for review` : null, d.feeds.failing ? `${plural(d.feeds.failing, 'feed')} failing` : null].filter(Boolean).join(' · '),
+  if (canSee('feeds') && (d.feeds.quarantined || d.feeds.failing)) items.push(item({ title: 'Feeds', detail: [d.feeds.quarantined ? `${plural(d.feeds.quarantined, 'file')} held for review` : null, d.feeds.failing ? `${plural(d.feeds.failing, 'feed')} failing` : null].filter(Boolean).join(' · '),
     badge: chip('serious', 'hold', 'To look at'), onClick: () => go('feeds') }));
 
   const waitingOnOwner = [d.hires ? plural(d.hires, 'new hire') : null, d.payChanges ? plural(d.payChanges, 'pay change') : null].filter(Boolean);
@@ -546,14 +552,14 @@ async function screenHome() {
   // Cards modules add to Home (pinned reports, ...). One that fails to load is left out, never breaks Home.
   const extras = (await Promise.all(HOME_CARDS.map((f) => Promise.resolve().then(f).catch(() => null)))).filter(Boolean);
   return frag(
-    head('Home', [el('button', { class: 'btn primary', type: 'button', onclick: () => openNewBill() }, icon('plus'), 'New bill')]),
+    head('Home', canSee('payables') ? [el('button', { class: 'btn primary', type: 'button', onclick: () => openNewBill() }, icon('plus'), 'New bill')] : []),
     trialBanner(), tiles, extras,
     el('div', { class: 'two', style: null },
       section('Needs a person', items.length ? `${items.length} open` : null, null,
         el('div', { class: 'panel' }, items.length ? items : empty('Nothing is waiting on a person.', 'Approvals, bills stopped at the gates, late sweeps and unmatched money show up here.'))),
       el('div', {},
-        section('Payroll', null, null, el('div', { class: 'panel' }, payrollCard)),
-        section('Feeds', null, null, el('div', { class: 'panel' }, feedsCard)))));
+        canSee('payroll') ? section('Payroll', null, null, el('div', { class: 'panel' }, payrollCard)) : null,
+        canSee('feeds') ? section('Feeds', null, null, el('div', { class: 'panel' }, feedsCard)) : null)));
 }
 /** Home for someone outside the back office: just the screens they work in. */
 async function screenRoleHome() {
