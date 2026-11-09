@@ -6,10 +6,11 @@
 import { adoptOpeningBalances } from "./ar.ts";
 import { q, one, type Client, type Scope } from "./db.ts";
 import { post } from "./posting.ts";
+import { installStarters } from "./reports.ts";
 
 export class SetupError extends Error {}
 
-export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service"] as const;
+export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports"] as const;
 export type ModuleId = (typeof MODULE_IDS)[number];
 
 type Account = [code: string, name: string, type: "asset" | "liability" | "equity" | "revenue" | "expense", normal: "D" | "C"];
@@ -97,7 +98,7 @@ export const PACKS: Pack[] = [
     blurb: "Showrooms and a distribution center, special orders and customizable upholstery, deposits and financing, white-glove delivery with routing, commissioned sales staff.",
     vertical: "furniture",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -123,7 +124,7 @@ export const PACKS: Pack[] = [
     blurb: "Serialized stock, manufacturer warranties and protection plans, install and haul-away on delivery, financing.",
     vertical: "retail",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -146,7 +147,7 @@ export const PACKS: Pack[] = [
     blurb: "Cash-and-carry stores with a web store; no delivery fleet or installment contracts unless you turn them on.",
     vertical: "retail",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "shop", "crm"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "shop", "crm", "reports"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS.filter(([k]) => k !== "delivery_exception"),
     settings: {
@@ -164,7 +165,7 @@ export const PACKS: Pack[] = [
     blurb: "Stores carrying back balances, delivery and pickup routes, a catalog and purchasing for rental merchandise. Agreements stay in your rental system; this pack reads it.",
     vertical: "rto",
     labels: { location: "Store", profitObject: "Store", aging: "Back balances" },
-    modules: ["catalog", "purchasing", "inventory", "ar", "workforce", "fleet", "service"],
+    modules: ["catalog", "purchasing", "inventory", "ar", "workforce", "fleet", "service", "reports"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -179,7 +180,7 @@ export const PACKS: Pack[] = [
     blurb: "Trucks are the profit objects. Fleet, maintenance, inspections, payroll and A/R; no stores, catalog or POS.",
     vertical: "trucking",
     labels: { location: "Terminal", profitObject: "Truck", aging: "Settlements" },
-    modules: ["ar", "workforce", "fleet"],
+    modules: ["ar", "workforce", "fleet", "reports"],
     accounts: [
       ["1050", "Undeposited funds", "asset", "D"],
       ["1100", "Accounts receivable, customers", "asset", "D"],
@@ -240,6 +241,9 @@ export async function applyPack(c: Client, scope: Scope, packId: string, applied
     if (on && r.rows[0]?.enabled) modulesOn++;
   }
 
+  // The starter reports the pack's modules call for (reports never removes one a person deleted).
+  const startersAdded = await installStarters(c, scope.entityId, pack.modules);
+
   for (const [kind, code, label, restock] of pack.reasons) {
     const r = await c.query(
       `insert into reason_code (entity_id, kind, code, label, restock) values ($1,$2,$3,$4,$5)
@@ -266,7 +270,7 @@ export async function applyPack(c: Client, scope: Scope, packId: string, applied
     relabelled = true;
   }
 
-  const summary = { accountsAdded, modulesOn, reasonsAdded, settingsAdded, relabelled };
+  const summary = { accountsAdded, modulesOn, reasonsAdded, settingsAdded, relabelled, startersAdded };
   await c.query(`insert into pack_application (entity_id, pack, applied_by, summary) values ($1,$2,$3,$4)`,
     [scope.entityId, pack.id, appliedBy, JSON.stringify(summary)]);
   return { pack: pack.id, ...summary };

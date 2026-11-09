@@ -16,6 +16,7 @@
     fleet: ['Fleet and delivery', 'Trucks, delivery windows, route building, driver app, proof of delivery'],
     shop: ['Web store', 'Online store with the product customizer, pickup and delivery'],
     crm: ['Customers and marketing', 'Customer profiles and consent, the lead tracker, follow-ups, campaigns and coupons'],
+    reports: ['Reports', 'Report creator and editor: curated datasets, saved and shared reports, schedules, CSV and Excel export'],
   };
   const KIND_LABEL = { store: 'Store', warehouse: 'Warehouse', outlet: 'Outlet', yard: 'Yard', office: 'Office', web: 'Online' };
   const REASON_LABEL = { return: 'Return reasons', adjustment: 'Stock adjustments', damage: 'Damage', discount: 'Discounts',

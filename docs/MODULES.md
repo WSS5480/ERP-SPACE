@@ -93,6 +93,21 @@ Data is placed with textContent only, never innerHTML.
 | workforce (time clock, commissions → payroll) | 0022 | 0016 | Back office |
 | fleet (vehicles, delivery routing) | 0023 | 0017 | Operations |
 | shop (omnichannel web store + customizer) | 0024 | 0018 | Retail |
+| reports (report creator and editor) | 0031 | none | Back office |
+
+## Reports
+
+A person never writes SQL. `packages/core/reports_datasets.ts` is the
+catalog: each dataset is one fixed query scoped by `$1` (the company) in
+every table it reads, with typed fields and the roles that may use it.
+`packages/core/reports.ts` checks a definition against that catalog
+(dataset, field, operator, aggregate and bucket ids from fixed lists;
+formulas are column ids, numeric field ids, numbers and `+ - * / ( )` only;
+every value a bound parameter), then runs it with a 10-second statement
+timeout and row caps (200 a page, 10,000 an export, 2,000 a snapshot). Roles
+are checked when a report is saved and again on every run, including a
+scheduled one, which runs as whoever set the schedule. A module that adds
+data worth reporting on adds a dataset to the catalog, not a screen.
 
 ## Running it
 

@@ -15,6 +15,7 @@ import { ingest, loadConnection } from "../packages/core/connections.ts";
 import "../packages/core/statements.ts";
 import { runFeed, feedDue, liveEnv, type FeedEnv } from "../packages/core/vendor_feeds.ts";
 import { processQueue, captureAbandonedCarts } from "../packages/core/crm.ts";
+import { runDueReports } from "../packages/core/reports.ts";
 
 /** Does a five-field cron expression match this minute (UTC)? */
 export function cronMatches(expr: string, d: Date): boolean {
@@ -142,6 +143,10 @@ async function main() {
   for (const r of await runDueCrm(now)) {
     if (r.note || r.sent || r.stopped || r.carts) console.log(`marketing ${r.entityId}: ${r.sent} sent, ${r.stopped} held back, ${r.carts} carts to leads${r.note ? ` — ${r.note}` : ""}`);
   }
+  // Scheduled reports: each keeps a snapshot and prepares its email.
+  const reports = await runDueReports(pool, tx);
+  for (const r of reports.runs) console.log(`report ${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
+  console.log(`${reports.due} scheduled reports were due`);
   await pool.end();
 }
 

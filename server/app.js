@@ -448,6 +448,7 @@ async function render() {
 }
 
 // ================================================================= home
+const HOME_CARDS = [];
 async function screenHome() {
   const d = await coApi('/home');
   const mine = d.approvals.mine;
@@ -498,9 +499,11 @@ async function screenHome() {
     badge: f.failing ? chip('critical', 'fail', 'Failing') : f.stale || f.quarantined ? chip('warning', 'warn', 'To look at') : null,
     onClick: () => go('feeds') });
 
+  // Cards modules add to Home (pinned reports, ...). One that fails to load is left out, never breaks Home.
+  const extras = (await Promise.all(HOME_CARDS.map((f) => Promise.resolve().then(f).catch(() => null)))).filter(Boolean);
   return frag(
     head('Home', [el('button', { class: 'btn primary', type: 'button', onclick: () => openNewBill() }, icon('plus'), 'New bill')]),
-    trialBanner(), tiles,
+    trialBanner(), tiles, extras,
     el('div', { class: 'two', style: null },
       section('Needs a person', items.length ? `${items.length} open` : null, null,
         el('div', { class: 'panel' }, items.length ? items : empty('Nothing is waiting on a person.', 'Approvals, bills stopped at the gates, late sweeps and unmatched money show up here.'))),
@@ -2031,6 +2034,9 @@ window.ERP = {
   S, $, el, frag, icon, ICONS, chip, money, dayLabel, shortDay, plural, cap, sentence, human, ago, size, todayIso, isoDay,
   api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
   head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input,
+  openEntry, NARROW,
+  /** homeCard(async () => node | null): a card on Home, after the tiles */
+  homeCard(fn) { HOME_CARDS.push(fn); },
   /** register('pos', 'Point of sale', 'cash', screenFn, 'Retail', {icon: 'M..', module: 'pos'}) -- hidden when the company has that module off */
   register(name, label, ic, fn, group, opts = {}) {
     if (opts.icon) ICONS[ic] = opts.icon;

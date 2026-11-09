@@ -22,7 +22,7 @@ alter table role_grant add constraint role_grant_role_check
 
 alter table entity_module drop constraint entity_module_module_check;
 alter table entity_module add constraint entity_module_module_check
-  check (module in ('catalog','purchasing','inventory','pos','ar','workforce','fleet','shop','service'));
+  check (module in ('catalog','purchasing','inventory','pos','ar','workforce','fleet','shop','service','reports','crm'));
 
 alter table journal_entry drop constraint journal_entry_source_type_check;
 alter table journal_entry add constraint journal_entry_source_type_check
