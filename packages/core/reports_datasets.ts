@@ -159,7 +159,7 @@ export const DATASETS: Dataset[] = [
       F("tax", "Tax", "money"), F("cost", "Cost (est.)", "money", { hint: "cost when sold, else the product's standard cost" }),
       F("margin", "Margin", "money"), F("entry_id", "Entry", "text", { agg: false }),
     ],
-    sql: `select ci.invoice_date as posted_on, 'sale' as kind, ci.number as document, so.number as order_number, so.channel,
+    sql: `select coalesce(cje.posting_date, ci.invoice_date) as posted_on, 'sale' as kind, ci.number as document, so.number as order_number, so.channel,
                  case when so.channel = 'web' then 'Web' else 'Store' end as channel_group,
                  lo.name as store, su.name as salesperson, cu.name as customer, il.sku,
                  coalesce(sl.description, il.description) as product, p.category, ${VENDOR} as vendor, il.revenue_code as revenue_account,
@@ -169,6 +169,7 @@ export const DATASETS: Dataset[] = [
                  ci.journal_entry_id::text as entry_id
             from customer_invoice_line il
             join customer_invoice ci on ci.id = il.invoice_id and ci.entity_id = $1 and ci.kind = 'sale'
+            left join journal_entry cje on cje.id = ci.journal_entry_id and cje.entity_id = $1
             left join sales_order_line sl on sl.id = il.sales_order_line_id and sl.entity_id = $1
             left join sales_order so on so.id = ci.sales_order_id and so.entity_id = $1
             left join pos_line pl on pl.sales_order_line_id = sl.id and pl.entity_id = $1
