@@ -9,7 +9,7 @@ import { post } from "./posting.ts";
 
 export class SetupError extends Error {}
 
-export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop"] as const;
+export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "service"] as const;
 export type ModuleId = (typeof MODULE_IDS)[number];
 
 type Account = [code: string, name: string, type: "asset" | "liability" | "equity" | "revenue" | "expense", normal: "D" | "C"];
@@ -21,6 +21,7 @@ const RETAIL_ACCOUNTS: Account[] = [
   ["1110", "Receivable from finance companies", "asset", "D"],
   ["1190", "Allowance for doubtful accounts", "asset", "C"],
   ["1300", "Merchandise inventory", "asset", "D"],
+  ["1150", "Vendor chargebacks receivable", "asset", "D"],
   ["1310", "Inventory in transit", "asset", "D"],
   ["2050", "Accrued liabilities / received not invoiced", "liability", "C"],
   ["2100", "Sales tax payable", "liability", "C"],
@@ -33,12 +34,15 @@ const RETAIL_ACCOUNTS: Account[] = [
   ["4020", "Fees and other revenue", "revenue", "C"],
   ["4030", "Delivery and setup revenue", "revenue", "C"],
   ["4040", "Protection plan revenue", "revenue", "C"],
+  ["4050", "Service revenue", "revenue", "C"],
   ["4900", "Sales returns and allowances", "revenue", "D"],
   ["4910", "Sales discounts", "revenue", "D"],
   ["5000", "Cost of goods sold", "expense", "D"],
   ["5030", "Freight in", "expense", "D"],
   ["5040", "Inventory shrink and damage", "expense", "D"],
   ["6130", "Sales commissions", "expense", "D"],
+  ["6150", "Warranty and service expense", "expense", "D"],
+  ["6155", "Service labor applied", "expense", "C"],
   ["6300", "Delivery and fleet", "expense", "D"],
   ["6310", "Fuel", "expense", "D"],
   ["6800", "Other operating", "expense", "D"],
@@ -93,7 +97,7 @@ export const PACKS: Pack[] = [
     blurb: "Showrooms and a distribution center, special orders and customizable upholstery, deposits and financing, white-glove delivery with routing, commissioned sales staff.",
     vertical: "furniture",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "service"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -109,6 +113,8 @@ export const PACKS: Pack[] = [
       "ar.late_fee": { rate_bps: 500, min_minor: 1000, grace_days: 10 },
       "ar.aging_buckets": [0, 30, 60, 90],
       "catalog.special_order_lead_days": 42,
+      "service.sla_hours": { urgent: 24, high: 48, normal: 120, low: 240 },
+      "service.labor_rate_minor": 3000,
     },
   },
   {
@@ -117,7 +123,7 @@ export const PACKS: Pack[] = [
     blurb: "Serialized stock, manufacturer warranties and protection plans, install and haul-away on delivery, financing.",
     vertical: "retail",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "service"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -130,6 +136,8 @@ export const PACKS: Pack[] = [
       "fleet.delivery_fee_minor": 7900,
       "workforce.commission": { basis: "sale", rate_bps: 300, earned_on: "delivered" },
       "ar.late_fee": { rate_bps: 500, min_minor: 1000, grace_days: 10 },
+      "service.sla_hours": { urgent: 24, high: 48, normal: 72, low: 168 },
+      "service.labor_rate_minor": 3500,
     },
   },
   {
@@ -156,7 +164,7 @@ export const PACKS: Pack[] = [
     blurb: "Stores carrying back balances, delivery and pickup routes, a catalog and purchasing for rental merchandise. Agreements stay in your rental system; this pack reads it.",
     vertical: "rto",
     labels: { location: "Store", profitObject: "Store", aging: "Back balances" },
-    modules: ["catalog", "purchasing", "inventory", "ar", "workforce", "fleet"],
+    modules: ["catalog", "purchasing", "inventory", "ar", "workforce", "fleet", "service"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
