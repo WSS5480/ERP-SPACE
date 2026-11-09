@@ -1306,7 +1306,7 @@ export async function importCatalogAppSource(c: Client, s: Scope, env: FeedEnv, 
      where ve.entity_id = $1 and ve.status = 'active' and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) and (v.id = $2::uuid or ($2::uuid is null and (lower(v.legal_name) = lower($3) or lower(coalesce(v.dba,'')) = lower($3))))
      limit 1`, [s.entityId, x.vendorId ?? null, label]))[0];
   if (!v && !x.vendorId && label) {
-    // The catalog app names a source loosely ("ASHLEY", "Ashley catalog", "PENTEX - ASHLEY CATALOG"):
+    // The catalog app names a source loosely ("ASHLEY", "Ashley catalog", "DEMO - ASHLEY CATALOG"):
     // take the one active vendor whose name's first word appears in the label, if exactly one does.
     const words = new Set(label.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3));
     const all = await q<{ id: string; name: string; legal_name: string; dba: string | null }>(c, `
