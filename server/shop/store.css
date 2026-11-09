@@ -184,8 +184,8 @@ details.more p{color:var(--ink-2);margin-top:8px;white-space:pre-line}
 @media (min-width:900px){.summary{position:sticky;top:132px}}
 
 /* --------------------------------------------------------------- checkout */
-.co{display:grid;gap:24px;margin:8px 0 48px}
-@media (min-width:900px){.co{grid-template-columns:1.4fr 1fr;align-items:start}}
+.co{display:grid;grid-template-columns:minmax(0,1fr);gap:24px;margin:8px 0 48px}
+@media (min-width:900px){.co{grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);align-items:start}}
 .panel{border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:14px}
 .panel h2{font-size:20px;margin-bottom:12px}
 .fields{display:grid;gap:12px;grid-template-columns:repeat(6,minmax(0,1fr))}
@@ -225,3 +225,9 @@ details.more p{color:var(--ink-2);margin-top:8px;white-space:pre-line}
 .foot b{display:block;margin-bottom:6px}
 .foot a{display:block;padding:6px 0;color:var(--ink-2);text-decoration:none}
 .foot a:hover{text-decoration:underline}
+
+/* coupon and lead form (crm) */
+.coupon{display:flex;gap:8px}
+.coupon input{flex:1;min-width:0;height:50px;border:1px solid #cfc8bc;border-radius:10px;padding:0 12px;text-transform:uppercase}
+.leadform{margin-top:10px}
+.leadform .f textarea{height:90px}
