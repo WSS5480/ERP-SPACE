@@ -11,5 +11,6 @@ import { module as ar } from "./ar.ts";
 import { module as workforce } from "./workforce.ts";
 import { module as fleet } from "./fleet.ts";
 import { module as shop } from "./shop.ts";
+import { module as reports } from "./reports.ts";
 
-export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop];
+export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, reports];

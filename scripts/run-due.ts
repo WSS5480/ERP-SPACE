@@ -14,6 +14,7 @@ import { pool, tx } from "../packages/core/db.ts";
 import { ingest, loadConnection } from "../packages/core/connections.ts";
 import "../packages/core/statements.ts";
 import { runFeed, feedDue, liveEnv, type FeedEnv } from "../packages/core/vendor_feeds.ts";
+import { runDueReports } from "../packages/core/reports.ts";
 
 /** Does a five-field cron expression match this minute (UTC)? */
 export function cronMatches(expr: string, d: Date): boolean {
@@ -109,6 +110,10 @@ async function main() {
   const vendors = await runDueVendorFeeds(now);
   for (const r of vendors.runs) console.log(`${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
   console.log(`${vendors.due} of ${vendors.of} scheduled vendor feeds were due`);
+  // Scheduled reports: each keeps a snapshot and prepares its email.
+  const reports = await runDueReports(pool, tx);
+  for (const r of reports.runs) console.log(`report ${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
+  console.log(`${reports.due} scheduled reports were due`);
   await pool.end();
 }
 

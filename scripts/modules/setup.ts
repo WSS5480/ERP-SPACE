@@ -9,11 +9,11 @@ export async function run(t: T) {
   const count = async (sql: string, p: unknown[]) => Number((await c.query(sql, p)).rows[0].n);
   try {
     t.ok("five packs ship in the box", PACKS.length === 5, PACKS.map((p) => p.id).join(", "));
-    t.ok("a company with no pack sees every module", (await enabledModules(c, ENTITY)).length === 8);
+    t.ok("a company with no pack sees every module", (await enabledModules(c, ENTITY)).length === 9);
   } finally { c.release(); }
 
   const r1 = await t.as(PEOPLE.STEVE, (c, co, a) => applyPack(c, scopeOf(co, a), "furniture", "Steve"));
-  t.ok("the furniture pack applies", r1.pack === "furniture" && r1.modulesOn === 8, JSON.stringify(r1));
+  t.ok("the furniture pack applies", r1.pack === "furniture" && r1.modulesOn === 9, JSON.stringify(r1));
   const r2 = await t.as(PEOPLE.STEVE, (c, co, a) => applyPack(c, scopeOf(co, a), "furniture", "Steve"));
   t.ok("applying it again adds nothing", r2.accountsAdded === 0 && r2.reasonsAdded === 0 && r2.settingsAdded === 0);
 
@@ -27,9 +27,9 @@ export async function run(t: T) {
 
   await t.as(PEOPLE.STEVE, (c) => setModule(c, ENTITY, "fleet", false, "Steve"));
   const mods = await t.as(PEOPLE.STEVE, (c) => enabledModules(c, ENTITY));
-  t.ok("turning fleet off leaves the rest on", !mods.includes("fleet") && mods.length === 7);
+  t.ok("turning fleet off leaves the rest on", !mods.includes("fleet") && mods.length === 8);
   const rio = await t.as(PEOPLE.STEVE, (c) => enabledModules(c, RIO_ENTITY));
-  t.ok("another client's company is untouched", rio.length === 8 && rio.includes("fleet"));
+  t.ok("another client's company is untouched", rio.length === 9 && rio.includes("fleet"));
   await t.as(PEOPLE.STEVE, (c) => setModule(c, ENTITY, "fleet", true, "Steve"));
   await t.throws("an unknown module is refused", () => t.as(PEOPLE.STEVE, (c) => setModule(c, ENTITY, "payroll2", true, "Steve")), /no module called/);
 
