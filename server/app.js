@@ -320,7 +320,42 @@ const SCREENS = [
 const TABS = ['home', 'approvals', 'payables', 'books'];
 let badgeCount = 0;
 function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + sub : ''}`; }
-const visibleScreens = () => SCREENS.filter((r) => !r[4] || !S.modules || S.modules.includes(r[4]));
+/**
+ * What each role works in. Acting as someone shows only their screens (the union of their roles);
+ * the owner sees everything. The server still checks every action on its own.
+ */
+const ROLE_SCREENS = {
+  controller: ['home', 'approvals', 'payables', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'reports', 'setup', 'business'],
+  approver: ['home', 'approvals', 'payables', 'reports'],
+  ap_clerk: ['home', 'payables', 'reports'],
+  viewer: ['home', 'books', 'chart', 'reports'],
+  hr: ['home', 'payroll', 'workforce'],
+  ar_clerk: ['home', 'ar', 'crm', 'service', 'reports'],
+  buyer: ['home', 'catalog', 'purchasing', 'inventory', 'payables', 'reports'],
+  store_manager: ['home', 'approvals', 'pos', 'aisle', 'crm', 'leads', 'myday', 'catalog', 'purchasing', 'inventory', 'fleet', 'service', 'ar', 'workforce', 'reports'],
+  sales: ['home', 'myday', 'pos', 'aisle', 'crm', 'leads', 'service'],
+  cashier: ['home', 'pos', 'service'],
+  warehouse: ['home', 'inventory', 'fleet'],
+  dispatcher: ['home', 'fleet', 'service', 'inventory'],
+  driver: ['home', 'myroute'],
+  technician: ['home', 'myroute', 'service'],
+  web_admin: ['home', 'shop', 'marketing', 'catalog'],
+  marketing: ['home', 'marketing', 'crm', 'leads', 'reports'],
+};
+const BACK_OFFICE = ['owner', 'controller', 'approver', 'ap_clerk', 'viewer'];
+function screensForPerson() {
+  const rs = (S.person && S.person.roles) || [];
+  if (rs.includes('owner')) return null;                    // everything
+  const set = new Set(['home']);
+  for (const r of rs) for (const n of ROLE_SCREENS[r] || []) set.add(n);
+  return set;
+}
+const backOfficeHome = () => !S.person || S.person.roles.some((r) => BACK_OFFICE.includes(r));
+const visibleScreens = () => {
+  const mine = screensForPerson();
+  return SCREENS.filter((r) => (!r[4] || !S.modules || S.modules.includes(r[4])) && (!mine || mine.has(r[0])));
+};
+const canSee = (name) => visibleScreens().some(([n]) => n === name);
 function renderNav() {
   const cur = S.route.screen;
   const badge = (name) => (name === 'approvals' && badgeCount ? el('span', { class: 'badge', text: String(badgeCount), 'aria-label': `${badgeCount} waiting on you` }) : null);
@@ -342,9 +377,9 @@ function renderNav() {
   }
   $('#nav').replaceChildren(...navKids);
   $('#tabbar').replaceChildren(
-    ...TABS.map((name) => { const [, label, ic] = SCREENS.find((s) => s[0] === name);
+    ...TABS.filter(canSee).map((name) => { const [, label, ic] = SCREENS.find((s) => s[0] === name);
       return el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null }, icon(ic), label === 'Payables' ? 'Bills' : label, badge(name)); }),
-    el('button', { type: 'button', class: TABS.includes(cur) ? null : 'on', onclick: openMore }, icon('more'), 'More'));
+    el('button', { type: 'button', class: TABS.filter(canSee).includes(cur) ? null : 'on', onclick: openMore }, icon('more'), 'More'));
   $('#co-name').textContent = S.co.name;
   $('#as-name').textContent = S.person ? `${S.person.name}${S.person.roles.length ? ' · ' + roles(S.person.roles) : ''}` : 'Pick a person';
   $('#who').replaceChildren('Signed in as ', el('b', { text: S.me.viewer.name }));
@@ -352,7 +387,7 @@ function renderNav() {
 function openMore() {
   const d = openDialog('More', S.co.name, { sheet: true });
   d.body.append(el('div', { class: 'menu' },
-    visibleScreens().filter(([n]) => !TABS.includes(n)).map(([name, label, ic]) =>
+    visibleScreens().filter(([n]) => !TABS.filter(canSee).includes(n)).map(([name, label, ic]) =>
       el('button', { type: 'button', class: S.route.screen === name ? 'on' : null, onclick: () => { d.close(); go(name); } }, icon(ic), label)),
     el('button', { type: 'button', onclick: () => { d.close(); render(); } }, icon('refresh'), 'Refresh'),
     el('button', { type: 'button', onclick: () => { d.close(); signOut(); } }, icon('out'), 'Sign out')));
@@ -431,6 +466,12 @@ async function refreshBadge() {
   } catch (_) { /* the screen will show any error */ }
 }
 async function render() {
+  // a screen the person you're acting as doesn't work in sends you to their Home
+  if (S.route && !canSee(S.route.screen)) {
+    S.route = { screen: 'home', sub: '' };
+    history.replaceState(null, '', `#/${S.co.id}/home`);
+    renderNav();
+  }
   const seq = ++S.seq;
   const main = $('#main');
   main.replaceChildren(loadingNode());
@@ -450,6 +491,7 @@ async function render() {
 // ================================================================= home
 const HOME_CARDS = [];
 async function screenHome() {
+  if (!backOfficeHome()) return screenRoleHome();
   const d = await coApi('/home');
   const mine = d.approvals.mine;
   const tiles = tilesRow(
@@ -511,6 +553,24 @@ async function screenHome() {
         section('Payroll', null, null, el('div', { class: 'panel' }, payrollCard)),
         section('Feeds', null, null, el('div', { class: 'panel' }, feedsCard)))));
 }
+/** Home for someone outside the back office: just the screens they work in. */
+async function screenRoleHome() {
+  const who = S.person ? S.person.name : 'nobody';
+  const mine = visibleScreens().filter(([n]) => n !== 'home');
+  const extras = (await Promise.all(HOME_CARDS.map((f) => Promise.resolve().then(f).catch(() => null)))).filter(Boolean);
+  return frag(head('Home'), trialBanner(),
+    el('p', { class: 'lead', text: `Acting as ${who}${S.person && S.person.roles.length ? ` (${roles(S.person.roles)})` : ''}: these are the screens they work in.` }),
+    section('Your screens', null, null, el('div', { class: 'panel' }, mine.length
+      ? mine.map(([name, label, ic]) => item({ title: label, detail: GROUP_HINT[name] || null, onClick: () => go(name) }))
+      : empty('No screens here', 'This person holds no roles in this company. Give them one from Setup, or switch who you are acting as.', true))),
+    extras);
+}
+const GROUP_HINT = { pos: 'Sell, take deposits and payments', aisle: 'Price and build carts on the floor', crm: 'Customer profiles, history and notes',
+  leads: 'Follow-ups and the pipeline', myday: 'Today’s calls, tasks and appointments', catalog: 'Products, options and prices',
+  purchasing: 'Purchase orders and receiving', inventory: 'Stock, bins, transfers and counts', fleet: 'Delivery calendar and routes',
+  myroute: 'Today’s stops', service: 'Service tickets and visits', ar: 'Customer accounts and collections', workforce: 'Time clock, shifts and commissions',
+  reports: 'Saved and starter reports', shop: 'The web store', marketing: 'Campaigns, coupons and lists', payables: 'Vendor bills', approvals: 'Waiting on a decision' };
+
 /** What a pay group's open period needs from a person now, or null if it is waiting on time or on someone else. */
 function payrollNext(p) {
   if (p.run_status === 'building') return 'Built; send it for approval';
