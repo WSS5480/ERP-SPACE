@@ -499,6 +499,7 @@ export type CheckoutIn = {
   cartId: string; email: string; name: string; phone: string | null; marketingOk: boolean;
   fulfillment: "pickup" | "delivery" | "ship"; pickupLocationId: string | null; address: Address | null;
   lines: LineIn[]; paymentToken: string; notes: string | null;
+  couponCode?: string | null;   // checked and redeemed through crm.checkCoupon / crm.redeemCoupon
 };
 
 const clean = (v: unknown, max: number) => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f<>]/g, " ").replace(/\s+/g, " ").trim().slice(0, max) : "");
@@ -569,11 +570,13 @@ export function parseCheckout(b: Record<string, unknown>, quoteOnly = false): Ch
     cartId, email, name, phone: phoneDigits || null, marketingOk: b.marketingOk === true,
     fulfillment: fulfillment as CheckoutIn["fulfillment"], pickupLocationId, address,
     lines: parseLines(b.lines), paymentToken: token, notes: clean(b.notes, 300) || null,
+    couponCode: clean(b.couponCode, 24).toUpperCase() || null,
   };
 }
 
 type Built = {
-  lines: (Priced & { fulfilFromId: string; taxMinor: bigint })[];
+  lines: (Priced & { fulfilFromId: string; taxMinor: bigint; discountMinor: bigint })[];
+  coupon: { code: string; label: string; discountMinor: bigint; merchandiseMinor: bigint } | null;
   fee: { minor: bigint; taxMinor: bigint; label: string } | null;
   orderLocationId: string; promisedOn: string | null;
   subtotalMinor: bigint; taxMinor: bigint; totalMinor: bigint; rateBps: number;
@@ -613,17 +616,34 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn): Promise<Built
       if (p.kind === "stock" && availAt(dc) >= p.qty) later(addBusinessDays(today, inp.fulfillment === "ship" ? site.ship_days : site.delivery_days));
       else if (p.availability.deliverBy) later(new Date(p.availability.deliverBy));
     }
-    lines.push({ ...p, fulfilFromId: from, taxMinor: 0n });
+    lines.push({ ...p, fulfilFromId: from, taxMinor: 0n, discountMinor: 0n });
   }
   const orderLocationId = inp.fulfillment === "pickup" ? inp.pickupLocationId! : site.web_location_id;
   const rateOf = (id: string | null) => (id ? locs.get(id)?.tax_rate_bps ?? 0 : 0);
   const rateBps = inp.fulfillment === "pickup" ? rateOf(inp.pickupLocationId)
     : rateOf(lines[0]?.fulfilFromId ?? null) || rateOf(site.web_location_id) || rateOf(site.tax_location_id);
   const bp = (m: bigint) => (m * BigInt(rateBps) + 5000n) / 10000n;
+  // A coupon (the CRM module's) comes off the merchandise, spread over the lines by value, before tax.
+  let coupon: Built["coupon"] = null;
+  const merch = lines.reduce((a, l) => a + l.unitPriceMinor * BigInt(l.qty), 0n);
+  if (inp.couponCode) {
+    const crm = await import("./crm.ts");
+    try {
+      const chk = await crm.checkCoupon(c, site.entity_id, inp.couponCode, { channel: "web", subtotalMinor: merch, email: inp.email || null });
+      coupon = { code: chk.code, label: chk.label, discountMinor: chk.discountMinor, merchandiseMinor: merch };
+    } catch (e) { if (e instanceof crm.CrmError) throw new ShopError(e.message); throw e; }
+    let left = coupon.discountMinor;
+    lines.forEach((l, i) => {
+      const net = l.unitPriceMinor * BigInt(l.qty);
+      const share = i === lines.length - 1 ? left : merch > 0n ? (coupon!.discountMinor * net) / merch : 0n;
+      l.discountMinor = share > net ? net : share;
+      left -= l.discountMinor;
+    });
+  }
   let sub = 0n, tax = 0n;
   for (const l of lines) {
     const net = l.unitPriceMinor * BigInt(l.qty);
-    l.taxMinor = l.taxable ? bp(net) : 0n;
+    l.taxMinor = l.taxable ? bp(net - l.discountMinor) : 0n;
     sub += net; tax += l.taxMinor;
   }
   let fee: Built["fee"] = null;
@@ -640,7 +660,8 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn): Promise<Built
   }
   tax += fee?.taxMinor ?? 0n;
   sub += fee?.minor ?? 0n;
-  return { lines, fee, orderLocationId, promisedOn: promised ? iso(promised) : null, subtotalMinor: sub, taxMinor: tax, totalMinor: sub + tax, rateBps };
+  const disc = coupon?.discountMinor ?? 0n;
+  return { lines, coupon, fee, orderLocationId, promisedOn: promised ? iso(promised) : null, subtotalMinor: sub, taxMinor: tax, totalMinor: sub - disc + tax, rateBps };
 }
 
 /** Checkout preview: what the order will cost with this fulfillment, from the server's own prices. */
@@ -651,6 +672,7 @@ export async function quote(c: Client, site: Site, inp: CheckoutIn) {
     fee: b.fee ? { label: b.fee.label, minor: b.fee.minor.toString() } : null,
     merchandiseMinor: b.lines.reduce((a, l) => a + l.unitPriceMinor * BigInt(l.qty), 0n).toString(),
     taxMinor: b.taxMinor.toString(), taxRateBps: b.rateBps, totalMinor: b.totalMinor.toString(), promisedOn: b.promisedOn,
+    coupon: b.coupon ? { code: b.coupon.code, label: b.coupon.label, discountMinor: b.coupon.discountMinor.toString() } : null,
   };
 }
 
@@ -774,10 +796,10 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
   let seq = 1;
   for (const l of b.lines) {
     await c.query(`
-      insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, config, fulfil_from_id)
-      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, config, fulfil_from_id, discount_minor)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
       [site.entity_id, order.id, seq++, l.productId, l.sku, l.description, l.qty, l.unitPriceMinor.toString(), l.taxMinor.toString(),
-       JSON.stringify(l.config), l.fulfilFromId]);
+       JSON.stringify(l.config), l.fulfilFromId, l.discountMinor.toString()]);
   }
   if (b.fee && b.fee.minor > 0n) {
     const fp = site.fee_product_id ? await q<{ sku: string }>(c, `select sku from product where id = $1 and entity_id = $2`, [site.fee_product_id, site.entity_id]) : [];
@@ -790,6 +812,12 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
   await c.query(`select sales_order_retotal($1) /* unscoped: the order id was just created for this entity */`, [order.id]);
   const tot = await one<{ total_minor: string }>(c, `select total_minor from sales_order where id = $1 and entity_id = $2`, [order.id, site.entity_id]);
   need(BigInt(tot.total_minor) === b.totalMinor, "The order total did not add up; nothing was charged.");
+  // The coupon is counted against this order before the card is touched; a code used up meanwhile stops the order here.
+  if (b.coupon) {
+    const crm = await import("./crm.ts");
+    try { await crm.redeemCoupon(c, site.entity_id, null, { code: b.coupon.code, orderId: order.id, channel: "web", discountMinor: b.coupon.discountMinor, subtotalMinor: b.coupon.merchandiseMinor }); }
+    catch (e) { if (e instanceof crm.CrmError) throw new ShopError(e.message); throw e; }
+  }
 
   // Stock first: if reserving fails, the card is never touched.
   await reserveOrder(c, site.entity_id, order.id);

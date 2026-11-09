@@ -15,6 +15,7 @@
     workforce: ['Time and commissions', 'Time clock, schedules, commission plans feeding payroll'],
     fleet: ['Fleet and delivery', 'Trucks, delivery windows, route building, driver app, proof of delivery'],
     shop: ['Web store', 'Online store with the product customizer, pickup and delivery'],
+    crm: ['Customers and marketing', 'Customer profiles and consent, the lead tracker, follow-ups, campaigns and coupons'],
   };
   const KIND_LABEL = { store: 'Store', warehouse: 'Warehouse', outlet: 'Outlet', yard: 'Yard', office: 'Office', web: 'Online' };
   const REASON_LABEL = { return: 'Return reasons', adjustment: 'Stock adjustments', damage: 'Damage', discount: 'Discounts',

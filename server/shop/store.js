@@ -211,7 +211,7 @@ function paintChrome() {
   $('#foot').replaceChildren(el('div', { class: 'foot-in' },
     el('div', {}, el('b', { text: s.name }), s.tagline ? el('span', { class: 'muted', text: s.tagline }) : null),
     el('div', {}, el('b', { text: 'Shop' }), s.categories.slice(0, 6).map((c) => el('a', { href: `#/c/${encodeURIComponent(c.name)}`, text: c.name }))),
-    el('div', {}, el('b', { text: 'Help' }), el('a', { href: '#/status', text: 'Order status' }), el('a', { href: '#/policies', text: 'Delivery, pickup and returns' }),
+    el('div', {}, el('b', { text: 'Help' }), el('a', { href: '#/status', text: 'Order status' }), el('a', { href: '#/contact', text: 'Contact us' }), el('a', { href: '#/policies', text: 'Delivery, pickup and returns' }),
       s.financingUrl ? el('a', { href: s.financingUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Apply for financing' }) : null),
     el('div', {}, el('b', { text: 'Stores' }), s.pickupStores.map((p) => el('span', { class: 'small muted' }, el('span', { text: p.name }), p.address ? el('br') : null, p.address || '', el('br'))))));
   paintCount();
@@ -372,6 +372,8 @@ async function pageProduct(id) {
             el('button', { type: 'button', 'aria-label': 'One more', onclick: () => { qty = Math.min(20, qty + 1); qtyOut.textContent = String(qty); } }, '+')),
           el('button', { class: 'btn primary', type: 'button', onclick: add }, 'Add to cart')),
         pkg,
+        el('details', { class: 'more' }, el('summary', { text: 'Request a quote or ask a question' }),
+          leadForm({ kind: 'quote', productId: p.id, choices: () => choiceList(), qty: () => qty, message: `Quote for ${p.name}` })),
         p.financingUrl ? el('div', { class: 'fin' }, el('b', { text: 'Pay over time. ' }), 'Apply in a few minutes and know right away. ',
           el('a', { href: p.financingUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Apply for financing' })) : null,
         el('details', { class: 'more' }, el('summary', { text: 'Delivery, pickup and returns' }), el('p', { text: S.site.policies || 'Ask the store about delivery and returns.' })),
@@ -480,6 +482,10 @@ async function pageCheckout() {
     return el('label', { class: 'choice' + (tok === card ? ' on' : '') }, input, el('div', {}, el('b', { text: title }), el('span', { text: sub })), el('span'));
   }));
   const sum = el('aside', { class: 'summary' }, loading('Adding it up…'));
+  let coupon = '';
+  const couponIn = el('input', { type: 'text', maxlength: '24', autocomplete: 'off', placeholder: 'Coupon code' });
+  const couponMsg = el('p', { class: 'small', 'aria-live': 'polite' });
+  const couponBtn = el('button', { class: 'btn', type: 'button', onclick: () => { coupon = couponIn.value.trim().toUpperCase(); couponMsg.textContent = coupon ? 'Checking…' : ''; refresh(); } }, 'Apply');
   const err = el('div', { 'aria-live': 'assertive' });
   const placeBtn = el('button', { class: 'btn primary block', type: 'submit' }, 'Place order');
   const body = () => ({
@@ -487,7 +493,7 @@ async function pageCheckout() {
     email: f.email.value.trim(), name: f.name.value.trim(), phone: f.phone.value.trim(), marketingOk: f.marketing.checked,
     fulfillment: mode, pickupLocationId: mode === 'pickup' ? f.store.value : undefined,
     address: mode === 'pickup' ? undefined : { line1: f.line1.value, line2: f.line2.value, city: f.city.value, state: f.state.value.toUpperCase(), postal: f.postal.value },
-    notes: f.notes.value, paymentToken: card,
+    notes: f.notes.value, paymentToken: card, couponCode: coupon || undefined,
   });
   const remember = () => sess.set(`shop.${SLUG}.form`, { email: f.email.value, name: f.name.value, phone: f.phone.value, marketing: f.marketing.checked,
     line1: f.line1.value, line2: f.line2.value, city: f.city.value, state: f.state.value, postal: f.postal.value, store: f.store.value, mode });
@@ -498,16 +504,21 @@ async function pageCheckout() {
       const b = body(); delete b.paymentToken;
       const r = await post('/quote', b);
       if (my !== qseq) return;
+      if (coupon) couponMsg.textContent = r.coupon ? `${r.coupon.label} applied.` : '';
       sum.replaceChildren(el('div', { class: 'contents' },
         el('h2', { text: 'Order summary' }),
         r.lines.map((l) => el('div', { class: 'sr-row small' }, el('span', { text: `${l.qty} × ${l.description}` }), el('span', { text: money2(l.lineMinor) }))),
         el('div', { class: 'sr-row' }, el('span', { text: 'Merchandise' }), el('span', { text: money2(r.merchandiseMinor) })),
+        r.coupon ? el('div', { class: 'sr-row' }, el('span', { text: `Coupon ${r.coupon.code}` }), el('span', { text: '−' + money2(r.coupon.discountMinor) })) : null,
         r.fee ? el('div', { class: 'sr-row' }, el('span', { text: r.fee.label }), el('span', { text: Number(r.fee.minor) ? money2(r.fee.minor) : 'Free' })) : null,
         el('div', { class: 'sr-row' }, el('span', { text: `Tax (${(r.taxRateBps / 100).toFixed(r.taxRateBps % 100 ? 2 : 0)}%)` }), el('span', { text: money2(r.taxMinor) })),
         el('div', { class: 'sr-row tot' }, el('span', { text: 'Total' }), el('span', { text: money2(r.totalMinor) })),
         r.promisedOn ? el('p', { class: 'small', text: `${mode === 'pickup' ? 'Ready for pickup' : 'Arrives'} by about ${day(r.promisedOn)}.` }) : null));
     } catch (e) {
-      if (my === qseq) sum.replaceChildren(el('h2', { text: 'Order summary' }), el('p', { class: 'small muted', text: e.message }));
+      if (my !== qseq) return;
+      // A code that doesn't apply is explained by the field and dropped; the rest of the order still adds up.
+      if (coupon && /coupon|code|used|expired|purchase of at least|starts on|can't be used/i.test(e.message)) { couponMsg.textContent = e.message; coupon = ''; refresh(); return; }
+      sum.replaceChildren(el('h2', { text: 'Order summary' }), el('p', { class: 'small muted', text: e.message }));
     }
   }
   const later = () => { clearTimeout(qt); qt = setTimeout(refresh, 450); };
@@ -539,6 +550,7 @@ async function pageCheckout() {
           el('div', { class: 'fields' }, field('Email', f.email), field('Full name', f.name, 'half'), field('Mobile phone (optional)', f.phone, 'half'),
             el('label', { class: 'check' }, f.marketing, 'Send me offers and new arrivals'))),
         el('section', { class: 'panel' }, el('h2', { text: 'How do you want it?' }), modes, addr, pick),
+        el('section', { class: 'panel' }, el('h2', { text: 'Coupon' }), el('div', { class: 'coupon' }, couponIn, couponBtn), couponMsg),
         el('section', { class: 'panel' }, el('h2', { text: 'Payment' }), cards,
           el('p', { class: 'testnote', text: 'Test mode: nothing is charged. A live store puts its card processor’s secure field here, and card numbers never reach this store’s server.' }),
           s.financingUrl ? el('p', { class: 'small' }, 'Want to pay over time? ', el('a', { href: s.financingUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Apply for financing' }), ' first, then come back.') : null),
@@ -590,6 +602,43 @@ function pageStatus() {
     } }, el('div', { class: 'fields' }, el('label', { class: 'f half' }, 'Order number', num), el('label', { class: 'f half' }, 'Email', em)), el('div', { class: 'buyrow' }, btn)),
     out));
 }
+/** The contact / request-a-quote form. It becomes a lead for the store's salespeople. */
+const UTM_KEY = `shop.${SLUG}.utm`;
+function leadForm(o) {
+  const saved = sess.get(`shop.${SLUG}.form`) || {};
+  const f = { name: el('input', { type: 'text', autocomplete: 'name', maxlength: '80', value: saved.name || '' }),
+    email: el('input', { type: 'email', autocomplete: 'email', maxlength: '120', value: saved.email || '' }),
+    phone: el('input', { type: 'tel', autocomplete: 'tel', maxlength: '20', value: saved.phone || '' }),
+    msg: el('textarea', { maxlength: '500', value: o.message || '' }),
+    store: el('select', {}, el('option', { value: '', text: 'Any store' }), S.site.pickupStores.map((p) => el('option', { value: p.id, text: p.name }))),
+    em: el('input', { type: 'checkbox' }), sms: el('input', { type: 'checkbox' }),
+    trap: el('input', { type: 'text', name: 'website', tabindex: '-1', autocomplete: 'off', class: 'sr', 'aria-hidden': 'true' }) };
+  f.msg.value = o.message || '';
+  const out = el('div', { 'aria-live': 'polite' });
+  const btn = el('button', { class: 'btn primary', type: 'submit' }, o.kind === 'quote' ? 'Request a quote' : 'Send');
+  const field = (label, input, cls) => el('label', { class: 'f' + (cls ? ' ' + cls : '') }, label, input);
+  return el('form', { class: 'leadform', novalidate: true, onsubmit: async (e) => {
+    e.preventDefault(); btn.disabled = true; out.replaceChildren();
+    try {
+      const utm = sess.get(UTM_KEY) || {};
+      const r = await post('/lead', { kind: o.kind, name: f.name.value, email: f.email.value, phone: f.phone.value, message: f.msg.value, pickupLocationId: f.store.value || undefined,
+        productId: o.productId, choices: o.choices ? o.choices() : undefined, qty: o.qty ? o.qty() : undefined, consentEmail: f.em.checked, consentSms: f.sms.checked, website: f.trap.value,
+        utmSource: utm.source, utmMedium: utm.medium, utmCampaign: utm.campaign });
+      out.replaceChildren(el('div', { class: 'notice', text: `${r.message}${r.reference ? ` Your reference is ${r.reference}.` : ''}` }));
+      btn.hidden = true;
+    } catch (x) { out.replaceChildren(el('div', { class: 'alert', role: 'alert', text: x.message })); btn.disabled = false; }
+  } },
+  el('div', { class: 'fields' }, field('Name', f.name, 'half'), field('Mobile phone', f.phone, 'half'), field('Email', f.email), field('Message', f.msg),
+    S.site.pickupStores.length ? field('Nearest store', f.store) : null,
+    el('label', { class: 'check' }, f.em, 'Email me offers and new arrivals'),
+    el('label', { class: 'check' }, f.sms, 'Text me offers (msg & data rates may apply; reply STOP to opt out)'), f.trap),
+  out, el('div', { class: 'buyrow' }, btn));
+}
+function pageContact() {
+  setMain(el('div', { class: 'wrap narrow' }, crumbs(el('a', { href: '#/', text: 'Home' }), el('span', { text: 'Contact us' })),
+    el('h1', { text: 'Contact us' }), el('p', { class: 'muted', text: 'Questions, a quote, or a design consultation — a salesperson will get back to you.' }),
+    el('div', { class: 'panel' }, leadForm({ kind: 'contact' }))));
+}
 function pagePolicies() {
   setMain(el('div', { class: 'wrap narrow' }, crumbs(el('a', { href: '#/', text: 'Home' }), el('span', { text: 'Policies' })),
     el('h1', { text: 'Delivery, pickup and returns' }), el('p', { class: 'desc', text: S.site.policies || 'Ask the store.' })));
@@ -617,11 +666,14 @@ async function route() {
     else if (parts[0] === 'order') pageOrder(parts.slice(1).join('/'));
     else if (parts[0] === 'status') pageStatus();
     else if (parts[0] === 'policies') pagePolicies();
+    else if (parts[0] === 'contact') pageContact();
     else await pageHome();
     const h1 = $('#main h1'); if (h1 && parts.length) main().focus({ preventScroll: true });
   } catch (e) { showErr(e); }
 }
 async function boot() {
+  const u = new URLSearchParams(location.search);
+  if (u.get('utm_source') || u.get('utm_campaign')) sess.set(UTM_KEY, { source: u.get('utm_source') || '', medium: u.get('utm_medium') || '', campaign: u.get('utm_campaign') || '' });
   try { S.site = await get('/site'); }
   catch (e) { setMain(errorBox(e, boot)); return; }
   paintChrome();
