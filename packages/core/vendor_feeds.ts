@@ -713,9 +713,12 @@ export function validateFeed(f: FeedRow, opts: { forTest?: boolean } = {}) {
 
 export async function saveFeed(c: Client, s: Scope, d: FeedDraft & { secrets?: Record<string, string | null> }, env: FeedEnv): Promise<string> {
   const f = cleanDraft(d);
-  const v = (await q<{ name: string }>(c, `select coalesce(v.dba, v.legal_name) as name from vendor_entity ve join vendor v on v.id = ve.vendor_id
-                                            where ve.entity_id = $1 and ve.vendor_id = $2 and ve.status = 'active'`, [s.entityId, f.vendor_id]))[0];
+  const v = (await q<{ name: string; merch: boolean; category: string | null }>(c, `select coalesce(v.dba, v.legal_name) as name,
+       exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) merch, (select label from vendor_category where id = coalesce(ve.category_id, v.category_id)) category
+       from vendor_entity ve join vendor v on v.id = ve.vendor_id
+      where ve.entity_id = $1 and ve.vendor_id = $2 and ve.status = 'active'`, [s.entityId, f.vendor_id]))[0];
   need(v, "that vendor is not set up for this company");
+  need(v.merch, `${v.name} is a ${(v.category ?? "non-merchandise").toLowerCase()} vendor; vendor APIs are for merchandise vendors (change its category under Payables → Vendors if it sells goods)`);
   validateFeed(f);
   if (f.secrets_from_feed_id) {
     const src = (await q<{ id: string }>(c, `select id from vendor_feed where id = $1 and entity_id = $2 and vendor_id = $3`, [f.secrets_from_feed_id, s.entityId, f.vendor_id]))[0];
@@ -1300,7 +1303,7 @@ export async function importCatalogAppSource(c: Client, s: Scope, env: FeedEnv, 
   const label = String(x.vendorName ?? src.vendor_label ?? src.name ?? "").trim();
   let v = (await q<{ id: string; name: string }>(c, `
     select v.id, coalesce(v.dba, v.legal_name) as name from vendor_entity ve join vendor v on v.id = ve.vendor_id
-     where ve.entity_id = $1 and ve.status = 'active' and (v.id = $2::uuid or ($2::uuid is null and (lower(v.legal_name) = lower($3) or lower(coalesce(v.dba,'')) = lower($3))))
+     where ve.entity_id = $1 and ve.status = 'active' and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) and (v.id = $2::uuid or ($2::uuid is null and (lower(v.legal_name) = lower($3) or lower(coalesce(v.dba,'')) = lower($3))))
      limit 1`, [s.entityId, x.vendorId ?? null, label]))[0];
   if (!v && !x.vendorId && label) {
     // The catalog app names a source loosely ("ASHLEY", "Ashley catalog", "PENTEX - ASHLEY CATALOG"):
@@ -1308,7 +1311,7 @@ export async function importCatalogAppSource(c: Client, s: Scope, env: FeedEnv, 
     const words = new Set(label.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3));
     const all = await q<{ id: string; name: string; legal_name: string; dba: string | null }>(c, `
       select v.id, coalesce(v.dba, v.legal_name) as name, v.legal_name, v.dba from vendor_entity ve join vendor v on v.id = ve.vendor_id
-       where ve.entity_id = $1 and ve.status = 'active'`, [s.entityId]);
+       where ve.entity_id = $1 and ve.status = 'active' and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise)`, [s.entityId]);
     const first = (n: string | null) => (n ?? "").toLowerCase().split(/[^a-z0-9]+/).find((w) => w.length >= 3) ?? "";
     const hits = all.filter((r) => words.has(first(r.legal_name)) || (r.dba && words.has(first(r.dba))));
     if (hits.length === 1) v = hits[0];

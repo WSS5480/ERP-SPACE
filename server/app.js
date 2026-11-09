@@ -861,17 +861,65 @@ function openPaymentRun(id) {
 
 async function vendorsView() {
   const v = await coApi('/vendors');
+  const cats = [];
+  for (const x of v) {
+    const k = x.category || 'none';
+    let g = cats.find((c) => c.k === k);
+    if (!g) cats.push(g = { k, label: x.category_label || 'No category yet', rows: [] });
+    g.rows.push(x);
+  }
+  cats.sort((a, b) => (a.k === 'none') - (b.k === 'none') || (b.k === 'merchandise') - (a.k === 'merchandise') || a.label.localeCompare(b.label));
+  if (S.vendorCat && !cats.some((c) => c.k === S.vendorCat)) S.vendorCat = null;
+  const pick = S.vendorCat || 'all';
+  const row = (x) => item({
+    title: x.name, detail: [x.city && x.state ? `${x.city}, ${x.state}` : x.state, x.gl_code ? `codes to ${x.gl_code} ${x.gl_name}` : null, `${x.terms_days}-day terms`, plural(x.bills, 'bill'),
+      x.last_bill ? `last ${shortDay(x.last_bill)}` : null, x.is_1099 ? '1099' : null, x.w9_on_file ? null : 'no W-9', x.bank_last4 ? `pays to ••${x.bank_last4}` : null,
+      x.category_here ? `${x.category_label} for ${S.co.name}` : null].filter(Boolean).join(' · '),
+    amount: Number(x.open_minor) ? `${money(x.open_minor)} open` : null,
+    badge: x.status === 'hold' ? chip('warning', 'clock', 'Awaiting approval') : x.status !== 'active' ? chip('neutral', 'pause', cap(x.status))
+      : x.bank_change_pending ? chip('warning', 'clock', 'Bank change waiting') : null,
+    onClick: () => openVendor(x.id) });
+  const shown = cats.filter((c) => pick === 'all' || c.k === pick);
   return frag(
     el('div', { class: 'toolbar' }, el('span', { class: 'grow sub', text: `${plural(v.length, 'vendor')} set up for ${S.co.name}.` }),
+      el('button', { class: 'btn', type: 'button', onclick: openVendorCategories }, icon('feed'), 'Categories'),
       el('button', { class: 'btn', type: 'button', onclick: openAddVendor }, icon('plus'), 'Add vendor')),
-    el('div', { class: 'panel' }, v.length ? v.map((x) => item({
-      title: x.name, detail: [x.city && x.state ? `${x.city}, ${x.state}` : x.state, x.gl_code ? `codes to ${x.gl_code} ${x.gl_name}` : null, `${x.terms_days}-day terms`, plural(x.bills, 'bill'),
-        x.last_bill ? `last ${shortDay(x.last_bill)}` : null, x.is_1099 ? '1099' : null, x.w9_on_file ? null : 'no W-9', x.bank_last4 ? `pays to ••${x.bank_last4}` : null].filter(Boolean).join(' · '),
-      amount: Number(x.open_minor) ? `${money(x.open_minor)} open` : null,
-      badge: x.status === 'hold' ? chip('warning', 'clock', 'Awaiting approval') : x.status !== 'active' ? chip('neutral', 'pause', cap(x.status))
-        : x.bank_change_pending ? chip('warning', 'clock', 'Bank change waiting') : null,
-      onClick: () => openVendor(x.id) })) : empty('No vendors yet.', null, true)),
-    el('p', { class: 'foot', text: 'Only the last four digits of a vendor’s bank numbers are kept here. New bank details need the controller and the owner, each after calling the vendor back on the phone already on file.' }));
+    cats.length > 1 ? el('div', { class: 'toolbar' }, seg([['all', 'All', v.length], ...cats.map((c) => [c.k, c.label, c.rows.length])], pick, (k) => { S.vendorCat = k === 'all' ? null : k; render(); })) : null,
+    v.length ? shown.map((c) => section(c.label, plural(c.rows.length, 'vendor'), null, el('div', { class: 'panel' }, c.rows.map(row))))
+      : el('div', { class: 'panel' }, empty('No vendors yet.', null, true)),
+    el('p', { class: 'foot', text: 'Only merchandise vendors show in Catalog and Buying. Only the last four digits of a vendor’s bank numbers are kept here. New bank details need the controller and the owner, each after calling the vendor back on the phone already on file.' }));
+}
+
+/** The client's vendor categories: label, whether it sells goods, and the account new vendors of it code to. */
+function openVendorCategories() {
+  const d = openDialog('Vendor categories', 'Shared by the client’s companies · new vendors start coded to the category’s account', { wide: true });
+  const again = () => { d.close(); openVendorCategories(); };
+  fillDialog(d, async () => {
+    const [r, o] = await Promise.all([coApi('/vendor-categories'), coApi('/options')]);
+    const accts = [['', 'No default'], ...o.accounts.map((a) => [a.id, `${a.code} ${a.name}`])];
+    const out = el('div');
+    const errInto = (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not saved', friendly(e)));
+    const card = (c) => {
+      const label = input({ maxlength: '60', value: c.label });
+      const gl = select(accts, c.default_gl_account_id || '');
+      const merch = el('input', { type: 'checkbox', checked: c.is_merchandise, disabled: c.code === 'merchandise' || null });
+      const on = el('input', { type: 'checkbox', checked: c.active });
+      const save = el('button', { class: 'btn small', type: 'button', onclick: () => act(save, () => post('/vendor-categories', { id: c.id, label: label.value, isMerchandise: merch.checked,
+        defaultGl: gl.value || null, active: on.checked }), 'Category saved', { close: again, errorInto }) }, 'Save');
+      return el('div', { class: 'panel' }, el('div', { class: 'form-grid' },
+        field(`${c.label} · ${plural(Number(c.vendors || 0), 'vendor')} here`, label), field('New vendors code to', gl),
+        el('label', { class: 'check' }, merch, 'Sells goods (shows in Catalog and Buying)'), el('label', { class: 'check' }, on, 'In use'),
+        el('div', { class: 'dlg-acts wide' }, save)));
+    };
+    const nl = input({ maxlength: '60', placeholder: 'e.g. Cleaning and janitorial' });
+    const ngl = select(accts, '');
+    const nm = el('input', { type: 'checkbox' });
+    const add = el('button', { class: 'btn primary', type: 'button', onclick: () => act(add, () => post('/vendor-categories', { label: nl.value, isMerchandise: nm.checked, defaultGl: ngl.value || null }),
+      'Category added', { close: again, errorInto }) }, 'Add category');
+    return frag(out, ...r.categories.map(card),
+      section('Add a category', null, null, el('div', { class: 'panel' }, el('div', { class: 'form-grid' }, field('Name', nl), field('New vendors code to', ngl),
+        el('label', { class: 'check' }, nm, 'Sells goods'), el('div', { class: 'dlg-acts wide' }, add)))));
+  });
 }
 
 const TAX_CLASS = { individual: 'Individual', sole_prop: 'Sole proprietor', partnership: 'Partnership', c_corp: 'C corporation', s_corp: 'S corporation', llc: 'LLC', other: 'Other' };
@@ -881,7 +929,9 @@ const checkbox = (label, checked) => { const box = el('input', { type: 'checkbox
 /** The vendor fields a person types, for adding and for editing. */
 function vendorForm(o, v) {
   v = v || {};
+  const cats = o.vendorCategories || [];
   const f = {
+    cat: select([['', 'Pick one'], ...cats.map((c) => [c.code, c.label])], v.category || ''),
     taxClass: select([['', 'Not known yet'], ...Object.entries(TAX_CLASS)], v.tax_classification || ''),
     tin: input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4 only', value: v.tin_last4 || '' }),
     w9: checkbox('W-9 on file', v.w9_on_file), is1099: checkbox('Gets a 1099', v.is_1099),
@@ -896,11 +946,20 @@ function vendorForm(o, v) {
     acct: select([['', 'None yet'], ...o.accounts.map((a) => [a.id, `${a.code} ${a.name}`])], v.default_gl_account_id || ''),
     store: select([['', 'Company-wide'], ...o.stores.map((s) => [s.id, s.name])], v.default_profit_object_id || ''),
   };
-  const body = () => ({ taxClassification: f.taxClass.value, tinLast4: f.tin.value, w9OnFile: f.w9.box.checked, is1099: f.is1099.box.checked,
+  // A new category brings its usual account when the vendor has none yet (or still has the old category's).
+  let lastDefault = (cats.find((c) => c.code === v.category) || {}).default_gl_account_id || '';
+  f.cat.addEventListener('change', () => {
+    const c = cats.find((x) => x.code === f.cat.value);
+    if (c && c.default_gl_account_id && (!f.acct.value || f.acct.value === lastDefault)) f.acct.value = c.default_gl_account_id;
+    lastDefault = (c && c.default_gl_account_id) || '';
+  });
+  const body = () => ({ category: f.cat.value || null, taxClassification: f.taxClass.value, tinLast4: f.tin.value, w9OnFile: f.w9.box.checked, is1099: f.is1099.box.checked,
     addressLine1: f.addr1.value, addressLine2: f.addr2.value, city: f.city.value, state: f.state.value, postalCode: f.zip.value, remitTo: f.remit.value,
     contactName: f.contact.value, contactPhone: f.phone.value, contactEmail: f.email.value,
     termsDays: Number(f.terms.value), glAccountId: f.acct.value || null, storeId: f.store.value || null });
   const fields = [
+    formSec('Kind of vendor'),
+    field('Category', f.cat, 'Merchandise vendors show in Catalog and Buying; utilities, rent and the rest only in Payables'),
     formSec('Tax papers'),
     field('Tax classification', f.taxClass), field('Tax ID', f.tin, 'The last four digits; the full number stays on the W-9'),
     f.w9.node, f.is1099.node,
@@ -957,7 +1016,7 @@ function openVendor(id) {
         `Changed ${ago(v.phone_changed_at)}. A call-back to a number changed alongside new bank details proves nothing; check it against an old bill or the vendor’s own website.`) : null,
       el('div', { class: 'panel' }, el('div', { class: 'facts' },
         fact('Address', address || '—'), fact('Contact', [v.contact_name, v.contact_phone].filter(Boolean).join(' · ') || '—'),
-        fact('Email', v.contact_email || '—'), fact('Terms', `${v.terms_days} days`),
+        fact('Email', v.contact_email || '—'), fact('Terms', `${v.terms_days} days`), fact('Category', v.category_label || 'Not set'),
         fact('Usually codes to', v.gl_code ? `${v.gl_code} ${v.gl_name}` : '—'), fact('Usual store', v.store || 'Company-wide'),
         v.remit_to ? fact('Remit to', v.remit_to) : null, fact('Added', `${fmtDate.format(new Date(v.created_at))}${v.created_by_name ? ' by ' + v.created_by_name : ''}`))),
       el('div', { class: 'dlg-acts' }, edit, bank),
@@ -1555,7 +1614,7 @@ function periodRange(key) {
 }
 async function screenBooks(sub) {
   const view = sub === 'tb' ? 'tb' : 'pnl';
-  const top = frag(head('Books'), el('div', { class: 'toolbar' }, seg([['pnl', 'Profit and loss'], ['tb', 'Trial balance']], view, (v) => go('books', v))));
+  const top = frag(head('Books'), el('div', { class: 'toolbar' }, seg([['pnl', 'Profit and loss'], ['tb', 'Trial balance'], ['coa', 'Chart of accounts']], view, (v) => (v === 'coa' ? go('chart') : go('books', v)))));
   return view === 'tb' ? frag(top, await trialBalanceView()) : frag(top, await pnlView());
 }
 const SECTIONS = [['Revenue', (c) => c.startsWith('4')], ['Cost of merchandise', (c) => c.startsWith('5')], ['Operating expenses', (c) => c.startsWith('6')], ['Other expenses', (c) => /^[789]/.test(c)]];

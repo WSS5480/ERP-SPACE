@@ -84,8 +84,8 @@ export async function formOptions(c: Client, co: Company) {
   const accounts = await q<{ id: string; code: string; name: string; account_type: string }>(c, `
     select ga.id, ga.code, ga.name, ga.account_type
       from gl_account ga
-     where ga.tenant_id = $1 and ga.is_postable
-       and ga.account_type in ('expense', 'asset')
+     where ga.tenant_id = $1 and ga.is_postable and ga.active
+       and ga.account_type in ('expense', 'asset', 'liability')
        and not exists (select 1 from bank_account ba where ba.gl_account_id = ga.id and ba.entity_id = $2)
      order by ga.code /* unscoped: the chart of accounts is shared across the client's companies */`,
     [co.tenantId, co.id]);
@@ -101,7 +101,7 @@ export async function formOptions(c: Client, co: Company) {
   const bookable = await q<{ id: string; code: string; name: string; account_type: string }>(c, `
     select ga.id, ga.code, ga.name, ga.account_type
       from gl_account ga
-     where ga.tenant_id = $1 and ga.is_postable
+     where ga.tenant_id = $1 and ga.is_postable and ga.active
        and not exists (select 1 from bank_account ba where ba.gl_account_id = ga.id and ba.entity_id = $2)
      order by ga.code /* unscoped: the chart of accounts is shared across the client's companies */`,
     [co.tenantId, co.id]);
@@ -114,7 +114,10 @@ export async function formOptions(c: Client, co: Company) {
      where entity_id = $1 and status = 'active' and purpose in ('payroll', 'operating') order by purpose desc, name`, [co.id]);
   const states = (await q<{ state: string }>(c, `
     select distinct state from location where entity_id = $1 and state is not null order by 1`, [co.id])).map((r) => r.state);
-  return { accounts, vendors, stores: await stores(c, co), bookable, payGroups, positions, payrollBanks, states };
+  const vendorCategories = await q(c, `
+    select vc.id, vc.code, vc.label, vc.is_merchandise, vc.default_gl_account_id, g.code gl_code from vendor_category vc left join gl_account g on g.id = vc.default_gl_account_id
+     where vc.tenant_id = $1 and vc.active order by vc.seq, vc.label /* unscoped: the categories are shared across the client's companies */`, [co.tenantId]);
+  return { accounts, vendors, stores: await stores(c, co), bookable, payGroups, positions, payrollBanks, states, vendorCategories };
 }
 
 // -------------------------------------------------------------- approvals
@@ -424,6 +427,7 @@ export async function vendors(c: Client, co: Company) {
     select v.id, coalesce(v.dba, v.legal_name) as name, v.legal_name, v.is_1099, v.w9_on_file, v.status as vendor_status,
            v.city, v.state, v.contact_name, v.contact_phone,
            ve.status, ve.terms_days, ga.code as gl_code, ga.name as gl_name, po.name as store,
+           vc.code as category, vc.label as category_label, (ve.category_id is not null) as category_here,
            (select count(*) from invoice i where i.vendor_id = v.id and i.entity_id = $1)::int as bills,
            (select coalesce(sum(i.total_minor), 0) from invoice i
              where i.vendor_id = v.id and i.entity_id = $1 and i.status in ('approved','scheduled','pending','validated','held','exception')) as open_minor,
@@ -435,6 +439,7 @@ export async function vendors(c: Client, co: Company) {
       join vendor v on v.id = ve.vendor_id
       left join gl_account ga on ga.id = ve.default_gl_account_id
       left join profit_object po on po.id = ve.default_profit_object_id
+      left join vendor_category vc on vc.id = coalesce(ve.category_id, v.category_id)
      where ve.entity_id = $1
      order by 2`, [co.id]);
 }
@@ -446,7 +451,9 @@ export async function vendor(c: Client, co: Company, id: string) {
            v.is_1099, v.tin_last4, v.w9_on_file, v.address_line1, v.address_line2, v.city, v.state, v.postal_code, v.remit_to,
            v.contact_name, v.contact_phone, v.contact_email, v.created_at, cu.name as created_by_name,
            ve.status, ve.terms_days, ve.default_gl_account_id, ve.default_profit_object_id,
-           ga.code as gl_code, ga.name as gl_name, po.name as store
+           ga.code as gl_code, ga.name as gl_name, po.name as store,
+           (select code from vendor_category where id = coalesce(ve.category_id, v.category_id)) as category,
+           (select label from vendor_category where id = coalesce(ve.category_id, v.category_id)) as category_label
       from vendor_entity ve
       join vendor v on v.id = ve.vendor_id
       left join app_user cu on cu.id = v.created_by

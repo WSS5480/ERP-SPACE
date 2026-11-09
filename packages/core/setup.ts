@@ -219,6 +219,8 @@ export async function applyPack(c: Client, scope: Scope, packId: string, applied
     `insert into entity_gl_account (entity_id, gl_account_id)
      select $1, id from gl_account where tenant_id = $2 and code = any($3)
      on conflict do nothing`, [scope.entityId, scope.tenantId, pack.accounts.map((a) => a[0])]);
+  // Vendor categories take their usual accounts from the chart the pack just filled (merchandise → 2050, utilities → 6410, …).
+  await c.query(`select vendor_category_defaults($1)`, [scope.tenantId]);
 
   for (const m of MODULE_IDS) {
     const on = pack.modules.includes(m);

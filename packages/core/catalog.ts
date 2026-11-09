@@ -219,12 +219,14 @@ const EXISTING_SQL = `
     from product p where p.entity_id = $1 and p.vendor_id = $2`;
 
 async function vendorOf(c: Client, entityId: string, vendorId: string) {
-  const v = (await q<{ id: string; name: string; sku_prefix: string | null }>(c, `
-    select v.id, coalesce(v.dba, v.legal_name) as name, vp.sku_prefix
+  const v = (await q<{ id: string; name: string; sku_prefix: string | null; merch: boolean; category: string | null }>(c, `
+    select v.id, coalesce(v.dba, v.legal_name) as name, vp.sku_prefix, exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) merch,
+           (select label from vendor_category where id = coalesce(ve.category_id, v.category_id)) category
       from vendor_entity ve join vendor v on v.id = ve.vendor_id
       left join vendor_profile vp on vp.vendor_id = v.id and vp.entity_id = ve.entity_id
      where ve.entity_id = $1 and ve.vendor_id = $2 and ve.status = 'active'`, [entityId, vendorId]))[0];
   need(v, "that vendor is not set up for this company");
+  need(v.merch, `${v.name} is a ${(v.category ?? "non-merchandise").toLowerCase()} vendor; products, prices and vendor facts are for merchandise vendors (change its category under Payables → Vendors if it sells goods)`);
   return v;
 }
 

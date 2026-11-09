@@ -106,7 +106,7 @@ async function orderForm(c: Client, co: Company, url: URL) {
            coalesce(vp.freight_min_minor, 0) freight_min_minor, coalesce(vp.freight_min_qty, 0) freight_min_qty
       from vendor_entity ve join vendor v on v.id = ve.vendor_id
       left join vendor_profile vp on vp.entity_id = ve.entity_id and vp.vendor_id = v.id
-     where ve.entity_id = $1 and ve.status = 'active'
+     where ve.entity_id = $1 and ve.status = 'active' and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise)
        and exists (select 1 from product p where p.entity_id = ve.entity_id and p.vendor_id = v.id and p.kind = 'stock')
      order by 2`, [co.id]);
   const locations = await q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' and kind in ('warehouse','store','outlet')

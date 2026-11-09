@@ -132,7 +132,7 @@ async function formOptions(c: Client, co: Company) {
   const [vendors, categories, locations, templates, priceLists] = await inOrder([
     () => q(c, `select v.id, coalesce(v.dba, v.legal_name) as name, vp.sku_prefix from vendor_entity ve join vendor v on v.id = ve.vendor_id
             left join vendor_profile vp on vp.entity_id = ve.entity_id and vp.vendor_id = v.id
-           where ve.entity_id = $1 and ve.status = 'active' order by 2`, [co.id]),
+           where ve.entity_id = $1 and ve.status = 'active' and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) order by 2`, [co.id]),
     () => q(c, `select category, array_agg(distinct subcategory) filter (where subcategory is not null) subs, count(*) n
             from product where entity_id = $1 and category is not null group by category order by category`, [co.id]),
     () => q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' order by kind <> 'warehouse', name`, [co.id]),
@@ -268,7 +268,7 @@ async function vendors(c: Client, co: Company) {
            (select max(last_run_at) from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id) feeds_last_run
       from vendor_entity ve join vendor v on v.id = ve.vendor_id
       left join vendor_profile vp on vp.entity_id = ve.entity_id and vp.vendor_id = v.id
-     where ve.entity_id = $1 and ve.status = 'active' order by 2`, [co.id]);
+     where ve.entity_id = $1 and ve.status = 'active' and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) order by 2`, [co.id]);
   const freight = await q(c, `select f.vendor_id, f.location_id, l.name location, f.freight_bps, f.per_unit_minor
                                 from vendor_freight f join location l on l.id = f.location_id where f.entity_id = $1 order by l.name`, [co.id]);
   return { vendors: rows.map((v) => ({ ...v, freight: freight.filter((f) => f.vendor_id === v.id) })) };
@@ -445,7 +445,7 @@ export const module: ErpModule = {
     });
     coGet(`/catalog/vendors/${ID}/feeds`, async (c, co, _u, m) => {
       const v = (await q<{ id: string; name: string }>(c, `select v.id, coalesce(v.dba, v.legal_name) as name from vendor_entity ve join vendor v on v.id = ve.vendor_id
-                                                           where ve.entity_id = $1 and ve.vendor_id = $2`, [co.id, m[2]]))[0];
+                                                           where ve.entity_id = $1 and ve.vendor_id = $2 and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise)`, [co.id, m[2]]))[0];
       if (!v) return null;
       const rows = await q(c, `select f.*, exists (select 1 from vendor_feed_run r where r.entity_id = f.entity_id and r.feed_id = f.id and r.finished_at is null) running
                                  from vendor_feed f where f.entity_id = $1 and f.vendor_id = $2 order by array_position(array['products','pricing','quantities','freight','images','orders','acknowledgments'], f.purpose), f.name`, [co.id, m[2]]);

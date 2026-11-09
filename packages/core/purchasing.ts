@@ -34,8 +34,9 @@ async function vendorFor(c: Client, s: Scope, vendorId: string): Promise<Vendor>
            coalesce(vp.freight_min_qty, 0) freight_min_qty, vp.order_email, vp.account_no
       from vendor_entity ve join vendor v on v.id = ve.vendor_id
       left join vendor_profile vp on vp.vendor_id = v.id and vp.entity_id = ve.entity_id
-     where ve.entity_id = $1 and ve.vendor_id = $2 and ve.status = 'active' and v.status = 'active'`, [s.entityId, vendorId]))[0];
-  need(v, "that vendor is not active for this company");
+     where ve.entity_id = $1 and ve.vendor_id = $2 and ve.status = 'active' and v.status = 'active'
+       and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise)`, [s.entityId, vendorId]))[0];
+  need(v, "that vendor is not active for this company, or is not a merchandise vendor");
   if (!v.gl) {
     // Receiving puts merchandise in inventory (Dr 1300 / Cr 2050); the vendor's
     // bill then clears 2050, so a PO line codes to 2050 unless the vendor says otherwise.

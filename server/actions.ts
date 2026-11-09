@@ -9,6 +9,7 @@
 // post on release.
 
 import { type Client, type Scope, q, one, audit } from "../packages/core/db.ts";
+import { categoryInfo, VendorCategoryError } from "../packages/core/vendor_categories.ts";
 import { decide, openRequest } from "../packages/core/approvals.ts";
 import { runGates, postToLedger, transition } from "../packages/core/invoice.ts";
 import { buildRun, requestRelease, release, postRun, IllustrativeTaxProvider, type Frequency, isFrequency,
@@ -252,13 +253,23 @@ function vendorFields(input: Record<string, unknown>) {
   };
 }
 
+/** The vendor category a request names, as a refusal the screen can show. */
+async function categoryFrom(c: Client, co: Company, v: unknown) {
+  const code = text(v, 60);
+  need(code, "pick the vendor's category (merchandise, utilities, rent, services…)");
+  try { return await categoryInfo(c, co.tenantId, code); }
+  catch (e) { if (e instanceof VendorCategoryError) throw new ActionError(e.message); throw e; }
+}
+
 export async function addVendor(c: Client, co: Company, a: Actor, input: Record<string, unknown>) {
   const name = text(input.name, 120);
   need(name.length >= 2, "enter the vendor's legal name");
+  const cat = await categoryFrom(c, co, input.category);
   const dba = text(input.dba, 120) || null;
   const terms = Number(input.termsDays ?? 30);
   need(Number.isInteger(terms) && terms >= 0 && terms <= 120, "terms are a number of days, 0 to 120");
-  const gl = typeof input.glAccountId === "string" && UUID.test(input.glAccountId) ? input.glAccountId : null;
+  // Left blank, the vendor codes to its category's usual account.
+  const gl = typeof input.glAccountId === "string" && UUID.test(input.glAccountId) ? input.glAccountId : cat.default_gl_account_id;
   const store = typeof input.storeId === "string" && UUID.test(input.storeId) ? input.storeId : null;
   const f = vendorFields(input);
   if (gl) {
@@ -276,17 +287,17 @@ export async function addVendor(c: Client, co: Company, a: Actor, input: Record<
 
   const v = await one<{ id: string }>(c, `
     insert into vendor (tenant_id, legal_name, dba, is_1099, status, created_by, tax_classification, tin_last4, w9_on_file,
-                        address_line1, address_line2, city, state, postal_code, remit_to, contact_name, contact_phone, contact_email)
-    values ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) returning id
+                        address_line1, address_line2, city, state, postal_code, remit_to, contact_name, contact_phone, contact_email, category_id)
+    values ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) returning id
     /* unscoped: vendors are shared across the client's companies */`,
     [co.tenantId, name, dba, f.is_1099, a.personId, f.tax_classification, f.tin_last4, f.w9_on_file,
-     f.address_line1, f.address_line2, f.city, f.state, f.postal_code, f.remit_to, f.contact_name, f.contact_phone, f.contact_email]);
+     f.address_line1, f.address_line2, f.city, f.state, f.postal_code, f.remit_to, f.contact_name, f.contact_phone, f.contact_email, cat.id]);
   await q(c, `
     insert into vendor_entity (vendor_id, entity_id, terms_days, default_gl_account_id, default_profit_object_id, status)
     select $1, $2, $3, $4, $5, 'hold' where exists (select 1 from entity where id = $2 and tenant_id = $6)
     /* unscoped: inserting this company's own row */`, [v.id, co.id, terms, gl, store, co.tenantId]);
   const s = scopeOf(co, a);
-  await audit(c, s, { table: "vendor", rowId: v.id, action: "insert", after: { name, terms, ...f }, reason: "added from the screen" });
+  await audit(c, s, { table: "vendor", rowId: v.id, action: "insert", after: { name, terms, category: cat.code, ...f }, reason: "added from the screen" });
   const approval = await openRequest(c, s, { subjectType: "vendor", subjectId: v.id, amountMinor: null, makerId: a.personId });
   if (!approval.required) {
     await q(c, `update vendor set status = 'active' where id = $1 and tenant_id = $2 /* unscoped: vendor row */`, [v.id, co.tenantId]);
@@ -342,6 +353,10 @@ export async function updateVendor(c: Client, co: Company, a: Actor, input: Reco
   await q(c, `update vendor_entity set terms_days = $3, default_gl_account_id = coalesce($4, default_gl_account_id),
                      default_profit_object_id = $5
                where vendor_id = $1 and entity_id = $2`, [v.id, co.id, terms, gl, store]);
+  if (input.category !== undefined && input.category !== null && input.category !== "") {
+    const cat = await categoryFrom(c, co, input.category);
+    await q(c, `update vendor set category_id = $2 where id = $1 and tenant_id = $3 /* unscoped: vendors are shared across the client's companies */`, [v.id, cat.id, co.tenantId]);
+  }
   await audit(c, scopeOf(co, a), { table: "vendor", rowId: v.id, action: "update", before, after: { ...f, terms_days: terms },
     reason: f.contact_phone !== before.contact_phone ? "details changed, including the phone on file" : "details changed" });
   return { id: v.id };
