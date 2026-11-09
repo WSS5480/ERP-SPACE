@@ -159,10 +159,11 @@ export function normalize(raw: unknown): Definition {
   need(cols.length <= LIMITS.columnsMax, `a report shows at most ${LIMITS.columnsMax} columns`);
   const columns: Column[] = [];
   const ids = new Set<string>();
+  const alias = new Map<string, string>(); // a column dropped because its field is a group → that group
   for (const x of cols) {
     const cx = x as Record<string, unknown>;
     const id = typeof cx.id === "string" && ID_RE.test(cx.id) ? cx.id : `c${columns.length + 1}`;
-    need(!ids.has(id), `two columns share the id ${id}`);
+    need(!ids.has(id) && !alias.has(id), `two columns share the id ${id}`);
     ids.add(id);
     const label = text(cx.label, 80) || undefined;
     if (cx.calc) {
@@ -182,7 +183,8 @@ export function normalize(raw: unknown): Definition {
       continue;
     }
     const f = fieldOf(ds, cx.field, "columns");
-    if (groupBy.some((g) => g.field === f.id && !g.bucket)) continue;        // a grouped field shows as its group already
+    { const gi = groupBy.findIndex((g) => g.field === f.id && !g.bucket);
+      if (gi >= 0) { ids.delete(id); alias.set(id, `g${gi}`); continue; } } // a grouped field shows as its group already
     const col: Column = { id, field: f.id, label };
     if (grouped) {
       need(cx.agg == null || cx.agg === "" || (typeof cx.agg === "string" && Object.hasOwn(AGGS, cx.agg)), `${f.label} cannot be totalled that way`);
@@ -225,7 +227,8 @@ export function normalize(raw: unknown): Definition {
   let sort: Sort | null = null;
   if (r.sort && typeof r.sort === "object") {
     const s = r.sort as Record<string, unknown>;
-    const by = String(s.by ?? "");
+    let by = String(s.by ?? "");
+    if (alias.has(by)) by = alias.get(by)!;
     need(ids.has(by) || /^g[0-2]$/.test(by) && Number(by[1]) < groupBy.length, "sort by one of the report's columns or groups");
     sort = { by, dir: s.dir === "desc" ? "desc" : "asc" };
   }

@@ -144,6 +144,15 @@ export async function run(t: T) {
   await t.throws("import apply: a run applies once", () => r.post("/chart/import/:id/apply", PEOPLE.CONTROLLER, {}, pv.runId), /already applied/);
   const again = await r.post<{ add: number; update: number; same: number }>("/chart/import/preview", PEOPLE.CONTROLLER, { csv, filename: "new.csv" });
   t.ok("import: the same file again adds and updates nothing", again.add === 0 && again.update === 0 && again.same === 4, JSON.stringify({ ...again, sample: undefined }));
+  // a child header above its parent header: preview and apply agree
+  const order = "code,name,type,postable,parent\n6492,Store upkeep detail,expense,no,6491\n6491,Store upkeep,expense,no,\n";
+  const opv = await r.post<{ runId: string; add: number; refuse: number }>("/chart/import/preview", PEOPLE.CONTROLLER, { csv: order });
+  const oap = await r.post<{ added: number; refused: number }>("/chart/import/:id/apply", PEOPLE.CONTROLLER, {}, opv.runId);
+  t.ok("import: a parent further down the file is added first, so apply matches the preview", opv.add === 2 && oap.added === 2 && oap.refused === 0, JSON.stringify(oap));
+  const loop = await r.post<{ update: number; refuse: number }>("/chart/import/preview", PEOPLE.CONTROLLER, { csv: "code,parent\n6491,6492\n" });
+  t.ok("import: a rollup loop is refused in the preview", loop.refuse === 1 && loop.update === 0, JSON.stringify({ ...loop, sample: undefined }));
+  const qb = await r.post<{ refuse: number; same: number }>("/chart/import/preview", PEOPLE.CONTROLLER, { csv: "Account,Name,Type,Balance\n6491,Store upkeep,Expense,1234.00\n" });
+  t.ok("import: a Balance column (QuickBooks, Xero) is not read as normal balance", qb.refuse === 0, JSON.stringify({ ...qb, sample: undefined }));
   await t.throws("import: a file with no code column is refused", () => r.post("/chart/import/preview", PEOPLE.CONTROLLER, { csv: "name,type\nX,expense" }), /code column/);
 
   // ---------------------------------------------------------------- isolation

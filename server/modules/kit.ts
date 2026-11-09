@@ -74,6 +74,16 @@ export async function requireRole(c: Client, co: Company, a: Actor, roles: strin
   return held;
 }
 
+/** For things the client's companies share (the chart, vendor categories): the role must hold in every one of them. */
+export async function requireRoleEverywhere(c: Client, co: Company, a: Actor, roles: string[], doing: string) {
+  const all = (await c.query<{ id: string; name: string }>(`select id, name from entity where tenant_id = $1 /* unscoped: the client's companies */`, [co.tenantId])).rows;
+  for (const e of all) {
+    const held = await rolesOf(c, { ...co, id: e.id }, a.personId);
+    need(held.has("owner") || roles.some((r) => held.has(r)),
+      `${doing} changes every company's books, so it needs one of: ${roles.map((r) => r.replace(/_/g, " ")).join(", ")} in ${e.name} too`);
+  }
+}
+
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const str = (v: unknown, max = 500): string => (typeof v === "string" ? v.trim().slice(0, max) : "");
 export const uuid = (v: unknown): string | null => (typeof v === "string" && UUID.test(v) ? v : null);

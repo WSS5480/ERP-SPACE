@@ -73,6 +73,11 @@ export async function run(t: T) {
   }
   const starterOf = (key: string) => starters.find((x) => x.starter === key)!;
 
+  // a column on a grouped field is shown as the group; sorting by it sorts by the group
+  const byStore = await runAs(t, PEOPLE.STEVE, (c, roles) => rep.run(c, ENTITY, roles, { dataset: "sales_posted", groupBy: [{ field: "store" }],
+    columns: [{ id: "s", field: "store" }, { id: "n", field: "net" }], sort: { by: "s", dir: "desc" } }));
+  t.ok("a sort on a grouped field's column sorts by that group", byStore.mode === "grouped" && byStore.rows.length > 0);
+
   // ------------------------------------------------------------ ties
   const salesYear = await runAs(t, PEOPLE.STEVE, (c, roles) => rep.run(c, ENTITY, roles, starterOf("sales_store_month").definition,
     { params: { 0: { op: "between", value: yearStart, value2: today } }, size: 200 }));

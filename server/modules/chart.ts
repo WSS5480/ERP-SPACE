@@ -3,7 +3,7 @@
 // deactivate, CSV import and export) and vendor categories (the pick list,
 // and setting a vendor's category for every company or one).
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
-import { ModuleError, need, requireRole, str, uuid } from "./kit.ts";
+import { ModuleError, need, requireRole, requireRoleEverywhere, str, uuid } from "./kit.ts";
 import { scopeOf } from "../actions.ts";
 import { q } from "../../packages/core/db.ts";
 import * as chart from "../../packages/core/chart.ts";
@@ -56,39 +56,40 @@ export const module: ErpModule = {
       return { run, rows };
     });
     coPost("/chart/accounts", async (c, co, a, b) => {
-      await requireRole(c, co, a, BOOKS, "adding to the chart of accounts");
+      await requireRoleEverywhere(c, co, a, BOOKS, "adding to the chart of accounts");
       return { id: await refuse(() => chart.createAccount(c, sc(co, a), accountIn(b))) };
     });
     coPost(`/chart/accounts/${ID}`, async (c, co, a, b, m) => {
-      await requireRole(c, co, a, BOOKS, "changing the chart of accounts");
+      await requireRoleEverywhere(c, co, a, BOOKS, "changing the chart of accounts");
       return { changed: await refuse(() => chart.updateAccount(c, sc(co, a), m[2], accountIn(b), str(b.reason, 300) || null)) };
     });
     coPost(`/chart/accounts/${ID}/companies`, async (c, co, a, b, m) => {
-      await requireRole(c, co, a, BOOKS, "choosing which companies use an account");
+      await requireRoleEverywhere(c, co, a, BOOKS, "choosing which companies use an account");
       const ids = (Array.isArray(b.companies) ? b.companies : []).map(uuid).filter(Boolean) as string[];
       return refuse(() => chart.setCompanies(c, sc(co, a), m[2], ids));
     });
     coPost("/chart/import/preview", async (c, co, a, b) => {
-      await requireRole(c, co, a, BOOKS, "importing a chart of accounts");
+      await requireRoleEverywhere(c, co, a, BOOKS, "importing a chart of accounts");
       need(typeof b.csv === "string" && b.csv.trim(), "choose the chart's CSV file first");
       need((b.csv as string).length <= 2_000_000, "the file is larger than 2 MB");
       return refuse(() => chart.previewCsv(c, sc(co, a), { csv: b.csv as string, filename: str(b.filename, 200) || null }));
     });
     coPost(`/chart/import/${ID}/apply`, async (c, co, a, _b, m) => {
-      await requireRole(c, co, a, BOOKS, "importing a chart of accounts");
+      await requireRoleEverywhere(c, co, a, BOOKS, "importing a chart of accounts");
       return refuse(() => chart.applyCsv(c, sc(co, a), m[2]));
     });
 
     // ---- vendor categories
     coGet("/vendor-categories", (c, co) => cats.listCategories(c, readScope(co)).then((categories) => ({ categories })));
     coPost("/vendor-categories", async (c, co, a, b) => {
-      await requireRole(c, co, a, BOOKS, "changing the vendor categories");
+      await requireRoleEverywhere(c, co, a, BOOKS, "changing the vendor categories");
       return { id: await refuse(() => cats.saveCategory(c, sc(co, a), { id: uuid(b.id), code: str(b.code, 40) || undefined, label: str(b.label, 60),
         isMerchandise: b.isMerchandise === undefined ? undefined : b.isMerchandise === true, defaultGl: b.defaultGl === undefined ? undefined : (str(b.defaultGl, 40) || null),
         active: b.active === undefined ? undefined : b.active !== false, seq: b.seq === undefined ? undefined : Number(b.seq) })) };
     });
     coPost(`/vendors/${ID}/category`, async (c, co, a, b, m) => {
-      await requireRole(c, co, a, PAYABLES, "setting a vendor's category");
+      if (b.thisCompanyOnly === true) await requireRole(c, co, a, PAYABLES, "setting a vendor's category");
+      else await requireRoleEverywhere(c, co, a, PAYABLES, "setting a vendor's category for every company");
       return refuse(() => cats.setVendorCategory(c, sc(co, a), m[2], str(b.category, 60) || null, { thisCompanyOnly: b.thisCompanyOnly === true }));
     });
   },

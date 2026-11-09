@@ -13,7 +13,8 @@
 //   covered parts / replacements leave stock as a $0 sale (Dr 5000 Cr 1300),
 //     then move to who carries them:      Dr 6150 (or 1150 vendor)  Cr 5000
 //   in-house labour                       Dr 6150 (or 1150)         Cr 6155 service labour applied
-//   a third party's work, until billed    Dr 6150 (or 1150)         Cr 2050 accrued
+//   a third party's work, until billed    Dr 6150 (or 1150)         Cr 2050 accrued (their vendor's bills code to 2050)
+//   other costs, paid elsewhere           record only; a chargeback  Dr 1150 Cr 6150
 //   billable service charges              the sale posts 4030; moved  Dr 4030  Cr 4050 service revenue
 
 import { createHash } from "node:crypto";
@@ -511,7 +512,9 @@ async function postCost(c: Client, scope: Scope, t: TicketRow, e: { kind: string
   const loc = await serviceLocation(c, scope.entityId, t);
   const po = await profitObjectFor(c, scope.entityId, loc);
   const id = (await one<{ id: string }>(c, `select gen_random_uuid()::text id /* unscoped: no table */`)).id;
-  const je = await post(c, scope, { date: today(), sourceType: "service" as never, sourceId: id,
+  // "other" costs are paid elsewhere (a card, a bill coded to 6150), which already books the expense:
+  // the ticket keeps the record, and only a chargeback to the vendor moves money in the books.
+  const je = debit === e.credit ? null : await post(c, scope, { date: today(), sourceType: "service" as never, sourceId: id,
     description: `${t.number}: ${e.kind.replace("_", " ")}${e.note ? ` — ${e.note}` : ""}`.slice(0, 300),
     lines: [{ code: debit, debit: e.amountMinor, profitObjectId: po }, { code: e.credit, credit: e.amountMinor, profitObjectId: po }] });
   await c.query(`insert into service_cost (id, entity_id, ticket_id, visit_id, kind, amount_minor, charge_to, note, journal_entry_id, created_by)
@@ -529,7 +532,8 @@ export async function addCost(c: Client, scope: Scope, ticketId: string, b: { ki
   need(t.status !== "closed" && t.status !== "cancelled", `ticket ${t.number} is ${t.status}`);
   need(["third_party", "other", "labor"].includes(b.kind), "a cost entered here is labour, a third party's work, or other");
   need(String(b.note ?? "").trim() || b.kind === "labor", "say what the cost is for");
-  const credit = b.kind === "labor" ? "6155" : "2050";
+  if (b.kind === "third_party") await needBillingVendor(c, scope, t.provider_id);
+  const credit = b.kind === "labor" ? "6155" : b.kind === "third_party" ? "2050" : "6150";
   return postCost(c, scope, t, { kind: b.kind, amountMinor: b.amountMinor, chargeTo: b.chargeTo || defaultChargeTo(t), credit, note: String(b.note ?? "").trim() });
 }
 
@@ -537,6 +541,13 @@ export async function addCost(c: Client, scope: Scope, ticketId: string, b: { ki
  * Covered goods that left stock as a $0 sale sit in cost of goods sold. Move
  * whatever has not been moved yet to service expense (or the vendor's chargeback).
  */
+/** An outside company's cost is accrued to 2050; that only clears if they bill us through payables as a linked vendor. */
+async function needBillingVendor(c: Client, scope: Scope, providerId: string | null) {
+  need(providerId, "assign the outside service company first, so its bill can clear this cost");
+  const r = await q<{ name: string; vendor_id: string | null }>(c, `select name, vendor_id from service_provider where entity_id = $1 and id = $2`, [scope.entityId, providerId]);
+  need(r[0]?.vendor_id, `link ${r[0]?.name ?? "the service company"} to its vendor in Service › Setup first, so its bill clears this cost instead of counting it twice`);
+}
+
 async function settleCovered(c: Client, scope: Scope, t: TicketRow) {
   if (!t.service_order_id) return 0n;
   const sold = BigInt((await one<{ s: string }>(c, `
@@ -695,6 +706,7 @@ export async function completeVisit(c: Client, scope: Scope, visitId: string, b:
   // labour
   if (minutes > 0) {
     if (v[0].provider_id) {
+      if (b.thirdPartyCostMinor && b.thirdPartyCostMinor > 0n) await needBillingVendor(c, scope, v[0].provider_id);
       if (b.thirdPartyCostMinor && b.thirdPartyCostMinor > 0n) await postCost(c, scope, t, { kind: "third_party", amountMinor: b.thirdPartyCostMinor,
         chargeTo: defaultChargeTo(t), credit: "2050", note: "outside service company", visitId });
     } else {
@@ -706,6 +718,7 @@ export async function completeVisit(c: Client, scope: Scope, visitId: string, b:
         note: `${minutes} min at ${usd(hourly)}/h`, visitId });
     }
   } else if (v[0].provider_id && b.thirdPartyCostMinor && b.thirdPartyCostMinor > 0n) {
+    await needBillingVendor(c, scope, v[0].provider_id);
     await postCost(c, scope, t, { kind: "third_party", amountMinor: b.thirdPartyCostMinor, chargeTo: defaultChargeTo(t), credit: "2050", note: "outside service company", visitId });
   }
   await c.query(`update service_visit set outcome = $3, work_notes = nullif($4,''), minutes = $5, technician_id = coalesce(technician_id, $6), completed_at = now()
@@ -973,7 +986,7 @@ export async function rules(c: Client, entityId: string) {
   const [w, p] = [
     await q(c, `select r.id, r.vendor_id, coalesce(v.dba, v.legal_name) vendor, r.category, r.months, r.covers, r.note from service_warranty_rule r
             left join vendor v on v.id = r.vendor_id where r.entity_id = $1 order by r.vendor_id nulls first, r.category nulls first`, [entityId]),
-    await q(c, `select id, name, phone, email, hourly_rate_minor::text hourly_rate_minor, categories, active from service_provider where entity_id = $1 order by name`, [entityId]),
+    await q(c, `select id, name, phone, email, vendor_id, hourly_rate_minor::text hourly_rate_minor, categories, active from service_provider where entity_id = $1 order by name`, [entityId]),
   ];
   return { warranty: w, providers: p, plans: (await settings(c, entityId)).planTerms };
 }
@@ -996,22 +1009,31 @@ export async function saveRule(c: Client, scope: Scope, b: { vendorId?: string |
   return { ok: true };
 }
 
-export async function saveProvider(c: Client, scope: Scope, b: { id?: string; name: string; phone?: string; email?: string; hourlyRateMinor?: bigint | null; active?: boolean }) {
+export async function saveProvider(c: Client, scope: Scope, b: { id?: string; name: string; phone?: string; email?: string; hourlyRateMinor?: bigint | null; active?: boolean; vendorId?: string | null }) {
   const name = String(b.name ?? "").trim();
   need(name, "name the service company");
+  const vendorId = b.vendorId && isId(b.vendorId) ? b.vendorId : null;
+  if (vendorId) {
+    // What a visit by them costs is accrued to 2050 until their bill comes, so their bills here code to 2050 and clear it.
+    const ok = await q(c, `select 1 from vendor_entity where entity_id = $1 and vendor_id = $2`, [scope.entityId, vendorId]);
+    need(ok.length, "that vendor is not set up in this company's payables");
+    await c.query(`update vendor_entity set default_gl_account_id = (select g.id from gl_account g join entity e on e.tenant_id = g.tenant_id
+                     where e.id = $1 and g.code = '2050') where entity_id = $1 and vendor_id = $2`, [scope.entityId, vendorId]);
+  }
   const dup = await q(c, `select 1 from service_provider where entity_id = $1 and lower(name) = lower($2) and ($3::uuid is null or id <> $3)`,
     [scope.entityId, name, b.id && isId(b.id) ? b.id : null]);
   need(!dup.length, `there is already a service company called ${name}`);
   if (b.id) {
     need(isId(b.id), "no such service company");
-    const r = await q(c, `update service_provider set name = $3, phone = nullif($4,''), email = nullif($5,''), hourly_rate_minor = $6, active = $7
+    const r = await q(c, `update service_provider set name = $3, phone = nullif($4,''), email = nullif($5,''), hourly_rate_minor = $6, active = $7,
+                                  vendor_id = coalesce($8, vendor_id)
                            where entity_id = $1 and id = $2 returning id`,
-      [scope.entityId, b.id, name, String(b.phone ?? ""), String(b.email ?? ""), b.hourlyRateMinor?.toString() ?? null, b.active !== false]);
+      [scope.entityId, b.id, name, String(b.phone ?? ""), String(b.email ?? ""), b.hourlyRateMinor?.toString() ?? null, b.active !== false, vendorId]);
     need(r.length, "no such service company");
     return { id: b.id };
   }
-  return one(c, `insert into service_provider (entity_id, name, phone, email, hourly_rate_minor) values ($1,$2,nullif($3,''),nullif($4,''),$5) returning id`,
-    [scope.entityId, name, String(b.phone ?? ""), String(b.email ?? ""), b.hourlyRateMinor?.toString() ?? null]);
+  return one(c, `insert into service_provider (entity_id, name, phone, email, hourly_rate_minor, vendor_id) values ($1,$2,nullif($3,''),nullif($4,''),$5,$6) returning id`,
+    [scope.entityId, name, String(b.phone ?? ""), String(b.email ?? ""), b.hourlyRateMinor?.toString() ?? null, vendorId]);
 }
 
 // ------------------------------------------------------- the public form --

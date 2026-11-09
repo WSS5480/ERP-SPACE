@@ -47,8 +47,18 @@ insert into entity_setting (entity_id, key, value, set_by) values
    '{"SVC-PROTECT-5Y":{"years":5,"covers":["protection_plan","defect","warranty","comfort"],"name":"5-year protection plan"}}','seed')
 on conflict (entity_id, key) do nothing;
 
+-- Keystone bills us through payables; its bills here code to 2050, which clears what each visit accrued.
+insert into vendor (id, tenant_id, legal_name, tax_classification, w9_on_file, status, category_id)
+select '66666666-0000-0000-0000-0000000000b1','11111111-1111-1111-1111-111111111111','Keystone Furniture Repair','llc',true,'active', vc.id
+  from (select 1) one left join vendor_category vc on vc.tenant_id = '11111111-1111-1111-1111-111111111111' and vc.code = 'services'
+on conflict (id) do nothing;
+insert into vendor_entity (vendor_id, entity_id, terms_days, default_gl_account_id)
+select '66666666-0000-0000-0000-0000000000b1', '22222222-2222-2222-2222-222222222222', 30, g.id
+  from gl_account g where g.tenant_id = '11111111-1111-1111-1111-111111111111' and g.code = '2050'
+on conflict do nothing;
+
 insert into service_provider (entity_id, name, phone, email, vendor_id, hourly_rate_minor, categories) values
-  ('22222222-2222-2222-2222-222222222222','Keystone Furniture Repair','717-555-0170','jobs@keystone.example',null,7500,'{Living room,Dining,Bedroom}');
+  ('22222222-2222-2222-2222-222222222222','Keystone Furniture Repair','717-555-0170','jobs@keystone.example','66666666-0000-0000-0000-0000000000b1',7500,'{Living room,Dining,Bedroom}');
 
 -- One open ticket from a phone call, so the screens have something to show.
 insert into service_ticket (id, entity_id, number, source, customer_id, address_id, issue_type, description, priority, sla_due_at, created_by)

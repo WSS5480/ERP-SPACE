@@ -389,13 +389,14 @@
     const r = await coApi('/service/settings');
     const rules = r.warranty.map((w) => item({ title: [w.vendor || 'Any vendor', w.category || 'any category'].join(' · '), amount: `${w.months} mo`,
       detail: `covers ${w.covers.map(words).join(', ').toLowerCase()}${w.note ? ' · ' + w.note : ''}` }));
-    const provs = r.providers.map((p) => item({ title: p.name, amount: p.hourly_rate_minor ? `${money(p.hourly_rate_minor)}/h` : '', badge: p.active ? null : chip('neutral', 'pause', 'Inactive'),
-      detail: [p.phone, p.email].filter(Boolean).join(' · ') }));
+    const provs = r.providers.map((p) => item({ title: p.name, amount: p.hourly_rate_minor ? `${money(p.hourly_rate_minor)}/h` : '',
+      badge: !p.active ? chip('neutral', 'pause', 'Inactive') : p.vendor_id ? null : chip('warning', 'warn', 'No vendor'),
+      detail: [p.phone, p.email].filter(Boolean).join(' · '), acts: [btn('Edit', () => providerDialog(p), { small: true })] }));
     const plans = Object.entries(r.plans || {}).map(([sku, p]) => item({ title: p.name || sku, amount: `${p.years} yr`, detail: `${sku} · covers ${(p.covers || []).map(words).join(', ').toLowerCase()}` }));
     return frag(
       section('Manufacturer warranty', 'the most specific rule wins', [btn('Add rule', ruleDialog, { small: true, ic: 'plus' })], rules.length ? panel(rules) : empty('No rules: nothing is under warranty', null, true)),
       section('Protection plans', 'set in company settings (service.plan_terms)', null, plans.length ? panel(plans) : empty('No plan terms set', 'Plans are read by the years in their SKU (5Y).', true)),
-      section('Outside service companies', null, [btn('Add company', providerDialog, { small: true, ic: 'plus' })], provs.length ? panel(provs) : empty('None yet', null, true)));
+      section('Outside service companies', null, [btn('Add company', () => providerDialog(), { small: true, ic: 'plus' })], provs.length ? panel(provs) : empty('None yet', null, true)));
   }
   function ruleDialog() {
     const d = openDialog('Warranty rule', 'By vendor, category, or both');
@@ -412,13 +413,21 @@
           covers: covers.filter(([, cb]) => cb.checked).map(([k]) => k) }), 'Rule saved', { close: d.close, errorInto: showErr(err) }), { primary: true }), btn('Cancel', d.close)), err);
     });
   }
-  function providerDialog() {
-    const d = openDialog('Outside service company', '');
+  function providerDialog(p0) {
+    const p = p0 && p0.id ? p0 : {};
+    const d = openDialog('Outside service company', 'Their visits are accrued until their bill comes through payables');
     const err = errSlot();
-    const f = { name: input({}), phone: input({ type: 'tel' }), email: input({ type: 'email' }), hourlyRate: input({ inputmode: 'decimal' }) };
-    d.body.append(el('div', { class: 'form-grid' }, field('Name', f.name), field('Phone', f.phone), field('Email', f.email), field('Rate per hour ($)', f.hourlyRate)),
-      el('div', { class: 'dlg-acts' }, btn('Save', (e) => act(e.currentTarget, () => post('/service/providers', Object.fromEntries(Object.entries(f).map(([k, i]) => [k, i.value]))),
-        'Saved', { close: () => { st.opts = null; d.close(); }, errorInto: showErr(err) }), { primary: true }), btn('Cancel', d.close)), err);
+    fillDialog(d, async () => {
+      const opts = await coApi('/options');
+      const f = { name: input({ value: p.name || '' }), phone: input({ type: 'tel', value: p.phone || '' }), email: input({ type: 'email', value: p.email || '' }),
+        hourlyRate: input({ inputmode: 'decimal', value: p.hourly_rate_minor ? (Number(p.hourly_rate_minor) / 100).toFixed(2) : '' }),
+        vendorId: select([['', 'Pick their vendor'], ...(opts.vendors || []).map((v) => [v.id, v.name || v.legal_name])], p.vendor_id || '') };
+      return frag(el('div', { class: 'form-grid' }, field('Name', f.name), field('Phone', f.phone), field('Email', f.email), field('Rate per hour ($)', f.hourlyRate),
+          field('Bills us as (vendor)', f.vendorId),
+          el('p', { class: 'muted wide', text: 'Their bills here code to 2050, which clears what each visit accrued. A visit cost can’t be entered until this is set.' })),
+        el('div', { class: 'dlg-acts' }, btn('Save', (e) => act(e.currentTarget, () => post('/service/providers', { id: p.id || null, ...Object.fromEntries(Object.entries(f).map(([k, i]) => [k, i.value])) }),
+          'Saved', { close: () => { st.opts = null; d.close(); }, errorInto: showErr(err) }), { primary: true }), btn('Cancel', d.close)), err);
+    });
   }
 
   E.register('service', 'Service', 'wrench', screenService, 'Operations', { icon: ICON_WRENCH });

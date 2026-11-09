@@ -72,7 +72,8 @@ export function parseCsv(text: string): string[][] {
 
 /** A CSV cell, quoted when it has to be. */
 export const csvCell = (v: unknown): string => {
-  const s = v == null ? "" : String(v);
+  let s = v == null ? "" : String(v);
+  if (/^[=+\-@\t\r]/.test(s) && !/^[+-]?\d+(\.\d+)?$/.test(s)) s = `'${s}`; // a spreadsheet would run it as a formula
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 

@@ -908,7 +908,7 @@ function openVendorCategories() {
       const merch = el('input', { type: 'checkbox', checked: c.is_merchandise, disabled: c.code === 'merchandise' || null });
       const on = el('input', { type: 'checkbox', checked: c.active });
       const save = el('button', { class: 'btn small', type: 'button', onclick: () => act(save, () => post('/vendor-categories', { id: c.id, label: label.value, isMerchandise: merch.checked,
-        defaultGl: gl.value || null, active: on.checked }), 'Category saved', { close: again, errorInto }) }, 'Save');
+        defaultGl: gl.value || null, active: on.checked }), 'Category saved', { close: again, errorInto: errInto }) }, 'Save');
       return el('div', { class: 'panel' }, el('div', { class: 'form-grid' },
         field(`${c.label} · ${plural(Number(c.vendors || 0), 'vendor')} here`, label), field('New vendors code to', gl),
         el('label', { class: 'check' }, merch, 'Sells goods (shows in Catalog and Buying)'), el('label', { class: 'check' }, on, 'In use'),
@@ -918,7 +918,7 @@ function openVendorCategories() {
     const ngl = select(accts, '');
     const nm = el('input', { type: 'checkbox' });
     const add = el('button', { class: 'btn primary', type: 'button', onclick: () => act(add, () => post('/vendor-categories', { label: nl.value, isMerchandise: nm.checked, defaultGl: ngl.value || null }),
-      'Category added', { close: again, errorInto }) }, 'Add category');
+      'Category added', { close: again, errorInto: errInto }) }, 'Add category');
     return frag(out, ...r.categories.map(card),
       section('Add a category', null, null, el('div', { class: 'panel' }, el('div', { class: 'form-grid' }, field('Name', nl), field('New vendors code to', ngl),
         el('label', { class: 'check' }, nm, 'Sells goods'), el('div', { class: 'dlg-acts wide' }, add)))));

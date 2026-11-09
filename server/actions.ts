@@ -355,7 +355,14 @@ export async function updateVendor(c: Client, co: Company, a: Actor, input: Reco
                where vendor_id = $1 and entity_id = $2`, [v.id, co.id, terms, gl, store]);
   if (input.category !== undefined && input.category !== null && input.category !== "") {
     const cat = await categoryFrom(c, co, input.category);
-    await q(c, `update vendor set category_id = $2 where id = $1 and tenant_id = $3 /* unscoped: vendors are shared across the client's companies */`, [v.id, cat.id, co.tenantId]);
+    // The form shows the category in effect here (this company's own one first). Only a change is
+    // written, and it goes where that value came from: this company's override, or the shared one.
+    const cur = (await q<{ own: string | null; shared: string | null }>(c, `select ve.category_id as own, v.category_id as shared
+       from vendor v join vendor_entity ve on ve.vendor_id = v.id and ve.entity_id = $2 where v.id = $1`, [v.id, co.id]))[0];
+    if (cur && cat.id !== (cur.own ?? cur.shared)) {
+      if (cur.own) await q(c, `update vendor_entity set category_id = $3 where vendor_id = $1 and entity_id = $2`, [v.id, co.id, cat.id]);
+      else await q(c, `update vendor set category_id = $2 where id = $1 and tenant_id = $3 /* unscoped: vendors are shared across the client's companies */`, [v.id, cat.id, co.tenantId]);
+    }
   }
   await audit(c, scopeOf(co, a), { table: "vendor", rowId: v.id, action: "update", before, after: { ...f, terms_days: terms },
     reason: f.contact_phone !== before.contact_phone ? "details changed, including the phone on file" : "details changed" });

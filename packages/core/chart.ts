@@ -268,7 +268,7 @@ export async function previewCsv(c: Client, s: Scope, a: { csv: string; filename
   const heads = g[0].map((h) => h.trim().toLowerCase().replace(/[^a-z]/g, "_").replace(/_+$/, ""));
   const col = (n: string, ...alts: string[]) => [n, ...alts].map((x) => heads.indexOf(x)).find((i) => i >= 0) ?? -1;
   const ix = { code: col("code", "account", "account_number", "number"), name: col("name", "account_name", "description_name"), type: col("type", "account_type"),
-    nb: col("normal_balance", "normal", "balance"), parent: col("parent", "rollup", "parent_code", "group"), postable: col("postable", "is_postable"),
+    nb: col("normal_balance", "normal"), parent: col("parent", "rollup", "parent_code", "group"), postable: col("postable", "is_postable"),
     active: col("active"), description: col("description", "notes"), companies: col("companies", "company", "entities") };
   need(ix.code >= 0, "the file needs a code column");
   const existing = new Map((await q<Acct & { parent_code: string | null; companies: string[] }>(c, `
@@ -291,6 +291,12 @@ export async function previewCsv(c: Client, s: Scope, a: { csv: string; filename
         postable: ix.postable >= 0 ? truthy(g[r][ix.postable] ?? "", cur?.is_postable ?? true) : cur?.is_postable ?? true });
     } catch { /* reported below */ }
   }
+  // where each code will roll up once the file is in: the file's parent column wins over the books
+  const parentAfter = new Map<string, string | null>([...existing].map(([k, v]) => [k, v.parent_code]));
+  if (ix.parent >= 0) { const once = new Set<string>(); for (let r = 1; r < g.length; r++) {
+    const code = (g[r][ix.code] ?? "").trim();
+    if (code && !once.has(code)) { once.add(code); parentAfter.set(code, (g[r][ix.parent] ?? "").trim() || null); }
+  } }
   const seen = new Set<string>();
   for (let r = 1; r < g.length; r++) {
     const cell = (i: number) => (i >= 0 ? String(g[r][i] ?? "").trim() : "");
@@ -322,6 +328,8 @@ export async function previewCsv(c: Client, s: Scope, a: { csv: string; filename
         const par = existing.get(f.parent as string), parF = inFile.get(f.parent as string);
         need(par || parF, `there is no account ${f.parent} to roll up into, here or in the file`);
         need(f.parent !== code, "an account cannot roll up into itself");
+        { let up: string | null | undefined = f.parent as string; const walked = new Set<string>();
+          while (up && !walked.has(up)) { need(up !== code, `${code} would end up rolling up into itself through ${f.parent}`); walked.add(up); up = parentAfter.get(up); } }
         const parPostable = parF ? parF.postable : par!.is_postable;
         need(!parPostable, `${f.parent} takes postings, so it cannot be a rollup parent; mark it postable = no`);
         need((parF?.type || par?.account_type) === type, `${f.parent} is ${parF?.type || par?.account_type}, not ${type}`);
@@ -380,7 +388,19 @@ export async function applyCsv(c: Client, s: Scope, runId: string) {
   counts.refused = rows.filter((r) => r.action === "refuse").length;
   // headers (postable = no) first, then the rest; adds before updates so parents named in the file exist
   todo.sort((a, b) => Number(a.fields.postable !== false) - Number(b.fields.postable !== false) || Number(a.action === "update") - Number(b.action === "update"));
-  for (const r of todo) {
+  // then make sure a parent named in the file goes in before anything under it, whatever the file order
+  const ordered: typeof todo = [];
+  { const byCodeInFile = new Map(todo.map((r) => [r.code, r]));
+    const placed = new Set<string>(), visiting = new Set<string>();
+    const place = (r: (typeof todo)[number]) => {
+      if (placed.has(r.code) || visiting.has(r.code)) return;
+      visiting.add(r.code);
+      const par = typeof r.fields.parent === "string" ? byCodeInFile.get(r.fields.parent) : undefined;
+      if (par) place(par);
+      visiting.delete(r.code); placed.add(r.code); ordered.push(r);
+    };
+    todo.forEach(place); }
+  for (const r of ordered) {
     const f = r.fields as AccountIn & { code: string; normalBalance?: string };
     await c.query("savepoint chart_row");
     try {

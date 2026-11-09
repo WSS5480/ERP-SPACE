@@ -232,7 +232,7 @@ export const module: ErpModule = {
     coPost("/service/providers", async (c, co, a, b) => {
       await requireRole(c, co, a, ["store_manager"], "setting up a service company");
       return plain(() => S.saveProvider(c, scopeOf(co, a), { id: uuid(b.id) ?? undefined, name: str(b.name, 120), phone: str(b.phone, 40), email: str(b.email, 160),
-        hourlyRateMinor: money(b.hourlyRate), active: b.active !== false }));
+        hourlyRateMinor: money(b.hourlyRate), active: b.active !== false, vendorId: uuid(b.vendorId) }));
     });
 
     // ------------------------------------------------- the public request form
