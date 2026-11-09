@@ -424,9 +424,9 @@
         vendorId: select([['', 'Pick their vendor'], ...(opts.vendors || []).map((v) => [v.id, v.name || v.legal_name])], p.vendor_id || '') };
       return frag(el('div', { class: 'form-grid' }, field('Name', f.name), field('Phone', f.phone), field('Email', f.email), field('Rate per hour ($)', f.hourlyRate),
           field('Bills us as (vendor)', f.vendorId),
-          el('p', { class: 'muted wide', text: 'Their bills here code to 2050, which clears what each visit accrued. A visit cost can’t be entered until this is set.' })),
+          el('p', { class: 'muted wide', text: 'Bills for their visits code to 2050, which clears what each visit accrued (a vendor with no usual account is switched to 2050). A visit cost can’t be entered until this is set; linking needs the controller.' })),
         el('div', { class: 'dlg-acts' }, btn('Save', (e) => act(e.currentTarget, () => post('/service/providers', { id: p.id || null, ...Object.fromEntries(Object.entries(f).map(([k, i]) => [k, i.value])) }),
-          'Saved', { close: () => { st.opts = null; d.close(); }, errorInto: showErr(err) }), { primary: true }), btn('Cancel', d.close)), err);
+          (r) => (r && r.note ? `Saved. ${r.note}` : 'Saved'), { close: () => { st.opts = null; d.close(); }, errorInto: showErr(err) }), { primary: true }), btn('Cancel', d.close)), err);
     });
   }
 

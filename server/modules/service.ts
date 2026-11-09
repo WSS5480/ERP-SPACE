@@ -231,6 +231,11 @@ export const module: ErpModule = {
     });
     coPost("/service/providers", async (c, co, a, b) => {
       await requireRole(c, co, a, ["store_manager"], "setting up a service company");
+      const vid = uuid(b.vendorId), pid = uuid(b.id);
+      if (vid) {
+        const cur = pid ? (await c.query<{ vendor_id: string | null }>(`select vendor_id from service_provider where entity_id = $1 and id = $2`, [co.id, pid])).rows[0]?.vendor_id : null;
+        if (cur !== vid) await requireRole(c, co, a, ["controller"], "linking a service company to a vendor (it sets how their bills are coded)");
+      }
       return plain(() => S.saveProvider(c, scopeOf(co, a), { id: uuid(b.id) ?? undefined, name: str(b.name, 120), phone: str(b.phone, 40), email: str(b.email, 160),
         hourlyRateMinor: money(b.hourlyRate), active: b.active !== false, vendorId: uuid(b.vendorId) }));
     });

@@ -76,7 +76,7 @@ export async function requireRole(c: Client, co: Company, a: Actor, roles: strin
 
 /** For things the client's companies share (the chart, vendor categories): the role must hold in every one of them. */
 export async function requireRoleEverywhere(c: Client, co: Company, a: Actor, roles: string[], doing: string) {
-  const all = (await c.query<{ id: string; name: string }>(`select id, name from entity where tenant_id = $1 /* unscoped: the client's companies */`, [co.tenantId])).rows;
+  const all = (await c.query<{ id: string; name: string }>(`select id, name from entity where tenant_id = $1 and status <> 'closed' /* unscoped: the client's open companies */`, [co.tenantId])).rows;
   for (const e of all) {
     const held = await rolesOf(c, { ...co, id: e.id }, a.personId);
     need(held.has("owner") || roles.some((r) => held.has(r)),

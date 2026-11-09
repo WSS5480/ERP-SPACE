@@ -18,7 +18,7 @@
 //   billable service charges              the sale posts 4030; moved  Dr 4030  Cr 4050 service revenue
 
 import { createHash } from "node:crypto";
-import { q, one, type Client, type Scope } from "./db.ts";
+import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post } from "./posting.ts";
 import { profitObjectFor } from "./posting.ts";
 import * as inventory from "./inventory.ts";
@@ -1013,12 +1013,26 @@ export async function saveProvider(c: Client, scope: Scope, b: { id?: string; na
   const name = String(b.name ?? "").trim();
   need(name, "name the service company");
   const vendorId = b.vendorId && isId(b.vendorId) ? b.vendorId : null;
-  if (vendorId) {
-    // What a visit by them costs is accrued to 2050 until their bill comes, so their bills here code to 2050 and clear it.
-    const ok = await q(c, `select 1 from vendor_entity where entity_id = $1 and vendor_id = $2`, [scope.entityId, vendorId]);
-    need(ok.length, "that vendor is not set up in this company's payables");
-    await c.query(`update vendor_entity set default_gl_account_id = (select g.id from gl_account g join entity e on e.tenant_id = g.tenant_id
-                     where e.id = $1 and g.code = '2050') where entity_id = $1 and vendor_id = $2`, [scope.entityId, vendorId]);
+  const prev = b.id && isId(b.id) ? (await q<{ vendor_id: string | null }>(c, `select vendor_id from service_provider where entity_id = $1 and id = $2`, [scope.entityId, b.id]))[0]?.vendor_id ?? null : null;
+  let note: string | null = null;
+  if (vendorId && vendorId !== prev) {
+    // What a visit by them costs is accrued to 2050 until their bill comes, so their bills should code to 2050 and clear it.
+    // Only a vendor with no usual account (or its category's usual one) is switched; one payables set by hand is left alone.
+    const ve = (await q<{ gl: string | null; code: string | null; cat_gl: string | null; name: string }>(c, `
+      select ve.default_gl_account_id gl, g.code, vc.default_gl_account_id cat_gl, coalesce(v.dba, v.legal_name) name
+        from vendor_entity ve join vendor v on v.id = ve.vendor_id
+        left join gl_account g on g.id = ve.default_gl_account_id
+        left join vendor_category vc on vc.id = coalesce(ve.category_id, v.category_id)
+       where ve.entity_id = $1 and ve.vendor_id = $2`, [scope.entityId, vendorId]))[0];
+    need(ve, "that vendor is not set up in this company's payables");
+    if (!ve.gl || ve.gl === ve.cat_gl) {
+      await c.query(`update vendor_entity set default_gl_account_id = (select g.id from gl_account g join entity e on e.tenant_id = g.tenant_id
+                       where e.id = $1 and g.code = '2050') where entity_id = $1 and vendor_id = $2`, [scope.entityId, vendorId]);
+      await audit(c, scope, { table: "vendor_entity", rowId: vendorId, action: "update", before: { default_gl: ve.code }, after: { default_gl: "2050" },
+        reason: `linked to service company ${name}: their bills clear the service costs accrued` });
+    } else if (ve.code !== "2050") {
+      note = `${ve.name}'s bills still code to ${ve.code}. Code the bills for service visits to 2050 so they clear what each visit accrued.`;
+    }
   }
   const dup = await q(c, `select 1 from service_provider where entity_id = $1 and lower(name) = lower($2) and ($3::uuid is null or id <> $3)`,
     [scope.entityId, name, b.id && isId(b.id) ? b.id : null]);
@@ -1030,10 +1044,11 @@ export async function saveProvider(c: Client, scope: Scope, b: { id?: string; na
                            where entity_id = $1 and id = $2 returning id`,
       [scope.entityId, b.id, name, String(b.phone ?? ""), String(b.email ?? ""), b.hourlyRateMinor?.toString() ?? null, b.active !== false, vendorId]);
     need(r.length, "no such service company");
-    return { id: b.id };
+    return { id: b.id, note };
   }
-  return one(c, `insert into service_provider (entity_id, name, phone, email, hourly_rate_minor, vendor_id) values ($1,$2,nullif($3,''),nullif($4,''),$5,$6) returning id`,
+  const r = await one<{ id: string }>(c, `insert into service_provider (entity_id, name, phone, email, hourly_rate_minor, vendor_id) values ($1,$2,nullif($3,''),nullif($4,''),$5,$6) returning id`,
     [scope.entityId, name, String(b.phone ?? ""), String(b.email ?? ""), b.hourlyRateMinor?.toString() ?? null, vendorId]);
+  return { id: r.id, note };
 }
 
 // ------------------------------------------------------- the public form --

@@ -361,7 +361,15 @@ export async function updateVendor(c: Client, co: Company, a: Actor, input: Reco
        from vendor v join vendor_entity ve on ve.vendor_id = v.id and ve.entity_id = $2 where v.id = $1`, [v.id, co.id]))[0];
     if (cur && cat.id !== (cur.own ?? cur.shared)) {
       if (cur.own) await q(c, `update vendor_entity set category_id = $3 where vendor_id = $1 and entity_id = $2`, [v.id, co.id, cat.id]);
-      else await q(c, `update vendor set category_id = $2 where id = $1 and tenant_id = $3 /* unscoped: vendors are shared across the client's companies */`, [v.id, cat.id, co.tenantId]);
+      else {
+        // the shared category moves this vendor for every company, so the sign-off has to hold in each open one
+        const all = await q<{ id: string; name: string }>(c, `select id, name from entity where tenant_id = $1 and status <> 'closed' /* unscoped: the client's open companies */`, [co.tenantId]);
+        for (const e of all) {
+          const h = await rolesOf(c, { ...co, id: e.id }, a.personId);
+          need(SIGN_OFF.some((r) => h.has(r)), `changing ${v.legal_name}'s category changes it for every company, so it needs the controller or the owner in ${e.name} too`);
+        }
+        await q(c, `update vendor set category_id = $2 where id = $1 and tenant_id = $3 /* unscoped: vendors are shared across the client's companies */`, [v.id, cat.id, co.tenantId]);
+      }
     }
   }
   await audit(c, scopeOf(co, a), { table: "vendor", rowId: v.id, action: "update", before, after: { ...f, terms_days: terms },
