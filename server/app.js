@@ -356,6 +356,8 @@ const visibleScreens = () => {
   return SCREENS.filter((r) => (!r[4] || !S.modules || S.modules.includes(r[4])) && (!mine || mine.has(r[0])));
 };
 const canSee = (name) => visibleScreens().some(([n]) => n === name);
+// the phone's bottom bar: the usual four for the owner, otherwise the person's own first screens
+const tabsNow = () => (screensForPerson() ? visibleScreens().slice(0, 4).map(([n]) => n) : TABS.filter(canSee));
 function renderNav() {
   const cur = S.route.screen;
   const badge = (name) => (name === 'approvals' && badgeCount ? el('span', { class: 'badge', text: String(badgeCount), 'aria-label': `${badgeCount} waiting on you` }) : null);
@@ -377,9 +379,9 @@ function renderNav() {
   }
   $('#nav').replaceChildren(...navKids);
   $('#tabbar').replaceChildren(
-    ...TABS.filter(canSee).map((name) => { const [, label, ic] = SCREENS.find((s) => s[0] === name);
+    ...tabsNow().map((name) => { const [, label, ic] = SCREENS.find((s) => s[0] === name);
       return el('a', { href: `#/${S.co.id}/${name}`, class: cur === name ? 'on' : null }, icon(ic), label === 'Payables' ? 'Bills' : label, badge(name)); }),
-    el('button', { type: 'button', class: TABS.filter(canSee).includes(cur) ? null : 'on', onclick: openMore }, icon('more'), 'More'));
+    el('button', { type: 'button', class: tabsNow().includes(cur) ? null : 'on', onclick: openMore }, icon('more'), 'More'));
   $('#co-name').textContent = S.co.name;
   $('#as-name').textContent = S.person ? `${S.person.name}${S.person.roles.length ? ' · ' + roles(S.person.roles) : ''}` : 'Pick a person';
   $('#who').replaceChildren('Signed in as ', el('b', { text: S.me.viewer.name }));
@@ -387,7 +389,7 @@ function renderNav() {
 function openMore() {
   const d = openDialog('More', S.co.name, { sheet: true });
   d.body.append(el('div', { class: 'menu' },
-    visibleScreens().filter(([n]) => !TABS.filter(canSee).includes(n)).map(([name, label, ic]) =>
+    visibleScreens().filter(([n]) => !tabsNow().includes(n)).map(([name, label, ic]) =>
       el('button', { type: 'button', class: S.route.screen === name ? 'on' : null, onclick: () => { d.close(); go(name); } }, icon(ic), label)),
     el('button', { type: 'button', onclick: () => { d.close(); render(); } }, icon('refresh'), 'Refresh'),
     el('button', { type: 'button', onclick: () => { d.close(); signOut(); } }, icon('out'), 'Sign out')));
@@ -559,7 +561,7 @@ async function screenRoleHome() {
   const mine = visibleScreens().filter(([n]) => n !== 'home');
   const extras = (await Promise.all(HOME_CARDS.map((f) => Promise.resolve().then(f).catch(() => null)))).filter(Boolean);
   return frag(head('Home'), trialBanner(),
-    el('p', { class: 'lead', text: `Acting as ${who}${S.person && S.person.roles.length ? ` (${roles(S.person.roles)})` : ''}: these are the screens they work in.` }),
+    el('p', { class: 'lead', text: `Acting as ${who}. These are the screens they work in; switch who you’re acting as to see someone else’s view.` }),
     section('Your screens', null, null, el('div', { class: 'panel' }, mine.length
       ? mine.map(([name, label, ic]) => item({ title: label, detail: GROUP_HINT[name] || null, onClick: () => go(name) }))
       : empty('No screens here', 'This person holds no roles in this company. Give them one from Setup, or switch who you are acting as.', true))),
