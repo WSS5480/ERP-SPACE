@@ -146,6 +146,8 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
         el('button', { class: 'btn small primary', type: 'button', onclick: () => { d.close(); openEdit(x); } }, 'Edit'),
         el('button', { class: 'btn small', type: 'button', onclick: () => openStatus(p, reopen) }, 'Status…'),
         el('button', { class: 'btn small', type: 'button', onclick: () => openTags({ ids: id }) }, 'Price tag'),
+        // A printable sheet for the customer: photos, options, dimensions, price and the store (opens in a new tab).
+        el('a', { class: 'btn small', href: `/api/c/${S.co.id}/catalog/products/${id}/tear-sheet`, target: '_blank', rel: 'noopener' }, 'Tear sheet'),
         x.groups.length ? el('button', { class: 'btn small', type: 'button', onclick: () => openPriceCheck(x) }, 'Price it') : null,
       ];
       const kitTotal = x.kit.reduce((a, k) => a + Number(k.qty) * Number(k.price_minor), 0);

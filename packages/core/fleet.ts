@@ -989,7 +989,8 @@ async function notify(c: Client, scope: Scope, stopId: string | null, kind: stri
 }
 
 /** A message to a customer about something other than a stop (a service ticket), through the same log and provider. */
-export async function messageCustomer(c: Client, scope: Scope, m: { customerId: string; body: string; orderId?: string | null }) {
+export async function messageCustomer(c: Client, scope: Scope, m: { customerId: string; body: string; orderId?: string | null; kind?: "service_update" | "tear_sheet" }) {
+  const kind = m.kind ?? "service_update";
   const cu = await q<{ phone: string | null; email: string | null }>(c, `select phone, email from customer where entity_id = $1 and id = $2`, [scope.entityId, m.customerId]);
   if (!cu.length) return null;
   const channel: "sms" | "email" = cu[0].phone ? "sms" : "email";
@@ -997,11 +998,11 @@ export async function messageCustomer(c: Client, scope: Scope, m: { customerId: 
   const body = `${await companyName(c, scope.entityId)}: ${m.body}`.slice(0, 1000);
   const row = await one<{ id: string }>(c, `
     insert into customer_message (entity_id, sales_order_id, customer_id, kind, channel, to_addr, body, provider, status)
-    values ($1,$2,$3,'service_update',$4,$5,$6,$7,$8) returning id`,
-    [scope.entityId, m.orderId ?? null, m.customerId, channel, to || "-", body, provider.name, to ? "queued" : "skipped"]);
+    values ($1,$2,$3,$9,$4,$5,$6,$7,$8) returning id`,
+    [scope.entityId, m.orderId ?? null, m.customerId, channel, to || "-", body, provider.name, to ? "queued" : "skipped", kind]);
   if (!to) return row.id;
   try {
-    const r = await provider.send({ channel, to, body, kind: "service_update" });
+    const r = await provider.send({ channel, to, body, kind });
     await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end
                     where entity_id = $1 and id = $2`, [scope.entityId, row.id, r.ok ? "sent" : "failed", r.ref ?? null, r.error ?? null]);
   } catch (e) {

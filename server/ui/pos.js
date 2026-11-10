@@ -70,7 +70,7 @@
   // The cart lives in memory while the screen is open.
   let cart = null;
   const newCart = () => ({ kind: 'sale', customer: null, addressId: '', promisedOn: '', delivery: null, lines: [], primary: S.person ? S.person.id : '', second: '', secondPct: 50,
-    taxExemptRef: '', notes: '', overrideReason: '' });
+    taxExemptRef: '', notes: '', overrideReason: '', hold: false });
 
   async function screen(sub) {
     if (sub && sub.startsWith('receipt-')) return receiptPage(sub.slice(8));
@@ -124,12 +124,16 @@
         cart.addressId = addr.value;
         drawDelivery();
         addr.addEventListener('change', () => { cart.addressId = addr.value; cart.delivery = null; drawDelivery(); });
-        const exempt = input({ value: cart.taxExemptRef, placeholder: 'Certificate number', maxlength: '60' });
-        exempt.addEventListener('input', () => { cart.taxExemptRef = exempt.value; });
+        // Exempt only under a current certificate on file: picked, never typed.
+        const certs = c.certificates || [];
+        if (cart.taxExemptRef && !certs.some((x) => x.number === cart.taxExemptRef)) cart.taxExemptRef = '';
+        const exempt = select(certs.map((x) => [x.number, `${x.number} · ${x.state} · ${words(x.reason)}${x.expiresOn ? ` · until ${shortDay(x.expiresOn)}` : ''}`]), cart.taxExemptRef, 'Not exempt');
+        exempt.addEventListener('change', () => { cart.taxExemptRef = exempt.value; });
         custBox.replaceChildren(item({ title: c.name, detail: [c.number, c.phone, c.email].filter(Boolean).join(' · '),
           acts: [el('button', { class: 'btn small', type: 'button', onclick: () => { cart.customer = null; cart.addressId = ''; cart.taxExemptRef = ''; drawCustomer(); } }, 'Change')] }),
-          pad(el('div', { class: 'form-grid' }, field('Deliver to', addr), field('Tax exempt', exempt, { hint: c.tax_exempt_ref ? 'Certificate on file.' : 'Only with a certificate.' }),
-            el('div', {}, el('button', { class: 'btn small', type: 'button', onclick: () => addressDialog(c, drawCustomer) }, 'Add an address')))));
+          pad(el('div', { class: 'form-grid' }, field('Deliver to', addr), field('Tax exempt', exempt, { hint: certs.length ? 'Current certificates on file.' : 'Needs a current certificate on file.' }),
+            el('div', { class: 'toolbar' }, el('button', { class: 'btn small', type: 'button', onclick: () => addressDialog(c, drawCustomer) }, 'Add an address'),
+              el('button', { class: 'btn small', type: 'button', onclick: () => certificateDialog(c, drawCustomer) }, 'Add a certificate')))));
       } else {
         const q = input({ placeholder: 'Name, phone or email', inputmode: 'search', 'aria-label': 'Find a customer' });
         const res = el('div');
@@ -139,7 +143,7 @@
           try {
             const rows = await coApi(`/pos/customers?q=${encodeURIComponent(q.value.trim())}`);
             res.replaceChildren(...(rows.length ? rows.map((c) => item({ title: c.name, detail: [c.number, c.phone, c.email].filter(Boolean).join(' · '),
-              onClick: () => { cart.customer = c; cart.taxExemptRef = c.tax_exempt_ref || ''; drawCustomer(); } })) : [empty('No one by that.', null, true)]));
+              onClick: () => { cart.customer = c; cart.taxExemptRef = ((c.certificates || [])[0] || {}).number || ''; drawCustomer(); } })) : [empty('No one by that.', null, true)]));
           } catch (e) { res.replaceChildren(E.errorBox(e)); }
         }, 250); });
         custBox.replaceChildren(pad(el('div', {}, el('div', { class: 'toolbar' }, el('div', { class: 'grow' }, q),
@@ -187,7 +191,11 @@
 
     // ---- details and save
     const kind = el('div');
-    const drawKind = () => kind.replaceChildren(seg([['sale', 'Sale'], ['quote', 'Quote'], ['layaway', 'Layaway']], cart.kind, (v) => { cart.kind = v; drawKind(); go2.textContent = v === 'quote' ? 'Save the quote' : 'Save and take payment'; }));
+    const holdBox = el('input', { type: 'checkbox', checked: cart.hold || null });
+    holdBox.addEventListener('change', () => { cart.hold = holdBox.checked; });
+    const holdRow = setup.settings.quoteHoldsAllowed ? el('label', { class: 'check' }, holdBox, el('span', { text: ` Hold the in-stock items for the customer (up to ${plural(setup.settings.quoteHoldMaxDays, 'day')})` })) : null;
+    const drawKind = () => { kind.replaceChildren(seg([['sale', 'Sale'], ['quote', 'Quote'], ['layaway', 'Layaway']], cart.kind, (v) => { cart.kind = v; drawKind(); go2.textContent = v === 'quote' ? 'Save the quote' : 'Save and take payment'; }),
+      cart.kind === 'quote' && holdRow ? holdRow : null); };
     const promised = input({ type: 'date', min: todayIso(), value: cart.promisedOn });
     promised.addEventListener('change', () => { cart.promisedOn = promised.value; });
     const people = setup.people.map((p) => [p.id, p.name]);
@@ -208,7 +216,13 @@
       delivery: cart.delivery ? { day: cart.delivery.day, windowId: cart.delivery.windowId } : null, taxExemptRef: cart.taxExemptRef || null, notes: cart.notes, overrideReason: cart.overrideReason || undefined,
       salespeople: cart.second && cart.second !== cart.primary ? [{ id: cart.primary, splitPct: 100 - cart.secondPct }, { id: cart.second, splitPct: cart.secondPct }] : cart.primary ? [{ id: cart.primary, splitPct: 100 }] : [],
       lines: cart.lines.map((l) => ({ productId: l.productId, qty: l.qty, choices: l.choices, fulfillment: l.fulfillment, discountPct: l.discountPct || undefined })) }),
-      null, (r) => { const k = cart.kind; cart = newCart(); E.render(); openOrder(r.id, k !== 'quote' && !r.pendingOverrides.length ? 'checkout' : null); }) },
+      null, async (r) => {
+        const k = cart.kind, hold = cart.hold;
+        if (k === 'quote' && hold) {
+          try { const h = await post(`/pos/orders/${r.id}/hold`, {}); toast(`Holding ${plural(h.linesHeld, 'line')} until ${shortDay(h.heldUntil)}.`, 'good'); }
+          catch (e) { toast(`The quote is saved, but nothing is held: ${friendly(e)}`, 'warning'); }
+        }
+        cart = newCart(); E.render(); openOrder(r.id, k !== 'quote' && !r.pendingOverrides.length ? 'checkout' : null); }) },
       cart.kind === 'quote' ? 'Save the quote' : 'Save and take payment');
     drawKind();
     return frag(
@@ -326,8 +340,18 @@
       const acts = [];
       const btn = (label, fn, primary) => el('button', { class: 'btn' + (primary ? ' primary' : ''), type: 'button', onclick: fn }, label);
       if (o.kind === 'quote' && o.status === 'draft') acts.push(btn('Convert to a sale', (e) => run(e.currentTarget, out, () => post(`/pos/orders/${id}/convert`), 'Converted. Take payment to place it.', reload), true));
-      if (o.status === 'draft' && o.kind !== 'quote') acts.push(btn('Take payment and place', () => tenderDialog(o, 'checkout', reload), true));
-      if (['open', 'fulfilling', 'fulfilled'].includes(o.status) && Number(o.balance_minor) > 0 && o.kind !== 'return') acts.push(btn('Take a payment', () => tenderDialog(o, 'pay', reload), true));
+      const holding = o.hold && o.hold.status === 'active';
+      if (o.kind === 'quote' && o.status === 'draft') {
+        if (!holding && setup.settings.quoteHoldsAllowed) acts.push(btn('Hold stock', (e) => run(e.currentTarget, out, () => post(`/pos/orders/${id}/hold`, {}),
+          (r) => `Holding ${plural(r.linesHeld, 'line')} until ${dayLabel(r.heldUntil)}.${r.notHeld ? ` ${plural(r.notHeld, 'line')} could not be held.` : ''}`, reload)));
+        if (holding && mgr) acts.push(btn('Extend the hold', () => extendHoldDialog(o, reload)));
+        if (holding) acts.push(btn('Let the stock go', async (e) => {
+          const why = await E.askReason({ title: 'Let the held stock go', label: 'Why', confirm: 'Let it go', optional: true });
+          if (why !== null) run(e.currentTarget, out, () => post(`/pos/orders/${id}/hold/release`, { reason: why }), 'The stock is free again.', reload);
+        }));
+      }
+      if (o.status === 'draft' && o.kind !== 'quote') acts.push(btn('Take payment and place', () => tenderDialog(o, 'checkout', reload, mgr), true));
+      if (['open', 'fulfilling', 'fulfilled'].includes(o.status) && Number(o.balance_minor) > 0 && o.kind !== 'return') acts.push(btn('Take a payment', () => tenderDialog(o, 'pay', reload, mgr), true));
       const handable = o.lines.filter((l) => ['pickup', 'carry'].includes(l.fulfillment) && ['reserved', 'ready', 'open'].includes(l.line_status) && l.role === 'item');
       if (['open', 'fulfilling'].includes(o.status) && handable.length) acts.push(btn('Hand over', () => handDialog(o, handable, reload)));
       const returnable = o.lines.filter((l) => l.line_status === 'fulfilled' && Number(l.qty) > Number(l.returned_qty));
@@ -346,13 +370,21 @@
       if (['draft', 'open'].includes(o.status)) acts.push(btn('Cancel', () => cancelDialog(o, reload)));
       if (o.status !== 'cancelled') acts.push(btn(o.signed_at ? 'Sign again' : 'Signature', () => signatureDialog(o, reload)));
       acts.push(btn('Receipt', () => { d.close(); go('pos', 'receipt-' + id); }));
-      if (next === 'checkout' && o.status === 'draft') { next = null; setTimeout(() => tenderDialog(o, 'checkout', reload), 0); }
+      if (o.kind !== 'return') {
+        acts.push(el('a', { class: 'btn', href: `/api/c/${S.co.id}/pos/orders/${id}/tear-sheet`, target: '_blank', rel: 'noopener' }, 'Tear sheet'));
+        if (o.customer_id) acts.push(btn('Send the tear sheet', (e) => run(e.currentTarget, out, () => post(`/pos/orders/${id}/tear-sheet/send`, {}),
+          (r) => `Sent by ${r.channel === 'sms' ? 'text' : 'email'} to ${r.to}${r.status === 'skipped' ? ' (no address on file, so it was not sent)' : ''}. The link works until ${shortDay(r.expiresAt)}.`)));
+      }
+      if (next === 'checkout' && o.status === 'draft') { next = null; setTimeout(() => tenderDialog(o, 'checkout', reload, mgr), 0); }
       return frag(
         el('p', { class: 'lead', text: `${o.number} · ${words(o.kind)} · ${words(o.status)}${o.original_number ? ` · against ${o.original_number}` : ''}` }),
         el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Customer', o.customer || 'Walk-in'), fact('Total', money(o.total_minor)), fact('Paid', money(o.paid_minor)),
           fact('Owed', money(o.balance_minor)), fact('Tax', `${money(o.tax_minor)}${o.tax_exempt_ref ? ' (exempt ' + o.tax_exempt_ref + ')' : ''}`),
           fact('Goes by', FUL[o.fulfillment] || o.fulfillment), o.promised_on ? fact('Promised', dayLabel(o.promised_on)) : null,
-          o.quote_expires_on ? fact('Quote good until', dayLabel(o.quote_expires_on)) : null, o.ship_line1 ? fact('Deliver to', `${o.ship_line1}, ${o.ship_city} ${o.ship_state}`) : null,
+          o.quote_expires_on ? fact('Quote good until', dayLabel(o.quote_expires_on)) : null,
+          o.hold ? fact('Stock hold', o.hold.status === 'active' ? `${plural(o.hold.lines_held, 'line')} held until ${dayLabel(o.hold.held_until)}${o.hold.extended_by ? ` (extended by ${o.hold.extended_by})` : ''}` : `ended: ${words(o.hold.status)}`) : null,
+          o.deposit && Number(o.deposit.requiredMinor) > 0 && o.status === 'draft' ? fact('Deposit needed', money(o.deposit.requiredMinor)) : null,
+          o.ship_line1 ? fact('Deliver to', `${o.ship_line1}, ${o.ship_city} ${o.ship_state}`) : null,
           o.delivery_stop ? fact('Delivery', `${o.delivery_stop.number} · ${dayLabel(o.delivery_stop.day)} ${o.delivery_stop.window || ''} · ${o.delivery_stop.confirmed ? 'confirmed' : 'to confirm'}`)
             : o.delivery_day ? fact('Delivery day', `${dayLabel(o.delivery_day)} ${o.delivery_window || ''} · not booked yet`) : null,
           fact('Sold by', o.salespeople.map((p) => `${p.name} ${p.split_bps / 100}%`).join(', ') || '—'),
@@ -360,6 +392,9 @@
         o.kind === 'layaway' && o.layaway_schedule.length ? section('Layaway schedule', o.paid_off_at ? 'paid off' : null, null, el('div', { class: 'panel' },
           o.layaway_schedule.map((s) => item({ title: dayLabel(s.due), amount: money(s.amount) })))) : null,
         section('Lines', null, null, el('div', { class: 'panel' }, lineItems)),
+        o.taxes && o.taxes.length ? section('Sales tax by jurisdiction', null, null, el('div', { class: 'panel' }, o.taxes.map((x) => item({ title: `${x.name} · ${words(x.level)}`,
+          amount: money(x.tax_minor), detail: [`${(x.rate_bps / 100).toFixed(2)}%`, x.sourced === 'destination' ? 'where the goods go' : 'at the store',
+            Number(x.taxable_minor) ? `on ${money(x.taxable_minor)}` : null, Number(x.exempt_minor) ? `${money(x.exempt_minor)} exempt (${words(x.exempt_reasons || '')})` : null].filter(Boolean).join(' · ') })))) : null,
         el('div', { class: 'dlg-acts' }, acts), out,
         section('Payments', null, null, el('div', { class: 'panel' }, o.receipts.length ? o.receipts.map((r) => item({ title: `${r.number} · ${TENDER[r.method] || r.method}`, amount: money(r.amount_minor),
           detail: [r.reference, r.received_by, ago(r.received_at)].filter(Boolean).join(' · ') })) : empty('Nothing paid yet.', null, true))),
@@ -384,22 +419,57 @@
     return { rows, add, values: () => rows.filter((x) => Number(x.a.value) > 0).map((x) => ({ method: x.m.value, amount: x.a.value, reference: x.r.value })) };
   }
 
-  function tenderDialog(o, mode, after) {
+  function tenderDialog(o, mode, after, mgr) {
     const d = openDialog(mode === 'checkout' ? `Place ${o.number}` : `Payment on ${o.number}`, `${money(o.balance_minor)} owed`, { wide: true });
     const box = el('div', { class: 'panel' });
     const t = tenderRows(box, [['card', dollars(o.kind === 'layaway' && mode === 'checkout' ? Math.ceil(Number(o.total_minor) * 0.2) : o.balance_minor)]]);
     const out = outBox();
     const pad2 = mode === 'checkout' ? sigPad() : null;
+    // The least that must be paid today when goods will be on order, and a manager's way past it.
+    const depBox = el('div');
+    const depWhy = input({ maxlength: '300', placeholder: 'Why less is allowed' });
+    const dep = o.deposit && mode === 'checkout' && o.kind === 'sale' && Number(o.deposit.requiredMinor) > 0 ? o.deposit : null;
+    if (dep) depBox.replaceChildren(resultBox('warning', 'warn', `Deposit needed: at least ${money(dep.requiredMinor)}`,
+      `${(dep.specialOrderBps / 100).toFixed(0)}% of the ${money(dep.onOrderMinor)} of goods that will be ordered for the customer${dep.stockedBps ? `, and ${(dep.stockedBps / 100).toFixed(0)}% of the ${money(dep.stockedMinor)} in stock` : ''}.`
+        + (mgr ? ' As a store manager you can allow less with a reason below.' : ' Less needs a store manager.')),
+      mgr ? pad(el('div', { class: 'form-grid' }, field('Allow a smaller deposit because', depWhy, { wide: true, hint: 'Only if the customer pays less than the minimum. Kept with the sale.' }))) : null);
     const b = el('button', { class: 'btn primary', type: 'button', onclick: () => run(b, out, () => post(`/pos/orders/${o.id}/${mode}`, { sessionId: getSess(), tenders: t.values(),
-      signature: pad2 && pad2.signed() ? pad2.data() : undefined, signedName: o.customer || '' }),
+      signature: pad2 && pad2.signed() ? pad2.data() : undefined, signedName: o.customer || '', depositOverrideReason: depWhy.value.trim() || undefined }),
       (r) => [mode === 'checkout' ? `Placed: ${words(r.status)}.` : 'Payment taken.', r.delivery ? (r.delivery.booked ? `Delivery ${r.delivery.number} booked for ${shortDay(r.delivery.day)}${r.delivery.confirmed ? ' and confirmed' : ', waiting for the delivery manager to confirm'}.` : r.delivery.note) : null, r.changeMinor && Number(r.changeMinor) ? `Change due ${money(r.changeMinor)}.` : null,
         Number(r.balanceMinor) > 0 ? `${money(r.balanceMinor)} still owed.` : 'Paid in full.', r.onOrder ? `${plural(r.onOrder, 'line')} on order with the vendor.` : null,
         r.handedOver ? `${plural(r.handedOver, 'line')} handed over.` : null].filter(Boolean).join(' '),
       async () => { await after(); E.render(); }) }, mode === 'checkout' ? 'Place the order' : 'Take it');
     d.body.append(el('p', { class: 'lead', text: o.kind === 'layaway' ? 'A layaway needs its deposit now; the goods wait until it is paid in full.' : 'Split across as many tenders as the customer likes. Cash can be more than owed; the change is shown.' }),
-      box, el('div', { class: 'toolbar' }, el('button', { class: 'btn small', type: 'button', onclick: () => t.add('cash', '') }, 'Another tender')),
+      depBox, box, el('div', { class: 'toolbar' }, el('button', { class: 'btn small', type: 'button', onclick: () => t.add('cash', '') }, 'Another tender')),
       pad2 ? section('Customer signature', 'optional', null, pad2.node) : null,
       el('div', { class: 'dlg-acts' }, b, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Close')), out);
+  }
+
+  function certificateDialog(c, after) {
+    const d = openDialog('Add a tax-exemption certificate', c.name);
+    const number = input({ maxlength: '60', placeholder: 'As printed on the certificate' });
+    const state = input({ maxlength: '2', autocapitalize: 'characters', placeholder: 'PA' });
+    const reason = select([['resale', 'Resale'], ['government', 'Government'], ['nonprofit', 'Nonprofit'], ['agricultural', 'Agricultural'], ['manufacturing', 'Manufacturing'], ['other', 'Other']], 'resale');
+    const expires = input({ type: 'date', min: todayIso() });
+    const out = outBox();
+    const b = el('button', { class: 'btn primary', type: 'button', onclick: () => run(b, out, () => post(`/pos/customers/${c.id}/certificates`, { number: number.value,
+      state: state.value, reason: reason.value, expiresOn: expires.value || null }), null, async () => {
+      c.certificates = [{ number: number.value.trim(), state: state.value.trim().toUpperCase(), reason: reason.value, expiresOn: expires.value || null }, ...(c.certificates || [])];
+      cart.taxExemptRef = number.value.trim(); d.close(); toast('Certificate on file.', 'good'); after(); }) }, 'Keep it on file');
+    d.body.append(el('p', { class: 'lead', text: 'Keep a copy of the paper certificate. A sale is only exempt in the certificate’s state, and an expired certificate is refused.' }),
+      el('div', { class: 'form-grid' }, field('Certificate number', number, { wide: true }), field('State', state), field('Why exempt', reason), field('Expires', expires, { hint: 'Leave empty if it does not expire.' })),
+      el('div', { class: 'dlg-acts' }, b, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+  }
+
+  function extendHoldDialog(o, after) {
+    const d = openDialog('Extend the stock hold', `${o.number} · held until ${dayLabel(o.hold.held_until)}`);
+    const until = input({ type: 'date', min: o.hold.held_until, max: o.quote_expires_on || null, value: o.quote_expires_on || '' });
+    const why = input({ maxlength: '300', placeholder: 'Why the customer needs longer' });
+    const out = outBox();
+    const b = el('button', { class: 'btn primary', type: 'button', onclick: () => run(b, out, () => post(`/pos/orders/${o.id}/hold/extend`, { until: until.value, reason: why.value }),
+      'Extended.', async () => { await after(); d.close(); }) }, 'Extend it');
+    d.body.append(el('div', { class: 'form-grid' }, field('Hold until', until, { hint: o.quote_expires_on ? `No later than the quote, ${dayLabel(o.quote_expires_on)}.` : null }),
+      field('Reason', why, { wide: true })), el('div', { class: 'dlg-acts' }, b, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
   }
 
   function handDialog(o, lines, after) {
@@ -577,6 +647,7 @@
         detail: [`${Number(l.qty)} × ${money(l.unit_price_minor)}`, Number(l.discount_minor) ? `${money(l.discount_minor)} off` : null, l.role === 'item' ? FUL[l.fulfillment] : null,
           l.promised_on ? `promised ${shortDay(l.promised_on)}` : null].filter(Boolean).join(' · ') })),
       row('Subtotal', money(Number(o.subtotal_minor) - Number(o.discount_minor))), row(`Tax${o.tax_exempt_ref ? ' (exempt ' + o.tax_exempt_ref + ')' : ''}`, money(o.tax_minor)),
+      (o.taxes || []).length > 1 ? o.taxes.map((x) => row(`· ${x.name} ${(x.rate_bps / 100).toFixed(2)}%`, money(x.tax_minor))) : null,
       row('Total', money(o.total_minor), true),
       o.receipts.map((r) => row(`${TENDER[r.method] || r.method}${r.reference ? ' ' + r.reference : ''}`, money(r.amount_minor))),
       row('Balance', money(o.balance_minor), true),

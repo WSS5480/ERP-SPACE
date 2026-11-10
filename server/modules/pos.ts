@@ -2,7 +2,7 @@
 // Routes under /api/c/<company>/pos/... The rules live in packages/core/pos.ts;
 // this file decides who may do what, reads requests and shapes screen data.
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
-import { need, requireRole, str, uuid, int, minor, ModuleError } from "./kit.ts";
+import { need, requireRole, str, uuid, int, minor, ModuleError, PublicPage } from "./kit.ts";
 import { q, one } from "../../packages/core/db.ts";
 import { scopeOf, rolesOf } from "../actions.ts";
 import * as pos from "../../packages/core/pos.ts";
@@ -11,11 +11,16 @@ import { PostingError } from "../../packages/core/posting.ts";
 import { PricingError, priceConfigured, type Choice } from "../../packages/core/pricing.ts";
 import { ArError } from "../../packages/core/ar.ts";
 import { ShopError } from "../../packages/core/shop.ts";
+import * as tax from "../../packages/core/tax.ts";
+import * as sheet from "./tearsheet.ts";
+import { currentImageFetch } from "./catalog.ts";
+import { tx } from "../../packages/core/db.ts";
 
 const ID = "([0-9a-fA-F-]{36})";
 
 export function refusal(e: unknown): unknown {
-  if (e instanceof pos.PosError || e instanceof InventoryError || e instanceof PostingError || e instanceof PricingError || e instanceof ArError || e instanceof ShopError)
+  if (e instanceof pos.PosError || e instanceof InventoryError || e instanceof PostingError || e instanceof PricingError || e instanceof ArError || e instanceof ShopError
+    || e instanceof tax.TaxError || e instanceof sheet.SheetError)
     return new ModuleError(e.message);
   return e;
 }
@@ -26,6 +31,11 @@ const safe = <A extends unknown[], R>(fn: (...a: A) => Promise<R>) => async (...
 const SELL = ["sales", "cashier", "store_manager"];
 const TILL = ["cashier", "store_manager"];
 const MANAGER = ["store_manager"];
+const CERTS = ["store_manager", "ar_clerk", "controller"];
+const isMgr = (held: Set<string>) => held.has("owner") || held.has("store_manager");
+/** Where links in customer messages point: the service's public address. */
+const publicBase = () => (process.env.ERP_PUBLIC_URL || process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/+$/, "");
+const sheetEnv = (): sheet.SheetEnv => ({ imageFetch: currentImageFetch() });
 const day = (v: unknown) => { const s = str(v, 10); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null; };
 const sc = (co: Company, a: Actor) => scopeOf(co, a);
 
@@ -67,6 +77,9 @@ async function customers(c: Client, co: Company, url: URL) {
   const term = str(url.searchParams.get("q"), 80);
   if (term.length < 2) return [];
   return q(c, `select cu.id, cu.number, cu.name, cu.phone, cu.email, cu.kind, cu.tax_exempt_ref, cu.status,
+      (select json_agg(json_build_object('id', x.id, 'number', x.number, 'state', x.state, 'reason', x.reason, 'expiresOn', x.expires_on) order by x.expires_on desc nulls first)
+         from tax_exemption_certificate x where x.entity_id = cu.entity_id and x.customer_id = cu.id and x.status = 'active'
+          and (x.expires_on is null or x.expires_on >= current_date)) certificates,
       (select json_agg(json_build_object('id', a.id, 'label', a.label, 'line1', a.line1, 'city', a.city, 'state', a.state, 'postal', a.postal, 'isDefault', a.is_default)
                order by a.is_default desc) from customer_address a where a.customer_id = cu.id and a.entity_id = cu.entity_id) addresses
     from customer cu where cu.entity_id = $1 and cu.status <> 'inactive'
@@ -150,7 +163,12 @@ async function sessions(c: Client, co: Company) {
 
 export const module: ErpModule = {
   id: "pos",
-  register({ coGet, coPost }) {
+  register({ coGet, coPost, publicRoute }) {
+    // The customer's copy: the link's random token is the only key, and it opens that one sheet, read only.
+    publicRoute("GET", /^\/sheet\/([A-Za-z0-9_-]{20,100})$/, async (_req, _url, m) => {
+      const page = await tx({ kind: "system", label: "customer (tear sheet link)" }, (c) => sheet.publicSheet(c, m[1], sheetEnv()));
+      return page ? [200, page] : [404, sheet.notFoundPage()];
+    });
     coGet("/pos/setup", safe((c, co, _u, _m, p) => setup(c, co, p)));
     coGet("/pos/customers", safe((c, co, url) => customers(c, co, url)));
     coGet("/pos/products", safe((c, co, url) => products(c, co, url)));
@@ -238,7 +256,8 @@ export const module: ErpModule = {
       const held = await requireRole(c, co, a, SELL, "checking out a sale");
       return pos.checkout(c, sc(co, a), m[2], { sessionId: uuid(b.sessionId), tenders: tenders(b.tenders),
         signatureDataUrl: typeof b.signature === "string" ? b.signature : undefined, signedName: str(b.signedName, 120),
-        deliveryManager: ["owner", "store_manager", "dispatcher"].some((r) => held.has(r)) });
+        deliveryManager: ["owner", "store_manager", "dispatcher"].some((r) => held.has(r)),
+        manager: isMgr(held), depositOverrideReason: str(b.depositOverrideReason, 300) || undefined });
     }));
     coPost(`/pos/orders/${ID}/pay`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, TILL.concat("sales"), "taking a payment");
@@ -259,6 +278,60 @@ export const module: ErpModule = {
       await requireRole(c, co, a, SELL, "taking a signature");
       return pos.saveSignature(c, sc(co, a), m[2], typeof b.signature === "string" ? b.signature : "", str(b.signedName, 120));
     }));
+    // ---- selling rules: deposit minimums and quote holds
+    coPost("/pos/settings", safe(async (c, co, a, b) => {
+      await requireRole(c, co, a, ["store_manager", "controller"], "changing the selling rules");
+      const pctIn = (v: unknown) => (v === undefined || v === null || v === "" ? undefined : Math.round(Number(v) * 100));
+      return pos.saveSettings(c, sc(co, a), { specialOrderDepositBps: pctIn(b.specialOrderDepositPct), stockedDepositBps: pctIn(b.stockedDepositPct),
+        quoteHoldsAllowed: typeof b.quoteHoldsAllowed === "boolean" ? b.quoteHoldsAllowed : undefined,
+        quoteHoldMaxDays: b.quoteHoldMaxDays === undefined ? undefined : int(b.quoteHoldMaxDays) });
+    }));
+    coGet(`/pos/orders/${ID}/deposit`, safe((c, co, _u, m) => pos.depositRequirement(c, co.id, m[2])));
+
+    // ---- quote stock holds
+    coPost(`/pos/orders/${ID}/hold`, safe(async (c, co, a, b, m) => {
+      await requireRole(c, co, a, SELL, "holding stock for a quote");
+      return pos.holdQuote(c, sc(co, a), m[2], { days: b.days === undefined || b.days === "" ? undefined : int(b.days) });
+    }));
+    coPost(`/pos/orders/${ID}/hold/extend`, safe(async (c, co, a, b, m) => {
+      await requireRole(c, co, a, MANAGER, "keeping a quote's stock on hold longer");
+      return pos.extendHold(c, sc(co, a), m[2], str(b.until, 10), str(b.reason, 300));
+    }));
+    coPost(`/pos/orders/${ID}/hold/release`, safe(async (c, co, a, b, m) => {
+      await requireRole(c, co, a, SELL, "letting a quote's stock go");
+      return pos.releaseHold(c, sc(co, a), m[2], str(b.reason, 300));
+    }));
+
+    // ---- exemption certificates
+    coGet(`/pos/customers/${ID}/certificates`, safe((c, co, _u, m) => tax.certificates(c, co.id, m[2])));
+    coPost(`/pos/customers/${ID}/certificates`, safe(async (c, co, a, b, m) => {
+      await requireRole(c, co, a, CERTS, "keeping a tax-exemption certificate on file");
+      return tax.saveCertificate(c, sc(co, a), { customerId: m[2], number: str(b.number, 60), state: str(b.state, 2), reason: str(b.reason, 20),
+        expiresOn: str(b.expiresOn, 10) || null });
+    }));
+    coPost(`/pos/certificates/${ID}/void`, safe(async (c, co, a, b, m) => {
+      await requireRole(c, co, a, CERTS, "voiding a tax-exemption certificate");
+      return tax.voidCertificate(c, sc(co, a), m[2], str(b.reason, 300));
+    }));
+
+    // ---- tear sheets: the print page (signed in), and a link the customer can open
+    coGet(`/pos/orders/${ID}/tear-sheet`, safe(async (c, co, _u, m) => {
+      const html = await sheet.orderSheet(c, co.id, m[2], sheetEnv());
+      return html ? new PublicPage(html) : null;
+    }));
+    coGet(`/pos/products/${ID}/tear-sheet`, safe(async (c, co, url, m) => {
+      const html = await sheet.productSheet(c, co.id, m[2], sheetEnv(), uuid(url.searchParams.get("locationId")));
+      return html ? new PublicPage(html) : null;
+    }));
+    coPost(`/pos/orders/${ID}/tear-sheet/send`, safe(async (c, co, a, b, m) => {
+      await requireRole(c, co, a, SELL, "sending a customer their quote");
+      return sheet.sendLink(c, sc(co, a), { orderId: m[2], customerId: uuid(b.customerId), baseUrl: publicBase() });
+    }));
+    coPost(`/pos/products/${ID}/tear-sheet/send`, safe(async (c, co, a, b, m) => {
+      await requireRole(c, co, a, SELL, "sending a customer a product sheet");
+      return sheet.sendLink(c, sc(co, a), { productId: m[2], customerId: uuid(b.customerId), baseUrl: publicBase() });
+    }));
+
     coPost(`/pos/orders/${ID}/return`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, TILL, "taking a return");
       return pos.returnGoods(c, sc(co, a), m[2], {

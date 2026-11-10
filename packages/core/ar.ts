@@ -20,6 +20,7 @@
 // that table and tie to the general ledger by construction.
 
 import { q, one, audit, type Client, type Scope } from "./db.ts";
+import { postLines as postTaxLines } from "./tax.ts";
 import { post, profitObjectFor, type PostLine } from "./posting.ts";
 import { format, mulBps } from "./money.ts";
 
@@ -142,6 +143,8 @@ export async function invoiceFulfilment(c: Client, scope: Scope, orderId: string
   const date = today();
   const je = await post(c, scope, { date, sourceType: "sale", sourceId: orderId,
     description: `Sale ${so.number}, ${lines.length} line${lines.length === 1 ? "" : "s"} handed over`, lines: out });
+  // The tax just credited to 2100 is the lines' tax by jurisdiction, now posted on this day.
+  await postTaxLines(c, scope.entityId, lines.map((l) => l.id), je, date);
 
   // The customer-facing invoice.
   const kind = gross < 0n ? "credit_memo" : "sale";

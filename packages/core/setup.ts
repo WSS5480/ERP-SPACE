@@ -4,6 +4,7 @@
 // default settings -- applied to one company. It only ever adds.
 
 import { adoptOpeningBalances } from "./ar.ts";
+import { derivedRate, locationRateChanged } from "./tax.ts";
 import { q, one, type Client, type Scope } from "./db.ts";
 import { post } from "./posting.ts";
 import { installStarters } from "./reports.ts";
@@ -500,12 +501,17 @@ export async function saveLocation(c: Client, scope: Scope, input: {
   if (hasGeo && (Math.abs(input.lat!) > 90 || Math.abs(input.lng!) > 180)) throw new SetupError("that map point is off the map");
   const addr = JSON.stringify(input.address ?? {});
   if (input.id) {
+    // A store taxed by its jurisdictions shows their combined rate; that rate is changed there, not here.
+    const derived = ["store", "outlet"].includes(input.kind) ? await derivedRate(c, scope.entityId, input.id).catch(() => null) : null;
+    if (derived !== null && input.taxRateBps !== undefined && tax !== derived)
+      throw new SetupError(`this store's sales tax comes from its tax jurisdictions (${(derived / 100).toFixed(2)}% together); change the rates in Sales tax setup`);
     const r = await c.query(
       `update location set code = $3, name = $4, kind = $5, state = $6, tax_rate_bps = $7, address = $8,
          geo = case when $9::float8 is null then geo else point($9, $10) end
        where id = $1 and entity_id = $2`,
       [input.id, scope.entityId, code, input.name.trim(), input.kind, st, tax, addr, hasGeo ? input.lng : null, hasGeo ? input.lat : null]);
     if (!r.rowCount) throw new SetupError("no such location");
+    await locationRateChanged(c, scope, input.id, tax);   // a store kept at a single rate: the new rate from today
     return input.id;
   }
   const id = (await one<{ id: string }>(c,

@@ -336,6 +336,7 @@
     style();
     if (!S.person) throw new Error('Pick who you are acting as; reports show what that person may see');
     if (sub === 'new') return editor(null);
+    if (sub === 'tax-filing') return taxFiling();
     if (/^e-[0-9a-f-]{36}$/i.test(sub)) return editor(sub.slice(2));
     if (/^r-[0-9a-f-]{36}$/i.test(sub)) return runView(sub.slice(2));
     return listView();
@@ -364,10 +365,56 @@
     };
     search.addEventListener('input', () => { QUERY = search.value; draw(); });
     draw();
-    return frag(head('Reports', [btn('New report', () => go('reports', 'new'), 'primary', 'plus')]),
+    return frag(head('Reports', [btn('Sales tax filing', () => go('reports', 'tax-filing'), null, 'file'), btn('New report', () => go('reports', 'new'), 'primary', 'plus')]),
       el('div', { class: 'toolbar' }, el('div', { class: 'grow' }, search)),
       box,
       el('p', { class: 'foot', text: 'Reports show only what the person you are acting as may see. Starters come with the modules you have on; make your own with New report or by duplicating one.' }));
+  }
+
+  // ------------------------------------------------------ sales tax filing
+  // Per jurisdiction for a period: gross, exempt by reason, taxable, tax, returns;
+  // tied to GL 2100 with any difference shown first. Cards, never a wide table.
+  const TAXP = { from: '', to: '' };
+  async function taxFiling() {
+    const iso = (d) => d.toISOString().slice(0, 10);
+    const now = new Date();
+    if (!TAXP.from) { TAXP.from = iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))); TAXP.to = iso(now); }
+    const from = input({ type: 'date', value: TAXP.from, 'aria-label': 'First day' }), to = input({ type: 'date', value: TAXP.to, 'aria-label': 'Last day' });
+    const out = el('div');
+    const month = (k) => { const m = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + k, 1)); const e = new Date(Date.UTC(m.getUTCFullYear(), m.getUTCMonth() + 1, 0));
+      from.value = iso(m); to.value = k === 0 ? iso(now) : iso(e); load(); };
+    const row = (k, v, strong) => el('div', { class: 'li' }, el('div', { class: 't', text: k }), el('div', { class: 'amt' }, strong ? el('b', { text: v }) : v));
+    async function load() {
+      TAXP.from = from.value; TAXP.to = to.value;
+      out.replaceChildren(loadingNode('Adding up the period…'));
+      try {
+        const f = await coApi(`/reports/tax-filing?from=${encodeURIComponent(from.value)}&to=${encodeURIComponent(to.value)}`);
+        const tie = f.tie;
+        out.replaceChildren(frag(
+          resultBox(tie.ties ? 'good' : 'critical', tie.ties ? 'ok' : 'warn', tie.ties ? 'Ties to GL 2100' : 'Does not tie to GL 2100', tie.note),
+          E.tilesRow(E.tile({ label: 'Gross sales', value: money(f.totals.grossMinor) }), E.tile({ label: 'Taxable sales', value: money(f.totals.taxableMinor) }),
+            E.tile({ label: 'Tax collected', value: money(f.totals.taxMinor) }), E.tile({ label: 'Net tax due', value: money(f.totals.netTaxMinor), tone: 'good' })),
+          f.rows.length ? f.rows.map((r) => section(`${r.name} · ${r.state}`, `${r.code}${r.filingRef ? ' · filed under ' + r.filingRef : ''}`, null, el('div', { class: 'panel' },
+            row('Gross sales', money(r.grossMinor)), row('Exempt sales', money(r.exemptMinor)),
+            Object.entries(r.exemptBy).map(([k, v]) => row(`· ${f.reasons[k] || k}`, money(v))),
+            row('Taxable sales', money(r.taxableMinor)), row('Tax collected', money(r.taxMinor)),
+            row('Returns', money(r.returnsMinor)), row('Tax refunded on returns', money(r.returnsTaxMinor)), row('Net tax due', money(r.netTaxMinor), true))))
+            : el('div', { class: 'panel' }, empty('Nothing reached the ledger in this period.', null, true)),
+          el('div', { class: 'panel' }, row('GL 2100, sales and returns', money(tie.glSalesMinor)), row('Jurisdictions together', money(tie.collectedMinor)),
+            row('Difference', money(tie.differenceMinor), true), Number(tie.glOtherMinor) ? row('Other 2100 activity (payments to the state and the like)', money(tie.glOtherMinor)) : null)));
+      } catch (e) { out.replaceChildren(resultBox('critical', 'fail', 'The filing did not load', friendly(e))); }
+    }
+    const exp = btn('Export CSV', async (e) => {
+      const b = e.currentTarget; busy(b, true, 'Exporting…');
+      try { await download(await post('/reports/tax-filing/export', { from: from.value, to: to.value })); }
+      catch (err) { toast(friendly(err), 'critical'); } finally { busy(b, false); }
+    }, 'primary', 'file');
+    load();
+    return frag(head('Sales tax filing', [exp, btn('All reports', () => go('reports', ''))]),
+      el('p', { class: 'lead', text: 'What to file, per jurisdiction, for sales that reached the ledger in the period (handed over or returned). The jurisdictions’ total is checked against GL 2100.' }),
+      el('div', { class: 'rp-acts' }, btn('This month', () => month(0)), btn('Last month', () => month(-1)),
+        field('From', from), field('To', to), btn('Show', () => load(), null, 'refresh')),
+      out);
   }
 
   const PARAMS = new Map();   // report id -> last prompt values, kept while the page is open

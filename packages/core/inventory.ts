@@ -91,6 +91,31 @@ export async function reserveOrder(c: Client, entityId: string, orderId: string)
 }
 
 /**
+ * Reserve only what can be covered now, for the named open stock lines (a
+ * quote holding stock for the customer). Lines that cannot be covered stay
+ * open -- nothing goes on order. Released with releaseLines.
+ */
+export async function reserveLines(c: Client, entityId: string, orderId: string, lineIds: string[]): Promise<string[]> {
+  if (!lineIds.length) return [];
+  const lines = await q<{ id: string; product_id: string; qty: string; fulfil_from_id: string | null; kind: string }>(c, `
+    select l.id, l.product_id, l.qty, l.fulfil_from_id, p.kind
+      from sales_order_line l join product p on p.id = l.product_id
+     where l.entity_id = $1 and l.sales_order_id = $2 and l.line_status = 'open' and l.qty > 0 and l.id = any($3)
+     order by l.seq for update of l`, [entityId, orderId, lineIds]);
+  const out: string[] = [];
+  for (const l of lines) {
+    if (l.kind !== "stock" || !l.fulfil_from_id) continue;
+    const av = await q<{ a: string }>(c, `select on_hand - reserved - held a from stock_level where entity_id = $1 and product_id = $2 and location_id = $3 for update`,
+      [entityId, l.product_id, l.fulfil_from_id]);
+    if (Number(av[0]?.a ?? 0) < Number(l.qty)) continue;
+    await bump(c, entityId, l.product_id, l.fulfil_from_id, { reserved: Number(l.qty) });
+    await c.query(`update sales_order_line set line_status = 'reserved' where id = $1 and entity_id = $2`, [l.id, entityId]);
+    out.push(l.id);
+  }
+  return out;
+}
+
+/**
  * Hand goods to the customer (carry-out, pickup, delivery). Relieves on hand
  * and any reservation, marks the lines fulfilled, and returns their cost for
  * the COGS posting. Fees, services and warranties fulfil with no stock.
