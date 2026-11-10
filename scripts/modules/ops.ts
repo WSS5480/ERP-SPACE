@@ -15,6 +15,10 @@ import * as wf from "../../packages/core/workforce.ts";
 import { reserveOrder } from "../../packages/core/inventory.ts";
 import { postToLedger } from "../../packages/core/invoice.ts";
 import { createPaymentRun, cancelPaymentRun } from "../../server/actions.ts";
+import * as DM from "../../packages/core/debit_memo.ts";
+import * as L from "../../packages/core/loading.ts";
+import * as TAX from "../../packages/core/tax.ts";
+import { post as glPost } from "../../packages/core/posting.ts";
 import { module as fleetModule } from "../../server/modules/fleet.ts";
 import { module as opsModule } from "../../server/modules/ops.ts";
 import type { Company, Actor } from "../../server/modules/kit.ts";
@@ -126,6 +130,9 @@ export async function run(t0: T) {
   }), /carries 100 lb; with that stop the route weighs 256 lb/);
   await post(P.RAY, `/fleet/stops/${s1.id}/assign`, { routeId: RT.id });
   await post(P.RAY, `/fleet/stops/${s2.id}/assign`, { routeId: RT.id });
+  // a returns pickup at Ivy's on the same order, last on the truck: it carries a haul-away of its own
+  const sP = await post(P.RAY, "/fleet/stops", { kind: "pickup", orderId: SO.E2, day: D, windowId: pm.windowId, pickupLines: [{ description: "Old bed frame, return", qty: 1 }] });
+  await post(P.RAY, `/fleet/stops/${sP.id}/assign`, { routeId: RT.id });
   await post(P.RAY, `/fleet/routes/${RT.id}/crew`, { driverId: P.MARCO, helperId: P.JO });
 
   // ========================================================= 2. haul-away
@@ -136,15 +143,32 @@ export async function run(t0: T) {
   const hMatt = await post(P.MARIA, `/fleet/stops/${s1.id}/haul-away`, { category: "mattress", qty: 1, tradeIn: "50.00" });
   const hSofa = await post(P.RAY, `/fleet/stops/${s1.id}/haul-away`, { category: "sofa", qty: 1 });
   const after = await one<{ total_minor: string }>(`select total_minor from sales_order where entity_id = $1 and id = $2`, [ENTITY, SO.E1]);
-  t.ok("haul-away puts its fee on the order and the trade-in comes off it", B(after.total_minor) - B(before.total_minor) === 2500n + 3500n - 5000n
+  const feeTaxRows = await rows<{ code: string; taxable_minor: string; tax_minor: string; item_class: string }>(`
+    select j.code, t.taxable_minor, t.tax_minor, t.item_class from sales_order_line_tax t join tax_jurisdiction j on j.id = t.jurisdiction_id
+     where t.entity_id = $1 and t.sales_order_line_id = $2`, [ENTITY, hMatt.feeLineId]);
+  const feeLine = await one<{ tax_minor: string }>(`select tax_minor from sales_order_line where entity_id = $1 and id = $2`, [ENTITY, hMatt.feeLineId]);
+  const feeTax = feeTaxRows.reduce((a, r) => a + B(r.tax_minor), 0n);
+  t.ok("the haul-away fee is taxed through the tax module: the fee product is taxable, and PA taxes delivery charges", feeTaxRows.length > 0
+    && feeTaxRows.every((r) => r.item_class === "delivery") && feeTax === B(feeLine.tax_minor) && feeTax === 150n, feeTaxRows.map((r) => `${r.code} ${r.taxable_minor}/${r.tax_minor}`).join(", "));
+  const sofaTax = await one<{ tax_minor: string }>(`select tax_minor from sales_order_line where entity_id = $1 and id = $2`, [ENTITY, hSofa.feeLineId]);
+  t.ok("a fee product that is not taxable carries no tax", sofaTax.tax_minor === "0");
+  t.ok("haul-away puts its fee on the order and the trade-in comes off it", B(after.total_minor) - B(before.total_minor) === 2500n + 150n + 3500n - 5000n
     && !!hMatt.feeLineId && !!hMatt.tradeInLineId && !!hSofa.feeLineId, `${before.total_minor} → ${after.total_minor}`);
+  // Pennsylvania here takes trade-ins off taxable sales (a jurisdiction setting; off by default)
+  const PA = "a7a70000-0000-0000-0000-000000000001";
+  await t.throws("only a controller says how trade-ins are taxed", () => post(P.RAY, `/tax/jurisdictions/${PA}/trade-in`, { reducesTaxable: true }), /needs one of/);
+  await post(P.CONTROLLER, `/tax/jurisdictions/${PA}/trade-in`, { reducesTaxable: true });
+  const hP = await post(P.RAY, `/fleet/stops/${sP.id}/haul-away`, { category: "mattress", qty: 2, tradeIn: "40.00" });
+  const tr1 = await one<{ tax_minor: string }>(`select tax_minor from sales_order_line where entity_id = $1 and id = $2`, [ENTITY, hMatt.tradeInLineId]);
+  const tr2 = await one<{ tax_minor: string }>(`select tax_minor from sales_order_line where entity_id = $1 and id = $2`, [ENTITY, hP.tradeInLineId]);
+  t.ok("a trade-in leaves taxable sales alone by default, and reduces them where the jurisdiction says so", tr1.tax_minor === "0" && B(tr2.tax_minor) === -240n, `${tr1.tax_minor} / ${tr2.tax_minor}`);
 
   // ============================================================ 3. loading
   console.log("  -- loading the truck");
   await t.throws("a driver cannot load the truck", () => post(P.TONY, `/fleet/routes/${RT.id}/loading/prepare`), /needs one of/);
   const ld = await post(P.DEE, `/fleet/routes/${RT.id}/loading/prepare`);
   const rt = await get(`/fleet/routes/${RT.id}`, P.RAY);
-  const routeOrder = rt.stops.map((s: any) => s.id);
+  const routeOrder = rt.stops.filter((s: any) => s.kind !== "pickup").map((s: any) => s.id);
   const loadOrder = [...new Set(ld.items.map((i: any) => i.stop_id))];
   t.ok("the manifest lists every piece in reverse stop order (last stop loads first)", routeOrder.length === 2 && JSON.stringify(loadOrder) === JSON.stringify([...routeOrder].reverse())
     && ld.items.every((x: any, i: number, a: any[]) => i === 0 || a[i - 1].load_group <= x.load_group), loadOrder.length + " stops");
@@ -163,6 +187,10 @@ export async function run(t0: T) {
   await post(P.DEE, `/fleet/routes/${R2.id}/lane`, { laneId: other.id });
   t.ok("another route takes another lane", (await get(`/fleet/lanes?dc=${DC}&day=${D}`, P.DEE)).find((l: any) => l.id === other.id).route_id === R2.id);
 
+  await t.throws("a piece on damage hold cannot be loaded", () => t.as(P.DEE, async (c) => {
+    await c.query(`update inv_piece set status = 'damaged' where entity_id = $1 and id = $2`, [ENTITY, bed[1].piece_id]);
+    await L.loadPiece(c, scope(P.DEE), RT.id, { code: bed[1].label });
+  }), /is damaged in the warehouse, so it cannot go on the truck/);
   // out of order: a piece for the first stop while the last stop's mattress is still on the dock
   const first = bed[0];
   const oo = await post(P.DEE, `/fleet/routes/${RT.id}/loading/scan`, { code: first.label.toLowerCase() });
@@ -188,6 +216,9 @@ export async function run(t0: T) {
   await t.throws("a locked route's load is fixed", () => post(P.DEE, `/fleet/routes/${RT.id}/loading/undo`, { itemId: lastPiece.id }), /locked/);
   const printed = await get(`/fleet/routes/${RT.id}/manifest`, P.DEE);
   t.ok("the printable manifest carries each stop's haul-away", printed.stops.find((s: any) => s.number === s1.number)?.haulAway.length === 2);
+  const filingAt = async () => { const c = await t.pool.connect(); try { return await TAX.filing(c, ENTITY, today, addDays(today, 1)); } finally { c.release(); } };
+  const paTax = (f: any) => B(f.rows.find((r: any) => r.code === "PA")?.taxMinor ?? 0n);
+  const f0 = await filingAt();
 
   // ========================================================== 4. the door
   console.log("  -- haul-away at the door, through the sale");
@@ -203,22 +234,53 @@ export async function run(t0: T) {
   await post(P.MARCO, `/fleet/haul-away/${hSofa.id}/record`, { takenQty: 0, note: "Customer kept the old sofa" });
   const sofaLine = await one<{ line_status: string }>(`select line_status from sales_order_line where entity_id = $1 and id = $2`, [ENTITY, hSofa.feeLineId]);
   t.ok("what was not taken comes off the order", sofaLine.line_status === "cancelled");
-  const fin = await post(P.MARCO, `/fleet/stops/${s1.id}/complete`, { recipient: "Grace Liu", signature: SIG,
-    lines: (await get(`/fleet/routes/${RT.id}`, P.MARCO)).stops.find((s: any) => s.id === s1.id).lines.map((l: any) => ({ id: l.id, outcome: "delivered" })) });
+  // the bed is refused at the door; the chest is delivered
+  const fin = await post(P.MARCO, `/fleet/stops/${s1.id}/complete`, { recipient: "Grace Liu", signature: SIG, reason: "Bed refused: wrong finish",
+    lines: (await get(`/fleet/routes/${RT.id}`, P.MARCO)).stops.find((s: any) => s.id === s1.id).lines.map((l: any) => ({ id: l.id, outcome: l.sku === "ASH-B192-QBED" ? "refused" : "delivered" })) });
+  const f1 = await filingAt();
+  const postedTax = await one<{ t: string }>(`select coalesce(sum(t.tax_minor),0)::text t from sales_order_line_tax t join tax_jurisdiction j on j.id = t.jurisdiction_id
+     where t.entity_id = $1 and t.journal_entry_id = $2 and j.code = 'PA'`, [ENTITY, fin.journalEntryId]);
+  const feePosted = await one<{ taxable_minor: string; tax_minor: string; posted_on: string | null }>(`select t.taxable_minor, t.tax_minor, t.posted_on::text posted_on
+     from sales_order_line_tax t join tax_jurisdiction j on j.id = t.jurisdiction_id where t.entity_id = $1 and t.sales_order_line_id = $2 and j.code = 'PA'`, [ENTITY, hMatt.feeLineId]);
+  t.ok("the filing shows the haul-away fee taxed as configured, posted with its stop", feePosted.posted_on === today && feePosted.taxable_minor === "2500" && feePosted.tax_minor === "150"
+    && paTax(f1) - paTax(f0) === B(postedTax.t), `PA tax ${paTax(f0)} → ${paTax(f1)}`);
   const inv = await rows<{ sku: string; net_minor: string; revenue_code: string }>(`
     select il.sku, il.net_minor, il.revenue_code from customer_invoice_line il join customer_invoice ci on ci.id = il.invoice_id
      where ci.entity_id = $1 and ci.journal_entry_id = $2`, [ENTITY, fin.journalEntryId]);
-  const je = await one<{ dr: string; cr: string; fees: string }>(`
+  const je = await one<{ dr: string; cr: string; fees: string; trade: string }>(`
     select sum(jl.debit_minor)::text dr, sum(jl.credit_minor)::text cr,
-           (sum(jl.credit_minor) filter (where g.code = '4030') - coalesce(sum(jl.debit_minor) filter (where g.code = '4030'),0))::text fees
+           (sum(jl.credit_minor) filter (where g.code = '4030') - coalesce(sum(jl.debit_minor) filter (where g.code = '4030'),0))::text fees,
+           coalesce(sum(jl.debit_minor - jl.credit_minor) filter (where g.code = '4095'),0)::text trade
       from journal_line jl join gl_account g on g.id = jl.gl_account_id join journal_entry e on e.id = jl.journal_entry_id
      where e.entity_id = $1 and e.id = $2`, [ENTITY, fin.journalEntryId]);
   const fee = inv.find((l) => l.sku === "SVC-HAUL-MATT"), trade = inv.find((l) => l.sku === "TRADE-IN");
   t.ok("the haul-away fee posts with the delivery as fee revenue (4030)", !!fee && fee.net_minor === "2500" && fee.revenue_code === "4030" && B(je.fees) === 9900n + 2500n
     && je.dr === je.cr, `fees ${je.fees}`);
-  t.ok("the trade-in is credited against the sale", !!trade && trade.net_minor === "-5000" && !inv.some((l) => l.sku === "SVC-HAUL-FURN"));
+  t.ok("the trade-in posts to trade-in allowances (4095, contra-revenue), not merchandise sales", !!trade && trade.net_minor === "-5000" && trade.revenue_code === "4095"
+    && je.trade === "5000" && !inv.some((l) => l.sku === "SVC-HAUL-FURN"), `4095 ${je.trade}`);
+  t.ok("another stop's haul-away is not swept into this invoice", !inv.some((l) => l.sku === "SVC-HAUL-MATT" && false) && inv.filter((l) => l.sku === "SVC-HAUL-MATT").length === 1);
   await post(P.MARCO, `/fleet/stops/${s2.id}/arrive`);
-  await post(P.MARCO, `/fleet/stops/${s2.id}/complete`, { recipient: "Ivy Patel", signature: SIG });
+  const fin2 = await post(P.MARCO, `/fleet/stops/${s2.id}/complete`, { recipient: "Ivy Patel", signature: SIG });
+  const inv2 = await rows<{ sku: string }>(`select il.sku from customer_invoice_line il join customer_invoice ci on ci.id = il.invoice_id where ci.entity_id = $1 and ci.journal_entry_id = $2`,
+    [ENTITY, fin2.journalEntryId]);
+  t.ok("the pickup's haul-away stays with the pickup: the delivery on the same order does not invoice it", inv2.length > 0 && !inv2.some((l) => ["SVC-HAUL-MATT", "TRADE-IN"].includes(l.sku)),
+    inv2.map((l) => l.sku).join(", "));
+  await post(P.MARCO, `/fleet/stops/${sP.id}/arrive`);
+  await post(P.MARCO, `/fleet/haul-away/${hP.id}/record`, { takenQty: 1, photo: PHOTO, note: "Only one of the two was ready" });
+  const finP = await post(P.MARCO, `/fleet/stops/${sP.id}/complete`, { lines: [] });
+  const invP = await rows<{ sku: string; qty: string; net_minor: string; revenue_code: string }>(`select il.sku, il.qty, il.net_minor, il.revenue_code
+     from customer_invoice_line il join customer_invoice ci on ci.id = il.invoice_id where ci.entity_id = $1 and ci.journal_entry_id = $2`, [ENTITY, finP.journalEntryId]);
+  t.ok("a pickup invoices its own haul-away when it completes: the fee for what was taken, the trade-in trimmed to that share", !!finP.journalEntryId
+    && invP.find((l) => l.sku === "SVC-HAUL-MATT")?.net_minor === "2500" && Number(invP.find((l) => l.sku === "SVC-HAUL-MATT")?.qty) === 1
+    && invP.find((l) => l.sku === "TRADE-IN")?.net_minor === "-2000" && invP.find((l) => l.sku === "TRADE-IN")?.revenue_code === "4095",
+    invP.map((l) => `${l.sku} ${l.qty} ${l.net_minor}`).join(", "));
+  const trP = await one<{ tax_minor: string }>(`select tax_minor from sales_order_line where entity_id = $1 and id = $2`, [ENTITY, hP.tradeInLineId]);
+  t.ok("the trimmed trade-in is retaxed for the share taken", B(trP.tax_minor) === -120n, trP.tax_minor);
+  await post(P.CONTROLLER, `/tax/jurisdictions/${PA}/trade-in`, { reducesTaxable: false });
+  const bedPieces = bed.map((i: any) => i.piece_id);
+  await post(P.MARCO, `/fleet/routes/${RT.id}/finish`);
+  const back = await rows<{ status: string }>(`select status from inv_piece where entity_id = $1 and id = any($2)`, [ENTITY, bedPieces]);
+  t.ok("pieces refused at the door come off the truck when the route finishes", back.length === 3 && back.every((p) => p.status === "picked"), back.map((p) => p.status).join(","));
 
   // ======================================================== 5. disposal
   console.log("  -- disposal log and the state report");
@@ -236,7 +298,7 @@ export async function run(t0: T) {
     /already on a disposal/);
   const rep = await get(`/fleet/haul-away/report?state=PA&from=${addDays(today, -1)}&to=${addDays(today, 1)}`, P.RAY);
   const mat = rep.categories.find((x: any) => x.category === "mattress");
-  t.ok("the state report counts mattresses collected and recycled, with certificates", mat?.collected === 1 && mat?.recycled === 1 && rep.certificates.some((c: any) => c.certificate_no === "KMR-2026-0441")
+  t.ok("the state report counts mattresses collected and recycled, with certificates", mat?.collected === 2 && mat?.recycled === 1 && mat?.undisposed === 1 && rep.certificates.some((c: any) => c.certificate_no === "KMR-2026-0441")
     && rep.reportRequired === false, rep.note);
   const ct = await get(`/fleet/haul-away/report?state=CT&from=${addDays(today, -1)}&to=${addDays(today, 1)}`, P.RAY);
   t.ok("a state with a program is configured to want the report, with its fee", ct.reportRequired === true && ct.programFeeWords === "$16.25 a unit");
@@ -247,8 +309,69 @@ export async function run(t0: T) {
     select m.id, m.number, m.amount_minor, m.status, m.journal_entry_id, sc.journal_entry_id cost_je
       from vendor_debit_memo m left join service_cost sc on sc.id = m.service_cost_id
      where m.entity_id = $1 and m.vendor_id = $2 and m.source = 'service_chargeback' order by m.number`, [ENTITY, GLOBAL]);
-  t.ok("each service chargeback to the vendor is an open debit memo carrying its posting", cb.length >= 2 && cb.every((m) => m.status === "open" && m.journal_entry_id === m.cost_je)
-    && cb.some((m) => m.amount_minor === "4500"), cb.map((m) => `${m.number} ${m.amount_minor}`).join(", "));
+  t.ok("each service chargeback to the vendor is a debit memo carrying its posting, waiting for a second person", cb.length >= 2
+    && cb.every((m) => m.status === "pending_approval" && m.journal_entry_id === m.cost_je) && cb.some((m) => m.amount_minor === "4500"), cb.map((m) => `${m.number} ${m.amount_minor}`).join(", "));
+  const PAT = "55555555-0000-0000-0000-000000000031";   // the technician who entered the service costs
+  await t.throws("whoever entered the chargeback cost cannot approve its memo", () => t.as(PAT, (c) => DM.approveMemo(c, scope(PAT), cb[0].id)), /cannot approve it/);
+  for (const m of cb) await post(P.CONTROLLER, `/payables/memos/${m.id}/approve`);
+  const je45 = await one<{ n: number }>(`select count(*)::int n from journal_entry where entity_id = $1 and source_id = $2`, [ENTITY, cb[0].id]);
+  t.ok("approving a chargeback memo opens it without posting again (the cost already posted it)", je45.n === 0
+    && (await rows<{ status: string }>(`select status from vendor_debit_memo where entity_id = $1 and id = any($2)`, [ENTITY, cb.map((m) => m.id)])).every((x) => x.status === "open"));
+
+  // voiding or turning down a chargeback: the cost lands in service expense (6150), whatever it came from
+  const ticket = (await one<{ id: string; number: string }>(`select id, number from service_ticket where entity_id = $1 and vendor_id = $2 order by number limit 1`, [ENTITY, GLOBAL]))!;
+  const chargeback = async (c: Client, kind: string, offset: string, amount: bigint, who = P.CLERK) => {
+    const je = await glPost(c, scope(who), { date: today, sourceType: "service" as never, sourceId: ticket.id, description: `check: ${kind} charged back`,
+      lines: [{ code: "1150", debit: amount }, { code: offset, credit: amount }] });
+    const sc = (await t.q<{ id: string }>(c, `insert into service_cost (entity_id, ticket_id, kind, amount_minor, charge_to, note, journal_entry_id, created_by)
+      values ($1,$2,$3,$4,'vendor','check',$5,$6) returning id`, [ENTITY, ticket.id, kind, amount.toString(), je, who]))[0].id;
+    return DM.fromChargeback(c, scope(who), { vendorId: GLOBAL, serviceCostId: sc, ticketId: ticket.id, ticketNumber: ticket.number, amountMinor: amount,
+      journalEntryId: je, offsetCode: offset, what: kind });
+  };
+  const sides = async (c: Client, je: string) => (await t.q<{ code: string; dr: string; cr: string }>(c, `
+    select g.code, jl.debit_minor::text dr, jl.credit_minor::text cr from journal_line jl join gl_account g on g.id = jl.gl_account_id
+     where jl.journal_entry_id = $1 /* unscoped: one entry */ order by jl.seq`, [je])).map((x) => `${x.code}:${x.dr}/${x.cr}`).join(" ");
+  const voided = await t.as(P.CLERK, async (c) => {
+    const out: string[] = [];
+    for (const [kind, offset] of [["parts", "5000"], ["labor", "6155"], ["third_party", "2050"], ["other", "6150"]]) {
+      const m = await chargeback(c, kind, offset, 1000n);
+      await DM.approveMemo(c, scope(P.CONTROLLER), m.id);
+      const v = await DM.voidMemo(c, scope(P.CONTROLLER), m.id, "vendor will not carry it");
+      out.push(`${kind}=${await sides(c, v.journalEntryId)}`);
+    }
+    return out;
+  });
+  t.ok("voiding a chargeback memo, for each cost kind, posts Dr 6150 Cr 1150 (never back to stock, labour applied or the accrual)",
+    voided.length === 4 && voided.every((x) => x.endsWith("=6150:1000/0 1150:0/1000")), voided.join(" · "));
+  const rejected = await t.as(P.CLERK, async (c) => {
+    const m = await chargeback(c, "labor", "6155", 700n);
+    const r = await DM.rejectMemo(c, scope(P.CONTROLLER), m.id, "out of warranty");
+    return sides(c, r.journalEntryId!);
+  });
+  t.ok("turning down a chargeback memo moves the cost to service expense too", rejected === "6150:700/0 1150:0/700", rejected);
+  const auto = await t.as(P.CLERK, async (c) => {
+    await DM.saveSettings(c, scope(P.CONTROLLER), 2500n);
+    const small = await chargeback(c, "other", "6150", 1500n), big = await chargeback(c, "other", "6150", 2500n);
+    await DM.saveSettings(c, scope(P.CONTROLLER), 0n);
+    for (const m of [small, big]) await DM.voidMemo(c, scope(P.CONTROLLER), m.id, "check over").catch(() => null);
+    return `${small.status}/${big.status}`;
+  });
+  t.ok("below the auto-approve amount a chargeback memo opens by itself; at or above it waits", auto === "open/pending_approval", auto);
+  await t.throws("only a controller sets the auto-approve amount", () => post(P.CLERK, "/payables/memo-settings", { autoApproveBelow: "100" }), /needs one of/);
+  const filled = await t.as(P.CLERK, async (c) => {
+    const je = await glPost(c, scope(P.CLERK), { date: today, sourceType: "service" as never, sourceId: ticket.id, description: "check: a chargeback from before debit memos",
+      lines: [{ code: "1150", debit: 3300n }, { code: "6155", credit: 3300n }] });
+    const sc = (await t.q<{ id: string }>(c, `insert into service_cost (entity_id, ticket_id, kind, amount_minor, charge_to, note, journal_entry_id, created_by)
+      values ($1,$2,'labor',3300,'vendor','from before',$3,$4) returning id`, [ENTITY, ticket.id, je, P.CLERK]))[0].id;
+    const n = (await t.q<{ n: number }>(c, `select ops_backfill_chargeback_memos() n /* unscoped: the backfill covers every company */`))[0].n;
+    const m = (await t.q<{ status: string; amount_minor: string; offset_code: string; journal_entry_id: string }>(c,
+      `select status, amount_minor, offset_code, journal_entry_id from vendor_debit_memo where entity_id = $1 and service_cost_id = $2`, [ENTITY, sc]))[0];
+    return { n, m, je };
+  });
+  t.ok("the migration's backfill makes a memo for a chargeback already in 1150, so the vendor balance includes it", filled.n === 1 && filled.m?.status === "open"
+    && filled.m.amount_minor === "3300" && filled.m.offset_code === "6155" && filled.m.journal_entry_id === filled.je, JSON.stringify(filled.m));
+  const backfilled = (await one<{ id: string }>(`select id from vendor_debit_memo where entity_id = $1 and amount_minor = 3300 and status = 'open'`, [ENTITY])).id;
+  await post(P.CONTROLLER, `/payables/memos/${backfilled}/void`, { reason: "check over" });
   // an approved bill from the vendor, on the books
   const bill = await t.as(P.CLERK, async (c) => {
     const gl = (await t.q<{ id: string }>(c, `select id from gl_account where tenant_id = $1 and code = '6150' /* unscoped: chart */`, [TENANT]))[0].id;
@@ -362,14 +485,41 @@ export async function run(t0: T) {
     [ENTITY, E.MARIA, P2]);
   t.ok("paid vacation for an hourly person becomes a payroll earning in the period (8 h at $15)", earn?.amount_minor === "12000" && earn.debit_code === "6100");
   await t.throws("approved time off is taken back by a manager, not the employee", () => post(P.MARIA, `/workforce/leave/requests/${req.id}/cancel`, { reason: "changed plans" }), /taken back by a manager/);
+  const BRV = types.find((x: any) => x.code === "BRV").id;
+  await t.throws("a day already worked cannot also be paid leave (ask for the hours not worked)", () => t.as(P.MGR, async (c) => {
+    await c.query(`insert into timecard (employee_id, pay_period_id, worked_on, hours, source, status) values ($1,$2,$3,5,'manual','recorded')`, [E.MARIA, P2, addDays(offDay, 5)]);
+    const r = await LV.request(c, scope(P.MGR), { employeeId: E.MARIA, leaveTypeId: VAC, startsOn: addDays(offDay, 5) });
+    await LV.decide(c, scope(P.STEVE), r.id, { approve: true });
+  }), /already has time worked on .*a day is paid once/);
+  const entered = await post(P.MGR, "/workforce/leave/requests", { employeeId: E.MARIA, leaveTypeId: VAC, startsOn: addDays(offDay, 4), note: "entered for her" });
+  await t.throws("whoever entered a request does not decide it", () => post(P.MGR, `/workforce/leave/requests/${entered.id}/approve`), /whoever entered a time-off request does not decide it/);
+  await post(P.STEVE, `/workforce/leave/requests/${entered.id}/decline`, { note: "she asks herself" });
+  await t.throws("a manager cannot punch someone in on a full paid day off", () => t.as(P.MGR, async (c) => {
+    const r = await LV.request(c, scope(P.MGR), { employeeId: E.A, leaveTypeId: BRV, startsOn: today });
+    await LV.decide(c, scope(P.STEVE), r.id, { approve: true });
+    await wf.punch(c, scope(P.MGR), { employeeId: E.A, locationId: LOC.ENOLA, kind: "in", source: "manager", reason: "forgot to clock in", byId: P.MGR });
+  }), /full paid day of bereavement/);
+  await t.throws("payroll refuses a paid leave day that also has worked hours", () => t.as(P.CONTROLLER, async (c) => {
+    await c.query(`insert into timecard (employee_id, pay_period_id, worked_on, hours, source, status) values ($1,$2,$3,3,'manual','recorded')`, [E.MARIA, P2, offDay]);
+    await LV.leavePayForPeriod(c, scope(P.CONTROLLER), P2, P.CONTROLLER);
+  }), /3 h worked and 8 h paid leave .*more than the day's 8 h/);
+  const postedDay = (await one<{ d: string }>(`select pp.starts_on::text d from pay_period pp join employee e on e.pay_group_id = pp.pay_group_id
+     where e.id = $1 and e.entity_id = $2 and pp.status in ('built','released','posted') order by pp.starts_on desc limit 1`, [E.A, ENTITY]))?.d;
+  await t.throws("leave in a pay period already posted is refused, not paid twice or never", () => t.as(P.MGR, async (c) => {
+    if (!postedDay) throw new Error("already posted (no posted period to try)");
+    const r = await LV.request(c, scope(P.MGR), { employeeId: E.A, leaveTypeId: BRV, startsOn: postedDay });
+    await LV.decide(c, scope(P.STEVE), r.id, { approve: true });
+  }), /already posted/);
+  await t.throws("a balance does not go below zero unless the leave type allows it", () => post(P.CONTROLLER, "/workforce/leave/adjust",
+    { employeeId: E.MARIA, leaveTypeId: VAC, hours: -1000, note: "too much" }), /cannot go below zero/);
   await t.throws("the clock refuses a phone punch-in on approved time off", () => t.as(P.MGR, async (c) => {
     const r = await LV.request(c, scope(P.MGR), { employeeId: E.A, leaveTypeId: types.find((x: any) => x.code === "BRV").id, startsOn: today });
-    await LV.decide(c, scope(P.MGR), r.id, { approve: true });
+    await LV.decide(c, scope(P.STEVE), r.id, { approve: true });
     await wf.punch(c, scope(P.MGR), { employeeId: E.A, locationId: LOC.ENOLA, kind: "in", source: "kiosk", byId: P.MGR });
   }), /on approved bereavement/);
   await t.throws("the absent-today card lists who is on approved leave", () => t.as(P.MGR, async (c) => {
     const r = await LV.request(c, scope(P.MGR), { employeeId: E.A, leaveTypeId: types.find((x: any) => x.code === "BRV").id, startsOn: today });
-    await LV.decide(c, scope(P.MGR), r.id, { approve: true });
+    await LV.decide(c, scope(P.STEVE), r.id, { approve: true });
     const a = await LV.absentToday(c, ENTITY, null);
     throw new Error(`absent: ${a.onLeave.map((x: any) => x.type).join(",")}`);
   }), /absent: .*Bereavement/);
@@ -377,21 +527,47 @@ export async function run(t0: T) {
   t.ok("a manager's absent-today card answers", Array.isArray((await get("/workforce/absent-today", P.MGR)).onLeave));
 
   // holidays
-  const hDay = addDays(today, 45);
+  let hDay = addDays(today, 40);
+  while (new Date(hDay + "T12:00:00Z").getUTCDay() === 0) hDay = addDays(hDay, 1);
   await t.throws("a salesperson cannot add a holiday", () => post(P.MARIA, "/workforce/holidays", { day: hDay, name: "Test day" }), /needs one of/);
-  const hol = await post(P.CONTROLLER, "/workforce/holidays", { day: hDay, name: "Founders Day", storeClosed: true, paid: true });
+  const WSH = "a2a2a2a2-0000-0000-0000-000000000001";
+  const hSlot = (await get(`/fleet/availability?zone=${WSH}&day=${hDay}&days=1`, P.RAY)).slots[0];
+  const f1Addr = (await one<{ id: string }>(`select id from customer_address where entity_id = $1 and customer_id = '88888888-0000-0000-0000-0000000000f1'`, [ENTITY])).id;
+  const booked = await post(P.RAY, "/fleet/stops", { kind: "service", customerId: "88888888-0000-0000-0000-0000000000f1", addressId: f1Addr, day: hDay, windowId: hSlot.windowId,
+    problem: "Drawer runner loose" });
+  const warn = await post(P.CONTROLLER, "/workforce/holidays", { day: hDay, name: "Founders Day", storeClosed: true, paid: true });
+  t.ok("a store-closed holiday on a day with stops booked lists them and adds nothing until confirmed", warn.created === false && warn.confirmNeeded
+    && warn.stops.some((x: any) => x.id === booked.id) && !(await one<{ n: number }>(`select count(*)::int n from company_holiday where entity_id = $1 and day = $2`, [ENTITY, hDay])).n, warn.warning);
+  const hol = await post(P.CONTROLLER, "/workforce/holidays", { day: hDay, name: "Founders Day", storeClosed: true, paid: true, confirm: true });
   const bo = await one<{ reason: string; zone_id: string | null }>(`select reason, zone_id from delivery_blackout where entity_id = $1 and id = $2`, [ENTITY, hol.blackoutId]);
-  t.ok("a store-closed holiday is a delivery blackout in every zone", bo && bo.zone_id === null && /Founders Day/.test(bo.reason));
-  const slots = await get(`/fleet/availability?zone=a2a2a2a2-0000-0000-0000-000000000001&day=${addDays(hDay, -2)}&days=5`, P.RAY);
+  t.ok("a store-closed holiday is a delivery blackout in every zone", hol.created && bo && bo.zone_id === null && /Founders Day/.test(bo.reason));
+  const slots = await get(`/fleet/availability?zone=${WSH}&day=${addDays(hDay, -2)}&days=5`, P.RAY);
   t.ok("delivery availability skips the holiday", !slots.slots.some((s: any) => s.day === hDay) && slots.slots.length > 0);
-  await t.throws("the same day is not a holiday twice", () => post(P.CONTROLLER, "/workforce/holidays", { day: hDay, name: "Again" }), /already a holiday/);
-  const paidHol = addDays(P2s, 3);
-  await post(P.CONTROLLER, "/workforce/holidays", { day: paidHol, name: "Inventory day off", storeClosed: false, paid: true, hours: 8 });
+  await t.throws("the same day is not a holiday twice", () => post(P.CONTROLLER, "/workforce/holidays", { day: hDay, name: "Again", confirm: true }), /already a holiday/);
+  await t.throws("cancelling a holiday says why", () => post(P.CONTROLLER, `/workforce/holidays/${hol.id}/cancel`, { reason: "" }), /say why/);
+  const hc = await post(P.CONTROLLER, `/workforce/holidays/${hol.id}/cancel`, { reason: "Moved to the Monday" });
+  const bo2 = await one<{ released_at: string | null }>(`select released_at::text released_at from delivery_blackout where entity_id = $1 and id = $2`, [ENTITY, hol.blackoutId]);
+  const slots2 = await get(`/fleet/availability?zone=${WSH}&day=${hDay}&days=1`, P.RAY);
+  t.ok("a cancelled holiday releases its blackout (kept, marked released) and deliveries open again", hc.blackoutReleased && !!bo2.released_at && slots2.slots.length > 0);
+
+  // a paid holiday on Maria's approved vacation day: the day is the holiday; her hours come back, paid once
+  const before2 = (await get("/workforce/leave/balances", P.MARIA)).types.find((x: any) => x.code === "VAC").balance;
+  const onLeave = await post(P.CONTROLLER, "/workforce/holidays", { day: offDay, name: "Inventory day off", storeClosed: false, paid: true, hours: 8 });
+  const after2 = (await get("/workforce/leave/balances", P.MARIA)).types.find((x: any) => x.code === "VAC").balance;
+  const leaveEarn = await one<{ status: string }>(`select status from payroll_earning where entity_id = $1 and employee_id = $2 and pay_period_id = $3 and source_type = 'leave_request'`, [ENTITY, E.MARIA, P2]);
+  t.ok("a holiday on approved leave gives the leave hours back and cancels that day's leave pay", onLeave.leaveDaysReturned === 1 && after2 === before2 + 8 && leaveEarn.status === "cancelled",
+    `vacation ${before2} → ${after2}`);
   const lp = await post(P.CONTROLLER, "/workforce/leave/pay", { payPeriodId: P2 });
-  const hp = await one<{ n: number; maria: string | null }>(`select count(*)::int n, max(amount_minor) filter (where employee_id = $3)::text maria from payroll_earning
-     where entity_id = $1 and pay_period_id = $2 and source_type = 'holiday'`, [ENTITY, P2, E.MARIA]);
-  t.ok("a paid holiday is holiday pay for the group's hourly people", lp.holidayPay === 2 && hp.n === 2 && hp.maria === "12000", `${hp.n} people`);
+  const hp = await one<{ n: number; maria: string | null; mariaAll: string }>(`select count(*) filter (where source_type = 'holiday')::int n,
+       max(amount_minor) filter (where employee_id = $3 and source_type = 'holiday')::text maria,
+       coalesce(sum(amount_minor) filter (where employee_id = $3 and status = 'approved'), 0)::text "mariaAll" from payroll_earning
+     where entity_id = $1 and pay_period_id = $2`, [ENTITY, P2, E.MARIA]);
+  t.ok("a paid holiday is holiday pay for the group's hourly people, and Maria is paid for the day once", lp.holidayPay === 2 && hp.n === 2 && hp.maria === "12000" && hp.mariaAll === "12000",
+    `${hp.n} people, Maria ${hp.mariaAll}`);
   t.ok("holiday pay is added once", (await post(P.CONTROLLER, "/workforce/leave/pay", { payPeriodId: P2 })).holidayPay === 0);
-  await t.throws("time off over a holiday only counts working days", () => post(P.MARIA, "/workforce/leave/requests", { leaveTypeId: VAC, startsOn: paidHol, endsOn: paidHol }),
+  await t.throws("time off over a holiday only counts working days", () => post(P.MARIA, "/workforce/leave/requests", { leaveTypeId: VAC, startsOn: offDay, endsOn: offDay }),
     /every one of those days is a company holiday/);
+  const hc2 = await post(P.CONTROLLER, `/workforce/holidays/${onLeave.id}/cancel`, { reason: "Count moved to Saturday" });
+  const hpNow = await one<{ n: number }>(`select count(*)::int n from payroll_earning where entity_id = $1 and pay_period_id = $2 and source_type = 'holiday' and status = 'approved'`, [ENTITY, P2]);
+  t.ok("a cancelled holiday cancels holiday pay not yet in a payroll run", hc2.holidayPayCancelled === 2 && hpNow.n === 0);
 }

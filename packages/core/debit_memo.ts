@@ -72,23 +72,43 @@ export async function billNet(c: Client, entityId: string, invoiceId: string): P
   return BigInt(r.net);
 }
 
+/** Below this a chargeback memo opens by itself (default $0: every one waits for a second person). */
+export async function settings(c: Client, entityId: string) {
+  const r = await q<{ v: string }>(c, `select memo_auto_approve_below_minor::text v from payables_setting where entity_id = $1`, [entityId]);
+  return { autoApproveBelowMinor: BigInt(r[0]?.v ?? "0") };
+}
+export async function saveSettings(c: Client, scope: Scope, autoApproveBelowMinor: bigint) {
+  need(autoApproveBelowMinor >= 0n, "the amount is not negative");
+  await c.query(`insert into payables_setting (entity_id, memo_auto_approve_below_minor, set_by) values ($1,$2,$3)
+                 on conflict (entity_id) do update set memo_auto_approve_below_minor = $2, set_by = $3, set_at = now()`,
+    [scope.entityId, autoApproveBelowMinor.toString(), scope.actor.id || null]);
+  return settings(c, scope.entityId);
+}
+
+/** Where a service chargeback goes when the vendor will not carry it: the company's own service expense. */
+const SERVICE_EXPENSE = "6150";
+
 /**
  * The service module charged a cost back to the vendor (already posted Dr 1150).
- * That posting becomes an open debit memo on the vendor's account, one per cost.
+ * That posting becomes a debit memo on the vendor's account, one per cost. The
+ * person who entered the cost is its maker: another person approves it, unless
+ * it is under the company's auto-approve amount (default $0, so never).
  */
 export async function fromChargeback(c: Client, scope: Scope, x: { vendorId: string; serviceCostId: string; ticketId: string; ticketNumber: string;
   amountMinor: bigint; journalEntryId: string; offsetCode: string; what: string }) {
   const v = await q(c, `select 1 from vendor where id = $1 and tenant_id = $2 /* unscoped: vendors are the client's, shared by its companies */`, [x.vendorId, scope.tenantId]);
   need(v.length, "the ticket's vendor is not one of this client's");
   const number = await nextNo(c, scope.entityId);
+  const auto = x.amountMinor < (await settings(c, scope.entityId)).autoApproveBelowMinor;
   const r = await one<{ id: string }>(c, `
     insert into vendor_debit_memo (tenant_id, entity_id, vendor_id, number, source, reason, amount_minor, offset_code, memo_date, status,
-                                   service_cost_id, service_ticket_id, journal_entry_id, created_by)
-    values ($1,$2,$3,$4,'service_chargeback',$5,$6,$7,$8,'open',$9,$10,$11,$12) returning id`,
+                                   service_cost_id, service_ticket_id, journal_entry_id, created_by, auto_approved)
+    values ($1,$2,$3,$4,'service_chargeback',$5,$6,$7,$8,$13,$9,$10,$11,$12,$14) returning id`,
     [scope.tenantId, scope.entityId, x.vendorId, number, `Service ${x.ticketNumber}: ${x.what}`.slice(0, 300), x.amountMinor.toString(), x.offsetCode,
-     today(), x.serviceCostId, x.ticketId, x.journalEntryId, scope.actor.id || null]);
-  await audit(c, scope, { table: "vendor_debit_memo", rowId: r.id, action: "insert", after: { number, source: "service_chargeback", amount: x.amountMinor.toString() } });
-  return { id: r.id, number };
+     today(), x.serviceCostId, x.ticketId, x.journalEntryId, scope.actor.id || null, auto ? "open" : "pending_approval", auto]);
+  await audit(c, scope, { table: "vendor_debit_memo", rowId: r.id, action: "insert",
+    after: { number, source: "service_chargeback", amount: x.amountMinor.toString(), status: auto ? "open (under the auto-approve amount)" : "pending_approval" } });
+  return { id: r.id, number, status: auto ? "open" : "pending_approval" };
 }
 
 /** A memo written by hand. It waits for a second person's approval before it counts. */
@@ -126,11 +146,20 @@ export async function createMemo(c: Client, scope: Scope, b: { vendorId: string;
   return { id: r.id, number, status: "pending_approval" };
 }
 
-/** A second person approves a manual memo: it posts Dr 1150 Cr its offset and becomes an open credit. */
+/**
+ * A second person approves a memo. A manual memo posts Dr 1150 Cr its offset;
+ * a chargeback memo is already posted (the service cost), so it just opens.
+ */
 export async function approveMemo(c: Client, scope: Scope, id: string, note = "") {
   const m = await memoOf(c, scope.entityId, id);
   need(m.status === "pending_approval", `debit memo ${m.number} is ${m.status.replace("_", " ")}`);
   need(m.created_by !== scope.actor.id, "whoever wrote a debit memo cannot approve it; another person does");
+  if (m.source === "service_chargeback" && m.journal_entry_id) {
+    await c.query(`update vendor_debit_memo set status = 'open', decided_by = $3, decided_at = now(), decision_note = nullif($4,'')
+                    where entity_id = $1 and id = $2`, [scope.entityId, id, scope.actor.id || null, note.trim().slice(0, 300)]);
+    await audit(c, scope, { table: "vendor_debit_memo", rowId: id, action: "transition", before: { status: m.status }, after: { status: "open" } });
+    return { status: "open", journalEntryId: m.journal_entry_id };
+  }
   const v = await vendorOf(c, scope.entityId, m.vendor_id);
   const amt = BigInt(m.amount_minor);
   const je = await post(c, scope, { date: m.memo_date, sourceType: "invoice", sourceId: m.id,
@@ -147,21 +176,33 @@ export async function rejectMemo(c: Client, scope: Scope, id: string, note: stri
   need(m.status === "pending_approval", `debit memo ${m.number} is ${m.status.replace("_", " ")}`);
   need(m.created_by !== scope.actor.id, "whoever wrote a debit memo cannot decide it");
   need(String(note ?? "").trim().length >= 3, "say why it is turned down");
-  await c.query(`update vendor_debit_memo set status = 'rejected', decided_by = $3, decided_at = now(), decision_note = $4 where entity_id = $1 and id = $2`,
-    [scope.entityId, id, scope.actor.id || null, note.trim().slice(0, 300)]);
-  return { status: "rejected" };
+  // a chargeback was already moved to 1150 by the service cost: turned down, the company carries it (Dr 6150 Cr 1150)
+  let rev: string | null = null;
+  if (m.source === "service_chargeback" && m.journal_entry_id) {
+    rev = await post(c, scope, { date: today(), sourceType: "invoice", sourceId: m.id, description: `Debit memo ${m.number} turned down: ${note.trim()}`.slice(0, 300),
+      lines: [{ code: SERVICE_EXPENSE, debit: BigInt(m.amount_minor), memo: m.number }, { code: "1150", credit: BigInt(m.amount_minor), memo: m.number }] });
+  }
+  await c.query(`update vendor_debit_memo set status = 'rejected', decided_by = $3, decided_at = now(), decision_note = $4, reversal_entry_id = $5 where entity_id = $1 and id = $2`,
+    [scope.entityId, id, scope.actor.id || null, note.trim().slice(0, 300), rev]);
+  return { status: "rejected", journalEntryId: rev };
 }
 
-/** Void an open memo nothing has been applied from: the 1150 debit is reversed. */
+/**
+ * Void an open memo nothing has been applied from: the 1150 debit is reversed.
+ * A manual memo reverses to its offset. A service chargeback does not go back to
+ * where the cost came from (stock, labour applied, the accrual): the cost is
+ * real and the vendor will not carry it, so it lands in service expense (6150).
+ */
 export async function voidMemo(c: Client, scope: Scope, id: string, reason: string) {
   const m = await memoOf(c, scope.entityId, id);
   need(m.status === "open", `debit memo ${m.number} is ${m.status.replace("_", " ")}; only an open memo is voided`);
   need(String(reason ?? "").trim().length >= 3, "say why it is voided");
   const left = await memoLeft(c, scope.entityId, id);
   need(left === BigInt(m.amount_minor), `debit memo ${m.number} has already been applied to a bill; it cannot be voided`);
+  const back = m.source === "service_chargeback" ? SERVICE_EXPENSE : m.offset_code;
   const je = await post(c, scope, { date: today(), sourceType: "invoice", sourceId: m.id, description: `Void debit memo ${m.number}: ${reason.trim()}`.slice(0, 300),
-    lines: [{ code: m.offset_code, debit: left, memo: m.number }, { code: "1150", credit: left, memo: m.number }] });
-  await c.query(`update vendor_debit_memo set status = 'void', void_reason = $3 where entity_id = $1 and id = $2`, [scope.entityId, id, reason.trim().slice(0, 300)]);
+    lines: [{ code: back, debit: left, memo: m.number }, { code: "1150", credit: left, memo: m.number }] });
+  await c.query(`update vendor_debit_memo set status = 'void', void_reason = $3, reversal_entry_id = $4 where entity_id = $1 and id = $2`, [scope.entityId, id, reason.trim().slice(0, 300), je]);
   await audit(c, scope, { table: "vendor_debit_memo", rowId: id, action: "transition", before: { status: "open" }, after: { status: "void", journalEntryId: je }, reason });
   return { status: "void", journalEntryId: je };
 }

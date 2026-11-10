@@ -348,6 +348,8 @@ export async function bills(c: Client, co: Company, tab: string) {
   const rows = await q(c, `
     select i.id, coalesce(v.dba, v.legal_name) as vendor, i.reference, i.kind, i.invoice_date::text, i.due_date::text,
            i.total_minor, i.status, greatest(0, current_date - i.due_date)::int as days_past_due,
+           (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as credited_minor,
+           i.total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as net_minor,
            (select string_agg(distinct po.name, ', ') from invoice_line il
               join profit_object po on po.id = il.profit_object_id where il.invoice_id = i.id) as stores,
            (select ae.reason from audit_event ae
@@ -429,8 +431,10 @@ export async function vendors(c: Client, co: Company) {
            ve.status, ve.terms_days, ga.code as gl_code, ga.name as gl_name, po.name as store,
            vc.code as category, vc.label as category_label, (ve.category_id is not null) as category_here,
            (select count(*) from invoice i where i.vendor_id = v.id and i.entity_id = $1)::int as bills,
-           (select coalesce(sum(i.total_minor), 0) from invoice i
+           (select coalesce(sum(i.total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id)), 0) from invoice i
              where i.vendor_id = v.id and i.entity_id = $1 and i.status in ('approved','scheduled','pending','validated','held','exception')) as open_minor,
+           (select coalesce(sum(i.total_minor), 0) from invoice i
+             where i.vendor_id = v.id and i.entity_id = $1 and i.status in ('approved','scheduled','pending','validated','held','exception')) as open_gross_minor,
            (select max(i.invoice_date)::text from invoice i where i.vendor_id = v.id and i.entity_id = $1) as last_bill,
            (select vba.account_last4 from vendor_bank_account vba
              where vba.vendor_id = v.id and vba.status = 'current' order by vba.version desc limit 1) as bank_last4,
@@ -495,7 +499,8 @@ export async function paymentRuns(c: Client, co: Company) {
      order by pr.pay_date desc, pr.created_at desc limit 20`, [co.id]);
   const eligible = await q(c, `
     select i.id, coalesce(v.dba, v.legal_name) as vendor, i.reference, i.invoice_date::text, i.due_date::text,
-           i.total_minor, greatest(0, current_date - i.due_date)::int as days_past_due
+           i.total_minor, (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as credited_minor, i.total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as net_minor,
+           greatest(0, current_date - i.due_date)::int as days_past_due
       from invoice i join vendor v on v.id = i.vendor_id
      where i.entity_id = $1 and i.status = 'approved' and i.ic_document_id is null
        and not exists (select 1 from payment p join payment_run pr on pr.id = p.payment_run_id
@@ -1018,12 +1023,12 @@ export async function home(c: Client, co: Company, personId: string | null) {
 
   const billStats = await one<{ due7_n: number; due7: string; overdue_n: number; overdue: string; attention: number; pending: number }>(c, `
     select count(*) filter (where status in ('approved','scheduled') and due_date <= current_date + 7)::int as due7_n,
-           coalesce(sum(total_minor) filter (where status in ('approved','scheduled') and due_date <= current_date + 7), 0) as due7,
+           coalesce(sum(total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id)) filter (where status in ('approved','scheduled') and due_date <= current_date + 7), 0) as due7,
            count(*) filter (where status in ('approved','scheduled') and due_date < current_date)::int as overdue_n,
-           coalesce(sum(total_minor) filter (where status in ('approved','scheduled') and due_date < current_date), 0) as overdue,
+           coalesce(sum(total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id)) filter (where status in ('approved','scheduled') and due_date < current_date), 0) as overdue,
            count(*) filter (where status in ('exception','held'))::int as attention,
            count(*) filter (where status = 'pending')::int as pending
-      from invoice where entity_id = $1 and ic_document_id is null`, [co.id]);
+      from invoice i where i.entity_id = $1 and i.ic_document_id is null`, [co.id]);
 
   const appr = await approvals(c, co, personId);
 

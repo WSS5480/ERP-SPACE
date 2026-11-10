@@ -438,14 +438,28 @@
       const day = input({ type: 'date' }), nm = input({ placeholder: 'Thanksgiving' });
       const closed = select([['yes', 'Stores closed (no deliveries)'], ['no', 'Stores open']], 'yes'), paid = select([['yes', 'Paid holiday'], ['no', 'Unpaid']], 'yes');
       const hrs = input({ type: 'number', min: '1', max: '24', value: '8', inputmode: 'decimal' });
-      formDialog('Add a holiday', null, [field('Day', day), field('Name', nm), field('Stores', closed), field('Pay', paid), field('Hours paid', hrs)], 'Add',
-        () => post('/workforce/holidays', { day: day.value, name: nm.value, storeClosed: closed.value === 'yes', paid: paid.value === 'yes', hours: hrs.value }),
-        (r) => (r.blackoutId ? 'Holiday added; deliveries are closed that day' : 'Holiday added'));
+      const body = (confirm) => ({ day: day.value, name: nm.value, storeClosed: closed.value === 'yes', paid: paid.value === 'yes', hours: hrs.value, confirm });
+      const done = (r) => (r.blackoutId ? 'Holiday added; deliveries are closed that day' : 'Holiday added') + (r.leaveDaysReturned ? `; ${plural(r.leaveDaysReturned, 'leave day')} given back` : '');
+      formDialog('Add a holiday', null, [field('Day', day), field('Name', nm), field('Stores', closed), field('Pay', paid), field('Hours paid', hrs)], 'Add', async () => {
+        const r = await post('/workforce/holidays', body(false));
+        if (!r.confirmNeeded) return r;
+        // stops are booked that day: say which, and add only when the person says so
+        const d2 = openDialog('Stops are booked that day', r.warning);
+        const err = errSlot();
+        d2.body.append(panel(r.stops.map((x) => item({ title: `${x.number} · ${x.customer || ''}`, detail: words(x.kind) }))),
+          el('div', { class: 'dlg-acts' }, btn('Add the holiday anyway', (e) => act(e.currentTarget, () => post('/workforce/holidays', body(true)), done, { close: d2.close, errorInto: showErr(err) }), { primary: true }),
+            btn('Not now', d2.close)), err);
+        return null;
+      }, (r) => (r ? done(r) : 'Stops are booked that day; nothing added yet'));
     };
+    const cancelHol = async (h, e) => { const why = await askReason({ title: `Cancel ${h.name}`, sub: dayLabel(h.day), label: 'Why' });
+      if (why) act(e.currentTarget, () => post(`/workforce/holidays/${h.id}/cancel`, { reason: why }), (r) => `Cancelled${r.blackoutReleased ? '; deliveries open again' : ''}${r.holidayPayCancelled ? `; ${plural(r.holidayPayCancelled, 'holiday payment')} cancelled` : ''}`); };
     return frag(el('div', { class: 'toolbar' }, y, el('span', { class: 'grow' }), o.setup ? btn('Add a holiday', add, { small: true, primary: true }) : null),
       section(`Holidays ${st.year}`, list.length ? plural(list.length, 'day') : null, null, list.length ? panel(list.map((h) => item({ title: h.name, amount: h.paid ? hours(h.hours) : '',
-        badge: h.store_closed ? chip('warning', 'hold', 'Stores closed') : chip('neutral', 'info', 'Stores open'),
-        detail: [dayLabel(h.day), h.paid ? 'paid' : 'unpaid', h.paid_people ? `holiday pay for ${plural(h.paid_people, 'person', 'people')}` : null].filter(Boolean).join(' · ') })))
+        badge: h.cancelled_at ? chip('neutral', 'info', 'Cancelled') : h.store_closed ? chip('warning', 'hold', 'Stores closed') : chip('neutral', 'info', 'Stores open'),
+        detail: [dayLabel(h.day), h.paid ? 'paid' : 'unpaid', h.paid_people ? `holiday pay for ${plural(h.paid_people, 'person', 'people')}` : null].filter(Boolean).join(' · '),
+        why: h.cancelled_at ? `Cancelled: ${h.cancel_reason}` : null,
+        acts: o.setup && !h.cancelled_at ? [btn('Cancel', (e) => cancelHol(h, e), { small: true })] : null })))
         : empty('No holidays set for that year', null, true)));
   }
 

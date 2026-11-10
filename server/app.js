@@ -103,6 +103,8 @@ const ROLE = { owner: 'owner', controller: 'controller', approver: 'approver', a
 const roles = (list) => (list || []).map((r) => ROLE[r] || r).join(', ');
 const subjTitle = (s) => (s.date && s.kind !== 'bill' ? `${s.title} for ${dayLabel(s.date)}` : s.title);
 // A bill's number never breaks across lines: "Meridian Supply · MS-260907".
+/** A bill's amount: what is left after vendor debit memos, with the gross shown when they differ. */
+const billAmount = (b) => (b.credited_minor && Number(b.credited_minor) ? `${money(b.net_minor)} (of ${money(b.total_minor)})` : money(b.total_minor));
 const billName = (vendor, ref) => (ref ? frag(vendor, ' · ', el('span', { class: 'nw', text: ref })) : vendor);
 const subjName = (s) => (s.kind === 'bill' && s.vendor ? billName(s.vendor, s.ref) : subjTitle(s));
 const subjDetail = (s) => [human(s.detail), s.kind === 'bill' && s.date ? `dated ${shortDay(s.date)}` : null].filter(Boolean).join(' · ');
@@ -516,7 +518,7 @@ async function screenHome() {
   for (const a of mine) items.push(item({ title: subjName(a.subject), detail: [`From ${a.maker_name}, ${ago(a.created_at)}`, a.steps > 1 ? `step ${a.step_seq} of ${a.steps}` : null].filter(Boolean).join(' · '),
     amount: a.amount_minor != null ? money(a.amount_minor) : null, badge: chip('warning', 'clock', 'Yours to approve'), onClick: () => openApproval(a) }));
   if (canSee('payables')) for (const b of d.attention) items.push(item({ title: billName(b.vendor, b.reference), detail: sentence(human(b.reason || '')),
-    amount: money(b.total_minor), badge: billChip(b.status), onClick: () => openBill(b.id) }));
+    amount: billAmount(b), badge: billChip(b.status), onClick: () => openBill(b.id) }));
   if (canSee('cash')) for (const t of d.sweepsOverdue) items.push(item({ title: `Move ${money(t.amount_minor)} in from ${t.from_account}`,
     detail: `Was due ${dayLabel(t.due_on)}${t.owner ? ` · on ${t.owner}’s list` : ''}`, badge: chip('serious', 'warn', 'Sweep late'), onClick: () => go('cash') }));
   if (canSee('recon') && (d.recon.lines || d.recon.late)) items.push(item({ title: 'Money nobody has matched yet',
@@ -725,7 +727,7 @@ async function screenPayables(sub) {
     title: billName(b.vendor, b.reference),
     detail: [b.stores, `dated ${shortDay(b.invoice_date)}`, b.due_date ? (b.days_past_due && ['approved', 'scheduled', 'pending'].includes(b.status) ? `${b.days_past_due} days past due` : `due ${shortDay(b.due_date)}`) : null,
       b.status === 'pending' && b.waiting_on ? `waiting on the ${ROLE[b.waiting_on] || b.waiting_on}` : null, b.pay_date ? `paid ${shortDay(b.pay_date)}` : null].filter(Boolean).join(' · '),
-    amount: money(b.total_minor), badge: billChip(b.status),
+    amount: billAmount(b), badge: billChip(b.status),
     why: ['exception', 'held'].includes(b.status) && b.reason ? sentence(human(b.reason)) : null,
     onClick: () => openBill(b.id),
   }));
@@ -853,7 +855,7 @@ async function paymentRunsView() {
   const picked = new Set(d.eligible.map((b) => b.id));
   const totalEl = el('span', { class: 'grow sub' });
   const updateTotal = () => {
-    const t = d.eligible.filter((b) => picked.has(b.id)).reduce((s, b) => s + Number(b.total_minor), 0);
+    const t = d.eligible.filter((b) => picked.has(b.id)).reduce((s, b) => s + Number(b.net_minor ?? b.total_minor), 0);
     totalEl.textContent = `${plural(picked.size, 'bill')} picked, ${money(t)}`;
     build.disabled = picked.size === 0;
   };
@@ -866,7 +868,7 @@ async function paymentRunsView() {
     const box = el('input', { type: 'checkbox', class: 'pickbox', checked: true, 'aria-label': `Pay ${b.vendor} ${b.reference || ''}`,
       onchange: (e) => { e.target.checked ? picked.add(b.id) : picked.delete(b.id); updateTotal(); } });
     return item({ pick: box, title: billName(b.vendor, b.reference),
-      detail: b.due_date ? (b.days_past_due ? `${b.days_past_due} days past due` : `due ${dayLabel(b.due_date)}`) : `dated ${dayLabel(b.invoice_date)}`, amount: money(b.total_minor) });
+      detail: b.due_date ? (b.days_past_due ? `${b.days_past_due} days past due` : `due ${dayLabel(b.due_date)}`) : `dated ${dayLabel(b.invoice_date)}`, amount: billAmount(b) });
   });
   updateTotal();
   const runs = d.runs.map((r) => runItem(r, d));
@@ -947,7 +949,7 @@ async function vendorsView() {
     title: x.name, detail: [x.city && x.state ? `${x.city}, ${x.state}` : x.state, x.gl_code ? `codes to ${x.gl_code} ${x.gl_name}` : null, `${x.terms_days}-day terms`, plural(x.bills, 'bill'),
       x.last_bill ? `last ${shortDay(x.last_bill)}` : null, x.is_1099 ? '1099' : null, x.w9_on_file ? null : 'no W-9', x.bank_last4 ? `pays to ••${x.bank_last4}` : null,
       x.category_here ? `${x.category_label} for ${S.co.name}` : null].filter(Boolean).join(' · '),
-    amount: Number(x.open_minor) ? `${money(x.open_minor)} open` : null,
+    amount: Number(x.open_minor) ? `${money(x.open_minor)} open${Number(x.open_gross_minor) !== Number(x.open_minor) ? ` (of ${money(x.open_gross_minor)})` : ''}` : null,
     badge: x.status === 'hold' ? chip('warning', 'clock', 'Awaiting approval') : x.status !== 'active' ? chip('neutral', 'pause', cap(x.status))
       : x.bank_change_pending ? chip('warning', 'clock', 'Bank change waiting') : null,
     onClick: () => openVendor(x.id) });
