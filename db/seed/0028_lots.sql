@@ -8,7 +8,8 @@ declare t record; acct record; cur text;
 begin
   for t in select id from tenant where exists (select 1 from gl_account g where g.tenant_id = tenant.id and g.code = '1110') loop
     for acct in select * from (values ('1115', 'Finance company holdbacks receivable', 'asset', 'D'),
-                                      ('6915', 'Finance company chargebacks', 'expense', 'D')) v(code, name, typ, nb) loop
+                                      ('6915', 'Finance company chargebacks', 'expense', 'D'),
+                                      ('2195', 'Unapplied finance deposits', 'liability', 'C')) v(code, name, typ, nb) loop
       select account_type into cur from gl_account where tenant_id = t.id and code = acct.code;
       if cur is null then
         insert into gl_account (tenant_id, code, name, account_type, normal_balance) values (t.id, acct.code, acct.name, acct.typ, acct.nb);

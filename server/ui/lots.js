@@ -18,6 +18,12 @@
   const errSlot = () => el('div');
   const showErr = (slot) => (e) => slot.replaceChildren(resultBox('critical', 'fail', 'Not done', friendly(e)));
   const LOT_WORD = { dye_lot: 'Dye lot', finish_batch: 'Finish batch', batch: 'Batch' };
+  /** Card or account numbers (13-19 digits) never show whole: only their last four. */
+  const mask = (v) => (v == null ? v : String(v).replace(/(?:\d[ -]?){12,18}\d/g, (m) => '…' + m.replace(/\D/g, '').slice(-4)));
+  // the label source tabs wrap on a phone rather than running off the side
+  const sheet = new CSSStyleSheet();
+  sheet.replaceSync('.lots-wrap .seg{display:flex;flex-wrap:wrap;max-width:100%;gap:4px}.lots-wrap .seg>*{flex:1 1 auto;min-width:0}');
+  document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
   /** Run fn, show what came back in slot (no full redraw unless asked). */
   async function run(b, slot, fn, ok, redraw) {
     b.disabled = true;
@@ -117,6 +123,7 @@
   function printHref() {
     const p = new URLSearchParams();
     for (const [k, v] of Object.entries(body())) if (v) p.set(k, String(v));
+    if (S.person) p.set('as', S.person.id);
     return `/api/c/${S.co.id}/labels/print?${p}`;
   }
 
@@ -173,7 +180,7 @@
       detail: [j.printer, j.by_name, dayLabel(String(j.at).slice(0, 10))].filter(Boolean).join(' · '), why: j.error || null }));
     return frag(
       head('Labels', [], 'Operations · cartons, bins and price tags'),
-      section('Print', null, null, el('div', { class: 'toolbar' }, srcSeg), el('div', { class: 'form-grid' }, pick, field('Template', tSel), field('Printer', pSel)),
+      section('Print', null, null, el('div', { class: 'toolbar lots-wrap' }, srcSeg), el('div', { class: 'form-grid' }, pick, field('Template', tSel), field('Printer', pSel)),
         el('div', { class: 'dlg-acts' }, download, send, page), out),
       section('Templates', 'size and fields, per kind of label', [btn('Add a template', () => templateDialog(o, null), { small: true })],
         o.templates.length ? panel(tCards) : empty('Built-in sizes in use', 'Carton 4 × 6, bin 4 × 2, price tag 4 × 3, at 203 dpi.', true)),
@@ -221,26 +228,31 @@
     const tiles = ag.lenders.map((l) => tile({ label: l.name, value: money(l.owedMinor), tone: l.exceptions ? 'warning' : 'neutral',
       text: l.exceptions ? `${plural(l.exceptions, 'exception')}` : 'owed to us', ic: l.exceptions ? 'warn' : 'info' }));
     const agingCards = ag.lenders.map((l) => item({ title: l.name, amount: money(l.owedMinor),
-      detail: `0-30 ${money(l.current)} · 31-60 ${money(l.d31_60)} · 61-90 ${money(l.d61_90)} · 90+ ${money(l.over90)} · holdbacks ${money(l.holdbackMinor)}`,
+      detail: `0-30 ${money(l.current)} · 31-60 ${money(l.d31_60)} · 61-90 ${money(l.d61_90)} · 90+ ${money(l.over90)} · holdbacks ${money(l.holdbackMinor)}`
+        + (Number(l.refundsDueBackMinor) ? ` · refunds to reverse ${money(l.refundsDueBackMinor)}` : ''),
       why: [l.reopened ? `${plural(l.reopened, 'chargeback')} reopened` : null, l.feeFlags ? `${plural(l.feeFlags, 'fee')} off the plan rate` : null].filter(Boolean).join(' · ') || null,
       acts: [btn('Set up file', () => lenderDialog(d, d.lenders.find((x) => x.id === l.companyId)), { small: true })] }));
     const exc = d.exceptions.map((x) => item({ title: `${x.company} · ${x.number} row ${x.row_no}`, amount: money(x.net_minor), badge: chip('warning', 'warn', words(x.kind)),
-      detail: [x.auth_code ? `auth ${x.auth_code}` : null, x.account_last4 ? `account …${x.account_last4}` : null, x.txn_on].filter(Boolean).join(' · '), why: x.exception,
+      detail: [x.auth_code ? `auth ${mask(x.auth_code)}` : null, x.account_last4 ? `account …${x.account_last4}` : null, x.txn_on].filter(Boolean).join(' · '), why: mask(x.exception),
       acts: [btn('Settle', () => exceptionDialog(d, x), { small: true, primary: true })] }));
+    const aside = (d.setAside || []).map((x) => item({ title: `${x.company} · ${x.number} row ${x.row_no}`, amount: money(x.net_minor), badge: chip('neutral', 'hold', 'In 2195'),
+      detail: [x.auth_code ? `auth ${mask(x.auth_code)}` : null, x.account_last4 ? `account …${x.account_last4}` : null, x.txn_on].filter(Boolean).join(' · '), why: mask(x.reason),
+      acts: [btn('Apply to a sale', () => exceptionDialog(d, { ...x, exception: 'Set aside in 2195 unapplied finance deposits; pick the sale it pays.', applyOnly: true }), { small: true })] }));
     const vari = d.variances.map((x) => item({ title: `${x.company} · ${x.receipt}`, amount: money(x.fee_variance_minor),
       detail: `${x.plan || 'plan'} · sale ${money(x.gross_minor)} · fee taken ${money(x.fee_minor)} · plan rate ${money(x.expected_fee_minor)}`, badge: chip('warning', 'warn', 'Fee off') }));
-    const reo = d.reopened.map((x) => item({ title: `${x.company} · ${x.receipt}`, amount: money(x.amount_minor), why: x.chargeback_reason,
+    const reo = d.reopened.map((x) => item({ title: `${x.company} · ${x.receipt}`, amount: money(x.amount_minor), why: mask(x.chargeback_reason),
       detail: `charged back ${dayLabel(x.on_day)} · waiting to be funded again`,
       acts: [btn('Write off', async (e) => { const why = await E.askReason({ title: 'Write off the chargeback', sub: `${x.receipt} · ${money(x.amount_minor)} to 6915`, label: 'Why will it not be funded again?' });
         if (why) act(e.currentTarget, () => post(`/settlements/sales/${x.id}/charge-off`, { reason: why }), 'Written off'); }, { small: true })] }));
     const imps = d.imports.map((x) => item({ title: `${x.number} · ${x.company}`, amount: money(x.net_minor),
       badge: x.exceptions ? chip('warning', 'warn', plural(x.exceptions, 'exception')) : x.bank_linked ? chip('good', 'ok', 'In the bank') : chip('neutral', 'pending', 'Posted'),
-      detail: [x.filename, `${x.matched} of ${x.rows} matched`, x.deposit_on ? `deposit ${dayLabel(x.deposit_on)}` : null, x.imported_by].filter(Boolean).join(' · '), onClick: () => importDialog(x) }));
+      detail: [mask(x.filename), `${x.matched} of ${x.rows} matched`, x.deposit_on ? `deposit ${dayLabel(x.deposit_on)}` : null, x.imported_by].filter(Boolean).join(' · '), onClick: () => importDialog(x) }));
     return frag(
       head('Finance settlements', [btn('Import a file', () => importFile(d), { primary: true })], 'Back office · what lenders owe and what they sent'),
       tiles.length ? tilesRow(...tiles) : null,
-      section('What each lender owes', `1110 ${money(ag.gl1110Minor)} · 1115 ${money(ag.gl1115Minor)}`, null, ag.lenders.length ? panel(agingCards) : empty('No finance companies', 'Add them in Receivables.', true)),
+      section('What each lender owes', `1110 ${money(ag.gl1110Minor)} · 1115 ${money(ag.gl1115Minor)}${Number(ag.differenceMinor) ? ` · ${money(ag.differenceMinor)} in 1110 not explained` : ''}`, null, ag.lenders.length ? panel(agingCards) : empty('No finance companies', 'Add them in Receivables.', true)),
       section('Exceptions', d.exceptions.length ? plural(d.exceptions.length, 'row') : null, null, d.exceptions.length ? panel(capped(exc, 10, 'rows')) : empty('Nothing waiting', 'Every row of every file matched a financed sale.')),
+      section('Set aside (2195)', `${money(ag.gl2195Minor)} unapplied`, null, aside.length ? panel(capped(aside, 10, 'rows')) : empty('Nothing set aside', null, true)),
       section('Fees off the plan rate', null, null, d.variances.length ? panel(capped(vari, 10, 'fees')) : empty('Every fee matched its plan', null, true)),
       section('Chargebacks reopened', null, null, d.reopened.length ? panel(reo) : empty('None open', null, true)),
       section('Files imported', null, null, d.imports.length ? panel(capped(imps, 10, 'files')) : empty('No files yet', null, true)));
@@ -283,15 +295,16 @@
   }
 
   function exceptionDialog(d, x) {
-    const want = x.kind === 'funding' ? 'awaiting_funding' : 'funded';
-    const sales = d.sales.filter((s) => s.company_id === x.company_id && s.status === want);
-    const pick = select([['', 'Pick the financed sale'], ...sales.map((s) => [s.id, `${s.receipt} · ${s.customer || ''} · ${money(s.amount_minor)}${s.auth_code ? ' · ' + s.auth_code : ''}`])], '');
+    const sales = d.sales.filter((s) => s.company_id === x.company_id && (x.kind === 'funding' ? s.status === 'awaiting_funding' : Number(s.funded_gross_minor) > 0));
+    const pick = select([['', 'Pick the financed sale'], ...sales.map((s) => [s.id, `${s.receipt} · ${s.customer || ''} · ${money(s.left_minor)} left of ${money(s.amount_minor)}${s.auth_code ? ' · ' + mask(s.auth_code) : ''}`])], '');
     const why = input({ placeholder: 'Or set it aside: why', maxlength: '300' });
     const dd = openDialog('Settle an exception', `${x.company} · ${x.number} row ${x.row_no} · ${money(x.net_minor)}`);
     const out = errSlot();
     const b1 = btn('Match and post', (e) => act(e.currentTarget, () => post(`/settlements/lines/${x.id}/resolve`, { financedSaleId: pick.value }), 'Posted', { close: dd.close, errorInto: showErr(out) }), { primary: true });
-    const b2 = btn('Set aside', (e) => act(e.currentTarget, () => post(`/settlements/lines/${x.id}/resolve`, { dismissReason: why.value }), 'Set aside', { close: dd.close, errorInto: showErr(out) }));
-    dd.body.append(el('p', { class: 'lead', text: x.exception }), el('div', { class: 'form-grid' }, field('Financed sale', pick), field('Reason', why)), el('div', { class: 'dlg-acts' }, b1, b2), out);
+    const b2 = x.applyOnly ? null : btn('Set aside', (e) => act(e.currentTarget, () => post(`/settlements/lines/${x.id}/resolve`, { dismissReason: why.value }),
+      Number(x.net_minor) ? 'Set aside in 2195' : 'Set aside', { close: dd.close, errorInto: showErr(out) }));
+    dd.body.append(el('p', { class: 'lead', text: mask(x.exception) }), el('div', { class: 'form-grid' }, field('Financed sale', pick), x.applyOnly ? null : field('Reason', why, Number(x.net_minor) ? 'The money still goes to the bank, held in 2195 until it is applied' : null)),
+      el('div', { class: 'dlg-acts' }, b1, b2), out);
   }
 
   async function importDialog(x) {
@@ -299,10 +312,10 @@
     try {
       const rows = await coApi(`/settlements/imports/${x.id}`);
       dd.body.append(el('div', { class: 'panel' }, rows.map((r) => item({ title: `Row ${r.row_no} · ${words(r.kind)}${r.receipt ? ' · ' + r.receipt : ''}`, amount: money(r.net_minor),
-        badge: r.status === 'posted' ? (r.fee_flag ? chip('warning', 'warn', 'Fee off') : chip('good', 'ok', 'Posted')) : r.status === 'exception' ? chip('warning', 'warn', 'Exception') : chip('neutral', 'info', 'Set aside'),
-        detail: [r.auth_code ? `auth ${r.auth_code}` : null, r.account_last4 ? `…${r.account_last4}` : null, r.gross_minor !== '0' ? `sale ${money(r.gross_minor)}` : null,
+        badge: r.status === 'posted' ? (r.fee_flag ? chip('warning', 'warn', 'Fee off') : chip('good', 'ok', 'Posted')) : r.status === 'exception' ? chip('warning', 'warn', 'Exception') : chip('neutral', 'info', r.status === 'suspense' ? 'In 2195' : 'Set aside'),
+        detail: [r.auth_code ? `auth ${mask(r.auth_code)}` : null, r.account_last4 ? `…${r.account_last4}` : null, r.gross_minor !== '0' ? `sale ${money(r.gross_minor)}` : null,
           r.fee_minor !== '0' ? `fee ${money(r.fee_minor)}` : null, r.holdback_minor !== '0' ? `holdback ${money(r.holdback_minor)}` : null, r.chargeback_mode ? words(r.chargeback_mode) : null].filter(Boolean).join(' · '),
-        why: r.exception || r.reason || (r.fee_flag ? `plan rate ${money(r.expected_fee_minor)}, off by ${money(r.fee_variance_minor)}` : null) }))));
+        why: mask(r.exception) || mask(r.reason) || (r.fee_flag ? `plan rate ${money(r.expected_fee_minor)}, off by ${money(r.fee_variance_minor)}` : null) }))));
     } catch (e) { dd.body.append(resultBox('critical', 'fail', 'Not loaded', friendly(e))); }
   }
 

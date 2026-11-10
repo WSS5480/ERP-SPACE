@@ -151,6 +151,32 @@ export async function run(t: T) {
     const ord = await R.get(t, `/lots/orders/${oC}`) as { lines: { pieces: { serial: string | null; lot: string | null }[] }[]; mixed: unknown[] };
     t.ok("delivery record: an order's lines list the serial and lot of each piece", ord.lines.every((l) => l.pieces.length === 1 && l.pieces[0].serial) && ord.mixed.length === 1);
 
+    // a line's chosen cover splits the group: the same products in two fabrics are matched apart
+    const po3 = await as(BUYER, (c, s) => pur.createPO(c, s, { vendorId: COASTER, shipToId: DC, lines: [{ productId: SOFA, qty: 2 }, { productId: LOVE, qty: 2 }], overBudgetReason: "lot checks" }, true));
+    const po3l = await read<{ id: string; product_id: string }>(`select id, product_id from purchase_order_line where entity_id = $1 and purchase_order_id = $2 order by seq`, [ENTITY, po3.poId]);
+    await I.post(t, DEE, "/inventory/receiving", { purchaseOrderId: po3.poId, locationId: DC, lines: [
+      { poLineId: po3l.find((x) => x.product_id === SOFA)!.id, qty: 2, units: [{ serial: "SN-E1", lot: "DL-700" }, { serial: "SN-E2", lot: "DL-701" }] },
+      { poLineId: po3l.find((x) => x.product_id === LOVE)!.id, qty: 2, units: [{ serial: "LV-E1", lot: "DL-800" }, { serial: "LV-E2", lot: "DL-801" }] }] });
+    const cfgOrder = async (no: string, sofaFabric: string, loveFabric: string) => as(PEOPLE.STEVE, async (c) => {
+      const o = (await q<{ id: string }>(c, `insert into sales_order (entity_id, number, channel, location_id, customer_id, status, fulfillment)
+        values ($1,$2,'phone',$3,$4,'open','pickup') returning id`, [ENTITY, no, LOC.ENOLA, CUSTOMER]))[0];
+      let seq = 1;
+      for (const [pid, fab] of [[SOFA, sofaFabric], [LOVE, loveFabric]]) await c.query(`insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, fulfil_from_id, line_status, config)
+        select $1, $2, $3, id, sku, name, 1, 99900, $5, 'open', jsonb_build_object('fabric', jsonb_build_array(jsonb_build_object('code', $6::text, 'label', $6::text))) from product where id = $4`,
+        [ENTITY, o.id, seq++, pid, DC, fab]);
+      await inv.reserveOrder(c, ENTITY, o.id);
+      return o.id;
+    });
+    const oE = await cfgOrder("LOT-SO-E", "saddle-leather", "black-leather");
+    // put the loveseat's piece on first, by hand, from a lot no sofa has
+    const eLove = (await read<{ id: string }>(`select id from sales_order_line where entity_id = $1 and sales_order_id = $2 and product_id = $3`, [ENTITY, oE, LOVE]))[0].id;
+    await I.post(t, DEE, "/inventory/allocate", { label: (await piece("LV-E1")).label, lineId: eLove });
+    const rE = await R.post(t, MARIA, `/lots/orders/${oE}/reserve`) as { warnings: string[] };
+    const oF = await cfgOrder("LOT-SO-F", "black-leather", "black-leather");
+    const rF = await R.post(t, MARIA, `/lots/orders/${oF}/reserve`) as { warnings: string[] };
+    t.ok("lots: lines in different fabrics are separate groups (no warning), the same fabric on both lines is one group (warned)",
+      !rE.warnings.length && rF.warnings.length === 1, J({ rE, rF }));
+
     // ----------------------------------------------------------------- recall
     const byLot = await R.get(t, "/lots/search?q=dl-200") as { serial_no: string; order_number: string | null; customer: string | null; matched_on: string; po_number: string }[];
     t.ok("recall: a dye lot finds every unit of it, with the order and customer it went to and the PO it came on",
@@ -206,7 +232,10 @@ export async function run(t: T) {
       const bz = await R.post(t, DEE, "/labels/zpl", { source: "bins", binIds: bins.map((b) => b.id) }) as { labels: number; zpl: string };
       t.ok("bin labels: one per bin with its code as the barcode", bz.labels === bins.length && bz.zpl.includes("^BCN"));
     }
-    const page = await R.get(t, `/labels/print?source=receipt&id=${rc1.receiptId}`);
+    await t.throws("print page: nobody named is refused", () => R.get(t, `/labels/print?source=receipt&id=${rc1.receiptId}`), /pick who you are acting as/);
+    await t.throws("print page: a driver cannot print labels", () => R.get(t, `/labels/print?source=receipt&id=${rc1.receiptId}&as=${TONY}`), /printing labels needs one of/);
+    const page = await R.get(t, `/labels/print?source=receipt&id=${rc1.receiptId}&as=${DEE}`);
+    t.ok("print page: a browser print is logged", (await read(`select 1 from label_print_job where entity_id = $1 and how = 'browser' and by_user = $2`, [ENTITY, DEE])).length > 0);
     const html = (page as PublicPage).text ?? "";
     t.ok("print page: a no-script page sized for the company's label template, with SVG barcodes (the Dymo and desktop fallback)",
       page instanceof PublicPage && html.includes("@page{size:3in 2in") && html.includes("<svg") && !/<script/i.test(html) && html.includes(`Barcode ${a1.label}`) && html.includes('nonce="__NONCE__"'));
@@ -217,6 +246,12 @@ export async function run(t: T) {
     await t.throws("printers: a host name is refused (DNS could move it)", () => R.post(t, PEOPLE.STEVE, "/labels/printers", { name: "Dock Zebra", host: "zebra.internal" }), /is not an IP address/);
     await t.throws("printers: loopback is refused", () => R.post(t, PEOPLE.STEVE, "/labels/printers", { name: "Dock Zebra", host: "127.0.0.1" }), /is not on a private network/);
     await t.throws("printers: a port other than 9100-9109 is refused", () => R.post(t, PEOPLE.STEVE, "/labels/printers", { name: "Dock Zebra", host: "192.168.1.50", port: 22 }), /port 9100/);
+    await t.throws("printers: the port is 9100 unless the owner's settings allow another", () => R.post(t, PEOPLE.STEVE, "/labels/printers", { name: "Dock Zebra 2", host: "192.168.1.51", port: 9101 }),
+      /listen on port 9100; another port is set by the owner/);
+    await as(PEOPLE.STEVE, (c) => c.query(`insert into entity_setting (entity_id, key, value) values ($1, 'labels.printer_ports', '[9100, 9101]') on conflict (entity_id, key) do update set value = excluded.value`, [ENTITY]));
+    const p9101 = await R.post(t, PEOPLE.STEVE, "/labels/printers", { name: "Dock Zebra 2", host: "192.168.1.51", port: 9101 }) as { port: number };
+    t.ok("printers: a port the owner allowed in settings is taken", p9101.port === 9101);
+    await t.throws("code 128: DEL and control characters are refused before encoding", async () => cat.code128("AB\x7fC"), /a control character cannot be printed in a barcode/);
     await t.throws("printers: the database refuses a public address however it is written", () => as(PEOPLE.STEVE, (c) => c.query(
       `insert into label_printer (entity_id, name, host) values ($1, 'raw', '93.184.216.34')`, [ENTITY])), /label_printer_host_check|violates check constraint/);
     const pr = await R.post(t, PEOPLE.STEVE, "/labels/printers", { name: "Dock Zebra", host: "192.168.1.50", locationId: DC }) as { id: string };
@@ -331,8 +366,18 @@ export async function run(t: T) {
     t.ok("chargeback: written off to 6915 with a reason, it leaves 1110", a3.f6915 - g3.f6915 === 80000n && g3.f1110 - a3.f1110 === 80000n);
     const exc2 = (await read<{ id: string }>(`select id from finance_remit_line where import_id = $1 and status = 'exception' /* unscoped: test lookup */`, [im2.importId]))[0].id;
     await t.throws("exceptions: setting a row aside needs a reason", () => R.post(t, JEN, `/settlements/lines/${exc2}/resolve`, { dismissReason: "" }), /pick the financed sale this row pays, or set it aside|say why/);
+    const sus0 = { f2195: await gl("2195"), bank: await gl(bankCode) };
     const dis = await R.post(t, JEN, `/settlements/lines/${exc2}/resolve`, { dismissReason: "belongs to the Palestine store's merchant number" }) as { status: string };
-    t.ok("exceptions: a row set aside with a reason leaves the list", dis.status === "dismissed" && !(await read(`select 1 from finance_remit_line where id = $1 and status = 'exception' /* unscoped: test lookup */`, [exc2])).length);
+    const sus1 = { f2195: await gl("2195"), bank: await gl(bankCode) };
+    t.ok("exceptions: a paid row set aside still puts its cash in the bank, held in 2195, and leaves the exception list",
+      dis.status === "suspense" && sus0.f2195 - sus1.f2195 === 84600n && sus1.bank - sus0.bank === 84600n
+      && !(await read(`select 1 from finance_remit_line where id = $1 and status = 'exception' /* unscoped: test lookup */`, [exc2])).length, J({ dis, sus0, sus1 }));
+    const S9 = await sale("FIN-LOT-9", 90000n, "P12", "AUTH-9B", null);
+    const b9 = await gl("1110");
+    await R.post(t, JEN, `/settlements/lines/${exc2}/resolve`, { financedSaleId: S9 });
+    const sus2 = await gl("2195");
+    t.ok("set aside: applying it to a sale later moves it from 2195 to the sale's receivable", sus2 === sus0.f2195 && b9 - (await gl("1110")) === 90000n
+      && (await read<{ status: string }>(`select status from financed_sale where id = $1 /* unscoped: test lookup */`, [S9]))[0].status === "funded");
     // expense mode: the lender takes a funded sale back and we do not expect it again
     await R.post(t, PEOPLE.CONTROLLER, `/settlements/lenders/${PRIME}`, { chargebackMode: "expense" });
     const b4 = { f6915: await gl("6915"), f1110: await gl("1110") };
@@ -340,7 +385,71 @@ export async function run(t: T) {
       `${today},Reversal,AUTH-1,,,,,,-940.00,fraud claim`].join("\n") });
     const a4 = { f6915: await gl("6915"), f1110: await gl("1110") };
     const s1 = (await read<{ status: string }>(`select status from financed_sale where id = $1 /* unscoped: test lookup */`, [S1]))[0];
-    t.ok("chargeback, expense mode: posts to 6915 and the sale is charged off, 1110 untouched", s1.status === "charged_off" && a4.f6915 - b4.f6915 === 94000n && a4.f1110 === b4.f1110);
+    t.ok("chargeback, expense mode: the whole sale goes to 6915 (its fee given back), the sale is charged off, 1110 back where it was", s1.status === "charged_off" && a4.f6915 - b4.f6915 === 100000n && a4.f1110 === b4.f1110,
+      J({ d6915: a4.f6915 - b4.f6915, d1110: a4.f1110 - b4.f1110 }));
+    await R.post(t, PEOPLE.CONTROLLER, `/settlements/lenders/${PRIME}`, { chargebackMode: "reopen" });
+    const H = "Funding Date,Type,Auth Code,Account,Plan,Sale Amount,Discount,Holdback,Net,Reason";
+    const file = (...rows: string[]) => R.post(t, JEN, "/settlements/import", { companyId: PRIME, text: [H, ...rows].join("\n") }) as Promise<{ importId: string; matched: number; exceptions: number }>;
+    const excOf = async (id: string) => (await read<{ exception: string | null; auth_code: string | null; account_last4: string | null }>(
+      `select exception, auth_code, account_last4 from finance_remit_line where import_id = $1 order by row_no /* unscoped: test lookup */`, [id]));
+    // a conflicting approval code never falls through to the account's last four
+    const SX = await sale("FIN-LOT-X", 143210n, "P12", "REALAUTH", "4111111111119876");
+    const fx1 = await file(`${today},Funding,OTHERAUTH,XXXX9876,P12,1432.10,10.00,0,1422.10,`);
+    const fxe = await excOf(fx1.importId);
+    t.ok("matching: a row whose approval code differs from the sale's is an exception, even when the account and amount fit",
+      fx1.matched === 0 && /its approval is REALAUTH, not OTHERAUTH/.test(fxe[0].exception ?? "") && (await read<{ status: string }>(`select status from financed_sale where id = $1 /* unscoped: test lookup */`, [SX]))[0].status === "awaiting_funding", J(fxe));
+    await sale("FIN-LOT-T1", 70000n, "P12", null, "5555");
+    await sale("FIN-LOT-T2", 70000n, "P12", null, "5555");
+    const two = await file(`${today},Funding,,XXXX5555,P12,700.00,42.00,0,658.00,`);
+    t.ok("matching: two sales that fit the account and amount go to exceptions", two.exceptions === 1 && /2 financed sales on account ending 5555/.test((await excOf(two.importId))[0].exception ?? ""));
+    // card numbers: kept as their last four only, and never echoed
+    const pan = await file(`${today},Funding,4111111111111111,,P12,1999.99,0,0,1999.99,`, `4111-1111-1111-2222,Funding,ZZZ,,P12,1010.00,0,0,1010.00,card 4111 1111 1111 3333 disputed`);
+    const pe = await excOf(pan.importId);
+    const raw = await read<{ t: string }>(`select concat_ws('|', l.auth_code, l.account_last4, l.reason, l.plan_code, l.exception) t from finance_remit_line l where import_id = $1 /* unscoped: test lookup */`, [pan.importId]);
+    t.ok("card numbers: an approval column holding one keeps only its last four, and no stored text or message carries 13+ digits",
+      pan.exceptions === 2 && pe[0].auth_code === null && pe[0].account_last4 === "1111" && /approval column carried a card or account number/.test(pe[0].exception ?? "")
+      && /date on this row cannot be read/.test(pe[1].exception ?? "") && raw.every((r) => !/\d{13,}/.test(r.t.replace(/[ -]/g, ""))), J(pe));
+    // partial funding: one sale over two deposits
+    const SP = await sale("FIN-LOT-P", 100000n, "P12", "PART-1", null);
+    const p0 = await gl("1110");
+    const fp1 = await file(`${today},Funding,PART-1,,P12,600.00,36.00,0,564.00,`);
+    const sp1 = (await read<{ status: string; funded_gross_minor: string }>(`select status, funded_gross_minor from financed_sale where id = $1 /* unscoped: test lookup */`, [SP]))[0];
+    const fp2 = await file(`${today},Funding,PART-1,,P12,400.00,24.00,0,376.00,`);
+    const sp2 = (await read<{ status: string; funded_gross_minor: string }>(`select status, funded_gross_minor from financed_sale where id = $1 /* unscoped: test lookup */`, [SP]))[0];
+    const fp3 = await file(`${today},Funding,PART-1,,P12,1.00,0,0,1.00,`);
+    t.ok("partial funding: a sale funded over two deposits keeps what is left, is funded when nothing is, and refuses more",
+      fp1.matched === 1 && sp1.status === "awaiting_funding" && sp1.funded_gross_minor === "60000" && fp2.matched === 1 && sp2.status === "funded" && p0 - (await gl("1110")) === 100000n && fp3.exceptions === 1,
+      J({ sp1, sp2 }));
+    // customer refunds on financed sales, then the lender's reversal: reopen mode and expense mode
+    const refund = (auth: string, amount: bigint) => as(JEN, async (c, s) => {
+      const r = (await q<{ id: string }>(c, `insert into customer_receipt (entity_id, number, customer_id, location_id, channel, method, amount_minor, reference)
+        values ($1,$2,$3,$4,'pos','financing',$5,$6) returning id`, [ENTITY, `FIN-RF-${auth}`, CUSTOMER, LOC.ENOLA, (-amount).toString(), auth]))[0];
+      await ar.postReceipt(c, s, r.id);
+    });
+    const diff0 = B((await R.get(t, "/settlements/aging") as { differenceMinor: string }).differenceMinor);
+    for (const mode of ["reopen", "expense"]) {
+      await R.post(t, PEOPLE.CONTROLLER, `/settlements/lenders/${PRIME}`, { chargebackMode: mode });
+      const before = { f1110: await gl("1110"), f6915: await gl("6915"), f6910: await gl("6910") };
+      const auth = `RF-${mode.toUpperCase()}`;
+      const SR = await sale(`FIN-LOT-${auth}`, 150000n, "P12", auth, null);
+      await file(`${today},Funding,${auth},,P12,1500.00,20.00,0,1480.00,`);
+      await refund(auth, 150000n);
+      const mid = (await read<{ refunded_minor: string; status: string }>(`select refunded_minor, status from financed_sale where id = $1 /* unscoped: test lookup */`, [SR]))[0];
+      const rv = await file(`${today},Chargeback,${auth},,,1500.00,,,-1480.00,customer returned it`);
+      const end = (await read<{ status: string }>(`select status from financed_sale where id = $1 /* unscoped: test lookup */`, [SR]))[0];
+      const after = { f1110: await gl("1110"), f6915: await gl("6915"), f6910: await gl("6910") };
+      t.ok(`refund then reversal (${mode} mode): the refund credits the sale, the lender's reversal clears it, 1110 nets to 0 and 6915 takes nothing`,
+        mid.refunded_minor === "150000" && rv.matched === 1 && end.status === "refunded" && after.f1110 === before.f1110 && after.f6915 === before.f6915 && after.f6910 === before.f6910,
+        J({ mid, end, d1110: after.f1110 - before.f1110, d6915: after.f6915 - before.f6915, d6910: after.f6910 - before.f6910 }));
+    }
+    // a refund before the lender funds: it owes only the rest
+    const SQ = await sale("FIN-LOT-Q", 100000n, "P12", "RF-PART", null);
+    await refund("RF-PART", 30000n);
+    const fq = await file(`${today},Funding,RF-PART,,P12,700.00,42.00,0,658.00,`);
+    t.ok("refund in part before funding: the lender funds what is left and the sale is funded", fq.matched === 1
+      && (await read<{ status: string }>(`select status from financed_sale where id = $1 /* unscoped: test lookup */`, [SQ]))[0].status === "funded");
+    const diff1 = B((await R.get(t, "/settlements/aging") as { differenceMinor: string }).differenceMinor);
+    t.ok("aging: what the lenders owe still ties to 1110 after refunds, partial funding and reversals", diff1 === diff0, J({ diff0, diff1 }));
     await R.post(t, PEOPLE.CONTROLLER, `/settlements/lenders/${PRIME}`, { chargebackMode: "reopen" });
     const unbalanced = await read(`select je.id from journal_entry je join journal_line jl on jl.journal_entry_id = je.id where je.entity_id = $1 and je.source_type = 'finance'
       group by je.id having sum(jl.debit_minor) <> sum(jl.credit_minor)`, [ENTITY]);

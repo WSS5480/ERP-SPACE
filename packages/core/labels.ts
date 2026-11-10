@@ -354,13 +354,21 @@ export async function printers(c: Client, entityId: string) {
     left join location lo on lo.id = lp.location_id where lp.entity_id = $1 order by lp.active desc, lp.name`, [entityId]);
 }
 
+/** The ports a label printer may be on: 9100, unless the owner set others (9100-9109) in labels.printer_ports. */
+export async function printerPorts(c: Client, entityId: string): Promise<number[]> {
+  const r = await q<{ value: unknown }>(c, `select value from entity_setting where entity_id = $1 and key = 'labels.printer_ports'`, [entityId]);
+  const v = Array.isArray(r[0]?.value) ? (r[0].value as unknown[]).map(Number).filter((n) => Number.isInteger(n) && n >= 9100 && n <= 9109) : [];
+  return v.length ? v : [9100];
+}
+
 /** Set up (or change) a printer. The caller checks that this is the owner. */
 export async function savePrinter(c: Client, scope: Scope, e: { id?: string | null; name: string; host: string; port?: number; locationId?: string | null; active?: boolean }) {
   const name = String(e.name ?? "").trim();
   need(name && name.length <= 60, "name the printer (up to 60 characters)");
   const host = privatePrinterHost(e.host);
   const port = e.port ?? 9100;
-  need(Number.isInteger(port) && port >= 9100 && port <= 9109, "label printers listen on port 9100 (9100 to 9109 are allowed)");
+  const allowed = await printerPorts(c, scope.entityId);
+  need(Number.isInteger(port) && allowed.includes(port), `label printers listen on port ${allowed.join(" or ")}; another port is set by the owner in the company's settings (labels.printer_ports)`);
   if (e.locationId) need((await q(c, `select 1 from location where id = $1 and entity_id = $2`, [e.locationId, scope.entityId])).length, "no such location");
   let id = e.id ?? null;
   if (id) {
@@ -401,6 +409,7 @@ export async function sendToPrinter(c: Client, scope: Scope, printerId: string, 
   need(r.length, "that is not one of this company's printers; the owner sets printers up in Labels");
   need(r[0].active, `${r[0].name} is switched off in Labels`);
   const host = privatePrinterHost(r[0].host);
+  need((await printerPorts(c, scope.entityId)).includes(r[0].port), `${r[0].name} is set to port ${r[0].port}, which the company's settings no longer allow`);
   need(zpl.length <= 2_000_000, "that is too many labels to send at once; send them in smaller batches");
   let error: string | null = null;
   try { await transport(host, r[0].port, zpl); }

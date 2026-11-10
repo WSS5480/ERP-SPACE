@@ -23,6 +23,7 @@ import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { postLines as postTaxLines } from "./tax.ts";
 import { post, profitObjectFor, type PostLine } from "./posting.ts";
 import { format, mulBps } from "./money.ts";
+import { recordFinancingRefund } from "./ar_settlement.ts";
 
 export class ArError extends Error {}
 
@@ -63,8 +64,11 @@ export async function postReceipt(c: Client, scope: Scope, receiptId: string): P
   const lines = amt > 0n
     ? [{ code: cashSide, debit: abs, profitObjectId: po }, { code: "2300", credit: abs, profitObjectId: po }]
     : [{ code: "2300", debit: abs, profitObjectId: po }, { code: cashSide, credit: abs, profitObjectId: po }];
-  return post(c, scope, { date: r.received_at, sourceType: amt > 0n ? "receipt" : "refund", sourceId: receiptId,
+  const je = await post(c, scope, { date: r.received_at, sourceType: amt > 0n ? "receipt" : "refund", sourceId: receiptId,
     description: `${amt > 0n ? "Receipt" : "Refund"} ${r.number}`, lines });
+  // A refund to a finance company's card credits the financed sale, so its settlement clears it rather than reopening it.
+  if (r.method === "financing" && amt < 0n) await recordFinancingRefund(c, scope, receiptId);
+  return je;
 }
 
 /**
@@ -1355,7 +1359,7 @@ export async function settleFinanceBatch(c: Client, scope: Scope, s: {
   const je = await post(c, scope, { date: on, sourceType: "finance", sourceId: st.id, description: `${co.name} funding ${s.reference.trim()}`,
     lines: [{ code: "1050", debit: s.fundedMinor }, { code: "6910", debit: fee, memo: "lender's fee" }, { code: "1110", credit: gross }] });
   await c.query(`update finance_settlement set journal_entry_id = $2 where id = $1 and entity_id = $3`, [st.id, je, scope.entityId]);
-  await c.query(`update financed_sale set status = 'funded', settlement_id = $2 where entity_id = $3 and id = any($1)`, [s.saleIds, st.id, scope.entityId]);
+  await c.query(`update financed_sale set status = 'funded', settlement_id = $2, funded_gross_minor = amount_minor - refunded_minor where entity_id = $3 and id = any($1)`, [s.saleIds, st.id, scope.entityId]);
   return { settlementId: st.id, journalEntryId: je, grossMinor: gross, fundedMinor: s.fundedMinor, feeMinor: fee, expectedFeeMinor: expected,
     varianceMinor: fee - expected };
 }

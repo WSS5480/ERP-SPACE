@@ -1882,6 +1882,17 @@ export type UnitIds = { serial?: string | null; lot?: string | null };
 /** The matching group of a product (alias p): its lot_group, else collection and color; null when it carries no lot. */
 export const LOT_KEY_SQL = `case when p.lot_class is null then null else upper(coalesce(nullif(trim(p.lot_group), ''),
   nullif(concat_ws(' ', p.collection, p.color), ''), p.id::text)) end`;
+/**
+ * The cover or finish chosen on an order line (alias l): the option values of its
+ * fabric / cover / leather / color / finish / stain groups, so two sofas of one
+ * product in different fabrics are different groups.
+ */
+export const LINE_OPTS_SQL = `coalesce((select string_agg(upper(e.k) || '=' || upper(coalesce(o.v->>'code', o.v->>'label', '')), ';' order by e.k, o.v->>'code')
+    from jsonb_each(case when jsonb_typeof(l.config) = 'object' then l.config else '{}'::jsonb end) e(k, v)
+    cross join lateral jsonb_array_elements(case when jsonb_typeof(e.v) = 'array' then e.v else '[]'::jsonb end) o(v)
+   where e.k ~* '(fabric|cover|leather|uphol|colou?r|finish|stain|wood)'), '')`;
+/** The matching group of an order line's product (aliases p and l): the product's group plus the line's cover or finish. */
+export const LINE_LOT_KEY_SQL = `(${LOT_KEY_SQL} || case when ${LINE_OPTS_SQL} = '' then '' else ' | ' || ${LINE_OPTS_SQL} end)`;
 export const LOT_WORD: Record<string, string> = { dye_lot: "dye lot", finish_batch: "finish batch", batch: "batch" };
 
 const SERIAL_RE = /^[\x21-\x7e]{1,60}$/, LOT_RE = /^[\x20-\x7e]{1,40}$/;
@@ -1990,13 +2001,19 @@ async function freeByLot(c: Client, entityId: string, productId: string, locatio
      order by min(created_at)`, [entityId, productId, locationId]);
 }
 
+/** An order line's matching group (its product's cover or finish group and the line's chosen options), or null. */
+export async function lineLotKey(c: Client, entityId: string, lineId: string): Promise<string | null> {
+  const r = await q<{ k: string | null }>(c, `select ${LINE_LOT_KEY_SQL} k from sales_order_line l join product p on p.id = l.product_id where l.id = $1 and l.entity_id = $2`, [lineId, entityId]);
+  return r[0]?.k ?? null;
+}
+
 /** The lots (non-blank) already on an order's pieces of one matching group, with how many units each. */
 async function lotsOnOrder(c: Client, entityId: string, orderId: string, key: string, exceptUnit: string | null = null) {
   return q<{ lot: string; units: string }>(c, `
     select upper(pc.lot_code) lot, count(distinct pc.unit_id)::text units
       from inv_piece pc join sales_order_line l on l.id = pc.sales_order_line_id join product p on p.id = pc.product_id
      where pc.entity_id = $1 and l.sales_order_id = $2 and pc.status in ('reserved','picked','loaded','delivered')
-       and ${LOT_KEY_SQL} = $3 and coalesce(pc.lot_code, '') <> '' and ($4::uuid is null or pc.unit_id <> $4)
+       and ${LINE_LOT_KEY_SQL} = $3 and coalesce(pc.lot_code, '') <> '' and ($4::uuid is null or pc.unit_id <> $4)
      group by upper(pc.lot_code) order by count(distinct pc.unit_id) desc, 1`, [entityId, orderId, key, exceptUnit]);
 }
 
@@ -2012,10 +2029,12 @@ export async function unitsByLot(c: Client, entityId: string, orderId: string, l
   if (n <= 0) return { units: [], mixed: false, lot: null, free: 0 };
   const p = await productOf(c, entityId, productId);
   if (!p.lot_class || !p.lot_key) { const u = await freeUnits(c, entityId, productId, locationId, n); return { units: u, mixed: false, lot: null, free: u.length }; }
+  const key = await lineLotKey(c, entityId, lineId);
+  if (!key) { const u = await freeUnits(c, entityId, productId, locationId, n); return { units: u, mixed: false, lot: null, free: u.length }; }
   const free = await freeByLot(c, entityId, productId, locationId);
   const byLot = new Map<string, FreeUnit[]>();
   for (const f of free) { if (!byLot.has(f.lot)) byLot.set(f.lot, []); byLot.get(f.lot)!.push(f); }
-  const used = (await lotsOnOrder(c, entityId, orderId, p.lot_key)).map((x) => x.lot);
+  const used = (await lotsOnOrder(c, entityId, orderId, key)).map((x) => x.lot);
   let order: string[];
   if (used.length) {
     order = [...used.filter((l) => byLot.has(l)), ...[...byLot.keys()].filter((l) => !used.includes(l)).sort((a, b) => byLot.get(b)!.length - byLot.get(a)!.length)];
@@ -2028,7 +2047,7 @@ export async function unitsByLot(c: Client, entityId: string, orderId: string, l
                                        and x.status in ('reserved','picked','loaded')))::text need
         from sales_order_line l join product p on p.id = l.product_id
        where l.entity_id = $1 and l.sales_order_id = $2 and l.id <> $3 and l.line_status in ('reserved','ready') and l.fulfil_from_id = $4
-         and p.serialized and ${LOT_KEY_SQL} = $5`, [entityId, orderId, lineId, locationId, p.lot_key]);
+         and p.serialized and ${LINE_LOT_KEY_SQL} = $5`, [entityId, orderId, lineId, locationId, key]);
     const score = new Map<string, number>();
     for (const o of others) {
       const k = Number(o.need); if (k <= 0) continue;
@@ -2061,7 +2080,7 @@ export async function unitsByLot(c: Client, entityId: string, orderId: string, l
 /** Matching groups on an order whose pieces come from more than one lot. */
 export async function lotMix(c: Client, entityId: string, orderId: string): Promise<{ key: string; lotClass: string; lots: string[]; products: string[]; message: string }[]> {
   const r = await q<{ key: string; lot_class: string; number: string; lots: string[]; products: string[] }>(c, `
-    select ${LOT_KEY_SQL} key, min(p.lot_class) lot_class, min(so.number) number,
+    select ${LINE_LOT_KEY_SQL} key, min(p.lot_class) lot_class, min(so.number) number,
            array_agg(distinct upper(pc.lot_code) order by upper(pc.lot_code)) lots, array_agg(distinct p.name order by p.name) products
       from inv_piece pc join sales_order_line l on l.id = pc.sales_order_line_id join sales_order so on so.id = l.sales_order_id
       join product p on p.id = pc.product_id
@@ -2073,12 +2092,14 @@ export async function lotMix(c: Client, entityId: string, orderId: string): Prom
 }
 
 /** Why putting this unit on the line would mix lots on its order, or null. */
-export async function lotConflict(c: Client, entityId: string, orderId: string, _lineId: string, unitId: string): Promise<string | null> {
-  const u = await q<{ lot: string | null; label: string; lot_class: string | null; key: string | null; name: string }>(c, `
-    select upper(pc.lot_code) lot, pc.label, p.lot_class, ${LOT_KEY_SQL} key, p.name from inv_piece pc join product p on p.id = pc.product_id
+export async function lotConflict(c: Client, entityId: string, orderId: string, lineId: string, unitId: string): Promise<string | null> {
+  const u = await q<{ lot: string | null; label: string; lot_class: string | null; name: string }>(c, `
+    select upper(pc.lot_code) lot, pc.label, p.lot_class, p.name from inv_piece pc join product p on p.id = pc.product_id
      where pc.entity_id = $1 and pc.unit_id = $2 order by pc.carton_seq limit 1`, [entityId, unitId]);
-  if (!u.length || !u[0].lot_class || !u[0].key || !u[0].lot) return null;
-  const used = (await lotsOnOrder(c, entityId, orderId, u[0].key, unitId)).map((x) => x.lot);
+  if (!u.length || !u[0].lot_class || !u[0].lot) return null;
+  const key = await lineLotKey(c, entityId, lineId);
+  if (!key) return null;
+  const used = (await lotsOnOrder(c, entityId, orderId, key, unitId)).map((x) => x.lot);
   if (!used.length || used.includes(u[0].lot)) return null;
   const word = LOT_WORD[u[0].lot_class] ?? "lot";
   return `${u[0].label} is ${word} ${u[0].lot}, but this order's other pieces of that cover or finish are ${word} ${used.join(", ")}`;
