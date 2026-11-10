@@ -23,6 +23,29 @@
   const dollars = (m) => (Number(m || 0) / 100).toFixed(2);
   const isManager = (setup) => setup.roles.includes('owner') || setup.roles.includes('store_manager');
 
+  /** Open delivery windows for an address and the goods going on the truck; a full or locked window cannot be picked. */
+  function pickDayDialog({ addressId, items, sub, onPick }) {
+    const d = openDialog('Pick delivery day', sub || '');
+    fillDialog(d, async () => {
+      const a = await coApi(`/fleet/availability?address=${encodeURIComponent(addressId)}&items=${encodeURIComponent(items || '')}&days=21`);
+      const byDay = new Map();
+      for (const x of a.slots) { if (!byDay.has(x.day)) byDay.set(x.day, []); byDay.get(x.day).push(x); }
+      const anyOpen = a.slots.some((x) => x.fits && !x.locked);
+      const days = [...byDay.entries()].map(([day, list]) => el('div', { class: 'field' },
+        el('span', { text: `${dayLabel(day)}${list.some((x) => x.locked) ? ' · locked by the delivery manager' : ''}` }),
+        el('div', { class: 'toolbar' }, list.map((x) => {
+          const ok = x.fits && !x.locked;
+          const left = x.caps.stops != null ? `${Math.max(x.caps.stops - x.used.stops, 0)} left` : 'open';
+          const b = el('button', { class: 'btn', type: 'button', disabled: !ok || null, onclick: () => { d.close(); onPick(x, a.zone.name); } },
+            el('b', { text: x.label }), el('span', { class: 'sub', text: x.locked ? 'locked' : x.fits ? left : 'full' }));
+          b.style.minHeight = '48px';
+          return b;
+        }))));
+      return frag(el('p', { class: 'lead', text: `${a.zone.name} · ${plural(a.size.pieces, 'piece')} · about ${a.size.labor} crew minutes at the door.` }),
+        anyOpen ? null : empty('No open windows', 'Every window in the next three weeks is full, locked or closed. Ask the delivery manager.', true), ...days);
+    });
+  }
+
   async function run(btn, out, fn, okText, after) {
     busy(btn, true);
     if (out) out.replaceChildren();
@@ -70,38 +93,16 @@
         cart.delivery ? 'Change day' : 'Pick delivery day');
       delBox.replaceChildren(el('div', { class: 'panel' }, item({
         title: cart.delivery ? `${dayLabel(cart.delivery.day)} · ${cart.delivery.label}` : 'No delivery day yet',
-        detail: !cart.addressId ? 'Pick the customer and their address first.'
+        detail: !cart.customer ? 'Pick the customer first.' : !cart.addressId ? 'Add the customer’s delivery address first.'
           : cart.delivery ? `${cart.delivery.zone} · booked when the sale is placed; the delivery manager confirms it`
           : 'Pick a day with room while the customer is here.',
         badge: cart.delivery ? chip('good', 'ok', 'Picked') : chip('warning', 'clock', 'To pick'),
         acts: cart.addressId ? [pick, cart.delivery ? el('button', { class: 'btn small', type: 'button', onclick: () => { cart.delivery = null; drawDelivery(); } }, 'Clear') : null].filter(Boolean) : null })));
     }
     function deliveryDialog() {
-      const d = openDialog('Pick delivery day', cart.customer ? cart.customer.name : '');
-      const out = el('div');
-      fillDialog(d, async () => {
-        const items = cart.lines.filter((l) => l.fulfillment === 'delivery').map((l) => `${l.productId}:${l.qty}`).join(',');
-        const a = await coApi(`/fleet/availability?address=${encodeURIComponent(cart.addressId)}&items=${encodeURIComponent(items)}&days=21`);
-        const open = a.slots.filter((x) => x.fits && !x.locked);
-        const byDay = new Map();
-        for (const x of a.slots) { if (!byDay.has(x.day)) byDay.set(x.day, []); byDay.get(x.day).push(x); }
-        const days = [...byDay.entries()].map(([day, list]) => {
-          const locked = list.some((x) => x.locked);
-          return el('div', { class: 'field' }, el('span', { text: `${dayLabel(day)}${locked ? ' · locked by the delivery manager' : ''}` }),
-            el('div', { class: 'toolbar' }, list.map((x) => {
-              const ok = x.fits && !x.locked;
-              const left = x.caps.stops != null ? `${Math.max(x.caps.stops - x.used.stops, 0)} left` : 'open';
-              const b = el('button', { class: 'btn', type: 'button', disabled: !ok || null,
-                onclick: () => { cart.delivery = { day: x.day, windowId: x.windowId, label: x.label, zone: a.zone.name }; cart.promisedOn = x.day; d.close(); drawDelivery(); E.render(); } },
-                el('b', { text: x.label }), el('span', { class: 'sub', text: x.locked ? 'locked' : x.fits ? left : 'full' }));
-              b.style.minHeight = '48px';
-              return b;
-            })));
-        });
-        return frag(el('p', { class: 'lead', text: `${a.zone.name} · ${plural(a.size.pieces, 'piece')} · about ${a.size.labor} crew minutes at the door.` }),
-          open.length ? null : empty('No open windows', 'Every window in the next three weeks is full, locked or closed. Ask the delivery manager.', true),
-          ...days, out);
-      });
+      const items = cart.lines.filter((l) => l.fulfillment === 'delivery').map((l) => `${l.productId}:${l.qty}`).join(',');
+      pickDayDialog({ addressId: cart.addressId, items, sub: cart.customer ? cart.customer.name : '', onPick: (x, zone) => {
+        cart.delivery = { day: x.day, windowId: x.windowId, label: x.label, zone }; cart.promisedOn = x.day; drawDelivery(); E.render(); } });
     }
     const open = setup.registers.filter((r) => r.session_id);
     if (!open.length) return section('No register is open', null, null, el('div', { class: 'panel' },
@@ -330,6 +331,12 @@
       if (['open', 'fulfilling'].includes(o.status) && handable.length) acts.push(btn('Hand over', () => handDialog(o, handable, reload)));
       const returnable = o.lines.filter((l) => l.line_status === 'fulfilled' && Number(l.qty) > Number(l.returned_qty));
       if (o.kind !== 'return' && returnable.length) acts.push(btn('Return or exchange', () => returnDialog(o, returnable, setup, reload)));
+      const truckLines = o.lines.filter((l) => l.fulfillment === 'delivery' && l.role === 'item' && !['fee', 'service', 'warranty'].includes(l.kind) && !['cancelled', 'fulfilled'].includes(l.line_status));
+      if (['draft', 'open', 'fulfilling'].includes(o.status) && o.kind !== 'return' && o.ship_address_id && truckLines.length && !(o.delivery_stop && o.delivery_stop.confirmed))
+        acts.push(btn(o.delivery_stop || o.delivery_day ? 'Change delivery day' : 'Pick delivery day', () => pickDayDialog({ addressId: o.ship_address_id, sub: `${o.number} · ${o.customer || ''}`,
+          items: truckLines.map((l) => `${l.product_id || ''}:${Number(l.qty)}`).join(','),
+          onPick: (x) => run(null, out, () => post(`/pos/orders/${id}/delivery-day`, { day: x.day, windowId: x.windowId }),
+            (r) => r.booked ? `Delivery booked for ${dayLabel(x.day)}, ${x.label}.` : (r.note || `Kept ${dayLabel(x.day)}, ${x.label}; it is booked when the sale is placed.`), reload) })));
       if (['draft', 'open'].includes(o.status)) acts.push(btn('Cancel', () => cancelDialog(o, reload)));
       if (o.status !== 'cancelled') acts.push(btn(o.signed_at ? 'Sign again' : 'Signature', () => signatureDialog(o, reload)));
       acts.push(btn('Receipt', () => { d.close(); go('pos', 'receipt-' + id); }));
@@ -340,6 +347,8 @@
           fact('Owed', money(o.balance_minor)), fact('Tax', `${money(o.tax_minor)}${o.tax_exempt_ref ? ' (exempt ' + o.tax_exempt_ref + ')' : ''}`),
           fact('Goes by', FUL[o.fulfillment] || o.fulfillment), o.promised_on ? fact('Promised', dayLabel(o.promised_on)) : null,
           o.quote_expires_on ? fact('Quote good until', dayLabel(o.quote_expires_on)) : null, o.ship_line1 ? fact('Deliver to', `${o.ship_line1}, ${o.ship_city} ${o.ship_state}`) : null,
+          o.delivery_stop ? fact('Delivery', `${o.delivery_stop.number} · ${dayLabel(o.delivery_stop.day)} ${o.delivery_stop.window || ''} · ${o.delivery_stop.confirmed ? 'confirmed' : 'to confirm'}`)
+            : o.delivery_day ? fact('Delivery day', `${dayLabel(o.delivery_day)} ${o.delivery_window || ''} · not booked yet`) : null,
           fact('Sold by', o.salespeople.map((p) => `${p.name} ${p.split_bps / 100}%`).join(', ') || '—'),
           Number(o.storeCreditMinor) ? fact('Store credit', money(o.storeCreditMinor)) : null)),
         o.kind === 'layaway' && o.layaway_schedule.length ? section('Layaway schedule', o.paid_off_at ? 'paid off' : null, null, el('div', { class: 'panel' },

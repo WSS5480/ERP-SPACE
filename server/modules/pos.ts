@@ -222,6 +222,11 @@ export const module: ErpModule = {
       await requireRole(c, co, a, MANAGER, "a price override");
       return pos.approveOverride(c, sc(co, a), m[2], uuid(b.lineId) ?? "", str(b.reason));
     }));
+    coPost(`/pos/orders/${ID}/delivery-day`, safe(async (c, co, a, b, m) => {
+      const held = await requireRole(c, co, a, SELL, "picking a delivery day");
+      const day = str(b.day, 10), windowId = str(b.windowId, 40);
+      return pos.setDeliveryDay(c, sc(co, a), m[2], day && windowId ? { day, windowId } : null, ["owner", "store_manager", "dispatcher"].some((r) => held.has(r)));
+    }));
     coPost(`/pos/orders/${ID}/convert`, safe(async (c, co, a, _b, m) => {
       await requireRole(c, co, a, SELL, "converting a quote");
       return pos.convertQuote(c, sc(co, a), m[2]);

@@ -120,14 +120,24 @@ export async function run(t: T) {
     t.ok("a locked day shows as locked at the register", av2.slots.filter((x) => x.day === slotA.day).every((x) => x.locked));
     const bl = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.ALICIA, shipAddressId: addr,
       delivery: { day: slotA.day, windowId: slotA.windowId }, lines: [{ productId: P.SOFA, qty: 1, fulfillment: "delivery" }] }) as { id: string };
-    await t.throws("a sale cannot book a locked day", () => R.post(t, MARIA, `/pos/orders/${bl.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "300.00", reference: "4242" }] }),
+    const blo0 = await R.post(t, MARIA, `/pos/orders/${bl.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "300.00", reference: "4242" }] }) as Awaited<ReturnType<typeof pos.checkout>>;
+    t.ok("a locked day does not stop the sale: it is placed, unbooked, and the salesperson is told why", blo0.status !== "draft" && blo0.delivery?.booked === false
+      && /locked by the delivery manager/.test(String(blo0.delivery?.note)), JSON.stringify(blo0.delivery));
+    await t.throws("the salesperson cannot pick the locked day again from the order", () => R.post(t, MARIA, `/pos/orders/${bl.id}/delivery-day`, { day: slotA.day, windowId: slotA.windowId }),
       /locked by the delivery manager/);
     await t.throws("opening a locked day needs a reason", () => RF.post(t, RAY, "/fleet/days/unlock", { day: slotA.day }), /say why/);
     await RF.post(t, RAY, "/fleet/days/unlock", { day: slotA.day, reason: "extra truck" });
-    const blo = await R.post(t, MARIA, `/pos/orders/${bl.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "300.00", reference: "4242" }] }) as Awaited<ReturnType<typeof pos.checkout>>;
-    t.ok("once opened again, the sale books it", !!blo.delivery?.booked);
-    for (const o of [bs.id, bl.id]) await R.post(t, MGR, `/pos/orders/${o}/cancel`, { reason: "check cleanup", sessionId: ses.id, refundMethod: "card", reference: "4242" });
-    const liveStops = await read<{ n: string }>(`select count(*) n from delivery_stop where entity_id = $1 and sales_order_id = any($2) and status <> 'cancelled'`, [ENTITY, [bs.id, bl.id]]);
+    const blo = await R.post(t, MARIA, `/pos/orders/${bl.id}/delivery-day`, { day: slotA.day, windowId: slotA.windowId }) as { booked: boolean };
+    t.ok("once opened again, picking the day from the order books it", !!blo.booked && (await view(bl.id)).delivery_stop != null);
+    const lwd = await R.post(t, MARIA, "/pos/orders", { kind: "layaway", locationId: LOC.ENOLA, customerId: CUST.ALICIA, shipAddressId: addr,
+      delivery: { day: slotB.day, windowId: slotB.windowId }, lines: [{ productId: P.SOFA, qty: 1, fulfillment: "delivery" }] }) as { id: string };
+    const lwdo = await R.post(t, MARIA, `/pos/orders/${lwd.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "300.00", reference: "4242" }] }) as Awaited<ReturnType<typeof pos.checkout>>;
+    t.ok("a layaway is not put on a truck until it is paid in full", lwdo.delivery?.booked === false && /paid in full/.test(String(lwdo.delivery?.note)));
+    const lwdv = await view(lwd.id);
+    await R.post(t, MARIA, `/pos/orders/${lwd.id}/pay`, { sessionId: ses.id, tenders: [{ method: "card", amount: String(Number(lwdv.balance_minor) / 100), reference: "4242" }] });
+    t.ok("paying the layaway off books the day it asked for", (await view(lwd.id)).delivery_stop != null);
+    for (const o of [bs.id, bl.id, lwd.id]) await R.post(t, MGR, `/pos/orders/${o}/cancel`, { reason: "check cleanup", sessionId: ses.id, refundMethod: "card", reference: "4242" });
+    const liveStops = await read<{ n: string }>(`select count(*) n from delivery_stop where entity_id = $1 and sales_order_id = any($2) and status <> 'cancelled'`, [ENTITY, [bs.id, bl.id, lwd.id]]);
     t.ok("cancelling the sale cancels its booked delivery", liveStops[0].n === "0");
 
     // ------------------------------------------------------- manager override

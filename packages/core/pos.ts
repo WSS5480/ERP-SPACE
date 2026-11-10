@@ -446,6 +446,7 @@ async function validatePeople(c: Client, scope: Scope, sp: { id: string; splitBp
 
 export async function createOrder(c: Client, scope: Scope, roles: Set<string>, e: OrderIn) {
   need(["sale", "quote", "layaway"].includes(e.kind), "a POS order is a sale, a quote or a layaway");
+  if (e.delivery && !(e.lines ?? []).some((l) => l.fulfillment === "delivery")) e = { ...e, delivery: null };   // nothing goes on a truck
   if (e.delivery?.day && /^\d{4}-\d{2}-\d{2}$/.test(e.delivery.day)) e = { ...e, promisedOn: e.delivery.day };   // the picked day is the promise
   const loc = await locationOf(c, scope.entityId, e.locationId);
   need(["store", "outlet"].includes(loc.kind), `${loc.name} is not a store`);
@@ -655,9 +656,14 @@ async function settleStatus(c: Client, scope: Scope, orderId: string) {
       when exists (select 1 from sales_order_line l where l.sales_order_id = so.id and l.entity_id = $2 and l.line_status = 'fulfilled') then 'fulfilling'
       else 'open' end
     where so.id = $1 and so.entity_id = $2 and so.status in ('open','fulfilling')`, [orderId, scope.entityId]);
-  await c.query(`update pos_order po set paid_off_at = now() from sales_order so
+  const off = await c.query(`update pos_order po set paid_off_at = now() from sales_order so
      where so.id = po.sales_order_id and po.sales_order_id = $1 and po.entity_id = $2 and po.kind = 'layaway' and po.paid_off_at is null
        and so.paid_minor >= so.total_minor`, [orderId, scope.entityId]);
+  // a layaway paid off now goes on the truck on the day it asked for, if that day still has room
+  if (off.rowCount) {
+    const live = await q(c, `select 1 from delivery_stop where entity_id = $1 and sales_order_id = $2 and status = 'scheduled'`, [scope.entityId, orderId]);
+    if (!live.length) await bookAtSale(c, scope, orderId, false);
+  }
 }
 
 /**
@@ -724,10 +730,11 @@ export async function checkout(c: Client, scope: Scope, orderId: string, e: { se
  * delivery manager to confirm. Goods still on order are not booked: the order keeps the requested
  * day, and dispatch books it (or texts the customer the link) once they arrive.
  */
-async function bookAtSale(c: Client, scope: Scope, orderId: string, manager: boolean) {
-  const r = await q<{ day: string | null; window_id: string | null }>(c, `select delivery_day::text as day, delivery_window_id as window_id from pos_order
-    where sales_order_id = $1 and entity_id = $2`, [orderId, scope.entityId]);
+async function bookAtSale(c: Client, scope: Scope, orderId: string, manager: boolean, soft = true) {
+  const r = await q<{ day: string | null; window_id: string | null; kind: string; paid_off: boolean }>(c, `select delivery_day::text as day, delivery_window_id as window_id,
+    kind, paid_off_at is not null paid_off from pos_order where sales_order_id = $1 and entity_id = $2`, [orderId, scope.entityId]);
   if (!r[0]?.day || !r[0].window_id) return null;
+  if (r[0].kind === "layaway" && !r[0].paid_off) return { booked: false, day: r[0].day, waiting: 0, note: "A layaway is delivered once it is paid in full; the day is kept and booked then." };
   const lines = await q<{ id: string; line_status: string }>(c, `
     select l.id, l.line_status from sales_order_line l join pos_line pl on pl.sales_order_line_id = l.id join product p on p.id = l.product_id
      where l.entity_id = $1 and l.sales_order_id = $2 and pl.fulfillment = 'delivery' and p.kind = any($3) and l.line_status not in ('cancelled','fulfilled')`,
@@ -736,9 +743,44 @@ async function bookAtSale(c: Client, scope: Scope, orderId: string, manager: boo
   const ready = lines.filter((l) => l.line_status === "reserved" || l.line_status === "ready").map((l) => l.id);
   const waiting = lines.length - ready.length;
   if (!ready.length) return { booked: false, day: r[0].day, waiting, note: "The goods are on order; the day is kept on the sale and booked when they arrive." };
-  const st = await fleet.bookStop(c, scope, { kind: "delivery", orderId, lineIds: ready, day: r[0].day, windowId: r[0].window_id,
-    manager, allowToday: manager, from: "sale" });
-  return { booked: true, number: st.number, day: r[0].day, waiting, confirmed: manager };
+  // A day that filled up or was locked since it was picked does not stop the sale: it is placed,
+  // the delivery waits in dispatch's list, and the salesperson is told to pick another day.
+  await c.query("savepoint book_at_sale");
+  try {
+    const st = await fleet.bookStop(c, scope, { kind: "delivery", orderId, lineIds: ready, day: r[0].day, windowId: r[0].window_id,
+      manager, allowToday: manager, from: "sale" });
+    await c.query("release savepoint book_at_sale");
+    return { booked: true, number: st.number, day: r[0].day, waiting, confirmed: manager };
+  } catch (err) {
+    await c.query("rollback to savepoint book_at_sale");
+    if (!soft || (!(err instanceof fleet.FleetError) && (err as { code?: string }).code !== "P0001")) throw err;   // only a refusal at placing is softened
+    return { booked: false, day: r[0].day, waiting, note: `The sale is placed, but the delivery is not booked because ${(err as Error).message}. Open the order to pick another day.` };
+  }
+}
+
+/** Pick or change the delivery day on a sale. A draft keeps it until it is placed; a placed sale books it now. */
+export async function setDeliveryDay(c: Client, scope: Scope, orderId: string, d: { day: string; windowId: string } | null, manager: boolean) {
+  const o = await orderOf(c, scope.entityId, orderId);
+  need(["draft", "open", "fulfilling"].includes(o.status), `${o.number} is ${o.status}`);
+  need(o.kind !== "return", "a return is not delivered");
+  if (d) {
+    need(/^\d{4}-\d{2}-\d{2}$/.test(d.day) && /^[0-9a-f-]{36}$/i.test(d.windowId), "pick a day and a window");
+    const w = await q(c, `select 1 from delivery_window where entity_id = $1 and id = $2 and active`, [scope.entityId, d.windowId]);
+    need(w.length, "that delivery window is not offered any more; pick again");
+  }
+  await c.query(`update pos_order set delivery_day = $3, delivery_window_id = $4 where sales_order_id = $1 and entity_id = $2`,
+    [orderId, scope.entityId, d?.day ?? null, d?.windowId ?? null]);
+  if (d) await c.query(`update sales_order set promised_on = $3 where id = $1 and entity_id = $2`, [orderId, scope.entityId, d.day]);
+  if (o.status === "draft" || !d) return { kept: true, booked: false };
+  // placed: move the live stop if there is one, else book it
+  const live = await q<{ id: string }>(c, `select id from delivery_stop where entity_id = $1 and sales_order_id = $2 and kind = 'delivery' and status = 'scheduled'
+    order by created_at desc limit 1`, [scope.entityId, orderId]);
+  if (live.length) {
+    await fleet.reschedule(c, scope, live[0].id, d.day, d.windowId, manager, "", manager);
+    return { kept: true, booked: true, moved: true };
+  }
+  const res = await bookAtSale(c, scope, orderId, manager, false);
+  return { kept: true, ...(res ?? { booked: false, note: "Nothing on this sale goes on a truck." }) };
 }
 
 /** A further payment: a deposit, a layaway instalment, the balance at pickup. */
@@ -802,12 +844,7 @@ export async function cancelOrder(c: Client, scope: Scope, orderId: string, e: {
   // a booked delivery goes with the order
   const stops = await q<{ id: string; number: string; route_status: string | null }>(c, `select s.id, s.number, r.status route_status from delivery_stop s
      left join delivery_route r on r.id = s.route_id where s.entity_id = $1 and s.sales_order_id = $2 and s.status = 'scheduled'`, [scope.entityId, orderId]);
-  for (const st of stops) {
-    need(!st.route_status || ["draft", "cancelled"].includes(st.route_status), `delivery ${st.number} is on a loaded truck; unlock the route first`);
-    await c.query(`update delivery_stop set status = 'cancelled', cancel_reason = $3, route_id = null, seq = null where entity_id = $1 and id = $2`,
-      [scope.entityId, st.id, `order cancelled: ${String(e.reason).trim()}`.slice(0, 300)]);
-    await c.query(`update delivery_stop_line set outcome = 'cancelled' where entity_id = $1 and stop_id = $2 and outcome = 'pending'`, [scope.entityId, st.id]);
-  }
+  for (const st of stops) await fleet.cancelStop(c, scope, st.id, `order cancelled: ${String(e.reason).trim()}`.slice(0, 300), true);
   await c.query(`update sales_order_line set line_status = 'cancelled' where entity_id = $1 and sales_order_id = $2 and line_status <> 'cancelled'`, [scope.entityId, orderId]);
   if (paid > 0n) {
     // Refund what was paid; the order's total drops to zero first so the refund is what is owed back.
@@ -1033,18 +1070,24 @@ export async function orderView(c: Client, entityId: string, id: string) {
            so.customer_id, cu.name customer, cu.phone customer_phone, cu.email customer_email, cu.number customer_number,
            so.location_id, l.name location, l.address location_address, l.tax_rate_bps,
            a.line1 ship_line1, a.city ship_city, a.state ship_state, a.postal ship_postal, so.ship_address_id,
+           po.delivery_day::text delivery_day, dw.label delivery_window,
+           (select json_build_object('number', ds.number, 'day', ds.scheduled_on::text, 'window', sw.label, 'confirmed', ds.confirmed_at is not null)
+              from delivery_stop ds left join delivery_window sw on sw.id = ds.window_id
+             where ds.entity_id = so.entity_id and ds.sales_order_id = so.id and ds.kind = 'delivery' and ds.status = 'scheduled'
+             order by ds.created_at desc limit 1) delivery_stop,
            e.name company, mk.name created_by
       from sales_order so left join pos_order po on po.sales_order_id = so.id
       join location l on l.id = so.location_id join entity e on e.id = so.entity_id
       left join customer cu on cu.id = so.customer_id left join customer_address a on a.id = so.ship_address_id
       left join sales_order oo on oo.id = po.original_order_id left join app_user mk on mk.id = po.created_by
+      left join delivery_window dw on dw.id = po.delivery_window_id
      where so.id = $1 and so.entity_id = $2`, [id, entityId]);
   if (!h.length) return null;
   const lines = await q(c, `
     select l.id, l.seq, l.sku, l.description, l.qty::text, l.unit_price_minor::text, l.discount_minor::text, l.tax_minor::text,
            (round(l.qty * l.unit_price_minor) - l.discount_minor)::bigint::text net_minor, l.line_status, l.config, fl.name fulfil_from,
            coalesce(pl.fulfillment, so.fulfillment) fulfillment, coalesce(pl.promised_on, so.promised_on)::text promised_on, pl.needs_override, pl.package_sku,
-           pl.return_reason, pl.return_disposition, coalesce(pl.role, 'item') role, p.kind,
+           pl.return_reason, pl.return_disposition, coalesce(pl.role, 'item') role, p.kind, l.product_id,
            ov.reason override_reason, ou.name override_by,
            (select coalesce(-sum(x.qty),0) from pos_line rp join sales_order_line x on x.id = rp.sales_order_line_id
              where rp.entity_id = l.entity_id and rp.original_line_id = l.id and rp.role = 'item')::text returned_qty

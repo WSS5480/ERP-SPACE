@@ -605,6 +605,7 @@ export async function confirmStop(c: Client, scope: Scope, stopId: string) {
   need(st.status === "scheduled", `stop ${st.number} is ${st.status}`);
   await c.query(`update delivery_stop set confirmed_at = coalesce(confirmed_at, now()), confirmed_by = coalesce(confirmed_by, $3)
                   where entity_id = $1 and id = $2`, [scope.entityId, stopId, scope.actor.id || null]);
+  await audit(c, scope, { table: "delivery_stop", rowId: stopId, action: "update", before: { confirmed: !!st.confirmed_at }, after: { confirmed: true } });
   return { ok: true, number: st.number };
 }
 
@@ -616,8 +617,17 @@ export async function lockDay(c: Client, scope: Scope, day: string) {
   const r = await c.query(`update delivery_stop set confirmed_at = now(), confirmed_by = $3
                             where entity_id = $1 and scheduled_on = $2 and status = 'scheduled' and confirmed_at is null`,
     [scope.entityId, day, scope.actor.id || null]);
-  await c.query(`insert into delivery_day_lock (entity_id, day, locked_by) values ($1,$2,$3)`, [scope.entityId, day, scope.actor.id || null]);
-  await audit(c, scope, { table: "delivery_day_lock", rowId: scope.entityId, action: "insert", after: { day, confirmed: r.rowCount } });
+  let lockId: string;
+  await c.query("savepoint day_lock");
+  try {
+    lockId = (await one<{ id: string }>(c, `insert into delivery_day_lock (entity_id, day, locked_by) values ($1,$2,$3) returning id`, [scope.entityId, day, scope.actor.id || null])).id;
+    await c.query("release savepoint day_lock");
+  } catch (e) {
+    await c.query("rollback to savepoint day_lock");
+    if ((e as { code?: string }).code === "23505") throw new FleetError(`${dayWords(day)} was just locked by someone else`);
+    throw e;
+  }
+  await audit(c, scope, { table: "delivery_day_lock", rowId: lockId, action: "insert", after: { day, confirmed: r.rowCount } });
   return { day, confirmed: r.rowCount ?? 0 };
 }
 
@@ -628,11 +638,13 @@ export async function unlockDay(c: Client, scope: Scope, day: string, reason: st
   need(cur, `${dayWords(day)} is not locked`);
   await c.query(`update delivery_day_lock set unlocked_at = now(), unlocked_by = $3, unlock_reason = $4 where entity_id = $1 and id = $2`,
     [scope.entityId, cur!.id, scope.actor.id || null, reason.trim().slice(0, 300)]);
+  await audit(c, scope, { table: "delivery_day_lock", rowId: cur!.id, action: "update", after: { day, unlocked: true }, reason: reason.trim().slice(0, 300) });
   return { day, unlocked: true };
 }
 
 /** Stops still waiting on the delivery manager, from today on. */
 export async function toConfirm(c: Client, entityId: string) {
+  const now = await localNow(c, (await settings(c, entityId)).tz);
   return q(c, `
     select s.id, s.number, s.scheduled_on::text scheduled_on, w.label window_label, z.name zone_name, s.booked_from, s.pieces,
            cu.name customer, a.city, so.number order_number, u.name booked_by
@@ -640,8 +652,8 @@ export async function toConfirm(c: Client, entityId: string) {
       left join delivery_window w on w.id = s.window_id left join delivery_zone z on z.id = s.zone_id
       left join customer cu on cu.id = s.customer_id left join customer_address a on a.id = s.address_id
       left join sales_order so on so.id = s.sales_order_id left join app_user u on u.id = s.created_by
-     where s.entity_id = $1 and s.status = 'scheduled' and s.confirmed_at is null and s.scheduled_on >= current_date - 1
-     order by s.scheduled_on, w.starts, s.number limit 200`, [entityId]);
+     where s.entity_id = $1 and s.status = 'scheduled' and s.confirmed_at is null and s.scheduled_on >= $2::date
+     order by s.scheduled_on, w.starts, s.number limit 200`, [entityId, now.day]);
 }
 
 async function checkSlot(c: Client, entityId: string, s: Settings, zone: { id: string; days: number[] }, day: string, windowId: string, allowToday: boolean) {
