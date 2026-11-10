@@ -323,6 +323,9 @@ async function cutLine(c: Client, s: Scope, po: PoRow, l: LineRow, n: number) {
   await c.query(`update purchase_order_line set cancelled_qty = cancelled_qty + $3 where id = $1 and entity_id = $2`, [l.id, s.entityId, n]);
   if (l.product_id) await addOnOrder(c, s.entityId, l.product_id, po.ship_to_location_id!, -n);
   if (openQty(l) - n <= 0) await c.query(`update po_line_sales_line set active = false where entity_id = $1 and purchase_order_line_id = $2 and active`, [s.entityId, l.id]);
+  // What containers carry of the line comes down with it, so nothing reads as on the road that will never come.
+  const wms = await import("./wms.ts");
+  await wms.trimForPoLine(c, s, l.id);
 }
 
 export async function cancelPO(c: Client, s: Scope, poId: string, reason: string) {
@@ -492,14 +495,19 @@ export async function retireContainerShares(c: Client, entityId: string, contain
   return pos;
 }
 
-/** Spread every landed cost on a PO over its lines again; the last line takes the rounding. A cost named for one line goes to that line. */
+/**
+ * Spread every landed cost on a PO over its lines again; the last line takes
+ * the rounding. A cost named for one line goes to that line. A container's
+ * shares are not spread here: they ride on that container's own units (wms).
+ */
 export async function reallocate(c: Client, entityId: string, poId: string) {
   const lines = await q<{ id: string; qty: string; unit: string; cube: string | null; weight: string | null }>(c, `
     select pol.id, pol.quantity - pol.cancelled_qty qty, pol.unit_price_minor unit, p.cubic_ft cube, p.weight_lb weight
       from purchase_order_line pol left join product p on p.id = pol.product_id
      where pol.entity_id = $1 and pol.purchase_order_id = $2 order by pol.seq`, [entityId, poId]);
   const costs = await q<{ amount_minor: string; basis: string; purchase_order_line_id: string | null }>(c,
-    `select amount_minor, basis, purchase_order_line_id from po_landed_cost where entity_id = $1 and purchase_order_id = $2 and active`, [entityId, poId]);
+    `select amount_minor, basis, purchase_order_line_id from po_landed_cost where entity_id = $1 and purchase_order_id = $2 and active
+        and container_cost_id is null`, [entityId, poId]);
   const alloc = new Map(lines.map((l) => [l.id, 0n]));
   const live = lines.filter((l) => Number(l.qty) > 0);
   for (const k of costs) {

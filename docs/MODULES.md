@@ -173,21 +173,32 @@ delivered to DC → unloaded, each with expected and actual days) carries PO
 lines with quantities; its DC day moves the lines, the PO and the customers'
 special orders through `purchasing.setLineEta`. Freight, drayage, duty,
 tariff and port fees are spread over its lines by cube, value, weight or
-quantity into `po_landed_cost` (one row per PO line, `basis = 'line'`; a
-re-spread retires old rows with `active = false`), so `reallocate` and
-receiving value the goods with them. Unloading (in part) is
-`inventory.receivePurchaseOrder` per PO. An 856 whose TD3 names a container
-attaches to it, or opens it. `inv_in_transit` (view) is what is on the road:
-shipped-not-received PO quantities and same-company transfers in transit;
-ATP, POS search and the endless aisle read it. Settings:
-`inventory.transfers_two_step` (off: a transfer lands when it ships),
-`inventory.in_transit_gl` ('1300' default, or '1310': Dr 1310 Cr 1300 on
-ship, reversed on receipt; the account is kept on the transfer),
-`inventory.transfer_days`, `wms.prep_gate` (off, warn, refuse). Prep jobs
-are queued on receipt (and before a delivery is booked) from `wms_prep_rule`
-by product or category; a problem goes to `inventory.reportDamage` with its
-photos (https links or pictures taken on the phone, as service tickets keep
-them). Fleet's `bookStop` and the pick-list route go through `wms.prepGate`.
+quantity (all-zero weights fall back to quantity). Each line's share rides on
+that container's own units (`wms_container_line.landed_minor`): unloading
+adds it to the units that come off (`ReceiveLine.extraMinor`, Dr 1300 Cr 2050),
+and a cost added later revalues the units still on hand (Dr 1300) and sends
+the part for units already gone to 5000, against 2050 (`inventory.revalue`).
+The shares are also written to `po_landed_cost` per PO line (`basis = 'line'`,
+re-spreads retire rows with `active = false`) for payables; `reallocate`
+leaves them out of `landed_minor`. A vendor's cut or a cancelled PO trims the
+containers (`wms.trimForPoLine`), and a container with nothing outstanding
+finishes. An 856 whose TD3 names a container attaches to it, or opens it; a
+link that cannot be made (unloaded, line already on another container) is a
+note on the document, never a quarantine. `inv_in_transit` (view) is what is
+on the road, capped by what is still on order; ATP, POS search and the
+endless aisle read it. Settings: `inventory.transfers_two_step` and
+`inventory.in_transit_gl` ('1310': Dr 1310 Cr 1300 on ship, reversed on
+receipt; '1300': the value stays in 1300 and moves between stores' columns on
+receipt). Every company that existed at migration 0038, and the furniture and
+appliance packs, are two-step through 1310; only a new company made without a
+pack starts one-step in 1300. `inventory.transfer_days`; `wms.prep_gate`
+(off, warn, refuse). Prep jobs are queued on receipt from `wms_prep_rule` by
+product or category; a problem goes to `inventory.reportDamage` with its
+photos. `wms.gateOrQueue` is checked at delivery booking, the pick list,
+loading (`loading.loadPiece`, per piece), `startRoute` and `completeStop`;
+labelled units are checked one by one, unlabelled stock by quantity free of
+prep at the location. Prep that was never queued is queued in its own
+transaction, so a refusal does not lose it.
 
 ## Reports
 

@@ -929,13 +929,23 @@ async function applySet(c: Client, s: Scope, _env: EdiEnv, p: Partner, type: str
     }
     // A notice that names its container or trailer attaches to it (and opens one if we had not booked it yet).
     let container: string | null = null;
+    // The shipment stands whatever happens to the link: a link that cannot be made is a note, not a quarantine.
+    const notes: string[] = [];
     if (a.equipment) {
-      const ct = await wms.attachShipment(c, s, { equipment: a.equipment, vendorId: p.vendor_id, carrier: a.carrierName || a.carrier || null, bol: a.bol ?? null,
-        shippedOn: a.shippedOn ?? a.date ?? null, deliveryOn: a.deliveryOn ?? null, shipped });
-      container = ct.number;
-      done.push(`on container ${ct.containerNo} (${ct.number})`);
+      await c.query("savepoint asn_container");
+      try {
+        const ct = await wms.attachShipment(c, s, { equipment: a.equipment, vendorId: p.vendor_id, carrier: a.carrierName || a.carrier || null, bol: a.bol ?? null,
+          shippedOn: a.shippedOn ?? a.date ?? null, deliveryOn: a.deliveryOn ?? null, shipped });
+        await c.query("release savepoint asn_container");
+        notes.push(...ct.notes);
+        if (ct.number && !ct.notes.some((n) => /already unloaded/.test(n))) { container = ct.number; done.push(`on container ${ct.containerNo} (${ct.number})`); }
+      } catch (e) {
+        await c.query("rollback to savepoint asn_container");
+        if (!(e instanceof wms.WmsError)) throw e;
+        notes.push(`not linked to container ${a.equipment}: ${e.message}`);
+      }
     }
-    return { poId: firstPo, summary: { applied: done.join(", "), container } };
+    return { poId: firstPo, summary: { applied: done.join(", "), container, notes: notes.length ? notes : undefined } };
   }
   if (type === "810") {
     const inv = v as unknown as x12.Invoice810;

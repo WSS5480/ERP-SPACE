@@ -11,10 +11,13 @@
 --      actual day. Its arrival day at the DC is what the PO lines and the
 --      customers' special orders on them are told.
 --   3. Freight, drayage, duty, tariff and port fees on a container are spread
---      over what it carries (by cube, value, weight or quantity) into
---      po_landed_cost, the landed cost purchasing already has, so receiving
---      values the goods with them. A re-spread retires the old shares (active
---      = false); nothing is deleted.
+--      over what it carries (by cube, value, weight or quantity). Each line's
+--      share rides on that container's own units: receiving off the container
+--      adds share / container qty to each unit's cost, and a cost added after
+--      units came in revalues the ones still on hand (1300) and sends the rest
+--      to cost of goods (5000). The shares are also kept in po_landed_cost
+--      (one row per PO line) so payables sees them; a re-spread retires the
+--      old rows (active = false). Nothing is deleted.
 --   4. Goods in transit never count as on hand. A transfer's in-transit value
 --      stays in 1300 unless the company keeps 1310; the account a transfer
 --      shipped through is kept on it, so its receipt reverses the same one.
@@ -31,19 +34,17 @@ alter table location add constraint location_kind_check
 -- ------------------------------------------------- transfers --
 alter table inv_transfer add column transit_gl text check (transit_gl in ('1300','1310'));
 alter table inv_transfer add column expected_on date;
--- Transfers already on the road went through 1310 (the only way they could).
-update inv_transfer set transit_gl = '1310' where status = 'in_transit' /* unscoped: one-time backfill of every company */;
+-- Transfers already on the road went through 1310 (the only way they could),
+-- and arrive a day after they shipped (the usual lead time), or tomorrow.
+update inv_transfer set transit_gl = '1310', expected_on = coalesce(shipped_at::date + 1, current_date + 1)
+ where status = 'in_transit' /* unscoped: one-time backfill of every company */;
 
--- Companies that already post transfers keep doing it the way they do today:
--- two steps, through 1310. New companies choose in Warehouse settings.
+-- Every company that exists today keeps transfers as they work today: two
+-- steps, through 1310. The furniture and appliance packs set the same. Only a
+-- brand-new company made without a pack starts one-step, in 1300.
 insert into entity_setting (entity_id, key, value, set_by, from_pack)
-  select distinct t.entity_id, 'inventory.transfers_two_step', 'true'::jsonb, 'migration 0038', false
-    from inv_transfer t
-  on conflict do nothing;
-insert into entity_setting (entity_id, key, value, set_by, from_pack)
-  select distinct je.entity_id, 'inventory.in_transit_gl', '"1310"'::jsonb, 'migration 0038', false
-    from journal_line jl join journal_entry je on je.id = jl.journal_entry_id join gl_account g on g.id = jl.gl_account_id
-   where g.code = '1310'
+  select e.id, k.key, k.value, 'migration 0038', false
+    from entity e cross join (values ('inventory.transfers_two_step', 'true'::jsonb), ('inventory.in_transit_gl', '"1310"'::jsonb)) k(key, value)
   on conflict do nothing;
 
 -- ------------------------------------------------- containers --
@@ -86,8 +87,10 @@ create table wms_container_line (
   entity_id              uuid not null references entity(id),
   container_id           uuid not null references wms_container(id),
   purchase_order_line_id uuid not null references purchase_order_line(id),
-  qty                    numeric(12,3) not null check (qty > 0),
+  qty                    numeric(12,3) not null check (qty >= 0),     -- 0 once the vendor cut it and nothing came off
   received_qty           numeric(12,3) not null default 0 check (received_qty >= 0),
+  landed_minor           bigint not null default 0 check (landed_minor >= 0),          -- this line's share of the container's costs
+  landed_applied_minor   bigint not null default 0,                                     -- of which already in inventory or cost of goods
   created_at             timestamptz not null default now(),
   check (received_qty <= qty),
   unique (container_id, purchase_order_line_id)
@@ -138,7 +141,8 @@ create index po_landed_cost_container on po_landed_cost (container_cost_id) wher
 create view inv_in_transit as
   select * from (
     select pol.entity_id, 'po'::text source, po.id ref_id, po.number ref_no, pol.product_id, po.ship_to_location_id to_location_id,
-           greatest(greatest(coalesce(sh.shipped, 0), coalesce(ct.departed, 0)) - coalesce(r.received, 0), 0)::numeric(12,3) qty,
+           -- shipped and not received, never more than is still on order (a vendor's cut takes it off the road)
+           greatest(least(greatest(coalesce(sh.shipped, 0), coalesce(ct.departed, 0)), pol.quantity - pol.cancelled_qty) - coalesce(r.received, 0), 0)::numeric(12,3) qty,
            coalesce(pol.expected_on, po.expected_on) arriving_on
       from purchase_order_line pol
       join purchase_order po on po.id = pol.purchase_order_id

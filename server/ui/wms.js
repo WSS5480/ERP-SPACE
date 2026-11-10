@@ -129,8 +129,9 @@
         }))),
         section('What it carries', null, c.stage === 'unloaded' ? null : [btn('Add PO lines', () => addLines(c, reload), { small: true })],
           el('div', { class: 'panel' }, c.lines.length ? c.lines.map((l) => item({ title: `${l.name} · ${l.sku}`, amount: `${qty(l.received_qty)} of ${qty(l.qty)} in`,
-            detail: [`${l.po_number} line ${l.seq}`, `PO cost ${money(l.unit_minor)}`, Number(l.share_minor) ? `freight and fees ${money(l.share_minor)}` : null,
-              Number(l.ordered) > 0 && Number(l.landed_minor) ? `lands at ${money(Number(l.unit_minor) + Math.round(Number(l.landed_minor) / Number(l.ordered)))} a unit` : null,
+            detail: [`${l.po_number} line ${l.seq}`, `PO cost ${money(l.unit_minor)}`, Number(l.container_landed_minor) ? `freight and fees ${money(l.container_landed_minor)}` : null,
+              Number(l.qty) > 0 && (Number(l.landed_minor) || Number(l.container_landed_minor)) ? `lands at ${money(Number(l.unit_minor)
+                + (Number(l.ordered) > 0 ? Math.round(Number(l.landed_minor) / Number(l.ordered)) : 0) + Math.round(Number(l.container_landed_minor) / Number(l.qty)))} a unit` : null,
               l.expected_on ? `due ${shortDay(l.expected_on)}` : null].filter(Boolean).join(' · ') }))
             : empty('Nothing on it yet.', 'Add the purchase order lines it carries, with how many of each.', true))),
         section('Freight, drayage, duty and fees', 'spread into each line’s landed cost', [btn('Add a cost', () => addCost(c, o, reload), { small: true })],

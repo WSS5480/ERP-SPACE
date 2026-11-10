@@ -624,7 +624,8 @@ export async function openPurchaseOrders(c: Client, entityId: string) {
      order by po.ordered_on, po.number, l.seq`, [entityId]);
 }
 
-export type ReceiveLine = { poLineId: string; qty: number; damagedQty?: number; damageNote?: string };
+/** extraMinor: cost carried by these units on top of the PO line's (a container's freight and duty share for what came off it). */
+export type ReceiveLine = { poLineId: string; qty: number; damagedQty?: number; damageNote?: string; extraMinor?: bigint };
 
 /**
  * Receive goods against a purchase order, partially or in full. Writes the
@@ -645,7 +646,7 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
   need(e.locationId, "pick the location receiving the goods");
   const loc = await q<{ id: string; kind: string }>(c, `select id, kind from location where id = $1 and entity_id = $2 and status = 'active'`, [e.locationId, entityId]);
   need(loc.length, "no such location");
-  need(loc[0].kind !== "in_transit", "goods are received where they are unloaded, not into an in-transit location");
+  need(!VIRTUAL_KINDS.includes(loc[0].kind), "goods are received where they are unloaded, not into an in-transit or supplier-held location");
   let binId = await binAt(c, entityId, e.binId, e.locationId);
   if (!binId) {
     const d = await q<{ receiving_bin_id: string | null }>(c, `select receiving_bin_id from inv_dock where entity_id = $1 and location_id = $2`, [entityId, e.locationId]);
@@ -674,8 +675,11 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
     const p = await productOf(c, entityId, l!.product_id!);
     // What a unit cost: the PO price plus its share of any landed cost purchasing spread over the line.
     const ordered = Number(l!.ordered);
-    const unitCost = BigInt(l!.unit_price_minor) + (ordered > 0 ? BigInt(Math.round(Number(l!.landed_minor ?? 0) / ordered)) : 0n);
-    const value = BigInt(Math.round(qty * Number(unitCost)));
+    const extra = ln.extraMinor ?? 0n;
+    need(extra >= 0n, "extra landed cost cannot be negative");
+    const unitCost = BigInt(l!.unit_price_minor) + (ordered > 0 ? BigInt(Math.round(Number(l!.landed_minor ?? 0) / ordered)) : 0n)
+      + (qty > 0 ? BigInt(Math.round(Number(extra) / qty)) : 0n);
+    const value = BigInt(Math.round(qty * Number(unitCost - (qty > 0 ? BigInt(Math.round(Number(extra) / qty)) : 0n)))) + extra;
     const grl = await one<{ id: string }>(c, `insert into goods_receipt_line (goods_receipt_id, purchase_order_line_id, quantity) values ($1,$2,$3) returning id`,
       [gr.id, l!.line_id, qty]);
     const labels: string[] = [];
@@ -830,7 +834,7 @@ export type TransferLineIn = { productId?: string; qty?: number; labels?: string
  */
 export async function createTransfer(c: Client, scope: Scope, e: { fromId: string; toId: string; lines: TransferLineIn[]; note?: string }) {
   need(e.fromId !== e.toId, "a transfer goes between two different locations");
-  const locs = await q<{ id: string }>(c, `select id from location where entity_id = $1 and id = any($2) and status = 'active' and kind <> 'in_transit'`, [scope.entityId, [e.fromId, e.toId]]);
+  const locs = await q<{ id: string }>(c, `select id from location where entity_id = $1 and id = any($2) and status = 'active' and kind not in ('in_transit','dropship')`, [scope.entityId, [e.fromId, e.toId]]);
   // To a store of another of the client's companies: the group module pairs a sale here with a bill there when it ships.
   const toEntity = locs.length === 1 && locs[0].id === e.fromId ? await siblingOf(c, scope.entityId, e.toId) : null;
   need(locs.length === 2 || toEntity, "pick two of this company's locations");
@@ -1730,6 +1734,36 @@ export async function availableToPromise(c: Client, entityId: string, productId:
     promise: availableNow > 0 ? "now" : arrivingOn ? `arriving on ${arrivingOn}` : dropship > 0 ? "ships from the supplier"
       : next?.expectedOn ? next.expectedOn : next ? "on order, no date yet" : "not available",
   };
+}
+
+/**
+ * A cost that reaches goods after they were received (freight or duty billed
+ * later): the part for units still on hand raises their value (Dr 1300, into
+ * the cost pool, and onto their labels' cost); the part for units already
+ * sold or gone goes to cost of goods (Dr 5000). The other side is 2050,
+ * received not invoiced, which the forwarder's bill clears. A negative
+ * amount reverses the same way.
+ */
+export async function revalue(c: Client, scope: Scope, e: { productId: string; locationId: string | null; onHandMinor: bigint; goneMinor: bigint;
+  unitIds?: string[]; sourceId: string; description: string }): Promise<string | null> {
+  const total = e.onHandMinor + e.goneMinor;
+  if (total === 0n) return null;
+  if (e.onHandMinor !== 0n) {
+    const p = await poolOf(c, scope.entityId, e.productId);
+    need(p.value + e.onHandMinor >= 0n, "that would take the stock's value below zero");
+    await c.query(`update inv_cost set value_minor = value_minor + $3, updated_at = now() where entity_id = $1 and product_id = $2`,
+      [scope.entityId, e.productId, e.onHandMinor.toString()]);
+    if (e.unitIds?.length) {
+      const per = BigInt(Math.round(Number(e.onHandMinor) / e.unitIds.length));
+      await c.query(`update inv_piece set cost_minor = greatest(cost_minor + $3, 0), updated_at = now() where entity_id = $1 and unit_id = any($2)`,
+        [scope.entityId, e.unitIds, per.toString()]);
+    }
+  }
+  const po = await profitObjectFor(c, scope.entityId, e.locationId);
+  const side = (code: string, v: bigint, memo?: string) => (v > 0n ? { code, debit: v, profitObjectId: po, memo } : { code, credit: -v, profitObjectId: po, memo });
+  const lines = [side("1300", e.onHandMinor), side("5000", e.goneMinor, "landed cost on goods already sold"), side("2050", -total, "received not invoiced")]
+    .filter((l) => (l.debit ?? l.credit ?? 0n) !== 0n);
+  return post(c, scope, { date: today(), sourceType: "inventory", sourceId: e.sourceId, description: e.description.slice(0, 300), lines });
 }
 
 /** Goods on the road for a product: shipped on a PO (an 856 or a container that left) or on a transfer, and where each is going. */

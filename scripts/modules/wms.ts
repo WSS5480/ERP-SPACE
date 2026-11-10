@@ -19,6 +19,7 @@ import * as F from "../../packages/core/fleet.ts";
 import * as x12 from "../../packages/core/x12.ts";
 import * as edi from "../../packages/core/edi.ts";
 import * as shop from "../../packages/core/shop.ts";
+import { PACKS } from "../../packages/core/setup.ts";
 import { module as wmsModule } from "../../server/modules/wms.ts";
 import { module as invModule } from "../../server/modules/inventory.ts";
 import { module as posModule } from "../../server/modules/pos.ts";
@@ -156,10 +157,12 @@ export async function run(t: T) {
       t.ok(`landed cost: ${kind.replace("_", " ")} by ${basis} is prorated over the container's lines, last line taking the rounding`,
         got.every((g, i) => g === want[i]) && got.reduce((a, b) => a + b, 0n) === amount, `${got.join("/")} vs ${want.join("/")}`);
     }
-    const landedA = B((await read<{ landed_minor: string }>(`select landed_minor::text from purchase_order_line where entity_id = $1 and id = $2`, [ENTITY, aTable.id]))[0].landed_minor);
-    const unitA = await as(PEOPLE.STEVE, (c) => pur.landedUnitCost(c, ENTITY, aTable.id));
-    t.ok("landed cost: the shares go into purchasing's landed cost, so the unit cost carries them",
-      landedA === expectTotal.get(aTable.id) && unitA === B(aTable.unit_price_minor) + BigInt(Math.round(Number(landedA) / 4)), `${landedA} ${unitA}`);
+    const ctShare = async (polId: string, ctId = ct1.id) => B((await read<{ v: string }>(`select landed_minor::text v from wms_container_line where entity_id = $1 and container_id = $2
+      and purchase_order_line_id = $3`, [ENTITY, ctId, polId]))[0]?.v);
+    const landedA = await ctShare(aTable.id), landedB = await ctShare(bTable.id);
+    const polLanded = B((await read<{ landed_minor: string }>(`select landed_minor::text from purchase_order_line where entity_id = $1 and id = $2`, [ENTITY, aTable.id]))[0].landed_minor);
+    t.ok("landed cost: each line's share rides on the container's own units (kept on the container line), not spread over the PO line",
+      landedA === expectTotal.get(aTable.id) && landedB === expectTotal.get(bTable.id) && polLanded === 0n, `${landedA} ${landedB} ${polLanded}`);
     // Adding a line re-spreads: the old shares are retired, never deleted, and the total still adds up.
     const before = Number((await read<{ n: string }>(`select count(*)::text n from po_landed_cost where entity_id = $1 and container_cost_id is not null`, [ENTITY]))[0].n);
     await W.post(t, BUYER, `/wms/containers/${ct1.id}/lines`, { lines: [{ poLineId: aChairs.id, qty: 6 }] });
@@ -188,9 +191,9 @@ export async function run(t: T) {
     t.ok("partial receipt: two POs received from one container; one line stays on it and the container is at the DC, not unloaded",
       r1.receipts.length === 2 && !r1.unloaded && r1.linesLeft === 1 && ct1Row.stage === "delivered_dc", JSON.stringify({ r1, ct1Row }));
     const pool1 = (await read<{ qty: string; value_minor: string }>(`select qty::text, value_minor::text from inv_cost where entity_id = $1 and product_id = $2`, [ENTITY, P.TABLE]))[0];
-    const unitB = await as(PEOPLE.STEVE, (c) => pur.landedUnitCost(c, ENTITY, bTable.id));
-    t.ok("partial receipt: the tables go into stock at PO cost plus their freight, drayage, duty and fees",
-      B(pool1.value_minor) - B(pool0.value_minor) === 3n * unitA + unitB && Number(pool1.qty) - Number(pool0.qty) === 4, `${B(pool1.value_minor) - B(pool0.value_minor)} vs ${3n * unitA + unitB}`);
+    const wantIn = 3n * B(aTable.unit_price_minor) + (landedA * 3000n) / 4000n + B(bTable.unit_price_minor) + landedB;
+    t.ok("partial receipt: the tables go into stock at PO cost plus their container's freight, drayage, duty and fees (3 of 4 take 3/4 of the share)",
+      B(pool1.value_minor) - B(pool0.value_minor) === wantIn && Number(pool1.qty) - Number(pool0.qty) === 4, `${B(pool1.value_minor) - B(pool0.value_minor)} vs ${wantIn}`);
     const left = await read<{ qty: string }>(`select qty::text from inv_in_transit where entity_id = $1 and source = 'po' and ref_id = $2 and product_id = $3`, [ENTITY, poA.poId, P.TABLE]);
     t.ok("in transit: the receipt clears what came in; the one still on the container stays on the road", Number(left[0]?.qty) === 1, JSON.stringify(left));
     const custLine = (await read<{ line_status: string; fulfil_from_id: string }>(`select line_status, fulfil_from_id from sales_order_line where entity_id = $1 and id = $2`, [ENTITY, so.lineId]))[0];
@@ -255,6 +258,32 @@ export async function run(t: T) {
     t.ok("prep gate: once its prep is done the pickup books, with nothing to warn about", !!booked.number && booked.prepWarning === null, JSON.stringify(booked));
     const labor = await W.get(t, "/wms/prep/labor") as { prep_type: string; jobs: number; minutes: number }[];
     t.ok("prep: labor minutes add up by kind of prep", (labor.find((x) => x.prep_type === "touch_up")?.minutes ?? 0) >= 27, JSON.stringify(labor));
+    // Refused, but not stuck: prep that was never queued is put on the queue, and stays there after the refusal.
+    await W.post(t, MGR, "/wms/prep/rules", { productId: P.TABLE, prepTypes: ["unbox", "touch_up", "steam"], stdMinutes: 25 });
+    const custUnit = (await read<{ unit_id: string }>(`select unit_id from inv_piece where entity_id = $1 and sales_order_line_id = $2 limit 1`, [ENTITY, so.lineId]))[0].unit_id;
+    await t.throws("prep gate: a kind of prep added since booking still refuses the pick list", () => I.post(t, DEE, "/inventory/pick-list", { orderIds: [so.id] }),
+      /needs steam\. Finish it in the prep queue first\. 1 prep job was put on the queue/);
+    const kept = await read<{ id: string; status: string }>(`select id, status from wms_prep_job where entity_id = $1 and unit_id = $2 and prep_type = 'steam'`, [ENTITY, custUnit]);
+    t.ok("prep gate: the job the refusal queued is kept, so the warehouse can do it (no deadlock)", kept.length === 1 && kept[0].status === "queued", JSON.stringify(kept));
+    const atLoad = await as(DEE, (c, s) => wms.gateForUnit(c, s, custUnit, "loading it"));
+    t.ok("prep gate: loading the piece (the check loading.ts makes) is refused too", atLoad.refuse && /loading it is refused: \S+ needs steam/.test(atLoad.message ?? ""), atLoad.message ?? "");
+    await W.post(t, DEE, `/wms/prep/${kept[0].id}/done`, { laborMinutes: 8 });
+    const staged = await I.post(t, DEE, "/inventory/pick-list", { orderIds: [so.id] }) as { prepWarning: string | null };
+    t.ok("prep gate: with the kept job done, the pick list stages", staged.prepWarning === null);
+    await W.post(t, MGR, "/wms/prep/rules", { productId: P.TABLE, prepTypes: ["unbox", "touch_up"], stdMinutes: 20 });
+    // Unlabelled stock is gated by quantity: what is free of prep at the location must cover the line.
+    const chairsDc = (await read<{ on_hand: string; held: string }>(`select on_hand::text, held::text from stock_level where entity_id = $1 and product_id = $2 and location_id = $3`,
+      [ENTITY, P.CHAIRS, DC]))[0];
+    const want = Number(chairsDc.on_hand) - Number(chairsDc.held);
+    const so2 = await as(PEOPLE.STEVE, async (c) => (await q<{ id: string }>(c, `insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, fulfil_from_id, line_status)
+        values ($1,$2,2,$3,'COA-121222','Andrea Side Chair (2-pack)',$4,19900,$5,'open') returning id`, [ENTITY, so.id, P.CHAIRS, want, DC]))[0].id);
+    const g1 = await wms.prepGate(c0, ENTITY, [so2], "booking the delivery");
+    t.ok("prep gate: chairs without labels are refused by quantity while some at the DC still wait on inspection", g1.refuse && /needs inspect/.test(g1.message ?? ""), g1.message ?? "");
+    const chairJobs = await read<{ id: string }>(`select id from wms_prep_job where entity_id = $1 and product_id = $2 and location_id = $3 and unit_id is null and status = 'queued'`, [ENTITY, P.CHAIRS, DC]);
+    for (const j of chairJobs) await W.post(t, DEE, `/wms/prep/${j.id}/done`, { laborMinutes: 4 });
+    const g2 = await wms.prepGate(c0, ENTITY, [so2], "booking the delivery");
+    t.ok("prep gate: once they are inspected the chairs go", !g2.refuse && g2.open.length === 0, g2.message ?? "");
+    await as(PEOPLE.STEVE, (c) => c.query(`update sales_order_line set line_status = 'cancelled' where entity_id = $1 and id = $2`, [ENTITY, so2]));
     await W.post(t, MGR, "/wms/settings", { prepGate: "warn" });
 
     // --------------------------------------------------- an 856 names its container
@@ -287,6 +316,91 @@ export async function run(t: T) {
       gotNew.documents[0]?.status === "applied" && opened[0]?.vendor_id === COASTER && opened[0]?.bol === "XPO-BOL-55" && opened[0]?.stage === "departed" && opened[0]?.dest_location_id === DC
       && Number(openedLines[0]?.qty) === 3, JSON.stringify({ d: gotNew.documents, opened, openedLines }));
 
+    // ---------------------------------- a container's costs stay with its own units
+    const tie0 = () => inv.tieOut(c0, ENTITY);
+    const sum2050 = async (ids: string[]) => B((await read<{ v: string }>(`select coalesce(sum(jl.credit_minor - jl.debit_minor), 0)::text v from journal_line jl
+      join journal_entry je on je.id = jl.journal_entry_id join gl_account g on g.id = jl.gl_account_id where je.entity_id = $1 and g.code = '2050' and je.source_id = any($2)`,
+      [ENTITY, ids]))[0].v);
+    const sumCode = async (ids: string[], code: string) => B((await read<{ v: string }>(`select coalesce(sum(jl.debit_minor - jl.credit_minor), 0)::text v from journal_line jl
+      join journal_entry je on je.id = jl.journal_entry_id join gl_account g on g.id = jl.gl_account_id where je.entity_id = $1 and g.code = $3 and je.source_id = any($2)`,
+      [ENTITY, ids, code]))[0].v);
+    const poX = await as(BUYER, (c, s) => pur.createPO(c, s, { vendorId: COASTER, shipToId: DC, lines: [{ productId: P.TABLE, qty: 10 }], overBudgetReason: "test" }, true));
+    const [xTable] = await lines(poX.poId);
+    const ct8 = await as(BUYER, (c, s) => wms.createContainer(c, s, { containerNo: "CAIU8000008", destLocationId: DC, vendorId: COASTER }));
+    const ct2u = await as(BUYER, (c, s) => wms.createContainer(c, s, { containerNo: "CAIU2000002", destLocationId: DC, vendorId: COASTER }));
+    await as(BUYER, (c, s) => wms.setContainerLines(c, s, ct8.id, [{ poLineId: xTable.id, qty: 8 }]));
+    await as(BUYER, (c, s) => wms.setContainerLines(c, s, ct2u.id, [{ poLineId: xTable.id, qty: 2 }]));
+    const clId = async (ctId: string, polId: string) => (await read<{ id: string }>(`select id from wms_container_line where entity_id = $1 and container_id = $2 and purchase_order_line_id = $3`,
+      [ENTITY, ctId, polId]))[0].id;
+    const r8 = await W.post(t, DEE, `/wms/containers/${ct8.id}/receive`, { lines: [{ containerLineId: await clId(ct8.id, xTable.id), qty: 8 }] }) as { receipts: { receiptId: string }[] };
+    await W.post(t, BUYER, `/wms/containers/${ct2u.id}/costs`, { kind: "freight", amount: "800.00", basis: "cube" });
+    await W.post(t, BUYER, `/wms/containers/${ct2u.id}/costs`, { kind: "duty", amount: "250.00", basis: "value" });
+    const r2u = await W.post(t, DEE, `/wms/containers/${ct2u.id}/receive`, { lines: [{ containerLineId: await clId(ct2u.id, xTable.id), qty: 2 }] }) as { receipts: { receiptId: string }[] };
+    const xIds = [...r8.receipts, ...r2u.receipts].map((x) => x.receiptId);
+    const unitX = B(xTable.unit_price_minor);
+    const x1300 = await sumCode(xIds, "1300"), x2050 = await sum2050(xIds);
+    t.ok("container cost: $1,050 on the 2-unit container lands on those 2 units in full, none of it on the 8 from the other container",
+      x1300 === 10n * unitX + 105000n && x2050 === 10n * unitX + 105000n, `1300 ${x1300} 2050 ${x2050} want ${10n * unitX + 105000n}`);
+    // The vendor's bill (the goods) and the forwarder's bill (freight and duty) clear 2050.
+    await as(PEOPLE.CONTROLLER, async (c, s) => {
+      const { post } = await import("../../packages/core/posting.ts");
+      const a = await post(c, s, { date: day(0), sourceType: "manual", sourceId: poX.poId, description: "Coaster bill for the tables", lines: [{ code: "2050", debit: 10n * unitX }, { code: "2010", credit: 10n * unitX }] });
+      const b = await post(c, s, { date: day(0), sourceType: "manual", sourceId: ct2u.id, description: "Forwarder bill: freight and duty", lines: [{ code: "2050", debit: 105000n }, { code: "2010", credit: 105000n }] });
+      return [a, b];
+    });
+    t.ok("container cost: once the vendor's and the forwarder's bills are in, 2050 for these goods nets to zero", (await sum2050([...xIds, poX.poId, ct2u.id])) === 0n);
+    // A cost billed after the goods came in: on-hand units are revalued, sold ones go to cost of goods.
+    const poY = await as(BUYER, (c, s) => pur.createPO(c, s, { vendorId: COASTER, shipToId: DC, lines: [{ productId: P.TABLE, qty: 2 }], overBudgetReason: "test" }, true));
+    const [yTable] = await lines(poY.poId);
+    const ctY = await as(BUYER, (c, s) => wms.createContainer(c, s, { containerNo: "CAIU3000003", destLocationId: DC, vendorId: COASTER }));
+    await as(BUYER, (c, s) => wms.setContainerLines(c, s, ctY.id, [{ poLineId: yTable.id, qty: 2 }]));
+    const rY = await W.post(t, DEE, `/wms/containers/${ctY.id}/receive`, { lines: [{ containerLineId: await clId(ctY.id, yTable.id), qty: 2 }] }) as { receipts: { receiptId: string }[]; unloaded: boolean };
+    const yLabels = await read<{ unit_id: string; label: string }>(`select pc.unit_id, min(pc.label) label from inv_piece pc join goods_receipt_line gl on gl.id = pc.goods_receipt_line_id
+      where pc.entity_id = $1 and gl.goods_receipt_id = $2 group by pc.unit_id order by 2`, [ENTITY, rY.receipts[0].receiptId]);
+    await as(PEOPLE.STEVE, (c, s) => inv.adjust(c, s, { locationId: DC, productId: P.TABLE, qty: -1, reasonCode: "lost", labels: [yLabels[0].label] }));
+    const cost0 = B((await read<{ v: string }>(`select max(cost_minor)::text v from inv_piece where entity_id = $1 and unit_id = $2`, [ENTITY, yLabels[1].unit_id]))[0].v);
+    const tieY0 = await tie0();
+    await W.post(t, BUYER, `/wms/containers/${ctY.id}/costs`, { kind: "freight", amount: "100.00", basis: "qty" });
+    const cost1 = B((await read<{ v: string }>(`select max(cost_minor)::text v from inv_piece where entity_id = $1 and unit_id = $2`, [ENTITY, yLabels[1].unit_id]))[0].v);
+    const late = { h: await sumCode([ctY.id], "1300"), g: await sumCode([ctY.id], "5000"), a: await sum2050([ctY.id]) };
+    const tieY1 = await tie0();
+    t.ok("late container cost: the unit still on hand is revalued (Dr 1300) and the one already gone goes to cost of goods (Dr 5000), all against 2050",
+      rY.unloaded && late.h === 5000n && late.g === 5000n && late.a === 10000n && cost1 === cost0 + 5000n && tieY0.ties && tieY1.ties,
+      JSON.stringify({ h: String(late.h), g: String(late.g), a: String(late.a), c0: String(cost0), c1: String(cost1), d: String(tieY1.differenceMinor) }));
+
+    // ---------------------------------------- a vendor's cut takes it off the road
+    const poZ = await as(BUYER, (c, s) => pur.createPO(c, s, { vendorId: COASTER, shipToId: DC, lines: [{ productId: P.CHAIRS, qty: 5 }], overBudgetReason: "test" }, true));
+    const [zChairs] = await lines(poZ.poId);
+    const ctZ = await as(BUYER, (c, s) => wms.createContainer(c, s, { containerNo: "CAIU5000005", destLocationId: DC, vendorId: COASTER }));
+    await as(BUYER, (c, s) => wms.setContainerLines(c, s, ctZ.id, [{ poLineId: zChairs.id, qty: 5 }]));
+    await as(BUYER, (c, s) => wms.setStage(c, s, ctZ.id, "departed", { actualOn: day(0) }));
+    await W.post(t, DEE, `/wms/containers/${ctZ.id}/receive`, { lines: [{ containerLineId: await clId(ctZ.id, zChairs.id), qty: 3 }] });
+    const zMid = await read<{ qty: string }>(`select qty::text from inv_in_transit where entity_id = $1 and ref_id = $2`, [ENTITY, poZ.poId]);
+    await as(BUYER, (c, s) => pur.acknowledgePO(c, s, poZ.poId, { lines: [{ lineId: zChairs.id, status: "changed", qty: 3 }] }));
+    const zAfter = await read<{ n: string }>(`select count(*)::text n from inv_in_transit where entity_id = $1 and ref_id = $2`, [ENTITY, poZ.poId]);
+    const zCt = (await read<{ stage: string; qty: string }>(`select ct.stage, cl.qty::text from wms_container ct join wms_container_line cl on cl.container_id = ct.id
+      where ct.entity_id = $1 and ct.id = $2`, [ENTITY, ctZ.id]))[0];
+    t.ok("cut-back: 5 on the container, 3 received, the vendor cuts the line to 3: nothing reads as arriving, the container line is trimmed and the container finishes",
+      Number(zMid[0]?.qty) === 2 && zAfter[0].n === "0" && Number(zCt.qty) === 3 && zCt.stage === "unloaded", JSON.stringify({ zMid, zAfter, zCt }));
+
+    // ------------------------------------------ 856s that cannot link still stand
+    const poD = await as(BUYER, (c, s) => pur.createPO(c, s, { vendorId: COASTER, shipToId: DC, lines: [{ productId: P.CHAIRS, qty: 2 }], overBudgetReason: "test" }, true));
+    const gotU = await as(BUYER, (c, s) => edi.receiveFile(c, s, env, { filename: "856-unloaded.edi", text: fromCoaster(9103, { shipmentId: "COA-UNL-1", date: day(0), shippedOn: day(0),
+      equipment: "MSCU1234567", orders: [{ poNumber: poD.number, lines: [{ line: 1, qty: 2 }] }] }) }));
+    const shU = await read<{ container_id: string | null }>(`select container_id from po_shipment where entity_id = $1 and purchase_order_id = $2`, [ENTITY, poD.poId]);
+    const docU = await read<{ summary: { notes?: string[] } }>(`select summary from edi_document where entity_id = $1 and id = $2`, [ENTITY, gotU.documents[0]?.id]);
+    t.ok("856: a notice naming a container already unloaded is applied without the link, with a plain note",
+      gotU.documents[0]?.status === "applied" && shU.length === 1 && shU[0].container_id === null && /already unloaded/.test((docU[0]?.summary.notes ?? []).join(" ")), JSON.stringify({ d: gotU.documents, shU, docU }));
+    const poE = await as(BUYER, (c, s) => pur.createPO(c, s, { vendorId: COASTER, shipToId: DC, lines: [{ productId: P.CHAIRS, qty: 2 }], overBudgetReason: "test" }, true));
+    const manual = await as(BUYER, (c, s) => wms.createContainer(c, s, { destLocationId: DC, vendorId: COASTER, note: "booked by phone, number to come" }));
+    await as(BUYER, async (c, s) => wms.setContainerLines(c, s, manual.id, [{ poLineId: (await lines(poE.poId))[0].id, qty: 2 }]));
+    const gotM = await as(BUYER, (c, s) => edi.receiveFile(c, s, env, { filename: "856-manual.edi", text: fromCoaster(9104, { shipmentId: "COA-MAN-1", date: day(0), shippedOn: day(0),
+      equipment: "SEGU4440004", orders: [{ poNumber: poE.number, lines: [{ line: 1, qty: 2 }] }] }) }));
+    const opened2 = await read<{ n: string }>(`select count(*)::text n from wms_container where entity_id = $1 and container_no = 'SEGU4440004'`, [ENTITY]);
+    const shM = await read<{ n: string }>(`select count(*)::text n from po_shipment where entity_id = $1 and purchase_order_id = $2`, [ENTITY, poE.poId]);
+    t.ok("856: a line already on a manual container with no number does not quarantine the notice; the shipment is kept and no container is opened",
+      gotM.documents[0]?.status === "applied" && shM[0].n === "1" && opened2[0].n === "0", JSON.stringify({ d: gotM.documents, opened2 }));
+
     // ------------------------------------------------------ two-step transfers
     const lastJe = async (sourceId: string) => read<{ code: string; debit_minor: string; credit_minor: string; po: string | null }>(`select g.code, jl.debit_minor, jl.credit_minor, jl.profit_object_id po
       from journal_line jl join journal_entry je on je.id = jl.journal_entry_id join gl_account g on g.id = jl.gl_account_id where je.entity_id = $1 and je.source_id = $2`, [ENTITY, sourceId]);
@@ -294,6 +408,11 @@ export async function run(t: T) {
     const tie = async () => inv.tieOut(c0, ENTITY);
     const s0 = await wms.settings(c0, ENTITY);
     t.ok("settings: the demo company ships transfers in two steps through 1310", s0.twoStepTransfers && s0.inTransitGl === "1310", JSON.stringify(s0));
+    const rioS = await inv.transferSettings(c0, RIO_ENTITY);
+    const freshS = await inv.transferSettings(c0, "00000000-0000-4000-8000-000000000000");
+    const packOk = ["furniture", "appliance"].every((id) => { const pk = PACKS.find((x) => x.id === id)!; return pk.settings["inventory.transfers_two_step"] === true && pk.settings["inventory.in_transit_gl"] === "1310"; });
+    t.ok("settings: every company that exists is two-step through 1310, as are the furniture and appliance packs; a new company with no pack starts one-step in 1300",
+      rioS.twoStep && rioS.transitGl === "1310" && packOk && !freshS.twoStep && freshS.transitGl === "1300", JSON.stringify({ rioS, freshS, packOk }));
     // A table still waiting on prep moves fine; prep is the destination's business.
     const tr1 = await I.post(t, DEE, "/inventory/transfers", { fromId: DC, toId: LOC.PALESTINE, lines: [{ productId: P.TABLE, qty: 1 }] }) as { id: string; number: string };
     const sh1 = await I.post(t, DEE, `/inventory/transfers/${tr1.id}/ship`, { expectedOn: day(2) }) as { valueMinor: bigint; transitGl: string; expectedOn: string };

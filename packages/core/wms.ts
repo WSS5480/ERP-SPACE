@@ -13,7 +13,7 @@
 // "unloaded"; that is the day its PO lines, and the customers waiting on
 // them, are told.
 
-import { q, one, audit, type Client, type Scope } from "./db.ts";
+import { q, one, audit, tx, type Client, type Scope } from "./db.ts";
 import * as inv from "./inventory.ts";
 import * as pur from "./purchasing.ts";
 
@@ -246,42 +246,90 @@ export async function addContainerCost(c: Client, s: Scope, containerId: string,
   return { id: r.id, number: ct.number, shares: spread.shares };
 }
 
+/** How much of a line's share belongs to `received` of its `qty` units: in proportion, the last unit taking whatever is left. */
+const shareFor = (landed: bigint, received: number, qty: number): bigint =>
+  qty <= 0 || received >= qty ? (received > 0 || qty <= 0 ? landed : 0n) : received <= 0 ? 0n : (landed * BigInt(Math.round(received * 1000))) / BigInt(Math.round(qty * 1000));
+
 /**
- * Spread every cost on a container over its lines again. The old shares are
- * retired (not deleted) and new ones put on each PO line through
- * purchasing's landed cost, so the next receipt values the goods with them.
- * The last line takes the rounding.
+ * Spread every cost on a container over its lines again (the last line takes
+ * the rounding; with nothing to weigh by, quantity decides). Each line's
+ * share rides on that container's own units: the units still to come off
+ * take it at receipt; for units already received the difference is put on
+ * them now -- the ones still on hand are revalued (1300) and the ones already
+ * sold go to cost of goods (5000), against 2050. The shares are also written
+ * to purchasing's landed cost per PO line (old rows retired, never deleted)
+ * so payables sees what a PO's freight and duty came to.
  */
 export async function spreadCosts(c: Client, s: Scope, containerId: string) {
   const costs = await q<{ id: string; kind: string; amount_minor: string; basis: string }>(c, `select id, kind, amount_minor::text, basis from wms_container_cost
      where entity_id = $1 and container_id = $2 order by created_at`, [s.entityId, containerId]);
   await pur.retireContainerShares(c, s.entityId, costs.map((x) => x.id));
-  const lines = await q<{ id: string; pol_id: string; qty: string; unit: string; cube: string | null; weight: string | null; sku: string | null; name: string | null }>(c, `
-    select cl.id, cl.purchase_order_line_id pol_id, cl.qty::text, pol.unit_price_minor::text unit, p.cubic_ft::text cube, p.weight_lb::text weight, p.sku, p.name
-      from wms_container_line cl join purchase_order_line pol on pol.id = cl.purchase_order_line_id join purchase_order po on po.id = pol.purchase_order_id
-      left join product p on p.id = pol.product_id
-     where cl.entity_id = $1 and cl.container_id = $2 order by po.number, pol.seq`, [s.entityId, containerId]);
+  const lines = await q<{ id: string; pol_id: string; qty: string; received_qty: string; landed_minor: string; applied: string; unit: string; cube: string | null;
+    weight: string | null; sku: string | null; name: string | null; product_id: string; serialized: boolean; dest: string; po_number: string }>(c, `
+    select cl.id, cl.purchase_order_line_id pol_id, cl.qty::text, cl.received_qty::text, cl.landed_minor::text, cl.landed_applied_minor::text applied,
+           pol.unit_price_minor::text unit, p.cubic_ft::text cube, p.weight_lb::text weight, p.sku, p.name, p.id product_id, p.serialized,
+           ct.dest_location_id dest, po.number po_number
+      from wms_container_line cl join wms_container ct on ct.id = cl.container_id
+      join purchase_order_line pol on pol.id = cl.purchase_order_line_id join purchase_order po on po.id = pol.purchase_order_id
+      join product p on p.id = pol.product_id
+     where cl.entity_id = $1 and cl.container_id = $2 order by po.number, pol.seq for update of cl`, [s.entityId, containerId]);
   const shares: { poLineId: string; kind: string; amountMinor: bigint }[] = [];
-  if (!lines.length) return { shares };
+  if (!lines.length) return { shares, revalued: 0n };
+  const total = new Map(lines.map((l) => [l.id, 0n]));
   for (const k of costs) {
-    const w = lines.map((l) => {
+    const weigh = (basis: string) => lines.map((l) => {
       const qn = Number(l.qty);
-      if (k.basis === "cube") { need(l.cube != null, `${l.name ?? l.sku} has no cube in the catalog; add it, or spread the ${words(k.kind)} by value`); return qn * Number(l.cube); }
-      if (k.basis === "weight") { need(l.weight != null, `${l.name ?? l.sku} has no weight in the catalog; add it, or spread the ${words(k.kind)} by value`); return qn * Number(l.weight); }
-      if (k.basis === "qty") return qn;
+      if (basis === "cube") { need(l.cube != null, `${l.name ?? l.sku} has no cube in the catalog; add it, or spread the ${words(k.kind)} by value`); return qn * Number(l.cube); }
+      if (basis === "weight") { need(l.weight != null, `${l.name ?? l.sku} has no weight in the catalog; add it, or spread the ${words(k.kind)} by value`); return qn * Number(l.weight); }
+      if (basis === "qty") return qn;
       return qn * Number(l.unit);
     }).map((v) => BigInt(Math.round(v * 1000)));
+    let w = weigh(k.basis);
+    if (w.every((x) => x === 0n)) w = weigh("qty");                // everything weighs nothing: by quantity
+    const live = w.map((x, i) => (x > 0n ? i : -1)).filter((i) => i >= 0);
+    const lastIdx = live.length ? live[live.length - 1] : lines.length - 1;
     const tw = w.reduce((a, b) => a + b, 0n);
     const amount = BigInt(k.amount_minor);
     let left = amount;
     for (const [i, l] of lines.entries()) {
-      const share = i === lines.length - 1 ? left : tw > 0n ? (amount * w[i]) / tw : 0n;
+      const share = i === lastIdx ? left : tw > 0n ? (amount * w[i]) / tw : 0n;
       left -= share;
+      total.set(l.id, total.get(l.id)! + share);
       shares.push({ poLineId: l.pol_id, kind: k.kind, amountMinor: share });
       await pur.addLineLandedCost(c, s, l.pol_id, { kind: k.kind, amountMinor: share, containerCostId: k.id, note: `container share (${k.basis})` });
     }
   }
-  return { shares };
+  let revalued = 0n;
+  for (const l of lines) {
+    const landed = total.get(l.id)!;
+    const received = Number(l.received_qty), qty = Number(l.qty);
+    const delta = shareFor(landed, received, qty) - BigInt(l.applied);
+    if (delta !== 0n) {
+      // The units that came off this container for this line, and how many are still ours.
+      let units: string[] = [];
+      let onHand: number;
+      if (l.serialized) {
+        const u = await q<{ unit_id: string; here: boolean }>(c, `
+          select pc.unit_id, bool_and(pc.status = any($4)) here from inv_piece pc
+            join goods_receipt_line gl on gl.id = pc.goods_receipt_line_id
+            join wms_container_receipt cr on cr.goods_receipt_id = gl.goods_receipt_id and cr.entity_id = pc.entity_id
+           where pc.entity_id = $1 and cr.container_id = $2 and gl.purchase_order_line_id = $3 group by pc.unit_id`,
+          [s.entityId, containerId, l.pol_id, inv.ON_HAND]);
+        units = u.filter((x) => x.here).map((x) => x.unit_id);
+        onHand = Math.min(units.length, received);
+      } else {
+        const oh = await q<{ n: string }>(c, `select coalesce(sum(on_hand), 0)::text n from stock_level where entity_id = $1 and product_id = $2`, [s.entityId, l.product_id]);
+        onHand = Math.max(0, Math.min(received, Number(oh[0].n)));
+      }
+      const here = received > 0 ? (delta * BigInt(Math.round(onHand * 1000))) / BigInt(Math.round(received * 1000)) : 0n;
+      await inv.revalue(c, s, { productId: l.product_id, locationId: l.dest, onHandMinor: here, goneMinor: delta - here, unitIds: units,
+        sourceId: containerId, description: `Container freight and duty on ${received} of ${l.sku} already received (${l.po_number})` });
+      revalued += delta;
+    }
+    await c.query(`update wms_container_line set landed_minor = $3, landed_applied_minor = landed_applied_minor + $4 where id = $1 and entity_id = $2`,
+      [l.id, s.entityId, landed.toString(), delta.toString()]);
+  }
+  return { shares, revalued };
 }
 
 // ------------------------------------------------------------ receiving --
@@ -289,31 +337,36 @@ export async function spreadCosts(c: Client, s: Scope, containerId: string) {
 /**
  * Unload some or all of a container into its destination. Each PO it
  * carries is received through inventory (pieces, labels, special orders,
- * the prep queue); what is not counted in stays on the container for a later
- * receipt. The first receipt marks it delivered to the DC; the last one,
- * unloaded.
+ * the prep queue), each unit carrying this container's freight and duty
+ * share; what is not counted in stays on the container for a later receipt.
+ * The first receipt marks it delivered to the DC; the last one, unloaded.
  */
 export async function receiveContainer(c: Client, s: Scope, containerId: string, e: { binId?: string | null; note?: string | null;
   lines: { containerLineId: string; qty: number; damagedQty?: number; damageNote?: string }[] }) {
   const ct = await containerOf(c, s.entityId, containerId);
   need(ct.stage !== "unloaded", `${ct.number} is already unloaded`);
   need(Array.isArray(e.lines) && e.lines.filter((x) => Number(x.qty) > 0).length, "say what came off the container");
-  const cls = await q<{ id: string; pol_id: string; po_id: string; po_number: string; po_kind: string; qty: string; received_qty: string; sku: string | null }>(c, `
-    select cl.id, cl.purchase_order_line_id pol_id, pol.purchase_order_id po_id, po.number po_number, po.kind po_kind, cl.qty::text, cl.received_qty::text, p.sku
+  const cls = await q<{ id: string; pol_id: string; po_id: string; po_number: string; po_kind: string; qty: string; received_qty: string; sku: string | null;
+    landed_minor: string; applied: string }>(c, `
+    select cl.id, cl.purchase_order_line_id pol_id, pol.purchase_order_id po_id, po.number po_number, po.kind po_kind, cl.qty::text, cl.received_qty::text, p.sku,
+           cl.landed_minor::text, cl.landed_applied_minor::text applied
       from wms_container_line cl join purchase_order_line pol on pol.id = cl.purchase_order_line_id join purchase_order po on po.id = pol.purchase_order_id
       left join product p on p.id = pol.product_id
      where cl.entity_id = $1 and cl.container_id = $2 for update of cl`, [s.entityId, containerId]);
   const byPo = new Map<string, inv.ReceiveLine[]>();
-  const counted: { id: string; qty: number }[] = [];
+  const counted: { id: string; qty: number; extra: bigint }[] = [];
   for (const l of e.lines) {
     const qty = Number(l.qty);
     if (!(qty > 0)) continue;
     const cl = cls.find((x) => x.id === l.containerLineId);
     need(cl, `that line is not on ${ct.number}`);
+    need(!counted.some((x) => x.id === cl!.id), "each container line once per receipt");
     const left = Number(cl!.qty) - Number(cl!.received_qty);
     need(qty <= left, `${cl!.sku ?? "that line"} on ${ct.number}: ${left} left to unload, not ${qty}`);
-    byPo.set(cl!.po_id, [...(byPo.get(cl!.po_id) ?? []), { poLineId: cl!.pol_id, qty, damagedQty: l.damagedQty, damageNote: l.damageNote }]);
-    counted.push({ id: cl!.id, qty });
+    // This container's share for these units: what the received count reaches, less what is already on goods.
+    const extra = shareFor(BigInt(cl!.landed_minor), Number(cl!.received_qty) + qty, Number(cl!.qty)) - BigInt(cl!.applied);
+    byPo.set(cl!.po_id, [...(byPo.get(cl!.po_id) ?? []), { poLineId: cl!.pol_id, qty, damagedQty: l.damagedQty, damageNote: l.damageNote, extraMinor: extra > 0n ? extra : 0n }]);
+    counted.push({ id: cl!.id, qty, extra: extra > 0n ? extra : 0n });
   }
   const receipts: { poNumber: string; receiptId: string; prepQueued: number; lines: number }[] = [];
   // Customers' special orders first, so their own goods off this container are the ones put on their orders.
@@ -325,13 +378,53 @@ export async function receiveContainer(c: Client, s: Scope, containerId: string,
     await c.query(`insert into wms_container_receipt (entity_id, container_id, goods_receipt_id) values ($1,$2,$3)`, [s.entityId, containerId, r.receiptId]);
     receipts.push({ poNumber: r.poNumber, receiptId: r.receiptId, prepQueued: r.prepQueued, lines: r.lines.length });
   }
-  for (const x of counted) await c.query(`update wms_container_line set received_qty = received_qty + $3 where id = $1 and entity_id = $2`, [x.id, s.entityId, x.qty]);
-  const rest = await q<{ n: string }>(c, `select count(*)::text n from wms_container_line where entity_id = $1 and container_id = $2 and received_qty < qty`, [s.entityId, containerId]);
+  for (const x of counted) await c.query(`update wms_container_line set received_qty = received_qty + $3, landed_applied_minor = landed_applied_minor + $4
+      where id = $1 and entity_id = $2`, [x.id, s.entityId, x.qty, x.extra.toString()]);
   const at = await q<{ stage: Stage; actual_on: string | null }>(c, `select stage, actual_on::text from wms_container_stage where entity_id = $1 and container_id = $2`, [s.entityId, containerId]);
   if (!at.find((x) => x.stage === "delivered_dc")?.actual_on) await setStage(c, s, containerId, "delivered_dc", { actualOn: today() });
-  const done = rest[0].n === "0";
-  if (done) await setStage(c, s, containerId, "unloaded", { actualOn: today() });
-  return { number: ct.number, receipts, unloaded: done, linesLeft: Number(rest[0].n) };
+  const fin = await finishIfDone(c, s, containerId);
+  return { number: ct.number, receipts, unloaded: fin.done, linesLeft: fin.left };
+}
+
+/** A container with nothing left outstanding on any line is finished (unloaded). */
+async function finishIfDone(c: Client, s: Scope, containerId: string): Promise<{ done: boolean; left: number }> {
+  const rest = await q<{ n: string }>(c, `select count(*)::text n from wms_container_line where entity_id = $1 and container_id = $2 and received_qty < qty`, [s.entityId, containerId]);
+  const left = Number(rest[0].n);
+  const st = await q<{ stage: string }>(c, `select stage from wms_container where entity_id = $1 and id = $2`, [s.entityId, containerId]);
+  if (left === 0 && st[0]?.stage !== "unloaded") await setStage(c, s, containerId, "unloaded", { actualOn: today() });
+  return { done: left === 0, left };
+}
+
+/**
+ * The vendor cut a PO line back (an acknowledgment) or the PO was cancelled:
+ * the containers carrying it are trimmed to what is still to come (latest
+ * arrival first, never below what came off them), their costs re-spread, and
+ * a container left with nothing outstanding is finished.
+ */
+export async function trimForPoLine(c: Client, s: Scope, poLineId: string) {
+  const pl = (await q<{ open: string }>(c, `select (pol.quantity - pol.cancelled_qty - coalesce((select sum(g.quantity) from goods_receipt_line g
+       where g.purchase_order_line_id = pol.id), 0))::text open from purchase_order_line pol where pol.id = $1 and pol.entity_id = $2`, [poLineId, s.entityId]))[0];
+  if (!pl) return { trimmed: 0 };
+  const cls = await q<{ id: string; container_id: string; qty: string; received_qty: string }>(c, `
+    select cl.id, cl.container_id, cl.qty::text, cl.received_qty::text from wms_container_line cl join wms_container ct on ct.id = cl.container_id
+     where cl.entity_id = $1 and cl.purchase_order_line_id = $2 and cl.qty > cl.received_qty
+     order by (select coalesce(st.actual_on, st.expected_on) from wms_container_stage st where st.entity_id = cl.entity_id and st.container_id = cl.container_id and st.stage = 'delivered_dc') desc nulls first,
+              ct.created_at desc for update of cl`, [s.entityId, poLineId]);
+  let excess = cls.reduce((a, x) => a + Number(x.qty) - Number(x.received_qty), 0) - Math.max(0, Number(pl.open));
+  const touched = new Set<string>();
+  for (const x of cls) {
+    if (excess <= 0) break;
+    const cut = Math.min(excess, Number(x.qty) - Number(x.received_qty));
+    await c.query(`update wms_container_line set qty = qty - $3 where id = $1 and entity_id = $2`, [x.id, s.entityId, cut]);
+    excess -= cut;
+    touched.add(x.container_id);
+  }
+  for (const id of touched) {
+    await spreadCosts(c, s, id);
+    await finishIfDone(c, s, id);
+  }
+  if (touched.size) await audit(c, s, { table: "wms_container_line", rowId: poLineId, action: "update", after: { trimmedOn: [...touched] }, reason: "the vendor cut the PO line" });
+  return { trimmed: touched.size };
 }
 
 // ---------------------------------------------------------- ship notices --
@@ -339,37 +432,57 @@ export async function receiveContainer(c: Client, s: Scope, containerId: string,
 /**
  * An 856 that names a container or trailer: the notice is attached to it, and
  * the shipped lines go on it. A container we had not booked yet is opened
- * from the notice, already departed.
+ * from the notice, already departed. What cannot go on it (the container is
+ * already unloaded, or the line is all on another container) is left off with
+ * a note; the notice itself still stands.
  */
 export async function attachShipment(c: Client, s: Scope, e: { equipment: string; vendorId: string; carrier?: string | null; bol?: string | null;
-  shippedOn?: string | null; deliveryOn?: string | null; shipped: { shipmentId: string; poLineId: string; qty: number }[] }) {
+  shippedOn?: string | null; deliveryOn?: string | null; shipped: { shipmentId: string; poLineId: string; qty: number }[] }):
+  Promise<{ id: string | null; number: string | null; containerNo: string; notes: string[] }> {
   const no = cleanNo(e.equipment);
-  need(CONTAINER_NO.test(no), `the ship notice names equipment ${e.equipment}, which is not a container or trailer number`);
-  need(e.shipped.length, "the ship notice lists nothing shipped");
-  let ct = (await q<{ id: string; number: string }>(c, `select id, number from wms_container where entity_id = $1 and upper(container_no) = $2 for update`, [s.entityId, no]))[0];
+  const notes: string[] = [];
+  if (!CONTAINER_NO.test(no)) return { id: null, number: null, containerNo: no, notes: [`equipment ${e.equipment} is not a container or trailer number, so the notice is kept without one`] };
+  if (!e.shipped.length) return { id: null, number: null, containerNo: no, notes };
+  let ct = (await q<{ id: string; number: string; stage: string }>(c, `select id, number, stage from wms_container where entity_id = $1 and upper(container_no) = $2 for update`, [s.entityId, no]))[0];
+  if (ct?.stage === "unloaded") return { id: ct.id, number: ct.number, containerNo: no, notes: [`container ${no} (${ct.number}) is already unloaded, so the notice is kept without it`] };
+  // What fits: each shipped line up to what is left to put on a container.
+  const want = new Map<string, number>();
+  for (const x of e.shipped) want.set(x.poLineId, (want.get(x.poLineId) ?? 0) + x.qty);
+  const set: { poLineId: string; qty: number }[] = [];
+  for (const [polId, qty] of want) {
+    const pl = await poLine(c, s.entityId, polId);
+    const mine = ct ? (await q<{ qty: string; received_qty: string }>(c, `select qty::text, received_qty::text from wms_container_line where entity_id = $1 and container_id = $2
+       and purchase_order_line_id = $3`, [s.entityId, ct.id, polId]))[0] : undefined;
+    const have = Number(mine?.qty ?? 0);
+    if (have >= qty) continue;
+    const elsewhere = Number((await q<{ n: string }>(c, `select coalesce(sum(qty - received_qty), 0)::text n from wms_container_line
+       where entity_id = $1 and purchase_order_line_id = $2 and ($3::uuid is null or container_id <> $3)`, [s.entityId, polId, ct?.id ?? null]))[0].n);
+    const room = Number(pl.open) + Number(mine?.received_qty ?? 0) - elsewhere;
+    const fit = Math.min(qty, room);
+    if (fit > have) set.push({ poLineId: polId, qty: fit });
+    if (fit < qty) notes.push(`${pl.po_number} line ${pl.seq} (${pl.sku}): ${qty - Math.max(fit, have, 0)} already sit on another container, so they were left off ${no}`);
+  }
   if (!ct) {
-    const first = await poLine(c, s.entityId, e.shipped[0].poLineId);
+    if (!set.length) return { id: null, number: null, containerNo: no, notes: [...notes, `nothing on the notice could go on ${no}, so no container was opened`] };
+    const first = await poLine(c, s.entityId, set[0].poLineId);
     need(first.ship_to, `${first.po_number} has no ship-to`);
-    ct = await createContainer(c, s, { containerNo: no, carrier: e.carrier ?? null, bol: e.bol ?? null, destLocationId: first.ship_to!, vendorId: e.vendorId,
+    const made = await createContainer(c, s, { containerNo: no, carrier: e.carrier ?? null, bol: e.bol ?? null, destLocationId: first.ship_to!, vendorId: e.vendorId,
       note: "opened from the vendor's ship notice", bookedOn: e.shippedOn ?? null });
+    ct = { ...made, stage: "booked" };
   } else if (e.bol || e.carrier) {
     await c.query(`update wms_container set bol = coalesce(bol, $3), carrier = coalesce(carrier, $4) where id = $1 and entity_id = $2`, [ct.id, s.entityId, e.bol ?? null, e.carrier ?? null]);
   }
-  // What the notice ships goes on the container (a line already there keeps the larger of the two quantities).
-  const want = new Map<string, number>();
-  for (const x of e.shipped) want.set(x.poLineId, (want.get(x.poLineId) ?? 0) + x.qty);
-  const have = new Map((await q<{ pol: string; qty: string }>(c, `select purchase_order_line_id pol, qty::text from wms_container_line where entity_id = $1 and container_id = $2`,
-    [s.entityId, ct.id])).map((x) => [x.pol, Number(x.qty)]));
-  const set = [...want].filter(([pol, qty]) => (have.get(pol) ?? 0) < qty).map(([poLineId, qty]) => ({ poLineId, qty }));
   if (set.length) await setContainerLines(c, s, ct.id, set);
   await pur.linkShipmentContainer(c, s.entityId, [...new Set(e.shipped.map((x) => x.shipmentId))], ct.id);
   const st = await q<{ stage: Stage; actual_on: string | null }>(c, `select stage, actual_on::text from wms_container_stage where entity_id = $1 and container_id = $2`, [s.entityId, ct.id]);
   if (!st.find((x) => x.stage === "departed")?.actual_on) {
-    const d = e.shippedOn && DAY.test(e.shippedOn) && e.shippedOn <= today() ? e.shippedOn : today();
+    const booked = st.find((x) => x.stage === "booked")?.actual_on ?? null;
+    let d = e.shippedOn && DAY.test(e.shippedOn) && e.shippedOn <= today() ? e.shippedOn : today();
+    if (booked && d < booked) d = booked;
     await setStage(c, s, ct.id, "departed", { actualOn: d });
   }
   if (e.deliveryOn && DAY.test(e.deliveryOn) && !st.find((x) => x.stage === "delivered_dc")?.actual_on) await setStage(c, s, ct.id, "delivered_dc", { expectedOn: e.deliveryOn });
-  return { id: ct.id, number: ct.number, containerNo: no };
+  return { id: ct.id, number: ct.number, containerNo: no, notes };
 }
 
 // -------------------------------------------------------------- reading --
@@ -397,6 +510,7 @@ export async function container(c: Client, entityId: string, id: string) {
   const lines = await q(c, `
     select cl.id, cl.purchase_order_line_id po_line_id, cl.qty::text, cl.received_qty::text, po.number po_number, po.id po_id, pol.seq, p.sku, p.name, p.serialized,
            pol.unit_price_minor::text unit_minor, pol.landed_minor::text landed_minor, (pol.quantity - pol.cancelled_qty)::text ordered, pol.expected_on::text expected_on,
+           cl.landed_minor::text container_landed_minor,
            (select coalesce(sum(k.amount_minor), 0)::text from po_landed_cost k join wms_container_cost cc on cc.id = k.container_cost_id
              where k.entity_id = cl.entity_id and k.purchase_order_line_id = cl.purchase_order_line_id and k.active and cc.container_id = cl.container_id) share_minor
       from wms_container_line cl join purchase_order_line pol on pol.id = cl.purchase_order_line_id join purchase_order po on po.id = pol.purchase_order_id
@@ -534,20 +648,11 @@ export async function queueForLines(c: Client, s: Scope, lineIds: string[]): Pro
   return { queued };
 }
 
-export type OpenPrep = { number: string; type: string; status: string; label: string | null };
+export type OpenPrep = { number: string; type: string; status: string; label: string | null; unitId?: string | null; productId?: string; locationId?: string };
 
-/**
- * Prep not finished on the labelled units allocated to these order lines:
- * every kind their product needs that is not done, and any other job still
- * open on them. Keyed by order line.
- */
-export async function prepOpenForLines(c: Client, entityId: string, lineIds: string[]): Promise<Map<string, OpenPrep[]>> {
+/** What a labelled unit still needs: every kind its product needs that is not done, and any other job still open on it. */
+async function openForUnits(c: Client, entityId: string, units: { unit_id: string; product_id: string; label: string; location_id: string }[]): Promise<Map<string, OpenPrep[]>> {
   const out = new Map<string, OpenPrep[]>();
-  if (!lineIds.length) return out;
-  const units = await q<{ unit_id: string; product_id: string; line_id: string; label: string }>(c, `
-    select unit_id, min(product_id::text)::uuid product_id, min(sales_order_line_id::text)::uuid line_id, min(label) label
-      from inv_piece where entity_id = $1 and sales_order_line_id = any($2) and status in ('reserved','picked','loaded')
-     group by unit_id`, [entityId, lineIds]);
   if (!units.length) return out;
   const jobs = await q<{ unit_id: string; number: string; prep_type: string; status: string }>(c, `select unit_id, number, prep_type, status from wms_prep_job
      where entity_id = $1 and unit_id = any($2) and status <> 'cancelled' order by created_at`, [entityId, units.map((u) => u.unit_id)]);
@@ -557,9 +662,49 @@ export async function prepOpenForLines(c: Client, entityId: string, lineIds: str
     const mine = jobs.filter((j) => j.unit_id === u.unit_id);
     const done = new Set(mine.filter((j) => j.status === "done").map((j) => j.prep_type));
     const list: OpenPrep[] = [];
-    for (const j of mine) if (j.status !== "done") list.push({ number: j.number, type: j.prep_type, status: j.status, label: u.label });
-    for (const t of rules.get(u.product_id)!) if (!done.has(t) && !list.some((x) => x.type === t)) list.push({ number: "", type: t, status: "not_queued", label: u.label });
-    if (list.length) out.set(u.line_id, [...(out.get(u.line_id) ?? []), ...list]);
+    const base = { label: u.label, unitId: u.unit_id, productId: u.product_id, locationId: u.location_id };
+    for (const j of mine) if (j.status !== "done") list.push({ number: j.number, type: j.prep_type, status: j.status, ...base });
+    for (const t of rules.get(u.product_id)!) if (!done.has(t) && !list.some((x) => x.type === t)) list.push({ number: "", type: t, status: "not_queued", ...base });
+    if (list.length) out.set(u.unit_id, list);
+  }
+  return out;
+}
+
+/**
+ * Prep not finished on what these order lines take. Labelled units allocated
+ * to a line are checked one by one. A line of unlabelled stock is checked by
+ * quantity: what is at its location, less what is held, less what is still
+ * waiting on prep there, must cover it. Keyed by order line.
+ */
+export async function prepOpenForLines(c: Client, entityId: string, lineIds: string[]): Promise<Map<string, OpenPrep[]>> {
+  const out = new Map<string, OpenPrep[]>();
+  if (!lineIds.length) return out;
+  const units = await q<{ unit_id: string; product_id: string; line_id: string; label: string; location_id: string }>(c, `
+    select unit_id, min(product_id::text)::uuid product_id, min(sales_order_line_id::text)::uuid line_id, min(label) label, min(location_id::text)::uuid location_id
+      from inv_piece where entity_id = $1 and sales_order_line_id = any($2) and status in ('reserved','picked','loaded')
+     group by unit_id`, [entityId, lineIds]);
+  const byUnit = await openForUnits(c, entityId, units);
+  for (const u of units) { const l = byUnit.get(u.unit_id); if (l) out.set(u.line_id, [...(out.get(u.line_id) ?? []), ...l]); }
+  // Unlabelled stock, by quantity.
+  const plain = await q<{ id: string; product_id: string; sku: string; qty: string; loc: string }>(c, `
+    select l.id, l.product_id, p.sku, l.qty::text, l.fulfil_from_id loc from sales_order_line l join product p on p.id = l.product_id
+     where l.entity_id = $1 and l.id = any($2) and not p.serialized and l.fulfil_from_id is not null and l.qty > 0
+       and p.kind in ('stock','configurable','special_order')`, [entityId, lineIds]);
+  for (const l of plain) {
+    const jobs = await q<{ number: string; prep_type: string; status: string; qty: string }>(c, `select number, prep_type, status, qty::text from wms_prep_job
+       where entity_id = $1 and product_id = $2 and location_id = $3 and unit_id is null and status in ('queued','in_progress','problem') order by created_at`,
+      [entityId, l.product_id, l.loc]);
+    if (!jobs.length) continue;
+    // A problem job's one unit is on hold already, so it counts once, in held.
+    const waiting = jobs.reduce((a, j) => a + Number(j.qty) - (j.status === "problem" ? 1 : 0), 0);
+    const lv = await q<{ on_hand: string; held: string }>(c, `select on_hand::text, held::text from stock_level where entity_id = $1 and product_id = $2 and location_id = $3`,
+      [entityId, l.product_id, l.loc]);
+    const ready = Number(lv[0]?.on_hand ?? 0) - Number(lv[0]?.held ?? 0) - Math.max(0, waiting);
+    if (ready >= Number(l.qty)) continue;
+    out.set(l.id, [...(out.get(l.id) ?? []), ...[...new Set(jobs.map((j) => j.prep_type))].map((t) => {
+      const j = jobs.find((x) => x.prep_type === t)!;
+      return { number: j.number, type: t, status: j.status, label: `${Number(l.qty) - Math.max(0, ready)} of ${Number(l.qty)} ${l.sku}`, productId: l.product_id, locationId: l.loc };
+    })]);
   }
   return out;
 }
@@ -570,22 +715,76 @@ export async function prepGateMode(c: Client, entityId: string): Promise<"off" |
   return v === "off" || v === "refuse" ? v : "warn";
 }
 
+function gateMessage(mode: string, open: OpenPrep[], doing: string, queued = 0) {
+  const list = open.slice(0, 4).map((x) => `${x.label ?? "a piece"} needs ${words(x.type)}${x.status === "problem" ? " (a problem was found)" : ""}`).join("; ");
+  const more = open.length > 4 ? ` and ${open.length - 4} more` : "";
+  const q_ = queued ? ` ${queued === 1 ? "1 prep job was" : `${queued} prep jobs were`} put on the queue for it.` : "";
+  return mode === "refuse"
+    ? `prep is not done, so ${doing} is refused: ${list}${more}. Finish it in the prep queue first.${q_}`
+    : `prep is not done yet: ${list}${more}`;
+}
+
 /**
- * The gate a delivery booking or a pick list goes through. Returns the open
- * prep and a sentence; refuse is true when the company refuses such goods.
+ * The gate a delivery booking or a pick list goes through, without changing
+ * anything. Returns the open prep and a sentence; refuse is true when the
+ * company refuses such goods.
  */
 export async function prepGate(c: Client, entityId: string, lineIds: string[], doing: string) {
   const mode = await prepGateMode(c, entityId);
   if (mode === "off") return { mode, open: [] as OpenPrep[], refuse: false, message: null as string | null };
-  const map = await prepOpenForLines(c, entityId, lineIds);
-  const open = [...map.values()].flat();
+  const open = [...(await prepOpenForLines(c, entityId, lineIds)).values()].flat();
   if (!open.length) return { mode, open, refuse: false, message: null };
-  const list = open.slice(0, 4).map((x) => `${x.label ?? "a piece"} needs ${words(x.type)}${x.status === "problem" ? " (a problem was found)" : ""}`).join("; ");
-  const more = open.length > 4 ? ` and ${open.length - 4} more` : "";
-  const message = mode === "refuse"
-    ? `prep is not done, so ${doing} is refused: ${list}${more}. Finish it in the prep queue first`
-    : `prep is not done yet: ${list}${more}`;
-  return { mode, open, refuse: mode === "refuse", message };
+  return { mode, open, refuse: mode === "refuse", message: gateMessage(mode, open, doing) };
+}
+
+/**
+ * Put prep that was never queued on the queue in its own transaction, so it
+ * is kept even when the caller is about to be refused (and roll back). The
+ * jobs name the unit, not the order line: the line's own change may be the
+ * one rolled back. Best effort: a lock wait gives up after a few seconds.
+ */
+async function queueKept(s: Scope, missing: OpenPrep[]): Promise<number> {
+  const todo = missing.filter((x) => x.status === "not_queued" && x.unitId && x.productId && x.locationId);
+  if (!todo.length) return 0;
+  try {
+    return await tx(s.actor, async (k) => {
+      await k.query(`set local lock_timeout = '3s'`);
+      let n = 0;
+      for (const x of todo) {
+        const p = await prepFor(k, s.entityId, x.productId!);
+        if (await addJob(k, s, { type: x.type as PrepType, productId: x.productId!, locationId: x.locationId!, unitId: x.unitId!, qty: 1, source: "delivery",
+          stdMinutes: p.stdMinutes })) n++;
+      }
+      return n;
+    });
+  } catch { return 0; }
+}
+
+/**
+ * The gate, and the queue behind it: prep that was never queued goes on the
+ * queue (kept even if this is refused), then the company's setting decides.
+ * Booking, staging a pick list, loading, starting the route and completing
+ * the stop all come through here.
+ */
+export async function gateOrQueue(c: Client, s: Scope, lineIds: string[], doing: string) {
+  const mode = await prepGateMode(c, s.entityId);
+  if (mode === "off" || !lineIds.length) return { mode, open: [] as OpenPrep[], refuse: false, message: null as string | null, queued: 0 };
+  const open = [...(await prepOpenForLines(c, s.entityId, lineIds)).values()].flat();
+  if (!open.length) return { mode, open, refuse: false, message: null, queued: 0 };
+  const queued = mode === "refuse" ? await queueKept(s, open) : (await queueForLines(c, s, lineIds)).queued;
+  return { mode, open, refuse: mode === "refuse", message: gateMessage(mode, open, doing, mode === "refuse" ? queued : 0), queued };
+}
+
+/** The gate for one labelled unit going on a truck. */
+export async function gateForUnit(c: Client, s: Scope, unitId: string, doing: string) {
+  const mode = await prepGateMode(c, s.entityId);
+  if (mode === "off") return { mode, refuse: false, message: null as string | null };
+  const u = await q<{ unit_id: string; product_id: string; label: string; location_id: string }>(c, `select unit_id, min(product_id::text)::uuid product_id, min(label) label,
+      min(location_id::text)::uuid location_id from inv_piece where entity_id = $1 and unit_id = $2 group by unit_id`, [s.entityId, unitId]);
+  const open = (await openForUnits(c, s.entityId, u)).get(unitId) ?? [];
+  if (!open.length) return { mode, refuse: false, message: null };
+  const queued = mode === "refuse" ? await queueKept(s, open) : 0;
+  return { mode, refuse: mode === "refuse", message: gateMessage(mode, open, doing, queued) };
 }
 
 type JobRow = { id: string; number: string; prep_type: PrepType; status: string; product_id: string; location_id: string; unit_id: string | null; qty: string;
@@ -599,9 +798,11 @@ async function jobOf(c: Client, entityId: string, id: string): Promise<JobRow> {
   return r[0];
 }
 
+/** A unit any of whose cartons is on hold or gone: the status that stops it, else null. */
 async function unitHeld(c: Client, entityId: string, unitId: string): Promise<string | null> {
-  const r = await q<{ status: string }>(c, `select status from inv_piece where entity_id = $1 and unit_id = $2 limit 1`, [entityId, unitId]);
-  return r[0] && ["damaged", "in_repair", "vendor_claim", "written_off", "returned_to_vendor", "delivered"].includes(r[0].status) ? r[0].status : null;
+  const r = await q<{ status: string }>(c, `select status from inv_piece where entity_id = $1 and unit_id = $2
+     and status = any($3) order by carton_seq limit 1`, [entityId, unitId, ["damaged", "in_repair", "vendor_claim", "written_off", "returned_to_vendor", "delivered"]]);
+  return r[0]?.status ?? null;
 }
 
 /** Start a job. A job with a problem starts again once its piece is off damage hold. */

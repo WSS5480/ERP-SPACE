@@ -746,8 +746,7 @@ export async function bookStop(c: Client, scope: Scope, b: BookInput) {
   // Goods whose deluxing, touch-up or assembly is not done: queued now if they never were, and warned about or refused, per the company.
   let prepWarning: string | null = null;
   if (lines.length) {
-    await wms.queueForLines(c, scope, lines.map((l) => l.id));
-    const gate = await wms.prepGate(c, scope.entityId, lines.map((l) => l.id), kind === "will_call" ? "booking the will-call" : "booking the delivery");
+    const gate = await wms.gateOrQueue(c, scope, lines.map((l) => l.id), kind === "will_call" ? "booking the will-call" : "booking the delivery");
     need(!gate.refuse, gate.message ?? "");
     prepWarning = gate.message;
   }
@@ -1432,6 +1431,12 @@ export async function startRoute(c: Client, scope: Scope, routeId: string, odome
   need(d[0].status !== "failed", "the truck failed its pre-trip inspection; a manager has to clear it");
   const left = await pendingPieces(c, scope.entityId, routeId);
   need(!left, `${left} piece(s) on route ${rt.number} are not loaded or marked short; the warehouse finishes the load first`);
+  // A piece swapped in or flagged after booking still stops the truck until its prep is done.
+  const onTruck = await q<{ id: string }>(c, `select distinct sl.sales_order_line_id id from delivery_stop_line sl join delivery_stop s on s.id = sl.stop_id
+     where sl.entity_id = $1 and s.route_id = $2 and s.status in ('scheduled','arrived') and s.kind <> 'pickup' and sl.outcome = 'pending' and sl.sales_order_line_id is not null`,
+    [scope.entityId, routeId]);
+  const gate = await wms.gateOrQueue(c, scope, onTruck.map((x) => x.id), `starting route ${rt.number}`);
+  need(!gate.refuse, gate.message ?? "");
   if (odometer != null) await recordOdometer(c, scope, rt.vehicle_id!, odometer, "route");
   await c.query(`update delivery_route set status = 'in_progress', started_at = now(), start_odometer = $3 where entity_id = $1 and id = $2`,
     [scope.entityId, routeId, odometer ?? null]);
@@ -1507,6 +1512,10 @@ export async function completeStop(c: Client, scope: Scope, stopId: string, b: C
   const good = lines.filter((l) => outcome.get(l.id)!.outcome === okWord);
   const bad = lines.filter((l) => outcome.get(l.id)!.outcome !== okWord);
   const allBad = lines.length > 0 && !good.length;
+  if (!isPickup && good.length) {
+    const gate = await wms.gateOrQueue(c, scope, good.map((l) => l.sales_order_line_id).filter(isId) as string[], "delivering it");
+    need(!gate.refuse, gate.message ?? "");
+  }
   const reason = String(b.reason ?? "").trim();
   if (bad.length || (exc && exc !== "partial")) need(reason, "say what happened, for the customer's file");
   if (isService) need(!exc || reason, "say why the service call was not done");

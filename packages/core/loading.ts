@@ -16,6 +16,7 @@
 
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import * as inventory from "./inventory.ts";
+import * as wms from "./wms.ts";
 import { FleetError } from "./fleet.ts";
 
 function need(cond: unknown, message: string): asserts cond {
@@ -262,6 +263,9 @@ export async function loadPiece(c: Client, scope: Scope, routeId: string, by: { 
   await syncLoad(c, scope, routeId);
   const it = await itemFor(c, scope.entityId, routeId, by);
   need(it.status !== "loaded", `${it.label} (${it.description}) is already loaded`);
+  // Prep (deluxing, touch-up, assembly) is checked again as each piece goes on: one swapped in or flagged since booking still stops here.
+  const prep = await prepAtLoading(c, scope, it);
+  need(!prep.refuse, prep.message ?? "");
   const before = await q<{ n: number; stop_number: string; stop_seq: number }>(c, `
     select count(*)::int n, min(s.number) stop_number, min(i.stop_seq)::int stop_seq from route_load_item i join delivery_stop s on s.id = i.stop_id
      where i.entity_id = $1 and i.route_id = $2 and i.status = 'pending' and i.load_group < $3 and i.id <> $4`,
@@ -273,8 +277,20 @@ export async function loadPiece(c: Client, scope: Scope, routeId: string, by: { 
   const left = await one<{ n: number }>(c, `select count(*)::int n from route_load_item where entity_id = $1 and route_id = $2 and status = 'pending'`, [scope.entityId, routeId]);
   return {
     itemId: it.id, label: it.label, description: it.description, stopSeq: it.stop_seq, left: left.n,
+    prepWarning: prep.message,
     warning: out ? `Out of order: ${before[0].n} piece${before[0].n === 1 ? "" : "s"} for a later stop (stop ${before[0].stop_seq}, ${before[0].stop_number}) ${before[0].n === 1 ? "is" : "are"} still on the dock and should go on first` : null,
   };
+}
+
+async function prepAtLoading(c: Client, scope: Scope, it: ItemRow) {
+  const doing = `loading ${it.label}`;
+  if (it.piece_id) {
+    const u = await q<{ unit_id: string }>(c, `select unit_id from inv_piece where entity_id = $1 and id = $2`, [scope.entityId, it.piece_id]);
+    if (u.length) return wms.gateForUnit(c, scope, u[0].unit_id, doing);
+  }
+  const l = await q<{ id: string | null }>(c, `select sl.sales_order_line_id id from route_load_item i join delivery_stop_line sl on sl.id = i.stop_line_id
+     where i.entity_id = $1 and i.id = $2`, [scope.entityId, it.id]);
+  return wms.gateOrQueue(c, scope, l[0]?.id ? [l[0].id] : [], doing);
 }
 
 /** A piece that is not here: it rides as short, with the reason, so the route can still be locked. */

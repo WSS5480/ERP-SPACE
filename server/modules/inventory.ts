@@ -300,9 +300,8 @@ export const module: ErpModule = {
       const list = await inv.pickListFor(c, co.id, ids);
       // Staging goods whose prep is not done: warned about, or refused, as the company chose.
       const lineIds = list.lines.map((l) => l.lineId);
-      const gate = await wms.prepGate(c, co.id, lineIds, "staging this pick list");
+      const gate = await wms.gateOrQueue(c, sc(co, a), lineIds, "staging this pick list");
       need(!gate.refuse, gate.message ?? "");
-      if (gate.open.some((x) => x.status === "not_queued")) await wms.queueForLines(c, sc(co, a), lineIds);
       return { ...list, prepWarning: gate.message };
     }));
 
