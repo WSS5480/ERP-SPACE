@@ -142,6 +142,7 @@ export const module: ErpModule = {
     pubGet("\\/products\\/([0-9a-f-]{36})", (c, site, _url, m) => shop.pubProduct(c, site, m[2]));
 
     pubPost("\\/price", "cart", (c, site, b) => shop.pubPrice(c, site, String(b.productId ?? ""), shop.parseChoices(b.choices)));
+    pubPost("\\/sectional-price", "cart", (c, site, b) => shop.pubSectionalPrice(c, site, String(b.productId ?? ""), shop.parseBuild(b.sectional)));
     pubPost("\\/cart", "cart", (c, site, b) => { return shop.saveCart(c, site, String(b.cartId ?? ""), b.lines ?? [], b.email); });
     pubPost("\\/quote", "cart", (c, site, b) => shop.quote(c, site, shop.parseCheckout(b, true)));
     pubPost("\\/checkout", "checkout", async (c, site, b) => {

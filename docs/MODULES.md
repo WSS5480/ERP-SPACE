@@ -101,6 +101,7 @@ Data is placed with textContent only, never innerHTML.
 | ops (truck loading manifest and lanes, haul-away and recycling, vendor debit memos, time off and holidays; extends fleet, payables, workforce) | 0039, 0041 | 0025 | Operations (Loading dock, Haul-away), Back office (Debit memos, Time off) |
 | lots (serial numbers and dye lots, label printing, finance company settlements; extends inventory, edi, catalog tags, ar) | 0045 | 0028 | Operations (Serials and lots, Labels), Back office (Finance settlements) |
 | trade (trade and designer accounts, the trade portal, room projects and follow-ups, the designer as a commission role; extends crm, catalog, tax, ar, shop, workforce) | 0044 | 0027 | Retail (Trade accounts, Room projects) |
+| configurator (sectionals, fabric/leather grades and swatches, option rules, condition grades; extends catalog, pos, inventory, shop, edi) | 0043 | 0026 | Retail (Sectionals), Operations (As-is grades) |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -307,6 +308,55 @@ are exceptions, settled by a person (matched to a sale, or set aside with a
 reason). When nothing is open and the posted cash equals one unmatched bank
 line of the lender's account near the deposit day, the settlement's cash
 lines are matched to it through `reconcile.matchManually`.
+## Configurator (migration 0043, extends catalog/pos/inventory/shop/edi)
+
+`packages/core/configurator.ts` owns it; `pricing.ts` owns the option rule engine.
+
+**Sectionals.** A family is a `configurable` product with a `sectional_family` row
+(fewest and most pieces, bundle discount, grade table, the stocked cover). Each piece
+is its own `stock` SKU (price, cost, cube, weight, vendor SKU) with a `sectional_piece`
+row: its kind (LAF/RAF sofa, loveseat, chair; armless chair/loveseat; wedge; corner;
+ottoman; LAF/RAF chaise; console), motion (none/manual/power), width, depth, seats.
+A layout reads left to right as you face it: both ends are arms facing out, pieces
+join only on armless sides, at most two corners/wedges, ottomans stand free.
+`sectional_layout` names the popular ones and is checked when saved. `priceBuild` gives
+the parts: piece price + the cover's grade adder for that piece type (else the grade's
+% uplift) + the piece's options, less the bundle discount spread by value; the overall
+width, depth, seats and the plan's rectangles (`geometry`; `layoutSvg` for print). POS
+(`insertLines`), the endless aisle (`aisleHandoff`) and the web (`priceLines` /
+`placeWebOrder`) write one line per piece and `recordSet` (`cfg_set`, `cfg_set_line`).
+A piece in a cover other than the stocked one, or with an option, is `on_order` from
+the start; purchasing makes one PO line per piece, keeping `config.cover` and
+`config.cfg` (cost in the grade, option factory codes). Voiding one piece voids the set;
+`partialSetWarning` is returned by `fleet.bookStop` (`setWarning`) and
+`pos.fulfilAtCounter`; returns are by line, i.e. by piece.
+
+**Grades and swatches.** `fabric_grade_table` per vendor, `fabric_grade` (A–Z or the
+vendor's code, % uplift), `fabric_grade_adder` (per piece type), `swatch` (cover name,
+grade, material, color family, content, cleaning code W/S/WS/X, vendor code, photo
+address served through the catalog's photo proxy `imageByUrl`, discontinued date).
+
+**Option rules.** `product_option_rule`: option A `requires` one of B, `excludes` C, or
+is `only_on` some piece types. `priceConfigured` checks requires/excludes on every
+product; `priceBuild` checks all three per piece (a power piece counts as `recline:
+power`).
+
+**Condition grades.** `gradePiece` keeps every grading (`inv_condition`, never edited):
+New / Like new / Good / Fair / Damaged, notes, photos, price = the company's % of
+retail (`condition_grade_rule`, controller), or a store manager's price with a reason.
+An as-is piece's tag price follows (`inventory.setAsIsPrice`). Report: `asIsReport` and
+the `as_is_condition` dataset.
+
+**Vendor catalog (best effort, never stops an import).** X12 832, per LIN item:
+`REF*ZZ*<family model>*SECTIONAL [name]`, `REF*ZZ*<piece words>*PIECE` (LAF SOFA, RAF
+LOVESEAT, ARMLESS CHAIR, WEDGE...), `REF*ZZ*<manual|power>*MOTION`, `REF*ZZ*<n>*SEATS`,
+`MEA` width/depth/height, and `CTP*<grade>*GRD*<adder>` per grade. A cover is an item
+with `REF*ZZ*<grade>*SWATCH`, `PID*F*73` color, `REF*ZZ*<family>*COLOR`,
+`REF*ZZ*<content>*CONTENT`, `REF*ZZ*<code>*CLEAN`, `REF*ZZ*<date>*DISCONTINUED`; it is not
+made a product. The vendor products feed reads columns `sectional_family`, `piece_type`,
+`motion`, `width_in`, `depth_in`, `seats`, and cover rows `swatch_code` + `grade`
+(`extrasFromRows`). Families are made once per vendor model (a draft until priced);
+covers go into the vendor's grade table (made from its SKU prefix).
 
 ## Reports
 

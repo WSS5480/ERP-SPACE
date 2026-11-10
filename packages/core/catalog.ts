@@ -944,6 +944,16 @@ export async function productImage(c: Client, entityId: string, productId: strin
   fetchImpl: ImageFetch = globalThis.fetch as unknown as ImageFetch, maxAgeDays = 7, resolveDns = false): Promise<{ contentType: string; dataUrl: string; bytes: number; cached: boolean } | null> {
   const im = (await q<{ url: string }>(c, `select url from product_image where entity_id = $1 and product_id = $2 and seq = $3`, [entityId, productId, seq]))[0];
   if (!im) return null;
+  return imageByUrl(c, entityId, im.url, fetchImpl, maxAgeDays, resolveDns);
+}
+
+/**
+ * A photo by its stored address, through the same checks and the same cache
+ * as a product's photos (the configurator's swatches use it too).
+ */
+export async function imageByUrl(c: Client, entityId: string, url: string,
+  fetchImpl: ImageFetch = globalThis.fetch as unknown as ImageFetch, maxAgeDays = 7, resolveDns = false): Promise<{ contentType: string; dataUrl: string; bytes: number; cached: boolean }> {
+  const im = { url };
   const hit = (await q<{ content_type: string; bytes: Buffer; fresh: boolean }>(c, `
     select content_type, bytes, fetched_at > now() - make_interval(days => $3) fresh from catalog_image_cache where entity_id = $1 and url = $2`,
     [entityId, im.url, maxAgeDays]))[0];

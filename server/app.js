@@ -327,22 +327,22 @@ function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + 
  * the owner sees everything. The server still checks every action on its own.
  */
 const ROLE_SCREENS = {
-  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business', 'salestax', 'wms', 'settlements', 'trade'],
+  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business', 'salestax', 'wms', 'settlements', 'trade', 'asis'],
   approver: ['home', 'approvals', 'storeorders', 'payables', 'memos', 'reports'],
   ap_clerk: ['home', 'payables', 'memos', 'edi', 'reports', 'trade'],
   viewer: ['home', 'books', 'chart', 'reports'],
   hr: ['home', 'payroll', 'workforce', 'timeoff'],
   ar_clerk: ['home', 'ar', 'crm', 'service', 'reports', 'workforce', 'timeoff', 'settlements', 'trade'],
-  buyer: ['home', 'purchasing', 'storeorders', 'edi', 'catalog', 'inventory', 'wms', 'payables', 'memos', 'reports', 'workforce', 'timeoff', 'lots', 'labels', 'trade'],
-  store_manager: ['home', 'pos', 'approvals', 'aisle', 'crm', 'leads', 'myday', 'projects', 'trade', 'catalog', 'purchasing', 'storeorders', 'inventory', 'wms', 'fleet', 'loading', 'haulaway', 'service', 'ar', 'workforce', 'timeoff', 'reports', 'lots', 'labels'],
-  sales: ['home', 'pos', 'myday', 'aisle', 'crm', 'leads', 'projects', 'trade', 'service', 'ar', 'workforce', 'timeoff'],
-  designer: ['home', 'projects', 'pos', 'crm', 'myday', 'trade', 'workforce', 'timeoff'],
+  buyer: ['home', 'purchasing', 'storeorders', 'edi', 'catalog', 'sectionals', 'inventory', 'wms', 'asis', 'payables', 'memos', 'reports', 'workforce', 'timeoff', 'lots', 'labels', 'trade'],
+  store_manager: ['home', 'pos', 'approvals', 'aisle', 'crm', 'leads', 'myday', 'projects', 'trade', 'catalog', 'sectionals', 'purchasing', 'storeorders', 'inventory', 'wms', 'asis', 'fleet', 'loading', 'haulaway', 'service', 'ar', 'workforce', 'timeoff', 'reports', 'lots', 'labels'],
+  sales: ['home', 'pos', 'myday', 'aisle', 'crm', 'leads', 'projects', 'trade', 'sectionals', 'service', 'ar', 'workforce', 'timeoff'],
+  designer: ['home', 'projects', 'pos', 'crm', 'myday', 'trade', 'sectionals', 'workforce', 'timeoff'],
   cashier: ['home', 'pos', 'ar', 'service', 'workforce', 'timeoff'],
-  warehouse: ['home', 'inventory', 'wms', 'fleet', 'loading', 'haulaway', 'pos', 'workforce', 'timeoff', 'lots', 'labels'],
+  warehouse: ['home', 'inventory', 'wms', 'fleet', 'loading', 'haulaway', 'pos', 'asis', 'workforce', 'timeoff', 'lots', 'labels'],
   dispatcher: ['home', 'fleet', 'loading', 'haulaway', 'service', 'inventory', 'workforce', 'timeoff', 'labels'],
   driver: ['home', 'myroute', 'workforce', 'timeoff'],
   technician: ['home', 'myroute', 'service', 'workforce', 'timeoff'],
-  web_admin: ['home', 'shop', 'marketing', 'catalog', 'workforce', 'timeoff'],
+  web_admin: ['home', 'shop', 'marketing', 'catalog', 'sectionals', 'workforce', 'timeoff'],
   marketing: ['home', 'marketing', 'crm', 'leads', 'projects', 'reports', 'workforce', 'timeoff'],
 };
 const BACK_OFFICE = ['owner', 'controller', 'approver', 'ap_clerk', 'viewer'];

@@ -15,11 +15,12 @@ import * as tax from "../../packages/core/tax.ts";
 import * as sheet from "./tearsheet.ts";
 import { currentImageFetch } from "./catalog.ts";
 import { tx } from "../../packages/core/db.ts";
+import * as sectionals from "../../packages/core/configurator.ts";
 
 const ID = "([0-9a-fA-F-]{36})";
 
 export function refusal(e: unknown): unknown {
-  if (e instanceof pos.PosError || e instanceof InventoryError || e instanceof PostingError || e instanceof PricingError || e instanceof ArError || e instanceof ShopError
+  if (e instanceof pos.PosError || e instanceof sectionals.ConfigError || e instanceof InventoryError || e instanceof PostingError || e instanceof PricingError || e instanceof ArError || e instanceof ShopError
     || e instanceof tax.TaxError || e instanceof sheet.SheetError)
     return new ModuleError(e.message);
   return e;
@@ -50,7 +51,19 @@ function lines(v: unknown): pos.LineIn[] {
     fulfillment: (str(l.fulfillment, 10) || undefined) as pos.Fulfil | undefined,
     discountMinor: l.discount != null && l.discount !== "" ? minor(l.discount) : undefined,
     discountBps: l.discountPct != null && l.discountPct !== "" ? Math.round(Number(l.discountPct) * 100) : undefined,
-    fulfilFromId: uuid(l.fulfilFromId), promisedOn: day(l.promisedOn), shipAddressId: uuid(l.shipAddressId) }));
+    fulfilFromId: uuid(l.fulfilFromId), promisedOn: day(l.promisedOn), shipAddressId: uuid(l.shipAddressId), sectional: sectionalBuild(l.sectional) }));
+}
+/** A sectional build from a request: layout or piece codes, the cover, and each piece's options. */
+export function sectionalBuild(v: unknown): sectionals.Build | null {
+  if (!v || typeof v !== "object") return null;
+  const b = v as Record<string, unknown>;
+  const code = (x: unknown) => str(x, 60).toLowerCase();
+  return {
+    layout: code(b.layout) || null,
+    pieces: Array.isArray(b.pieces) ? b.pieces.slice(0, 12).map(code).filter(Boolean) : [],
+    cover: code(b.cover) || null,
+    pieceOptions: Array.isArray(b.pieceOptions) ? b.pieceOptions.slice(0, 12).map((o) => choices(o)) : [],
+  };
 }
 function tenders(v: unknown): pos.Tender[] {
   return (Array.isArray(v) ? v : []).slice(0, 8).map((t: Record<string, unknown>) => ({ method: str(t.method, 20), amountMinor: minor(t.amount ?? 0),
@@ -136,7 +149,9 @@ async function products(c: Client, co: Company, url: URL) {
            coalesce((select sum(t.qty) from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id and t.to_location_id = $3), 0)::text arriving_here,
            coalesce((select sum(t.qty) from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id), 0)::text arriving,
            (select min(t.arriving_on)::text from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id) arriving_on,
-           exists (select 1 from product_option_group g where g.entity_id = p.entity_id and g.product_id = p.id) configurable
+           exists (select 1 from product_option_group g where g.entity_id = p.entity_id and g.product_id = p.id) configurable,
+           exists (select 1 from sectional_family f where f.entity_id = p.entity_id and f.product_id = p.id and f.active) sectional,
+           (select count(*) from inv_piece x where x.entity_id = p.entity_id and x.product_id = p.id and x.status = 'as_is' and x.carton_seq = 1)::int as_is
       from product p
      where p.entity_id = $1 and p.status not in ('draft','discontinued')
        and ($2 = '' or p.name ilike '%' || $2 || '%' or p.sku ilike '%' || $2 || '%' or p.collection ilike '%' || $2 || '%' or p.category ilike '%' || $2 || '%')
@@ -150,7 +165,10 @@ async function product(c: Client, co: Company, id: string) {
       (select json_agg(json_build_object('code', o.code, 'label', o.label, 'delta', o.price_delta_minor::text, 'leadDays', o.lead_days, 'swatch', o.swatch) order by o.seq)
          from product_option o where o.group_id = g.id and o.entity_id = g.entity_id and o.active) options
     from product_option_group g where g.entity_id = $1 and g.product_id = $2 order by g.seq`, [co.id, id]);
-  return { ...p[0], groups };
+  // A sectional opens the builder; an as-is or floor piece shows its condition grade.
+  const family = await sectionals.familyView(c, co.id, id);
+  const asIs = (await sectionals.gradesForProducts(c, co.id, [id])).map((x) => ({ ...x, gradeWords: x.grade ? sectionals.CONDITION_WORDS[x.grade] : "Not graded" }));
+  return { ...p[0], groups, sectional: family, asIs };
 }
 
 async function sessions(c: Client, co: Company) {

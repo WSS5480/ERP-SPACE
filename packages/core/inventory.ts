@@ -180,6 +180,17 @@ export async function restock(c: Client, entityId: string, productId: string, lo
   await returnUnits(c, entityId, productId, locationId, qty, "in_stock", opts);
 }
 
+/**
+ * The price an as-is unit is tagged at. The configurator's condition grade
+ * sets it; only a unit that is as-is carries one. Returns the cartons changed.
+ */
+export async function setAsIsPrice(c: Client, entityId: string, unitId: string, priceMinor: bigint, note: string | null = null): Promise<number> {
+  need(priceMinor >= 0n, "an as-is price cannot be negative");
+  const r = await c.query(`update inv_piece set as_is_price_minor = $3, as_is_note = coalesce($4, as_is_note), updated_at = now()
+     where entity_id = $1 and unit_id = $2 and status = 'as_is'`, [entityId, unitId, priceMinor.toString(), note]);
+  return r.rowCount ?? 0;
+}
+
 /** Low-level adjust, for the inventory module's own receiving/transfer/count code. */
 export const _bump = bump;
 
