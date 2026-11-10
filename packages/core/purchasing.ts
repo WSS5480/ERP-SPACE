@@ -397,7 +397,7 @@ export async function acknowledgePO(c: Client, s: Scope, poId: string, a: { vend
 }
 
 /** An 855-style CSV: po_number, line (or vendor_sku), status, qty, ship_date, vendor_ref. Bad rows are listed, good ones applied. */
-export async function importAcks(c: Client, s: Scope, a: { csv: string; filename?: string | null }) {
+export async function importAcks(c: Client, s: Scope, a: { csv: string; filename?: string | null; vendorId?: string | null }) {
   const rows = parseCsv(a.csv ?? "");
   need(rows.length >= 2, "the file has no rows under its heading line");
   need(rows.length <= 5001, "5,000 rows at most per file");
@@ -424,7 +424,9 @@ export async function importAcks(c: Client, s: Scope, a: { csv: string; filename
   }
   let applied = 0;
   for (const [num, acks] of byPo) {
-    const po = (await q<{ id: string }>(c, `select id from purchase_order where entity_id = $1 and number = $2`, [s.entityId, num]))[0];
+    // From a vendor's own feed, only that vendor's orders: one vendor's file can never answer another's PO.
+    const po = (await q<{ id: string }>(c, `select id from purchase_order where entity_id = $1 and number = $2 and ($3::uuid is null or vendor_id = $3)`,
+      [s.entityId, num, a.vendorId ?? null]))[0];
     if (!po) { for (const x of acks) problems.push({ row: x.row, message: `no purchase order ${num}` }); continue; }
     await c.query("savepoint ack");
     try {
@@ -810,4 +812,29 @@ export async function markSent(c: Client, s: Scope, poId: string, destination: s
   await c.query(`insert into po_transmission (entity_id, purchase_order_id, method, status, destination, detail, sent_by) values ($1,$2,'edi','sent',$3,$4,$5)`,
     [s.entityId, poId, destination.slice(0, 200), detail.slice(0, 500), s.actor.id || null]);
   await c.query(`update purchase_order set exported_at = now() where id = $1 and entity_id = $2`, [poId, s.entityId]);
+}
+
+/**
+ * The vendor changed a line's price (an 855 IP, say): the PO line takes the
+ * new price, keeps the one it had, and is flagged for the buyer to review.
+ * Landed cost is spread again. The bill is then matched to the new price.
+ */
+export async function vendorPriceChange(c: Client, s: Scope, poLineId: string, unitMinor: bigint, note: string) {
+  const l = (await q<{ id: string; po: string; number: string; status: string; unit: string; seq: number }>(c, `
+    select pol.id, po.id po, po.number, po.status, pol.unit_price_minor::text unit, pol.seq from purchase_order_line pol join purchase_order po on po.id = pol.purchase_order_id
+     where pol.id = $1 and pol.entity_id = $2 for update of pol`, [poLineId, s.entityId]))[0];
+  need(l, "no such purchase order line");
+  need(l.status === "open", `${l.number} is ${l.status}; its prices are settled`);
+  need(unitMinor >= 0n, "a price cannot be negative");
+  await c.query(`update purchase_order_line set price_changed_from = coalesce(price_changed_from, unit_price_minor), unit_price_minor = $3,
+                        price_review_note = $4 where id = $1 and entity_id = $2`, [poLineId, s.entityId, unitMinor.toString(), note.slice(0, 300)]);
+  await reallocate(c, s.entityId, l.po);
+  await audit(c, s, { table: "purchase_order_line", rowId: poLineId, action: "update", before: { unit: l.unit }, after: { unit: unitMinor.toString(), review: note } });
+}
+
+/** The buyer has looked at a vendor's price change. */
+export async function clearPriceReview(c: Client, s: Scope, poLineId: string) {
+  const r = await q(c, `update purchase_order_line set price_review_note = null where id = $1 and entity_id = $2 and price_review_note is not null returning id`, [poLineId, s.entityId]);
+  need(r.length, "that line has no price change waiting for review");
+  await audit(c, s, { table: "purchase_order_line", rowId: poLineId, action: "update", after: { priceReviewed: true } });
 }

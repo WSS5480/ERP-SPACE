@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { type T, ENTITY, PEOPLE } from "./harness.ts";
-import { q, type Client } from "../../packages/core/db.ts";
+import { q, tx, type Client } from "../../packages/core/db.ts";
 import * as x12 from "../../packages/core/x12.ts";
 import * as edi from "../../packages/core/edi.ts";
 import * as pur from "../../packages/core/purchasing.ts";
@@ -119,7 +119,8 @@ export async function run(t: T) {
   t.ok("X12 846: round trip of quantities and an availability date", a846.v.items[0].qty === 14 && a846.v.items[1].availableOn === "2026-12-20" && !a846.v.errors.length);
   const a997 = rt("997", x12.build997({ functionalId: "PO", groupControl: "7", sets: [{ type: "850", control: "0001", accepted: true }, { type: "850", control: "0002", accepted: false, notes: ["bad item"] }],
     status: "P", included: 2, received: 2, accepted: 1 }), x12.parse997);
-  t.ok("X12 997: round trip, per-set accept and reject with the reason", a997.v.groupControl === "7" && a997.v.sets[0].accepted && !a997.v.sets[1].accepted && a997.v.sets[1].notes?.[0] === "bad item"
+  t.ok("X12 997: round trip, per-set accept and reject with a valid AK5 code (no AK3/AK4 with blank required elements)", a997.v.groupControl === "7" && a997.v.sets[0].accepted && !a997.v.sets[1].accepted
+    && a997.v.sets[1].code === "5" && a997.v.sets[1].notes?.[0] === "one or more segments in error" && !a997.ix.groups[0].sets[0].segments.some((x) => x[0] === "AK3" || x[0] === "AK4")
     && a997.v.status === "P" && a997.v.accepted === 1 && a997.ix.groups[0].functionalId === "FA");
   const odd: x12.Separators = { element: "|", segment: "\n", sub: ":", repetition: "^" };
   const odd5010 = x12.writeInterchange({ ...env0, version: "005010" }, [{ type: "846", control: 9, segments: x12.build846({ reference: "R", date: null, items: [{ vendorSku: "A1", qty: 1 }] }) }], odd);
@@ -151,7 +152,9 @@ export async function run(t: T) {
   const ashP2 = await read(t, (c) => edi.loadPartner(c, ENTITY, ashley.id));
   t.ok("partners: one vendor mixes channels: EDI for 850/855/856/810, the API for catalog, price, quantities and freight",
     ashP2.edi_enabled && ashP2.documents["850"] === "edi" && ashP2.documents["810"] === "edi" && ashP2.documents["832"] === "api" && ashP2.documents.freight === "api");
-  const sftp = await asPerson(t, BUYER, (c, co, a) => edi.pollPartner(c, scopeOf(co, a), env, ashley.id));
+  const buyerScope = await asPerson(t, BUYER, async (_c, co, a) => scopeOf(co, a));
+  const runAs = (fn: (c: Client) => Promise<unknown>) => tx(buyerScope.actor, fn);
+  const sftp = await edi.pollPartner(runAs as edi.TxRun, buyerScope, env, ashley.id);
   t.ok("SFTP: settings and password are kept, and polling says plainly it is not built", !sftp.ok && /SFTP is not built into this version/.test(sftp.note), sftp.note);
   await t.throws("partners: a secret in the transport settings is refused", () => r.post("/edi/partners", BUYER, { partner: { vendor_id: V.ASHLEY, transport_config: { host: "h", user: "u", password: "x" } } }), /may not hold password/);
   await t.throws("partners: a channel a document cannot use is refused", () => r.post("/edi/partners", BUYER, { partner: { vendor_id: V.ASHLEY, documents: { "810": "api" } } }), /goes by edi, email, file, off/);
@@ -169,8 +172,8 @@ export async function run(t: T) {
   // ================================================================ 850 out
   const stockPo = await asPerson(t, BUYER, (c, co, a) => pur.createPO(c, scopeOf(co, a), { vendorId: V.COASTER, shipToId: DC, lines: [{ productId: P.TABLE, qty: 2 }, { productId: P.CHAIRS, qty: 4 }] }, false));
   const sent = await r.post<{ channel: string; status: string; documentId: string; detail: string }>("/edi/pos/:id/send", BUYER, {}, stockPo.poId);
-  const outFiles = await readdir(join(drop, "coaster", "out"));
-  const outText = outFiles.length ? await readFile(join(drop, "coaster", "out", outFiles[0]), "utf8") : "";
+  const outFiles = await readdir(join(drop, ENTITY, "coaster", "out"));
+  const outText = outFiles.length ? await readFile(join(drop, ENTITY, "coaster", "out", outFiles[0]), "utf8") : "";
   const outIx = outText ? x12.parseInterchange(outText) : null;
   const out850 = outIx ? x12.parse850(outIx.groups[0].sets[0].segments) : null;
   t.ok("850: a real PO goes by the partner's channel (EDI) into the drop folder", sent.channel === "edi" && sent.status === "sent" && outFiles.length === 1, JSON.stringify(sent));
@@ -200,7 +203,8 @@ export async function run(t: T) {
   const salesOrder = await read(t, async (c) => (await q<{ id: string }>(c, `select sales_order_id id from sales_order_line where id = $1 and entity_id = $2`, [LAMP_LINE, ENTITY]))[0].id);
   const ack855 = fromVendor(COASTER_ID, "P", 502, [{ type: "855", control: 1, segments: x12.build855({ poNumber: spPo.number, ackType: "AC", date: day(0), vendorRef: "COA-SO-1",
     lines: [{ vendorSku: "CO-LAMP-X", status: "IB", qty: 1, date: day(40) }] }) }]);
-  const got855 = await r.post<edi.Received>("/edi/upload", PEOPLE.CLERK, { text: ack855, filename: "855.edi" });
+  await t.throws("roles: an A/P clerk takes bills, not acknowledgments", () => r.post("/edi/upload", PEOPLE.CLERK, { text: ack855, filename: "855.edi" }), /taking in a 855 .* needs one of: buyer, store manager/);
+  const got855 = await r.post<edi.Received>("/edi/upload", STORE_MGR, { text: ack855, filename: "855.edi" });
   const eta = await read(t, (c) => pur.etaForOrder(c, ENTITY, salesOrder));
   const lampEta = eta.find((x) => x.sales_order_line_id === LAMP_LINE);
   t.ok("855 in: applied through acknowledgePO; the vendor's mapped item finds the line; the backorder date reaches the customer's order",
@@ -208,9 +212,10 @@ export async function run(t: T) {
   const ack997Out = await read(t, async (c) => (await q<{ status: string; raw: string; related_id: string }>(c,
     `select status, raw, related_id from edi_document where entity_id = $1 and direction = 'out' and doc_type = '997' and related_id = $2`, [ENTITY, got855.documents[0].id]))[0]);
   const ack997Parsed = ack997Out ? x12.parse997(x12.parseInterchange(ack997Out.raw).groups[0].sets[0].segments) : null;
-  t.ok("997 out: every inbound group is answered, accepted, and dropped in the partner's out folder", got855.acks.length === 1 && ack997Out?.status === "sent"
-    && ack997Parsed?.functionalId === "PR" && ack997Parsed?.status === "A" && ack997Parsed?.sets[0]?.accepted === true);
-  const dup = await r.post<edi.Received>("/edi/upload", PEOPLE.CLERK, { text: ack855, filename: "855-again.edi" });
+  t.ok("997 out: every inbound group is answered, accepted, and dropped in the partner's out folder; no AK3/AK4 with blank required elements",
+    got855.acks.length === 1 && ack997Out?.status === "sent" && ack997Parsed?.functionalId === "PR" && ack997Parsed?.status === "A" && ack997Parsed?.sets[0]?.accepted === true
+    && !/AK3|AK4/.test(ack997Out?.raw ?? "") && /AK5\*A~/.test(ack997Out?.raw ?? ""));
+  const dup = await r.post<edi.Received>("/edi/upload", BUYER, { text: ack855, filename: "855-again.edi" });
   t.ok("duplicates: the same control numbers again are logged as ignored and not applied twice", dup.documents[0]?.status === "ignored" && /repeat/.test(dup.documents[0]?.reason ?? ""), JSON.stringify(dup.documents));
 
   // ================================================================ 856 → in transit
@@ -230,6 +235,7 @@ export async function run(t: T) {
   // ================================================================ receive, then 810 → bill, three-way match
   const lines = await read(t, async (c) => q<{ id: string; seq: number }>(c, `select id, seq from purchase_order_line where entity_id = $1 and purchase_order_id = $2 order by seq`, [ENTITY, stockPo.poId]));
   await asPerson(t, PEOPLE.STEVE, (c, co, a) => receivePurchaseOrder(c, scopeOf(co, a), { purchaseOrderId: stockPo.poId, locationId: DC, lines: [{ poLineId: lines[0].id, qty: 2 }, { poLineId: lines[1].id, qty: 4 }] }));
+  await asPerson(t, BUYER, (c, co, a) => pur.addLandedCost(c, scopeOf(co, a), stockPo.poId, { kind: "freight", amountMinor: 2500n, basis: "value", note: "R+L quote" }));
   const inv = fromVendor(COASTER_ID, "P", 505, [{ type: "810", control: 1, segments: x12.build810({ invoiceNumber: `COA-INV-${stockPo.number}`, invoiceDate: day(0), poNumber: stockPo.number,
     lines: [{ line: 1, qty: 2, unitMinor: 19000n, vendorSku: "121221" }, { line: 2, qty: 4, unitMinor: 8200n, vendorSku: "121222" }], charges: [{ code: "D240", description: "Freight", amountMinor: 2500n }],
     totalMinor: 73300n, termsDays: 30 }) }]);
@@ -245,6 +251,57 @@ export async function run(t: T) {
   const gotAgain = await r.post<edi.Received>("/edi/upload", PEOPLE.CLERK, { text: inv2, filename: "810-resent.edi" });
   t.ok("810 in: the same bill number again under new control numbers is quarantined, not billed twice", gotAgain.documents[0]?.status === "quarantined" && /already has a bill numbered/.test(gotAgain.documents[0]?.reason ?? ""),
     JSON.stringify(gotAgain.documents));
+
+  // ================================================================ the match, for every merchandise bill
+  const billOf = (docId: string) => read(t, async (c) => (await q<{ status: string; total_minor: string; created_by: string; maker: string; reason: string | null }>(c, `
+    select i.status, i.total_minor, i.created_by, u.email maker,
+           (select e.reason from audit_event e where e.entity_id = i.entity_id and e.table_name = 'invoice' and e.row_id = i.id::text and e.after->>'status' = 'exception' limit 1) reason
+      from invoice i join edi_document d on d.invoice_id = i.id left join app_user u on u.id = i.created_by where d.id = $1 and d.entity_id = $2`, [docId, ENTITY]))[0]);
+  const again810 = fromVendor(COASTER_ID, "P", 520, [{ type: "810", control: 1, segments: x12.build810({ invoiceNumber: `COA-INV-${stockPo.number}-B`, invoiceDate: day(0), poNumber: stockPo.number,
+    lines: [{ line: 1, qty: 2, unitMinor: 19000n, vendorSku: "121221" }], charges: [], totalMinor: 38000n }) }]);
+  const gotTwice = await r.post<edi.Received>("/edi/upload", PEOPLE.CLERK, { text: again810, filename: "810-twice.edi" });
+  const twice = await billOf(gotTwice.documents[0].id);
+  t.ok("match: billing a line again past what was received less what was billed is an exception", twice?.status === "exception" && /invoiced but not received: .*billed before 2/.test(twice?.reason ?? ""), JSON.stringify(twice));
+  const one = await asPerson(t, BUYER, (c, co, a) => pur.createPO(c, scopeOf(co, a), { vendorId: V.COASTER, shipToId: DC, lines: [{ productId: P.TABLE, qty: 1 }, { productId: P.CHAIRS, qty: 1 }] }, false));
+  const oneLines = await read(t, async (c) => q<{ id: string; seq: number; unit: string }>(c, `select id, seq, unit_price_minor::text unit from purchase_order_line where entity_id = $1 and purchase_order_id = $2 order by seq`, [ENTITY, one.poId]));
+  await asPerson(t, PEOPLE.STEVE, (c, co, a) => receivePurchaseOrder(c, scopeOf(co, a), { purchaseOrderId: one.poId, locationId: DC, lines: oneLines.map((l) => ({ poLineId: l.id, qty: 1 })) }));
+  const sysScope = { tenantId: buyerScope.tenantId, entityId: ENTITY, actor: { kind: "system" as const, label: "scheduler" } };
+  const over = fromVendor(COASTER_ID, "P", 521, [{ type: "810", control: 1, segments: x12.build810({ invoiceNumber: "COA-OVER-1", invoiceDate: day(0), poNumber: one.number,
+    lines: [{ line: 1, qty: 1, unitMinor: 45000n, vendorSku: "121221" }], charges: [{ code: "D240", description: "Freight", amountMinor: 30000n }], totalMinor: 75000n }) }]);
+  const gotOverBill = await tx(sysScope.actor, (c) => edi.receiveFile(c, sysScope, env, { text: over, filename: "over.edi" }));
+  const overBill = await billOf(gotOverBill.documents[0].id);
+  t.ok("match: an 810 at more than the PO price, with freight the PO does not expect, is an exception with both reasons, never approved or posted",
+    overBill?.status === "exception" && /billed at \$450\.00 each against \$\d+\.\d\d on the purchase order/.test(overBill?.reason ?? "") && /charges of \$300\.00 are more than the purchase order expects/.test(overBill?.reason ?? ""),
+    JSON.stringify(overBill));
+  t.ok("maker: a bill the scheduler brought in is entered by the client's EDI intake user, so any real approver may approve it", overBill?.maker === "edi-intake@system.invalid");
+  const alw = fromVendor(COASTER_ID, "P", 522, [{ type: "810", control: 1, segments: x12.build810({ invoiceNumber: "COA-ALW-1", invoiceDate: day(0), poNumber: one.number,
+    lines: [{ line: 2, qty: 1, unitMinor: BigInt(oneLines[1].unit), vendorSku: "121222" }], charges: [{ code: "C310", description: "Discount", amountMinor: -400n }], totalMinor: BigInt(oneLines[1].unit) - 400n }) }]);
+  const gotAlw = await r.post<edi.Received>("/edi/upload", PEOPLE.CLERK, { text: alw, filename: "alw.edi" });
+  const alwBill = await billOf(gotAlw.documents[0].id);
+  t.ok("810 in: an allowance (SAC*A) takes the total down and the bill still matches", gotAlw.documents[0]?.status === "applied" && alwBill?.total_minor === String(BigInt(oneLines[1].unit) - 400n)
+    && ["approved", "pending"].includes(alwBill?.status ?? ""), JSON.stringify({ d: gotAlw.documents, alwBill }));
+
+  // ================================================================ lines must agree; split and repriced 855 lines
+  const two = await asPerson(t, BUYER, (c, co, a) => pur.createPO(c, scopeOf(co, a), { vendorId: V.COASTER, shipToId: DC, lines: [{ productId: P.CHAIRS, qty: 4 }, { productId: P.TABLE, qty: 1 }] }, false));
+  const wrongLine = fromVendor(COASTER_ID, "P", 523, [{ type: "856", control: 1, segments: x12.build856({ shipmentId: "COA-ASN-X", date: day(0), orders: [{ poNumber: two.number, lines: [{ line: 1, vendorSku: "121221", qty: 1 }] }] }) }]);
+  const gotWrong = await r.post<edi.Received>("/edi/upload", BUYER, { text: wrongLine, filename: "wrong.edi" });
+  t.ok("lines: an 856 whose line number points at another product than its item is quarantined, not shipped on the wrong line",
+    gotWrong.documents[0]?.status === "quarantined" && /line number and the item disagree/.test(gotWrong.documents[0]?.reason ?? ""), gotWrong.documents[0]?.reason ?? "");
+  const split = fromVendor(COASTER_ID, "P", 524, [{ type: "855", control: 1, segments: [["BAK", "00", "AC", two.number, day(0).replace(/-/g, "")],
+    ["PO1", "1", "4", "EA", "82.00", "PE", "VN", "121222"], ["ACK", "IA", "2", "EA", "068", day(10).replace(/-/g, "")], ["ACK", "IB", "2", "EA", "068", day(30).replace(/-/g, "")],
+    ["PO1", "2", "1", "EA", "205.00", "PE", "VN", "121221"], ["ACK", "IP", "1", "EA"], ["CTT", "2"]] }]);
+  const gotSplit = await r.post<edi.Received>("/edi/upload", BUYER, { text: split, filename: "split.edi" });
+  const twoLines = await read(t, async (c) => q<{ seq: number; ack_status: string; expected_on: string; unit_price_minor: string; price_review_note: string | null; price_changed_from: string | null }>(c,
+    `select seq, ack_status, expected_on::text, unit_price_minor::text, price_review_note, price_changed_from::text from purchase_order_line where entity_id = $1 and purchase_order_id = $2 order by seq`, [ENTITY, two.poId]));
+  t.ok("855 in: one PO1 split into 2 accepted + 2 backordered is one backordered line due when its last part is", gotSplit.documents[0]?.status === "applied"
+    && twoLines[0].ack_status === "backordered" && twoLines[0].expected_on === day(30), JSON.stringify({ d: gotSplit.documents, l: twoLines[0] }));
+  t.ok("855 in: an IP price change changes the PO line's price, keeps the old one and flags it for the buyer", twoLines[1].unit_price_minor === "20500" && !!twoLines[1].price_review_note
+    && twoLines[1].price_changed_from !== null && twoLines[1].price_changed_from !== "20500", JSON.stringify(twoLines[1]));
+  const lineId2 = await read(t, async (c) => (await q<{ id: string }>(c, `select id from purchase_order_line where entity_id = $1 and purchase_order_id = $2 and seq = 2`, [ENTITY, two.poId]))[0].id);
+  await r.post("/edi/po-lines/:id/price-reviewed", BUYER, {}, lineId2);
+  t.ok("855 in: the buyer marks the price change reviewed", (await read(t, async (c) => (await q<{ n: string | null }>(c, `select price_review_note n from purchase_order_line where id = $1 and entity_id = $2`, [lineId2, ENTITY]))[0].n)) === null);
+  const scoped = await asPerson(t, BUYER, (c, co, a) => pur.importAcks(c, scopeOf(co, a), { csv: `po_number,line,status\n${two.number},1,reject\n`, vendorId: V.GLOBAL }));
+  t.ok("acks: an import from one vendor's feed cannot answer another vendor's PO", scoped.applied === 0 && /no purchase order/.test(scoped.problems[0]?.message ?? ""));
 
   // ================================================================ 832 → cost through the price history
   const cat = fromVendor(COASTER_ID, "P", 507, [{ type: "832", control: 1, segments: x12.build832({ catalogId: "COA-2026-11", date: day(0), items: [
@@ -269,13 +326,16 @@ export async function run(t: T) {
   // ================================================================ bad documents
   const nopo = fromVendor(COASTER_ID, "P", 509, [{ type: "855", control: 1, segments: x12.build855({ poNumber: "PO-NOPE", ackType: "AC", date: day(0), lines: [{ line: 1, status: "IA" }] }) }]);
   const gotNo = await r.post<edi.Received>("/edi/upload", BUYER, { text: nopo, filename: "x.edi" });
-  t.ok("quarantine: an 855 for a PO we never sent is held with the reason, and its 997 rejects it", gotNo.documents[0]?.status === "quarantined" && /no purchase order PO-NOPE/.test(gotNo.documents[0]?.reason ?? "")
-    && await read(t, async (c) => x12.parse997(x12.parseInterchange((await q<{ raw: string }>(c, `select raw from edi_document where id = $1 and entity_id = $2`, [gotNo.acks[0], ENTITY]))[0].raw).groups[0].sets[0].segments).status === "R"));
+  t.ok("quarantine: an 855 for a PO we never sent is held with the reason; its 997 still accepts it (a 997 answers syntax, the hold is ours)",
+    gotNo.documents[0]?.status === "quarantined" && /no purchase order PO-NOPE/.test(gotNo.documents[0]?.reason ?? "")
+    && await read(t, async (c) => x12.parse997(x12.parseInterchange((await q<{ raw: string }>(c, `select raw from edi_document where id = $1 and entity_id = $2`, [gotNo.acks[0], ENTITY]))[0].raw).groups[0].sets[0].segments).status === "A"));
   const badCount = fromVendor(COASTER_ID, "P", 510, [{ type: "855", control: 1, segments: x12.build855({ poNumber: spPo.number, ackType: "AC", date: day(0), lines: [{ line: 1, status: "IA" }] }) }]).replace(/SE\*\d+\*0001/, "SE*2*0001");
   const gotBad = await r.post<edi.Received>("/edi/upload", BUYER, { text: badCount, filename: "bad.edi" });
   const lampAfter = (await read(t, (c) => pur.etaForOrder(c, ENTITY, salesOrder))).find((x) => x.sales_order_line_id === LAMP_LINE);
-  t.ok("quarantine: a set whose SE count is wrong is held and nothing from it is applied", gotBad.documents[0]?.status === "quarantined" && /SE01 says 2/.test(gotBad.documents[0]?.reason ?? "")
-    && lampAfter?.ack_status === "backordered", gotBad.documents[0]?.reason ?? "");
+  const bad997 = await read(t, async (c) => x12.parse997(x12.parseInterchange((await q<{ raw: string }>(c, `select raw from edi_document where id = $1 and entity_id = $2`, [gotBad.acks[0], ENTITY]))[0].raw).groups[0].sets[0].segments));
+  t.ok("quarantine: a set whose SE count is wrong is held and nothing from it is applied; its 997 rejects it with AK5 code 4, valid on its own",
+    gotBad.documents[0]?.status === "quarantined" && /SE01 says 2/.test(gotBad.documents[0]?.reason ?? "") && lampAfter?.ack_status === "backordered"
+    && bad997.status === "R" && bad997.sets[0]?.code === "4" && !bad997.errors.length, gotBad.documents[0]?.reason ?? "");
   const junk = await r.post<edi.Received>("/edi/upload", BUYER, { text: "PO,LINE,QTY\nPO-1,1,2\n", filename: "notx12.csv" });
   t.ok("quarantine: a file that is not X12 is kept with the reason", junk.documents[0]?.status === "quarantined" && /not an X12 file/.test(junk.documents[0]?.reason ?? ""));
   const testFile = fromVendor(COASTER_ID, "T", 511, [{ type: "846", control: 1, segments: x12.build846({ reference: "ADV-T", date: day(0), items: [{ vendorSku: "121222", qty: 999 }] }) }]);
@@ -286,13 +346,18 @@ export async function run(t: T) {
   await t.throws("roles: a salesperson cannot upload EDI files", () => r.post("/edi/upload", SALES, { text: adv }), /needs one of: buyer, ap clerk/);
 
   // ================================================================ the drop folder, polled
-  await mkdir(join(drop, "coaster", "in"), { recursive: true });
-  await writeFile(join(drop, "coaster", "in", "adv-2.edi"), fromVendor(COASTER_ID, "P", 512, [{ type: "846", control: 1, segments: x12.build846({ reference: "ADV-2", date: day(0), items: [{ vendorSku: "121221", qty: 6 }] }) }]));
+  await mkdir(join(drop, ENTITY, "coaster", "in"), { recursive: true });
+  // A file in the same folder addressed to another company's ISA id is left alone.
+  await writeFile(join(drop, ENTITY, "coaster", "in", "for-someone-else.edi"), x12.writeInterchange({ sender: COASTER_ID, receiver: { qual: "ZZ", id: "SISTERCO" }, gsSender: COASTER_ID.id, gsReceiver: "SISTERCO",
+    version: "004010", usage: "P", isaControl: 777, gsControl: 777 }, [{ type: "846", control: 1, segments: x12.build846({ reference: "X", date: null, items: [{ vendorSku: "121221", qty: 1 }] }) }]));
+  await writeFile(join(drop, ENTITY, "coaster", "in", "adv-2.edi"), fromVendor(COASTER_ID, "P", 512, [{ type: "846", control: 1, segments: x12.build846({ reference: "ADV-2", date: day(0), items: [{ vendorSku: "121221", qty: 6 }] }) }]));
   const due = await runDueEdi(new Date(), env, { entityId: ENTITY });
-  const moved = await readdir(join(drop, "coaster", "in", "done"));
+  const moved = await readdir(join(drop, ENTITY, "coaster", "in", "done"));
+  const stillIn = (await readdir(join(drop, ENTITY, "coaster", "in"))).filter((n) => n.endsWith(".edi"));
   const atp2 = await read(t, async (c) => (await q<{ qty_available: string }>(c, `select qty_available from vendor_availability where entity_id = $1 and vendor_id = $2 and vendor_sku = '121221'`, [ENTITY, V.COASTER]))[0]);
   t.ok("scheduler: the drop folder is polled, the file applied and archived; SFTP records its refusal on its own partner",
     due.find((x) => x.vendor.startsWith("Coaster"))?.ok === true && moved.length === 1 && Number(atp2?.qty_available) === 6
+    && stillIn.join() === "for-someone-else.edi" && /1 left for another company/.test(due.find((x) => x.vendor.startsWith("Coaster"))?.note ?? "")
     && due.some((x) => x.vendor.startsWith("Ashley") && !x.ok && /SFTP/.test(x.note)), JSON.stringify(due));
 
   // ================================================================ VAN + API ordering + order status (Global)
@@ -338,7 +403,43 @@ export async function run(t: T) {
   const polled = await r.post<{ ok: boolean; note: string }>("/edi/partners/:id/poll", BUYER, {}, global.id);
   const tStatus = await read(t, async (c) => (await q<{ status: string; reason: string }>(c, `select status, reason from edi_document where id = $1 and entity_id = $2`, [test850.documentId, ENTITY]))[0]);
   t.ok("VAN: polled for new files; the vendor's 997 rejecting our test 850 marks it rejected with their reason, and the file is acknowledged to the VAN",
-    polled.ok && tStatus.status === "rejected" && /unknown ship-to/.test(tStatus.reason) && net.state.acked.includes("m-1"), JSON.stringify({ polled, tStatus }));
+    polled.ok && tStatus.status === "rejected" && /rejected it in their 997: one or more segments in error/.test(tStatus.reason) && net.state.acked.includes("m-1"), JSON.stringify({ polled, tStatus }));
+
+  // ================================================================ the 850, laid out per partner
+  await r.post("/edi/partners", BUYER, { partner: { vendor_id: V.COASTER, options: { billTo: { name: "Demo Furniture AP", code: "BT-1", address1: "9 Main St", city: "Enola", state: "PA", postal: "17025" },
+    vendorN1: true, td5: { scac: "rlca", method: "M", routing: "R+L Carriers" }, fob: "PP", shipByDays: 14, cancelAfterDays: 45, itemIds: ["VN", "IN"], refs: [], contact: { name: "Ana", phone: "7175550100", email: "ana@example.com" } } } });
+  await t.throws("850 layout: an item id the system does not send is refused", () => r.post("/edi/partners", BUYER, { partner: { vendor_id: V.COASTER, options: { itemIds: ["ZZ"] } } }), /not an item id/);
+  const three = await asPerson(t, BUYER, (c, co, a) => pur.createPO(c, scopeOf(co, a), { vendorId: V.COASTER, shipToId: DC, lines: [{ productId: P.CHAIRS, qty: 2 }] }, false));
+  const s3 = await r.post<{ documentId: string }>("/edi/pos/:id/send", BUYER, {}, three.poId);
+  const raw3 = await read(t, async (c) => (await q<{ raw: string }>(c, `select raw from edi_document where id = $1 and entity_id = $2`, [s3.documentId, ENTITY]))[0].raw);
+  const p3 = x12.parse850(x12.parseInterchange(raw3).groups[0].sets[0].segments);
+  t.ok("850 layout: bill-to, vendor party, TD5 routing, FOB, ship-by and cancel-after, buyer contact and the partner's item ids, without the references it turned off",
+    p3.billTo?.name === "Demo Furniture AP" && p3.billTo?.postal === "17025" && !!p3.vendor && p3.td5?.scac === "RLCA" && p3.fob === "PP" && p3.shipBy === day(14) && p3.cancelAfter === day(45)
+    && p3.contact?.email === "ana@example.com" && /PO1\*1\*2\*EA\*[\d.]+\*PE\*VN\*121222\*IN\*COA-121222/.test(raw3) && !/\*BP\*/.test(raw3) && !/REF\*IA/.test(raw3), raw3.slice(0, 600));
+
+  // ================================================================ VAN with no acknowledge address
+  await r.post("/edi/partners", BUYER, { partner: { vendor_id: V.GLOBAL, transport_config: { sendUrl: "https://van.example/send", listUrl: "https://van.example/inbox", auth: "bearer" } } });
+  const docsBefore = await read(t, async (c) => Number((await q<{ n: string }>(c, `select count(*) n from edi_document where entity_id = $1 and partner_id = $2`, [ENTITY, global.id]))[0].n));
+  const repoll = await r.post<{ ok: boolean; note: string }>("/edi/partners/:id/poll", BUYER, {}, global.id);
+  const docsAfter = await read(t, async (c) => Number((await q<{ n: string }>(c, `select count(*) n from edi_document where entity_id = $1 and partner_id = $2`, [ENTITY, global.id]))[0].n));
+  t.ok("VAN: without an acknowledge address the same file is offered again, and is skipped by its checksum without adding a row", repoll.ok && /1 already taken in/.test(repoll.note) && docsAfter === docsBefore, repoll.note);
+  const ixRows = await read(t, async (c) => (await q<{ sets: string; raws: string }>(c, `select count(*) sets, count(d.raw) raws from edi_document d where d.entity_id = $1 and d.direction = 'in' and d.interchange_id is not null`, [ENTITY]))[0]);
+  t.ok("storage: an inbound interchange's raw text is kept once, its sets point at it", Number(ixRows.sets) > 5 && Number(ixRows.raws) === 0, JSON.stringify(ixRows));
+
+  // ================================================================ ISA ids across companies
+  await t.throws("partners: giving one partner another's ISA id is a plain refusal", () => r.post("/edi/partners", BUYER, { partner: { vendor_id: V.GLOBAL, their_isa_qual: COASTER_ID.qual, their_isa_id: COASTER_ID.id } }),
+    /Coaster Company of America already uses ISA id 01\/COASTERUSA/);
+  const sib = await t.pool.connect();
+  try {
+    await sib.query("begin");
+    const ent = (await q<{ id: string }>(sib, `insert into entity (tenant_id, name, legal_name) values ($1, 'Check sister co', 'Check sister co LLC') returning id /* unscoped: a sister company for the check */`, [buyerScope.tenantId]))[0];
+    let msg = "";
+    try {
+      await sib.query("savepoint s1");
+      await q(sib, `insert into edi_partner (entity_id, vendor_id, our_isa_qual, our_isa_id, their_isa_qual, their_isa_id) values ($1,$2,'ZZ',$3,$4,$5)`, [ent.id, V.COASTER, OURS.id, COASTER_ID.qual, COASTER_ID.id]);
+    } catch (e) { msg = (e as Error).message; await sib.query("rollback to savepoint s1"); }
+    t.ok("partners: a sister company cannot pair the same ISA ids, so neither takes the other's files from a shared mailbox", /each company needs its own ISA id/.test(msg), msg);
+  } finally { await sib.query("rollback"); sib.release(); }
 
   // ================================================================ secrets never come back
   const list = JSON.stringify(await r.get("/edi/partners"));
@@ -346,7 +447,7 @@ export async function run(t: T) {
   const docsAll = JSON.stringify(await r.get("/edi/documents", "?limit=300"));
   const detail = JSON.stringify(await r.get("/edi/documents/:id", "", apiSend.documentId));
   t.ok("secrets: no GET returns a partner's or a feed's secret, only which are set (masked)", ![list, one_, docsAll, detail].some((x) => x.includes("VAN-TOKEN-9999") || x.includes("Sftp-Secret-4411") || x.includes("G-ORDERS-7777"))
-    && list.includes("••••99") && one_.includes("sftpPassword"));
+    && list.includes('"masked":"set"') && !list.includes("••••") && one_.includes("sftpPassword"));
   const stored = await read(t, async (c) => (await q<{ n: string }>(c, `select count(*) n from edi_partner where entity_id = $1 and transport_config::text like '%Secret%'`, [ENTITY]))[0].n);
   t.ok("secrets: passwords live sealed, never in the settings", stored === "0");
 
@@ -356,10 +457,17 @@ export async function run(t: T) {
   t.ok("PO trail: 850 out, the vendor's 997, 856 and 810 in, and the shipment", ["out:850", "in:997", "in:856", "in:810"].every((x) => types.includes(x)) && trail.shipments.length === 1, types.join(","));
 
   // ================================================================ store orders (catalog app flow)
-  await r.post("/edi/freight-mins", BUYER, { vendorId: V.COASTER, scope: "category", scopeValue: "Dining", measure: "qty", minimum: 4 });
+  // The catalog app's rules: one category rule pooling several, matched loosely; the general minimum counts only the other items.
+  t.ok("freight: loose category match (case, plurals, either inside the other)", so.looseMatch("Dining", ["dining room"]) && so.looseMatch("Accents", ["accent"]) && so.looseMatch("BEDROOM", ["Bedrooms"])
+    && !so.looseMatch("Living room", ["Bedroom"]) && so.ruleNames("Dining, Bedroom / Youth and Accents").length === 4);
+  await r.post("/edi/freight-mins", BUYER, { vendorId: V.ASHLEY, scope: "category", scopeValue: "Bedrooms", measure: "qty", minimum: 3 });
+  const ashCheck = await read(t, (c) => so.freightCheck(c, ENTITY, V.ASHLEY, [{ productId: "77777777-0000-0000-0000-000000000004", qty: 1 }, { productId: "77777777-0000-0000-0000-000000000001", qty: 1 }]));
+  t.ok("freight: a category rule counts its items; the vendor's general minimum counts only the other items", ashCheck.length === 2 && /Bedrooms \(category\) needs 3 pieces/.test(ashCheck[0].message)
+    && ashCheck[1].rule === "other items" && ashCheck[1].have === "38500" && !ashCheck[1].ok, JSON.stringify(ashCheck));
+  await r.post("/edi/freight-mins", BUYER, { vendorId: V.COASTER, scope: "category", scopeValue: "dining room, accent", measure: "qty", minimum: 4 });
   await t.throws("roles: a store manager cannot set freight minimums", () => r.post("/edi/freight-mins", STORE_MGR, { vendorId: V.COASTER, scope: "all", measure: "cost", minimum: "100" }), /needs one of: buyer/);
   const cart = await r.post<{ id: string; number: string }>("/edi/store-orders", STORE_MGR, { locationId: ENOLA, vendorId: V.COASTER, lines: [{ productId: P.CHAIRS, qty: 2 }] });
-  await t.throws("store orders: submit is refused while a freight minimum is short, saying which", () => r.post("/edi/store-orders/:id/submit", STORE_MGR, {}, cart.id), /Dining \(category\) needs 4 pieces .* has 2/);
+  await t.throws("store orders: submit is refused while a freight minimum is short, saying which", () => r.post("/edi/store-orders/:id/submit", STORE_MGR, {}, cart.id), /dining room, accent \(category\) needs 4 pieces .* has 2/);
   await t.throws("store orders: a cart holds one vendor", () => r.post("/edi/store-orders/:id/lines", STORE_MGR, { lines: [{ productId: P.GLB, qty: 1 }] }, cart.id), /another vendor/);
   await r.post("/edi/store-orders/:id/lines", STORE_MGR, { lines: [{ productId: P.CHAIRS, qty: 4 }, { productId: P.TABLE, qty: 6 }, { productId: P.LAMP, qty: 2 }] }, cart.id);
   await r.post("/edi/store-orders/:id/submit", STORE_MGR, {}, cart.id);
@@ -374,6 +482,14 @@ export async function run(t: T) {
   const own = await r.post<{ id: string }>("/edi/store-orders", BUYER, { locationId: ENOLA, vendorId: V.COASTER, lines: [{ productId: P.TABLE, qty: 8 }] });
   await r.post("/edi/store-orders/:id/submit", BUYER, {}, own.id);
   await t.throws("store orders: whoever submitted cannot approve their own", () => r.post("/edi/store-orders/:id/approve", BUYER, {}, own.id), /cannot also approve/);
+  const built = await r.post<{ id: string }>("/edi/store-orders", BUYER, { locationId: ENOLA, vendorId: V.COASTER, lines: [{ productId: P.TABLE, qty: 8 }] });
+  await r.post("/edi/store-orders/:id/submit", STORE_MGR, {}, built.id);
+  await t.throws("store orders: whoever built the cart cannot approve it either", () => r.post("/edi/store-orders/:id/approve", BUYER, {}, built.id), /built a store order's cart cannot also approve/);
+  const pal = await r.post<{ id: string }>("/edi/store-orders", BUYER, { locationId: "33333333-0000-0000-0000-000000000002", vendorId: V.COASTER, lines: [{ productId: P.TABLE, qty: 8 }] });
+  await r.post("/edi/store-orders/:id/submit", BUYER, {}, pal.id);
+  await t.throws("store orders: another store's manager cannot send an order back to draft", () => r.post("/edi/store-orders/:id/back", STORE_MGR, { reason: "too many" }, pal.id), /another store's order/);
+  await r.post("/edi/store-orders/:id/back", APPROVER, { reason: "fewer tables" }, pal.id);
+  t.ok("store orders: an approver sends it back with the reason", (await r.get<{ order: { status: string; decision_note: string } }>("/edi/store-orders/:id", "", pal.id)).order.status === "draft");
   await t.throws("store orders: turning one down needs a reason", () => r.post("/edi/store-orders/:id/reject", APPROVER, { reason: "" }, own.id), /say why/);
   await r.post("/edi/store-orders/:id/reject", APPROVER, { reason: "the DC has tables" }, own.id);
   t.ok("store orders: a turned-down order keeps its reason", ((await r.get<{ order: { status: string; decision_note: string } }>("/edi/store-orders/:id", "", own.id)).order).decision_note === "the DC has tables");

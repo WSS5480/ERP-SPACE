@@ -1164,7 +1164,7 @@ async function applyPurpose(c: Client, s: Scope, f: FeedRow & { vendor: string }
     if (acks.length) {
       const csv = recordsToCsv(acks.map((r) => ({ po_number: r.po_number ?? "", line: r.line ?? "", vendor_sku: r.vendor_sku ?? "", status: r.status ?? "",
         qty: r.qty ?? "", ship_date: r.ship_date ?? "", vendor_ref: r.vendor_ref ?? "" })));
-      const r = await importAcks(c, s, { csv, filename: `${f.name} (API)` });
+      const r = await importAcks(c, s, { csv, filename: `${f.name} (API)`, vendorId: f.vendor_id });
       applied += r.applied; rowsN += r.rows;
       problems.push(...r.problems.map((p) => p.message));
     }
