@@ -299,3 +299,48 @@ export async function postToLedger(c: Client, scope: Scope, invoiceId: string): 
   });
   return je.id;
 }
+
+// ======================================================= sibling companies
+// A bill from one of the client's own companies, written by the group module
+// with its sales invoice in the sibling. Its posting is the group module's
+// journal entry (Dr the cost, Cr Due to related companies 2190), so it is
+// recorded approved and is settled in Group, never in a payment run.
+
+export async function billFromSibling(c: Client, scope: Scope, x: {
+  vendorId: string; documentId: string; reference: string; date: string;
+  lines: { glCode: string; description: string; amountMinor: bigint; profitObjectId?: string | null }[];
+}): Promise<string> {
+  const v = await q<{ id: string }>(c, `select v.id from vendor v join vendor_entity ve on ve.vendor_id = v.id and ve.entity_id = $2
+     where v.id = $1 and v.related_entity_id is not null`, [x.vendorId, scope.entityId]);
+  if (!v.length) throw new TransitionError("that vendor is not one of this client's own companies");
+  const total = x.lines.reduce((s, l) => s + l.amountMinor, 0n);
+  if (total <= 0n) throw new TransitionError("an inter-company bill is for more than zero");
+  const codes = [...new Set(x.lines.map((l) => l.glCode))];
+  const accts = await q<{ id: string; code: string }>(c, `select id, code from gl_account where tenant_id = $1 and code = any($2) /* unscoped: chart is tenant-wide */`,
+    [scope.tenantId, codes]);
+  const byCode = new Map(accts.map((a) => [a.code, a.id]));
+  const inv = await one<{ id: string }>(c, `
+    insert into invoice (tenant_id, entity_id, vendor_id, kind, reference, invoice_date, due_date, total_minor, status, created_by, ic_document_id)
+    values ($1,$2,$3,'operating',$4,$5,$5,$6,'approved',$7,$8) returning id`,
+    [scope.tenantId, scope.entityId, x.vendorId, x.reference, x.date, total.toString(), scope.actor.id || null, x.documentId]);
+  let seq = 1;
+  for (const l of x.lines) {
+    await c.query(`insert into invoice_line (invoice_id, seq, gl_account_id, profit_object_id, description, amount_minor) values ($1,$2,$3,$4,$5,$6)`,
+      [inv.id, seq++, byCode.get(l.glCode), l.profitObjectId ?? null, l.description.slice(0, 300), l.amountMinor.toString()]);
+  }
+  await audit(c, scope, { table: "invoice", rowId: inv.id, action: "insert", after: { status: "approved", total: total.toString(), sibling: true },
+    reason: "a bill from a sister company, recorded with its invoice there" });
+  return inv.id;
+}
+
+/** Group settled these sibling bills: approved → scheduled → paid, each step audited. */
+export async function settleSiblingBills(c: Client, scope: Scope, documentIds: string[], how: string): Promise<number> {
+  if (!documentIds.length) return 0;
+  const bills = await q<{ id: string }>(c, `select id from invoice where entity_id = $1 and ic_document_id = any($2) and status = 'approved'`,
+    [scope.entityId, documentIds]);
+  for (const b of bills) {
+    await transition(c, scope, b.id, "scheduled", how);
+    await transition(c, scope, b.id, "paid", how);
+  }
+  return bills.length;
+}

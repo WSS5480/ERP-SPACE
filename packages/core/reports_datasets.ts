@@ -43,6 +43,8 @@ const F = (id: string, label: string, type: FieldType, extra: Partial<Field> = {
 
 const FINANCE = ["controller", "viewer"];
 const SALES = ["controller", "viewer", "store_manager", "sales", "buyer"];
+/** Held by a person who is a controller in every one of the client's companies (see rolesFor in reports.ts). */
+export const GROUP = "controller_everywhere";
 
 // The P&L sections the Books screen uses, by account code.
 const SECTION = `case when ga.code like '4%' then 'Revenue' when ga.code like '5%' then 'Cost of merchandise'
@@ -113,6 +115,35 @@ export const DATASETS: Dataset[] = [
             from journal_line jl
             join journal_entry je on je.id = jl.journal_entry_id and je.entity_id = $1
             join gl_account ga on ga.id = jl.gl_account_id`,
+  },
+  {
+    // Across companies: every company of the client that $1 belongs to. Only a controller in
+    // every one of them (or the owner) may use it -- reports.ts grants the role for that.
+    id: "group_gl", label: "Group ledger lines (all companies)", folder: "Finance", modules: [], roles: [GROUP],
+    description: "Every posted journal line in each of the client's companies, with the company, so a report can compare or total them. Inter-company accounts are flagged.",
+    dateField: "posted_on", detail: ["company", "posted_on", "account", "description", "debit", "credit"],
+    fields: [
+      F("company", "Company", "text"), F("posted_on", "Posting date", "date"), F("period", "Period", "text", { hint: "YYYY-MM" }),
+      F("account_code", "Account code", "text"), F("account_name", "Account name", "text"), F("account", "Account", "text"),
+      F("account_type", "Account type", "text"), F("section", "P&L section", "text"), F("intercompany", "Inter-company account", "bool"),
+      F("store", "Store", "text"), F("source", "Source", "text"), F("description", "Description", "text"),
+      F("debit", "Debit", "money"), F("credit", "Credit", "money"), F("net", "Net (debit − credit)", "money"),
+      F("amount", "P&L amount (revenue and costs up)", "money"),
+    ],
+    sql: `select e.name as company, je.posting_date as posted_on, to_char(je.posting_date, 'YYYY-MM') as period,
+                 ga.code as account_code, ga.name as account_name, ga.code || ' ' || ga.name as account, ga.account_type,
+                 case when ga.account_type in ('revenue','expense') then ${SECTION} end as section,
+                 ga.code in ('1195','2190','4090','5090') as intercompany,
+                 coalesce(po.name, 'Company') as store, je.source_type as source, je.description,
+                 jl.debit_minor as debit, jl.credit_minor as credit, jl.debit_minor - jl.credit_minor as net,
+                 case when ga.account_type = 'revenue' then jl.credit_minor - jl.debit_minor
+                      when ga.account_type = 'expense' then jl.debit_minor - jl.credit_minor else 0 end as amount
+            from journal_line jl
+            join journal_entry je on je.id = jl.journal_entry_id
+            join entity e on e.id = je.entity_id and e.tenant_id = (select me.tenant_id from entity me where me.id = $1)
+            join gl_account ga on ga.id = jl.gl_account_id and ga.tenant_id = e.tenant_id
+            left join profit_object po on po.id = jl.profit_object_id and po.entity_id = je.entity_id
+           /* unscoped: every company of the client that company $1 belongs to */`,
   },
   {
     id: "sales_lines", label: "Sales order lines", folder: "Sales", modules: ["pos", "shop"], roles: SALES,

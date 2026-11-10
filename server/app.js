@@ -325,7 +325,7 @@ function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + 
  * the owner sees everything. The server still checks every action on its own.
  */
 const ROLE_SCREENS = {
-  controller: ['home', 'approvals', 'payables', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'reports', 'setup', 'business'],
+  controller: ['home', 'approvals', 'payables', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'reports', 'group', 'setup', 'business'],
   approver: ['home', 'approvals', 'payables', 'reports'],
   ap_clerk: ['home', 'payables', 'reports'],
   viewer: ['home', 'books', 'chart', 'reports'],
@@ -577,7 +577,7 @@ const GROUP_HINT = { pos: 'Sell, take deposits and payments', aisle: 'Price and 
   leads: 'Follow-ups and the pipeline', myday: 'Today’s calls, tasks and appointments', catalog: 'Products, options and prices',
   purchasing: 'Purchase orders and receiving', inventory: 'Stock, bins, transfers and counts', fleet: 'Delivery calendar and routes',
   myroute: 'Today’s stops', service: 'Service tickets and visits', ar: 'Customer accounts and collections', workforce: 'Time clock, shifts and commissions',
-  reports: 'Saved and starter reports', shop: 'The web store', marketing: 'Campaigns, coupons and lists', payables: 'Vendor bills', approvals: 'Waiting on a decision' };
+  reports: 'Saved and starter reports', group: 'The companies together, inter-company', shop: 'The web store', marketing: 'Campaigns, coupons and lists', payables: 'Vendor bills', approvals: 'Waiting on a decision' };
 
 /** What a pay group's open period needs from a person now, or null if it is waiting on time or on someone else. */
 function payrollNext(p) {

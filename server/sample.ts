@@ -424,7 +424,7 @@ async function build(c: Client, co: Company, log: (s: string) => void): Promise<
   while (!isBankDay(payDay)) payDay = addDays(payDay, 1);
   if (payDay > yesterday) payDay = addDays(yesterday, -1);
   const toPay = await q<{ id: string }>(c, `
-    select id from invoice where entity_id = $1 and status = 'approved' and invoice_date <= $2::date`, [co.id, payDay]);
+    select id from invoice where entity_id = $1 and status = 'approved' and ic_document_id is null and invoice_date <= $2::date`, [co.id, payDay]);
   let paid = 0;
   if (toPay.length) {
     const run = await createPaymentRun(c, co, clerk, { payDate: payDay, method: "ach", invoiceIds: toPay.map((x) => x.id) }, { allowPast: true });

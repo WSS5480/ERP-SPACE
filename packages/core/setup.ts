@@ -10,10 +10,18 @@ import { installStarters } from "./reports.ts";
 
 export class SetupError extends Error {}
 
-export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports"] as const;
+export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group"] as const;
 export type ModuleId = (typeof MODULE_IDS)[number];
 
 type Account = [code: string, name: string, type: "asset" | "liability" | "equity" | "revenue" | "expense", normal: "D" | "C"];
+
+/** Inter-company accounts the group module posts to (Group: consolidation, sibling documents, settle). Every pack carries them. */
+export const GROUP_ACCOUNTS: Account[] = [
+  ["1195", "Due from related companies", "asset", "D"],
+  ["2190", "Due to related companies", "liability", "C"],
+  ["4090", "Inter-company sales", "revenue", "C"],
+  ["5090", "Inter-company cost of sales", "expense", "D"],
+];
 
 /** Accounts any retail module may post to. Every retail pack carries them. */
 const RETAIL_ACCOUNTS: Account[] = [
@@ -49,6 +57,7 @@ const RETAIL_ACCOUNTS: Account[] = [
   ["6800", "Other operating", "expense", "D"],
   ["6900", "Bad debt expense", "expense", "D"],
   ["6910", "Card and finance fees", "expense", "D"],
+  ...GROUP_ACCOUNTS,
 ];
 
 type Reason = [kind: string, code: string, label: string, restock?: boolean];
@@ -98,7 +107,7 @@ export const PACKS: Pack[] = [
     blurb: "Showrooms and a distribution center, special orders and customizable upholstery, deposits and financing, white-glove delivery with routing, commissioned sales staff.",
     vertical: "furniture",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -124,7 +133,7 @@ export const PACKS: Pack[] = [
     blurb: "Serialized stock, manufacturer warranties and protection plans, install and haul-away on delivery, financing.",
     vertical: "retail",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -147,7 +156,7 @@ export const PACKS: Pack[] = [
     blurb: "Cash-and-carry stores with a web store; no delivery fleet or installment contracts unless you turn them on.",
     vertical: "retail",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "shop", "crm", "reports"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "shop", "crm", "reports", "group"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS.filter(([k]) => k !== "delivery_exception"),
     settings: {
@@ -165,7 +174,7 @@ export const PACKS: Pack[] = [
     blurb: "Stores carrying back balances, delivery and pickup routes, a catalog and purchasing for rental merchandise. Agreements stay in your rental system; this pack reads it.",
     vertical: "rto",
     labels: { location: "Store", profitObject: "Store", aging: "Back balances" },
-    modules: ["catalog", "purchasing", "inventory", "ar", "workforce", "fleet", "service", "reports"],
+    modules: ["catalog", "purchasing", "inventory", "ar", "workforce", "fleet", "service", "reports", "group"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -180,7 +189,7 @@ export const PACKS: Pack[] = [
     blurb: "Trucks are the profit objects. Fleet, maintenance, inspections, payroll and A/R; no stores, catalog or POS.",
     vertical: "trucking",
     labels: { location: "Terminal", profitObject: "Truck", aging: "Settlements" },
-    modules: ["ar", "workforce", "fleet", "reports"],
+    modules: ["ar", "workforce", "fleet", "reports", "group"],
     accounts: [
       ["1050", "Undeposited funds", "asset", "D"],
       ["1100", "Accounts receivable, customers", "asset", "D"],
@@ -192,7 +201,9 @@ export const PACKS: Pack[] = [
       ["4020", "Fees and other revenue", "revenue", "C"],
       ["6300", "Fleet repairs and maintenance", "expense", "D"],
       ["6310", "Fuel", "expense", "D"],
+      ["6800", "Other operating", "expense", "D"],
       ["6900", "Bad debt expense", "expense", "D"],
+      ...GROUP_ACCOUNTS,
     ],
     reasons: RETAIL_REASONS.filter(([k]) => k === "write_off" || k === "void"),
     settings: {

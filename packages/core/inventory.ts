@@ -742,12 +742,15 @@ export type TransferLineIn = { productId?: string; qty?: number; labels?: string
 export async function createTransfer(c: Client, scope: Scope, e: { fromId: string; toId: string; lines: TransferLineIn[]; note?: string }) {
   need(e.fromId !== e.toId, "a transfer goes between two different locations");
   const locs = await q<{ id: string }>(c, `select id from location where entity_id = $1 and id = any($2) and status = 'active'`, [scope.entityId, [e.fromId, e.toId]]);
-  need(locs.length === 2, "pick two of this company's locations");
+  // To a store of another of the client's companies: the group module pairs a sale here with a bill there when it ships.
+  const toEntity = locs.length === 1 && locs[0].id === e.fromId ? await siblingOf(c, scope.entityId, e.toId) : null;
+  need(locs.length === 2 || toEntity, "pick two of this company's locations");
   need(e.lines?.length, "a transfer needs at least one line");
   const number = await nextNo(c, scope.entityId, "transfer", "TR-");
-  const t = await one<{ id: string }>(c, `insert into inv_transfer (entity_id, number, from_location_id, to_location_id, note, created_by)
-    values ($1,$2,$3,$4,$5,$6) returning id`, [scope.entityId, number, e.fromId, e.toId, e.note ?? null, scope.actor.id || null]);
+  const t = await one<{ id: string }>(c, `insert into inv_transfer (entity_id, number, from_location_id, to_location_id, note, created_by, to_entity_id)
+    values ($1,$2,$3,$4,$5,$6,$7) returning id`, [scope.entityId, number, e.fromId, e.toId, e.note ?? null, scope.actor.id || null, toEntity]);
   const addCustomerLine = async (lineId: string) => {
+      need(!toEntity, "a customer's order moves only between the selling company's own locations");
       const sl = await lineOf(c, scope.entityId, lineId);
       need(sl.product_id, "that order line has no product to move");
       need(["reserved", "ready"].includes(sl.line_status), `${sl.number}'s line is ${sl.line_status.replace("_", " ")}; only reserved goods move for a customer`);
@@ -786,7 +789,7 @@ export async function createTransfer(c: Client, scope: Scope, e: { fromId: strin
     } else {
       // Not enough free stock here? A customer's goods reserved here for pickup at the destination are what is moving.
       const free = (await level(c, scope.entityId, p.id, e.fromId)).available;
-      if (free < want) {
+      if (free < want && !toEntity) {
         const cust = await q<{ id: string; qty: string }>(c, `
           select l.id, l.qty from sales_order_line l join sales_order so on so.id = l.sales_order_id
             left join pos_line pl on pl.sales_order_line_id = l.id and pl.entity_id = l.entity_id
@@ -809,6 +812,9 @@ export async function createTransfer(c: Client, scope: Scope, e: { fromId: strin
 export async function shipTransfer(c: Client, scope: Scope, id: string) {
   const t = await transferOf(c, scope.entityId, id);
   need(t.status === "draft", `transfer ${t.number} is ${t.status.replace("_", " ")}, so it cannot ship`);
+  // To another of the client's companies: the goods leave this company's books (sold to the sibling at transfer price).
+  const across = !!t.to_entity_id;
+  const outStatus = across ? "delivered" : "in_transit";
   const lines = await q<{ id: string; product_id: string; qty: string; unit_ids: string[]; sales_order_line_id: string | null }>(c,
     `select id, product_id, qty, unit_ids, sales_order_line_id from inv_transfer_line where entity_id = $1 and transfer_id = $2`, [scope.entityId, id]);
   let value = 0n;
@@ -856,17 +862,25 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
         need(units.length === qty, `${p.name}: only ${units.length} free labelled unit${units.length === 1 ? "" : "s"} at the origin`);
         await c.query(`update inv_transfer_line set unit_ids = $3 where id = $1 and entity_id = $2`, [l.id, scope.entityId, units]);
       }
-      for (const u of units) await transitionUnit(c, scope.entityId, by, u, "in_transit",
+      for (const u of units) await transitionUnit(c, scope.entityId, by, u, outStatus,
         { kind: "transfer_out", refType: "transfer", refId: id, transferId: id });
     } else {
       await bump(c, scope.entityId, p.id, t.from_location_id, { onHand: -qty });
       await binStockTake(c, scope.entityId, p.id, t.from_location_id, qty);
-      await logMove(c, scope.entityId, { kind: "transfer_out", productId: p.id, qty, fromLoc: t.from_location_id, toStatus: "in_transit",
+      await logMove(c, scope.entityId, { kind: "transfer_out", productId: p.id, qty, fromLoc: t.from_location_id, toStatus: outStatus,
         refType: "transfer", refId: id, by: scope.actor.id });
     }
     await c.query(`update inv_transfer_line set value_minor = $3, cost_minor = $4 where id = $1 and entity_id = $2`, [l.id, scope.entityId, lineValue.toString(),
       (qty ? BigInt(Math.round(Number(lineValue) / qty)) : 0n).toString()]);
     value += lineValue;
+  }
+  if (across) {
+    // Shipped and landed in one step: the sibling holds the goods from here, at transfer price, on a bill from this company.
+    await c.query(`update inv_transfer set status = 'received', shipped_by = $3, shipped_at = now(), received_by = $3, received_at = now()
+                    where id = $1 and entity_id = $2`, [id, scope.entityId, by]);
+    const group = await import("./group.ts");
+    const docs = await group.completeAcross(c, scope, id);
+    return { number: t.number, valueMinor: value, ...docs };
   }
   await c.query(`update inv_transfer set status = 'in_transit', shipped_by = $3, shipped_at = now() where id = $1 and entity_id = $2`, [id, scope.entityId, by]);
   if (value > 0n) {
@@ -928,10 +942,60 @@ export async function cancelTransfer(c: Client, scope: Scope, id: string) {
 }
 
 async function transferOf(c: Client, entityId: string, id: string) {
-  const r = await q<{ id: string; number: string; status: string; from_location_id: string; to_location_id: string }>(c,
-    `select id, number, status, from_location_id, to_location_id from inv_transfer where id = $1 and entity_id = $2 for update`, [id, entityId]);
+  const r = await q<{ id: string; number: string; status: string; from_location_id: string; to_location_id: string; to_entity_id: string | null }>(c,
+    `select id, number, status, from_location_id, to_location_id, to_entity_id from inv_transfer where id = $1 and entity_id = $2 for update`, [id, entityId]);
   need(r.length, "no such transfer");
   return r[0];
+}
+
+/** The company of a location that belongs to another open company of the same client, else null. */
+async function siblingOf(c: Client, entityId: string, locationId: string): Promise<string | null> {
+  const r = await q<{ entity_id: string }>(c, `select l.entity_id from location l join entity e on e.id = l.entity_id join entity me on me.id = $1
+     where l.id = $2 and l.status = 'active' and e.tenant_id = me.tenant_id and e.id <> me.id and e.status = 'active'
+     /* unscoped: a location of a sister company of this one */`, [entityId, locationId]);
+  return r[0]?.entity_id ?? null;
+}
+
+/**
+ * The receiving end of a transfer from another of the client's companies:
+ * the goods land here at the transfer price (the group module posts the bill,
+ * Dr 1300 Cr 2190). Lines name this company's own products. Recorded as a
+ * received transfer here too, so the history shows where the stock came from.
+ */
+export async function landAcross(c: Client, scope: Scope, e: { fromEntityId: string; fromLocationId: string; toLocationId: string; senderNumber: string;
+  lines: { productId: string; qty: number; valueMinor: bigint }[]; binId?: string | null }): Promise<{ transferId: string; number: string; valueMinor: bigint }> {
+  const loc = await q<{ id: string }>(c, `select id from location where id = $1 and entity_id = $2 and status = 'active'`, [e.toLocationId, scope.entityId]);
+  need(loc.length, "no such location");
+  const bin = await binAt(c, scope.entityId, e.binId, e.toLocationId);
+  const by = scope.actor.id || null;
+  const number = await nextNo(c, scope.entityId, "transfer", "TR-");
+  const t = await one<{ id: string }>(c, `insert into inv_transfer (entity_id, number, from_location_id, to_location_id, status, note, created_by,
+      shipped_by, shipped_at, received_by, received_at, from_entity_id)
+    values ($1,$2,$3,$4,'received',$5,$6,$6,now(),$6,now(),$7) returning id`,
+    [scope.entityId, number, e.fromLocationId, e.toLocationId, `from ${e.senderNumber}`, by, e.fromEntityId]);
+  let value = 0n;
+  const products = new Set<string>();
+  for (const l of e.lines) {
+    const p = await productOf(c, scope.entityId, l.productId);
+    const qty = Number(l.qty);
+    need(qty > 0, "transfer a positive quantity");
+    await c.query(`insert into inv_transfer_line (entity_id, transfer_id, product_id, qty, cost_minor, value_minor) values ($1,$2,$3,$4,$5,$6)`,
+      [scope.entityId, t.id, p.id, qty, (BigInt(Math.round(Number(l.valueMinor) / qty))).toString(), l.valueMinor.toString()]);
+    await costIn(c, scope.entityId, p.id, qty, l.valueMinor);
+    if (p.serialized) {
+      await createUnits(c, scope.entityId, p, { locationId: e.toLocationId, binId: bin, qty, status: "in_stock", costMinor: BigInt(Math.round(Number(l.valueMinor) / qty)),
+        kind: "transfer_in", refType: "transfer", refId: t.id, by, reason: `from ${e.senderNumber}` });
+    } else {
+      if (bin) await binStockAdd(c, scope.entityId, bin, p.id, qty);
+      await logMove(c, scope.entityId, { kind: "transfer_in", productId: p.id, qty, toLoc: e.toLocationId, toBin: bin, toStatus: "in_stock",
+        refType: "transfer", refId: t.id, reason: `from ${e.senderNumber}`, by });
+    }
+    await bump(c, scope.entityId, p.id, e.toLocationId, { onHand: qty });
+    products.add(p.id);
+    value += l.valueMinor;
+  }
+  if (products.size) await recheckBackorders(c, scope.entityId, { productIds: [...products] });
+  return { transferId: t.id, number, valueMinor: value };
 }
 
 // =============================================================== allocation

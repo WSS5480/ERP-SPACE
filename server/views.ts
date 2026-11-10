@@ -497,7 +497,7 @@ export async function paymentRuns(c: Client, co: Company) {
     select i.id, coalesce(v.dba, v.legal_name) as vendor, i.reference, i.invoice_date::text, i.due_date::text,
            i.total_minor, greatest(0, current_date - i.due_date)::int as days_past_due
       from invoice i join vendor v on v.id = i.vendor_id
-     where i.entity_id = $1 and i.status = 'approved'
+     where i.entity_id = $1 and i.status = 'approved' and i.ic_document_id is null
        and not exists (select 1 from payment p join payment_run pr on pr.id = p.payment_run_id
                         where p.invoice_id = i.id and pr.status in ('building','pending_release','released','settled'))
      order by i.due_date nulls last, i.invoice_date`, [co.id]);

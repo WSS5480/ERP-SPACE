@@ -13,7 +13,7 @@
 
 import { deflateRawSync, crc32 } from "node:zlib";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
-import { DATASETS, DATASET, type Dataset, type Field, type FieldType } from "./reports_datasets.ts";
+import { DATASETS, DATASET, GROUP, type Dataset, type Field, type FieldType } from "./reports_datasets.ts";
 
 export { DATASETS, DATASET };
 export type { Dataset, Field, FieldType };
@@ -96,10 +96,21 @@ export async function rolesFor(c: Client, entityId: string, personId: string | n
     select distinct g.role from role_grant g join app_user u on u.id = g.app_user_id
       join entity e on e.id = $1
      where g.app_user_id = $2 and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = e.tenant_id))`, [entityId, personId]);
-  return new Set(r.map((x) => x.role));
+  const roles = new Set(r.map((x) => x.role));
+  // Datasets across the client's companies: a controller (or owner) in every open one of them.
+  if (roles.has("controller") || roles.has("owner")) {
+    const short = await q(c, `
+      select 1 from entity x join entity me on me.id = $1
+       where x.tenant_id = me.tenant_id and x.status <> 'closed'
+         and not exists (select 1 from role_grant g join app_user u on u.id = g.app_user_id
+                          where g.app_user_id = $2 and g.role in ('controller','owner') and (g.entity_id = x.id or (g.entity_id is null and u.tenant_id = x.tenant_id)))
+       limit 1 /* unscoped: every company of this company's client */`, [entityId, personId]);
+    if (!short.length) roles.add(GROUP);
+  }
+  return roles;
 }
 
-const roleWords = (roles: string[]) => roles.map((r) => r.replace(/_/g, " ")).join(", ");
+const roleWords = (roles: string[]) => roles.map((r) => (r === GROUP ? "a controller in every company" : r.replace(/_/g, " "))).join(", ");
 
 export function mayUse(ds: Dataset, roles: Set<string>): boolean {
   return roles.has("owner") || ds.roles.some((r) => roles.has(r));

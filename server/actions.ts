@@ -461,10 +461,14 @@ export async function createPaymentRun(c: Client, co: Company, a: Actor, input: 
   const bank = await resolveDisbursementAccount(c, s, { method });
   const invs = await q<{ id: string; total_minor: string }>(c, `
     select i.id, i.total_minor from invoice i
-     where i.entity_id = $1 and i.id = any($2::uuid[]) and i.status = 'approved'
+     where i.entity_id = $1 and i.id = any($2::uuid[]) and i.status = 'approved' and i.ic_document_id is null
        and not exists (select 1 from payment p join payment_run pr on pr.id = p.payment_run_id
                         where p.invoice_id = i.id and pr.status in ('building','pending_release','released','settled'))`,
     [co.id, ids]);
+  if (invs.length !== ids.length) {
+    const sib = await q(c, `select 1 from invoice where entity_id = $1 and id = any($2::uuid[]) and ic_document_id is not null`, [co.id, ids]);
+    need(!sib.length, "a bill from one of the client's own companies is settled in Group, not in a payment run");
+  }
   need(invs.length === ids.length, "some of those bills are not approved, or are already in a run; refresh and pick again");
 
   const run = await one<{ id: string }>(c, `

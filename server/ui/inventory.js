@@ -320,7 +320,8 @@
       el('div', { class: 'panel' }, list.length ? list.map((t) => item({ title: `${t.number} · ${t.from_name} → ${t.to_name}`, amount: t.status === 'draft' ? null : money(t.value_minor), badge: statusChip(t.status),
         detail: (t.lines || []).map((l) => `${l.name} × ${qty(l.qty)}`).join(' · '),
         acts: t.status === 'draft' ? [
-          el('button', { class: 'btn small primary', type: 'button', onclick: (e) => run(e.currentTarget, null, () => post(`/inventory/transfers/${t.id}/ship`), 'Shipped; the stock is in transit.', () => E.render()) }, 'Ship'),
+          el('button', { class: 'btn small primary', type: 'button', onclick: (e) => run(e.currentTarget, null, () => post(`/inventory/transfers/${t.id}/ship`),
+            (r) => (r.toCompany ? `Shipped to ${r.toCompany}${r.document ? `: ${r.document}, invoice ${r.invoiceNumber} here and a matching bill there` : ''}.` : 'Shipped; the stock is in transit.'), () => E.render()) }, 'Ship'),
           el('button', { class: 'btn small', type: 'button', onclick: (e) => run(e.currentTarget, null, () => post(`/inventory/transfers/${t.id}/cancel`), 'Cancelled.', () => E.render()) }, 'Cancel')]
           : t.status === 'in_transit' ? [el('button', { class: 'btn small primary', type: 'button', onclick: () => receiveTransfer(t, L) }, 'Receive')] : [] }))
         : empty('No transfers.', null, true))));
@@ -329,8 +330,10 @@
     const d = openDialog('New transfer', 'Stock moving between locations', { wide: true });
     fillDialog(d, async () => {
       const P = await products();
+      // Another of the client's companies' stores too: shipping there pairs a sale here with a bill there (Group).
+      const sib = await coApi('/group/locations').then((r) => r.locations).catch(() => []);
       const from = select(locOptions(L), (L.locations.find((l) => l.kind === 'warehouse') || {}).id);
-      const to = select(locOptions(L), '', 'To');
+      const to = select([...locOptions(L), ...sib.map((l) => [l.id, `${l.name} · ${l.company}`])], '', 'To');
       const rowsBox = el('div', { class: 'panel' });
       const rows = [];
       const addRow = () => {

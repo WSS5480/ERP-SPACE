@@ -17,6 +17,8 @@
     shop: ['Web store', 'Online store with the product customizer, pickup and delivery'],
     crm: ['Customers and marketing', 'Customer profiles and consent, the lead tracker, follow-ups, campaigns and coupons'],
     reports: ['Reports', 'Report creator and editor: curated datasets, saved and shared reports, schedules, CSV and Excel export'],
+    service: ['Service and repair', 'Service tickets from the first call to the fix: parts, visits, who pays and what it cost'],
+    group: ['Group accounting', 'The client’s companies together: combined statements with eliminations, inter-company billing, net-to-zero and settle'],
   };
   const KIND_LABEL = { store: 'Store', warehouse: 'Warehouse', outlet: 'Outlet', yard: 'Yard', office: 'Office', web: 'Online' };
   const REASON_LABEL = { return: 'Return reasons', adjustment: 'Stock adjustments', damage: 'Damage', discount: 'Discounts',

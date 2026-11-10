@@ -15,5 +15,6 @@ import { module as chart } from "./chart.ts";
 import { module as crm } from "./crm.ts";
 import { module as service } from "./service.ts";
 import { module as reports } from "./reports.ts";
+import { module as group } from "./group.ts";
 
-export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports];
+export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports, group];

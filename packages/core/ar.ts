@@ -1388,3 +1388,46 @@ export async function depositLiability(c: Client, entityId: string) {
   const gl = -(await glBalance(c, entityId, "2300"));
   return { orders: rows, unassigned: loose, unposted, totalMinor: total, glMinor: gl, differenceMinor: total - gl };
 }
+
+// ======================================================= sibling companies
+// The group module bills one of the client's own companies through here, so
+// the invoice is a real customer invoice in this company's receivables. It
+// posts to Due from related companies (1195), not 1100, and so it writes no
+// ar_ledger row: the aging keeps tying to 1100, and the sibling's balance is
+// carried in the group's own sub-ledger until Group settles it.
+
+/** A customer invoice to a sibling company. The journal entry is the group module's (Dr 1195, Cr 4090). */
+export async function invoiceSibling(c: Client, scope: Scope, x: {
+  customerId: string; locationId: string | null; documentId: string; date: string; journalEntryId: string; costMinor: bigint; memo: string;
+  lines: { sku: string | null; description: string; qty: number; unitPriceMinor: bigint; netMinor: bigint }[];
+}): Promise<{ invoiceId: string; number: string }> {
+  const cu = await q<{ id: string }>(c, `select id from customer where id = $1 and entity_id = $2 and related_entity_id is not null`, [x.customerId, scope.entityId]);
+  need(cu.length, "that customer is not one of this client's own companies");
+  need(x.lines.length, "an invoice needs at least one line");
+  const total = x.lines.reduce((s, l) => s + l.netMinor, 0n);
+  need(total > 0n, "an inter-company invoice is for more than zero");
+  const number = await nextNo(c, scope.entityId, "invoice", "INV-");
+  const inv = await one<{ id: string }>(c, `
+    insert into customer_invoice (entity_id, number, kind, customer_id, location_id, journal_entry_id, invoice_date, due_date,
+                                  subtotal_minor, tax_minor, total_minor, deposit_applied_minor, charged_minor, cost_minor, status, memo,
+                                  created_by, ic_document_id)
+    values ($1,$2,'sale',$3,$4,$5,$6,$6,$7,0,$7,0,$7,$8,'open',$9,$10,$11) returning id`,
+    [scope.entityId, number, x.customerId, x.locationId, x.journalEntryId, x.date, total.toString(), x.costMinor.toString(), x.memo.slice(0, 300),
+     scope.actor.id || null, x.documentId]);
+  let seq = 1;
+  for (const l of x.lines) {
+    await c.query(`insert into customer_invoice_line (entity_id, invoice_id, seq, sku, description, qty, unit_price_minor, discount_minor, net_minor, tax_minor, revenue_code)
+                   values ($1,$2,$3,$4,$5,$6,$7,0,$8,0,'4090')`,
+      [scope.entityId, inv.id, seq++, l.sku, l.description.slice(0, 300), l.qty, l.unitPriceMinor.toString(), l.netMinor.toString()]);
+  }
+  await audit(c, scope, { table: "customer_invoice", rowId: inv.id, action: "insert", after: { number, total: total.toString(), sibling: true } });
+  return { invoiceId: inv.id, number };
+}
+
+/** Group settled these sibling invoices: they are paid. */
+export async function settleSiblingInvoices(c: Client, scope: Scope, documentIds: string[]): Promise<number> {
+  if (!documentIds.length) return 0;
+  const r = await c.query(`update customer_invoice set status = 'paid' where entity_id = $1 and ic_document_id = any($2) and status = 'open'`,
+    [scope.entityId, documentIds]);
+  return r.rowCount ?? 0;
+}

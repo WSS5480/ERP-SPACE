@@ -94,6 +94,24 @@ Data is placed with textContent only, never innerHTML.
 | fleet (vehicles, delivery routing) | 0023 | 0017 | Operations |
 | shop (omnichannel web store + customizer) | 0024 | 0018 | Retail |
 | reports (report creator and editor) | 0031 | none | Back office |
+| group (multi-company: consolidation, inter-company documents, net-to-zero and settle) | 0035 | 0021 | Back office |
+
+## Group accounting
+
+A client (tenant) can run several companies (entities). `packages/core/group.ts`
+owns what spans them. Inter-company accounts, by code, in every pack: 1195 Due
+from related companies, 2190 Due to related companies, 4090 Inter-company
+sales, 5090 Inter-company cost of sales. Every group posting to 1195/2190 is
+also an `ic_ledger` row naming the other company, so a pair's balances tie to
+the GL by construction. A sale or charge to a sibling is a pair of documents:
+a `customer_invoice` in the seller (`ar.invoiceSibling`, no `ar_ledger` row, so
+the aging still ties to 1100) and an approved bill in the buyer
+(`invoice.billFromSibling`), both carrying `ic_document_id`; such bills never go
+in a payment run, Group settles them. A transfer to a sibling's location
+(`inventory.createTransfer` / `shipTransfer`) leaves at average cost and lands
+there at transfer price in one step (`inventory.landAcross`); same-company
+transfers are unchanged. Who: the owner, or a controller in every company
+covered (`group.requireGroupRole`).
 
 ## Reports
 

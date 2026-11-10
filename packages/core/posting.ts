@@ -13,11 +13,12 @@ export type PostLine = {
   credit?: bigint;
   profitObjectId?: string | null;
   memo?: string;
+  bankAccountId?: string | null;  // a cash line: which of the company's bank accounts it moves
 };
 
 export class PostingError extends Error {}
 
-export type SourceType = "sale" | "receipt" | "refund" | "inventory" | "commission" | "ar" | "fleet" | "finance" | "manual" | "opening";
+export type SourceType = "sale" | "receipt" | "refund" | "inventory" | "commission" | "ar" | "fleet" | "finance" | "manual" | "opening" | "intercompany";
 
 /** The store's profit object, so revenue and cost land on the right P&L column. */
 export async function profitObjectFor(c: Client, entityId: string, locationId: string | null): Promise<string | null> {
@@ -68,9 +69,10 @@ export async function post(c: Client, scope: Scope, e: {
   let seq = 1;
   for (const l of lines) {
     await c.query(
-      `insert into journal_line (journal_entry_id, seq, gl_account_id, profit_object_id, debit_minor, credit_minor, memo)
-       values ($1,$2,$3,$4,$5,$6,$7)`,
-      [je.id, seq++, byCode.get(l.code), l.profitObjectId ?? null, (l.debit ?? 0n).toString(), (l.credit ?? 0n).toString(), l.memo ?? null]);
+      `insert into journal_line (journal_entry_id, seq, gl_account_id, profit_object_id, debit_minor, credit_minor, memo, bank_account_id)
+       values ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [je.id, seq++, byCode.get(l.code), l.profitObjectId ?? null, (l.debit ?? 0n).toString(), (l.credit ?? 0n).toString(), l.memo ?? null,
+       l.bankAccountId ?? null]);
   }
   return je.id;
 }
