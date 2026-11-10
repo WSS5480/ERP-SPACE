@@ -189,7 +189,7 @@ export const PRICE_TOLERANCE_BPS = 100;
  * bills already billed, and the billed unit price must sit within the
  * company's tolerance of the PO price. Charges that are not PO lines
  * (freight, fuel) may not pass the landed cost recorded on the PO plus the
- * setting payables.charge_limit_minor (default $250). Allowances (negative
+ * setting payables.charge_limit_minor (default $250) or payables.charge_limit_bps of the order (default 5%), whichever is less,. Allowances (negative
  * lines) always pass. A miss sends the bill to the exception queue, where
  * the controller or owner must look before it can be approved.
  */
@@ -242,7 +242,12 @@ async function matchMerchandise(
                       where oi.entity_id = $2 and oi.purchase_order_id = $3 and oi.id <> $1 and oi.status <> 'rejected'
                         and o.purchase_order_line_id is null and o.amount_minor > 0), 0) before
       from invoice_line il where il.invoice_id = $1`, [invoiceId, scope.entityId, poId]);
-  const charges = BigInt(extra[0]?.charges ?? 0), allowed = BigInt(extra[0]?.landed ?? 0) - BigInt(extra[0]?.before ?? 0) + chargeLimit;
+  // the allowance for unrecorded freight is the lesser of the flat limit and a share of the order (setting payables.charge_limit_bps, default 5%)
+  const poValue = BigInt((await q<{ v: string }>(c, `select coalesce(sum(round(quantity * unit_price_minor)), 0)::bigint::text v from purchase_order_line
+     where entity_id = $1 and purchase_order_id = $2`, [scope.entityId, poId]))[0]?.v ?? "0");
+  const shareBps = BigInt(Math.round(await settingNumber(c, scope.entityId, "payables.charge_limit_bps", 500)));
+  const flat = chargeLimit < (poValue * shareBps) / 10000n ? chargeLimit : (poValue * shareBps) / 10000n;
+  const charges = BigInt(extra[0]?.charges ?? 0), allowed = BigInt(extra[0]?.landed ?? 0) - BigInt(extra[0]?.before ?? 0) + flat;
   if (charges > 0n && charges > (allowed > 0n ? allowed : 0n)) {
     problems.push(`charges of ${usd(charges)} are more than the purchase order expects (${usd(allowed > 0n ? allowed : 0n)} of freight and other landed cost)`);
   }
