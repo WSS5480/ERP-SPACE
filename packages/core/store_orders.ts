@@ -46,7 +46,35 @@ export async function freightMins(c: Client, entityId: string, vendorId: string)
 
 export type FreightCheck = { rule: string; measure: string; have: string; minimum: string; ok: boolean; message: string };
 
-/** Each of the vendor's minimums that this cart touches, met or not. A category or brand rule counts only that category's or brand's lines. */
+const norm = (v: string | null | undefined) => String(v ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+/** The names one rule pools: "Dining, Bedroom / Youth and Accents" is four. */
+export function ruleNames(value: string | null | undefined): string[] {
+  return String(value ?? "").split(/[,;/]|\band\b|\bor\b/i).map((x) => x.trim()).filter((x) => x && !/^total$/i.test(x));
+}
+/**
+ * The catalog app's loose match: case and punctuation ignored, a trailing S
+ * ignored (Chair matches Chairs), and either name inside the other
+ * (Dining matches Dining Room).
+ */
+export function looseMatch(itemValue: string | null | undefined, names: string[]): boolean {
+  const ic = norm(itemValue);
+  if (!ic) return false;
+  for (const n of names) {
+    const r = norm(n);
+    if (!r) continue;
+    const rs = r.replace(/S$/, ""), is = ic.replace(/S$/, "");
+    if (ic === r || is === rs || ic.includes(rs) || rs.includes(is)) return true;
+  }
+  return false;
+}
+
+/**
+ * The vendor's freight minimums against a cart, as the catalog app counts
+ * them: a category or brand rule (which may pool several, "Dining, Bedroom")
+ * counts the cart's items that match it, loosely; the vendor's general
+ * minimum counts the other items, those no category or brand rule took.
+ * Pieces or cost, per rule.
+ */
 export async function freightCheck(c: Client, entityId: string, vendorId: string, lines: { productId: string; qty: number }[]): Promise<FreightCheck[]> {
   const rules = (await freightMins(c, entityId, vendorId)).filter((r) => r.active);
   const vp = (await q<{ freight_min_minor: string; freight_min_qty: number }>(c, `select freight_min_minor, freight_min_qty from vendor_profile where entity_id = $1 and vendor_id = $2`, [entityId, vendorId]))[0];
@@ -55,27 +83,33 @@ export async function freightCheck(c: Client, entityId: string, vendorId: string
   if (!rules.length || !lines.length) return [];
   const prods = new Map((await q<{ id: string; category: string | null; brand: string | null; cost_minor: string }>(c,
     `select id, category, brand, cost_minor from product where entity_id = $1 and id = any($2)`, [entityId, lines.map((l) => l.productId)])).map((p) => [p.id, p]));
+  const scoped = rules.filter((r) => r.scope !== "all");
+  const general = rules.filter((r) => r.scope === "all");
+  const taken = new Set<number>();
   const out: FreightCheck[] = [];
-  for (const r of rules) {
-    const mine = lines.filter((l) => {
-      const p = prods.get(l.productId);
-      if (!p) return false;
-      if (r.scope === "category") return (p.category ?? "").toLowerCase() === (r.scope_value ?? "").toLowerCase();
-      if (r.scope === "brand") return (p.brand ?? "").toLowerCase() === (r.scope_value ?? "").toLowerCase();
-      return true;
-    });
-    if (!mine.length) continue;
-    const label = r.scope === "all" ? "the order" : `${r.scope_value} (${r.scope})`;
+  const check = (label: string, r: { measure: string; minimum: string }, mine: { productId: string; qty: number }[]) => {
     if (r.measure === "qty") {
       const have = mine.reduce((a, l) => a + l.qty, 0), min = Number(r.minimum);
       out.push({ rule: label, measure: "qty", have: String(have), minimum: String(min), ok: have >= min,
-        message: have >= min ? `${label}: ${have} pieces, minimum ${min}` : `${label} needs ${min} pieces for the freight minimum; the cart has ${have}` });
+        message: have >= min ? `${label}: ${have} pieces, minimum ${min}` : `${label} needs ${min} pieces for the freight minimum; the cart has ${have} (${min - have} more to go)` });
     } else {
-      const have = mine.reduce((a, l) => a + BigInt(Math.round(l.qty * Number(prods.get(l.productId)!.cost_minor))), 0n), min = BigInt(r.minimum);
+      const have = mine.reduce((a, l) => a + BigInt(Math.round(l.qty * Number(prods.get(l.productId)?.cost_minor ?? 0))), 0n), min = BigInt(r.minimum);
       out.push({ rule: label, measure: "cost", have: have.toString(), minimum: min.toString(), ok: have >= min,
-        message: have >= min ? `${label}: ${money(have)}, minimum ${money(min)}` : `${label} needs ${money(min)} at cost for the freight minimum; the cart has ${money(have)}` });
+        message: have >= min ? `${label}: ${money(have)}, minimum ${money(min)}` : `${label} needs ${money(min)} at cost for the freight minimum; the cart has ${money(have)} (${money(min - have)} more to go)` });
     }
+  };
+  for (const r of scoped) {
+    const names = ruleNames(r.scope_value);
+    const mine: { productId: string; qty: number }[] = [];
+    lines.forEach((l, i) => {
+      const p = prods.get(l.productId);
+      if (!p) return;
+      if (looseMatch(r.scope === "category" ? p.category : p.brand, names)) { mine.push(l); taken.add(i); }
+    });
+    if (mine.length) check(`${names.join(", ")} (${r.scope})`, r, mine);
   }
+  const others = lines.filter((_l, i) => !taken.has(i));
+  if (others.length) for (const r of general) check(taken.size ? "other items" : "the order", r, others);
   return out;
 }
 
@@ -157,10 +191,17 @@ export async function submitStoreOrder(c: Client, s: Scope, id: string) {
 }
 
 /** Send a submitted order back to draft so the store can change it (the catalog app's "Revert to edit"). */
-export async function returnToDraft(c: Client, s: Scope, id: string, reason: string) {
+export async function returnToDraft(c: Client, s: Scope, id: string, reason: string, decider = false) {
   const o = await orderFor(c, s.entityId, id);
   need(o.status === "submitted", `${o.number} is ${o.status}; only a submitted order goes back to draft`);
   need(reason && reason.trim(), "say why it goes back, so the store knows what to change");
+  // An approver may send any order back; a store's own people only their store's (who started or submitted it, or who works there).
+  if (!decider) {
+    const mine = o.created_by === s.actor.id || o.submitted_by === s.actor.id || (await q(c, `
+      select 1 from employee e join profit_object po on po.id = e.profit_object_id and po.entity_id = e.entity_id
+       where e.entity_id = $1 and e.app_user_id = $2 and po.location_id = $3 and e.status = 'active'`, [s.entityId, s.actor.id ?? null, o.location_id])).length > 0;
+    need(mine, `${o.number} is another store's order; only its own store or an approver can send it back`);
+  }
   await c.query(`update store_order set status = 'draft', submitted_by = null, submitted_at = null, decision_note = $3 where id = $1 and entity_id = $2`, [id, s.entityId, reason.trim().slice(0, 300)]);
   await audit(c, s, { table: "store_order", rowId: id, action: "transition", before: { status: "submitted" }, after: { status: "draft" }, reason });
   return { number: o.number };
@@ -177,6 +218,7 @@ export async function approveStoreOrder(c: Client, s: Scope, id: string, a: { no
   const o = await orderFor(c, s.entityId, id);
   need(o.status === "submitted", `${o.number} is ${o.status}; only a submitted order is approved`);
   need(!s.actor.id || o.submitted_by !== s.actor.id, "whoever submitted a store order cannot also approve it");
+  need(!s.actor.id || o.created_by !== s.actor.id, "whoever built a store order's cart cannot also approve it");
   const lines = await linesOf(c, s.entityId, id);
   need(lines.length, "the order has no lines");
   let placed: pur.Placed;
@@ -205,7 +247,7 @@ export async function rejectStoreOrder(c: Client, s: Scope, id: string, reason: 
   const o = await orderFor(c, s.entityId, id);
   need(o.status === "submitted", `${o.number} is ${o.status}; only a submitted order is turned down`);
   need(reason && reason.trim(), "say why it is turned down");
-  need(!s.actor.id || o.submitted_by !== s.actor.id, "whoever submitted a store order cannot also decide it");
+  need(!s.actor.id || (o.submitted_by !== s.actor.id && o.created_by !== s.actor.id), "whoever built or submitted a store order cannot also decide it");
   await c.query(`update store_order set status = 'rejected', decided_by = $3, decided_at = now(), decision_note = $4 where id = $1 and entity_id = $2`, [id, s.entityId, s.actor.id || null, reason.trim().slice(0, 300)]);
   await audit(c, s, { table: "store_order", rowId: id, action: "transition", before: { status: "submitted" }, after: { status: "rejected" }, reason });
   return { number: o.number };

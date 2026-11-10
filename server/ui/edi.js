@@ -10,7 +10,14 @@
   const E = window.ERP;
   if (!E) return;
   const { el, frag, icon, chip, money, plural, cap, coApi, post, go, toast, act, openDialog, resultBox, fillDialog, askReason,
-    head, section, tile, tilesRow, empty, item, capped, seg, fact, friendly, render, shortDay } = E;
+    head, section, tile, tilesRow, empty, item, capped, seg, fact, friendly, render, shortDay, NARROW } = E;
+  /** Tabs: a segmented row on a wide screen, a picker on a phone, so no label is cut off. */
+  const tabsOf = (tabs, value, onPick) => {
+    if (!NARROW || !NARROW.matches) return seg(tabs, value, onPick);
+    const pick = el('select', { 'aria-label': 'Show' }, tabs.map(([k, label]) => el('option', { value: k, text: label, selected: k === value || null })));
+    pick.onchange = () => onPick(pick.value);
+    return el('label', { class: 'field wide' }, el('span', { text: 'Show' }), pick);
+  };
 
   const field = (label, control, hint, wide) => el('label', { class: 'field' + (wide ? ' wide' : '') }, el('span', { text: label }), control, hint ? el('span', { class: 'hint', text: hint }) : null);
   const select = (options, value) => el('select', {}, options.map(([v, t]) => el('option', { value: v, text: t, selected: String(v) === String(value ?? '') || null })));
@@ -59,7 +66,7 @@
     const tab = TABS.some(([k]) => k === sub) ? sub : 'partners';
     const body = await ({ partners: tabPartners, inbox: () => tabDocs('in'), outbox: () => tabDocs('out'), upload: tabUpload })[tab]();
     return frag(head('Vendor EDI', [el('button', { class: 'btn primary', type: 'button', onclick: () => go('edi', 'upload') }, icon('plus'), 'Upload EDI file')], 'Setup › Vendors'),
-      el('div', { class: 'toolbar' }, seg(TABS, tab, (k) => go('edi', k === 'partners' ? '' : k))), body);
+      el('div', { class: 'toolbar' }, tabsOf(TABS, tab, (k) => go('edi', k === 'partners' ? '' : k))), body);
   }
 
   async function tabPartners() {
@@ -127,7 +134,7 @@
       const tFields = Object.fromEntries(Object.entries(tf).map(([k, c]) => [k, field(LABEL[k], c)]));
       const SECRETS = { manual: [], dropfolder: [], van: ['vanToken', 'vanApiKey', 'vanPassword'], sftp: ['sftpPassword', 'sftpKey'], as2: ['as2Password'] };
       const setMasked = Object.fromEntries((det ? det.secrets : []).map((x) => [x.name, x.masked]));
-      const sIn = Object.fromEntries(list.secretNames.map((n) => [n, input({ type: 'password', autocomplete: 'new-password', placeholder: setMasked[n] ? `Set (${setMasked[n]}); type to replace` : 'Not set' })]));
+      const sIn = Object.fromEntries(list.secretNames.map((n) => [n, input({ type: 'password', autocomplete: 'new-password', placeholder: setMasked[n] ? 'Set; type to replace' : 'Not set' })]));
       const sFields = Object.fromEntries(list.secretNames.map((n) => [n, field(n.replace(/([A-Z])/g, ' $1').toLowerCase(), sIn[n])]));
       const note = el('div');
       const syncT = () => {
@@ -138,11 +145,41 @@
           : transport.value === 'dropfolder' && !list.dropDirSet ? resultBox('warning', 'warn', 'No drop directory on the server', 'Set ERP_EDI_DROP_DIR in the service environment; partner folders sit under it.') : '');
       };
       transport.onchange = syncT; syncT();
+      // 850 layout: parties, routing, dates, item ids and references this vendor wants.
+      const o = cur.options || {};
+      const bt = o.billTo || {}, td = o.td5 || {}, ct = o.contact || {};
+      const L = {
+        btName: input({ value: bt.name || '', placeholder: 'Bill-to name' }), btCode: input({ value: bt.code || '', placeholder: 'Their code for us' }), btAddr: input({ value: bt.address1 || '' }),
+        btCity: input({ value: bt.city || '' }), btState: input({ value: bt.state || '', maxlength: '2' }), btPostal: input({ value: bt.postal || '', inputmode: 'numeric' }),
+        vendorN1: el('input', { type: 'checkbox', checked: !!o.vendorN1 }),
+        scac: input({ value: td.scac || '', maxlength: '4', placeholder: 'SCAC' }), method: input({ value: td.method || '', maxlength: '2', placeholder: 'M, LT…' }), routing: input({ value: td.routing || '', placeholder: 'Routing / carrier name' }),
+        fob: select([['', 'Not sent'], ['PP', 'PP · prepaid'], ['CC', 'CC · collect'], ['PB', 'PB · customer pickup'], ['DF', 'DF · defined by buyer and seller'], ['PC', 'PC · prepaid, charged back']], o.fob || ''),
+        shipBy: input({ value: o.shipByDays ?? '', inputmode: 'numeric', placeholder: 'days after order' }), cancelAfter: input({ value: o.cancelAfterDays ?? '', inputmode: 'numeric', placeholder: 'days after order' }),
+        ctName: input({ value: ct.name || '' }), ctPhone: input({ value: ct.phone || '', inputmode: 'tel' }), ctEmail: input({ value: ct.email || '', inputmode: 'email' }),
+      };
+      const ITEM_IDS = [['VN', 'VN · their model'], ['BP', 'BP · our SKU (buyer part)'], ['UP', 'UP · UPC'], ['IN', 'IN · our item number'], ['SK', 'SK · our SKU']];
+      const idOn = Object.fromEntries(ITEM_IDS.map(([k]) => [k, el('input', { type: 'checkbox', checked: (o.itemIds || ['VN', 'BP', 'UP']).includes(k) })]));
+      const refOn = { IA: el('input', { type: 'checkbox', checked: (o.refs || ['IA', 'CO']).includes('IA') }), CO: el('input', { type: 'checkbox', checked: (o.refs || ['IA', 'CO']).includes('CO') }) };
+      const layoutBox = frag(
+        el('div', { class: 'edi-sec', text: '850 layout' }),
+        el('div', { class: 'form-grid' }, field('Bill to (N1 BT)', L.btName), field('Bill-to code', L.btCode), field('Address', L.btAddr), field('City', L.btCity), field('State', L.btState), field('ZIP', L.btPostal),
+          el('label', { class: 'check wide' }, L.vendorN1, 'Send the vendor party (N1 VN) with our account number'),
+          field('Carrier SCAC (TD5)', L.scac), field('Method', L.method), field('Routing', L.routing, null, true), field('FOB', L.fob),
+          field('Ship by (DTM 010)', L.shipBy), field('Cancel after (DTM 001)', L.cancelAfter),
+          field('Buyer contact (PER)', L.ctName), field('Phone', L.ctPhone), field('Email', L.ctEmail)),
+        el('div', { class: 'field wide' }, el('span', { text: 'Item ids on each line (PO1), in this order' }), el('div', { class: 'form-grid' }, ITEM_IDS.map(([k, t]) => el('label', { class: 'check' }, idOn[k], t)))),
+        el('div', { class: 'field wide' }, el('span', { text: 'References' }), el('div', { class: 'form-grid' }, el('label', { class: 'check' }, refOn.IA, 'REF IA · our account number'), el('label', { class: 'check' }, refOn.CO, 'REF CO · customer order per line'))));
+      const options = () => ({
+        billTo: L.btName.value ? { name: L.btName.value, code: L.btCode.value, address1: L.btAddr.value, city: L.btCity.value, state: L.btState.value, postal: L.btPostal.value } : null,
+        vendorN1: L.vendorN1.checked, td5: L.scac.value || L.routing.value ? { scac: L.scac.value, method: L.method.value, routing: L.routing.value } : null, fob: L.fob.value || null,
+        shipByDays: L.shipBy.value, cancelAfterDays: L.cancelAfter.value, itemIds: ITEM_IDS.map(([k]) => k).filter((k) => idOn[k].checked),
+        refs: Object.keys(refOn).filter((k) => refOn[k].checked), contact: L.ctName.value || L.ctPhone.value || L.ctEmail.value ? { name: L.ctName.value, phone: L.ctPhone.value, email: L.ctEmail.value } : null,
+      });
       const err = el('div');
       const body = () => ({
         partner: { vendor_id: vendor.value, edi_enabled: on.checked, version: version.value, usage: usage.value, our_isa_qual: oq.value, our_isa_id: oid.value, their_isa_qual: tq.value, their_isa_id: tid.value,
           our_gs_id: ogs.value, their_gs_id: tgs.value, element_sep: seps[0].value, segment_term: seps[1].value, subelement_sep: seps[2].value, repetition_sep: seps[3].value,
-          documents: Object.fromEntries(Object.entries(docSel).map(([k, s]) => [k, s.value])), transport: transport.value, send_on_approval: sendOnApproval.checked,
+          documents: Object.fromEntries(Object.entries(docSel).map(([k, s]) => [k, s.value])), transport: transport.value, send_on_approval: sendOnApproval.checked, options: options(),
           transport_config: Object.fromEntries(SHOW[transport.value].map((k) => [k, tf[k].value]).filter(([, v]) => v !== '')) },
         secrets: Object.fromEntries(SECRETS[transport.value].map((k) => [k, sIn[k].value]).filter(([, v]) => v)),
       });
@@ -165,6 +202,7 @@
         field('Separators: element, segment, sub-element, repetition', el('div', { class: 'edi-seps' }, seps), 'Usually * ~ > ^; incoming files say their own in the ISA', true),
         el('div', { class: 'edi-sec', text: 'Which way each document travels' }), docBox,
         el('label', { class: 'check' }, sendOnApproval, 'Send a store order’s PO by this channel as soon as it is approved'),
+        layoutBox,
         el('div', { class: 'edi-sec', text: 'How files travel' }), el('div', { class: 'form-grid' }, field('Transport', transport, null, true), Object.values(tFields), Object.values(sFields)), note,
         el('div', { class: 'dlg-acts' }, save, test, poll, status, el('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Close')), err,
         p ? itemMapSection(p, det.items, again) : null, feeds);
@@ -269,7 +307,7 @@
       detail: [o.location, `${plural(Number(o.lines), 'line')}, ${Number(o.units)} pieces`, o.po_number, o.submitted_by_name ? `by ${o.submitted_by_name}` : o.created_by_name, day(o.submitted_at || o.created_at)].filter(Boolean).join(' · '),
       why: o.decision_note || null, onClick: () => openStore(o.id) }));
     return frag(head('Store orders', [el('button', { class: 'btn primary', type: 'button', onclick: () => openCart(null) }, icon('plus'), 'New store order')]),
-      el('div', { class: 'toolbar' }, seg([['draft', 'Drafts'], ['submitted', 'To approve'], ['approved', 'Approved'], ['rejected', 'Turned down'], ['all', 'All']], SOF, (k) => { SOF = k; render(); })),
+      el('div', { class: 'toolbar' }, tabsOf([['draft', 'Drafts'], ['submitted', 'To approve'], ['approved', 'Approved'], ['rejected', 'Turned down'], ['all', 'All']], SOF, (k) => { SOF = k; render(); })),
       section('Orders', `${d.orders.length}`, null, el('div', { class: 'panel' }, rows.length ? capped(rows, 25, 'orders') : empty('None here.', null, true))),
       el('p', { class: 'foot', text: 'A store builds a cart for one vendor; the vendor’s freight minimums must be met to submit; a district manager or the purchasing director approves it (not whoever submitted it), which places the PO and sends it by the vendor’s channel.' }));
   }

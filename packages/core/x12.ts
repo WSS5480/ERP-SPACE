@@ -265,28 +265,58 @@ const ids = (x: { vendorSku?: string; ourSku?: string; upc?: string }): string[]
 // ---------------------------------------------------------------- 850 --
 
 export type PoLine850 = { line: number; qty: number; uom?: string; unitMinor: bigint; vendorSku?: string; ourSku?: string; upc?: string; description?: string; options?: string[]; customerOrder?: string | null };
+export type Address = { name: string; code?: string; address1?: string; city?: string; state?: string; postal?: string };
 export type Po850 = {
   poNumber: string; date: string; purpose?: "00" | "05"; orderType?: "SA" | "OS" | "SP";
   vendorAccount?: string | null; requestedOn?: string | null; note?: string | null;
   shipTo: { code: string; name: string; address1?: string; city?: string; state?: string; postal?: string };
+  billTo?: Address | null; vendor?: Address | null;
+  shipBy?: string | null; cancelAfter?: string | null; fob?: string | null;
+  td5?: { scac?: string; method?: string; routing?: string } | null;
+  contact?: { name?: string; phone?: string; email?: string } | null;
   lines: PoLine850[];
 };
+/** How a partner wants its 850 laid out. */
+export type Layout850 = { itemIds?: string[]; refs?: string[] };
+export const ITEM_QUALIFIERS = ["VN", "BP", "UP", "IN", "SK"] as const;
+export const REF_CHOICES = ["IA", "CO"] as const;
 
-export function build850(p: Po850): Segment[] {
+const party = (code: string, a: Address): Segment[] => {
+  const out: Segment[] = [["N1", code, a.name, a.code ? "92" : "", a.code ?? ""]];
+  if (a.address1) out.push(["N3", a.address1]);
+  if (a.city || a.state || a.postal) out.push(["N4", a.city ?? "", a.state ?? "", a.postal ?? ""]);
+  return out;
+};
+
+export function build850(p: Po850, layout: Layout850 = {}): Segment[] {
   if (!p.lines.length) throw new X12Error("an 850 needs at least one line");
+  const idOrder = (layout.itemIds?.length ? layout.itemIds : ["VN", "BP", "UP"]).filter((q) => (ITEM_QUALIFIERS as readonly string[]).includes(q));
+  const refs = layout.refs ?? ["IA", "CO"];
   const segs: Segment[] = [["BEG", p.purpose ?? "00", p.orderType ?? "SA", p.poNumber, "", dateOut(p.date)]];
-  if (p.vendorAccount) segs.push(["REF", "IA", p.vendorAccount]);
+  if (p.vendorAccount && refs.includes("IA")) segs.push(["REF", "IA", p.vendorAccount]);
+  if (p.contact && (p.contact.name || p.contact.phone || p.contact.email)) {
+    segs.push(["PER", "BD", p.contact.name ?? "", ...(p.contact.phone ? ["TE", p.contact.phone] : []), ...(p.contact.email ? ["EM", p.contact.email] : [])]);
+  }
+  if (p.fob) segs.push(["FOB", p.fob]);
   if (p.requestedOn) segs.push(["DTM", "002", dateOut(p.requestedOn)]);
+  if (p.shipBy) segs.push(["DTM", "010", dateOut(p.shipBy)]);
+  if (p.cancelAfter) segs.push(["DTM", "001", dateOut(p.cancelAfter)]);
+  if (p.td5 && (p.td5.scac || p.td5.routing)) segs.push(["TD5", "O", p.td5.scac ? "2" : "", p.td5.scac ?? "", p.td5.method ?? "", p.td5.routing ?? ""]);
   if (p.note) segs.push(["MSG", p.note]);
-  segs.push(["N1", "ST", p.shipTo.name, "92", p.shipTo.code]);
-  if (p.shipTo.address1) segs.push(["N3", p.shipTo.address1]);
-  if (p.shipTo.city || p.shipTo.state || p.shipTo.postal) segs.push(["N4", p.shipTo.city ?? "", p.shipTo.state ?? "", p.shipTo.postal ?? ""]);
+  if (p.billTo) segs.push(...party("BT", p.billTo));
+  segs.push(...party("ST", { ...p.shipTo, code: p.shipTo.code }));
+  if (p.vendor) segs.push(...party("VN", p.vendor));
   let hash = 0;
   for (const l of p.lines) {
-    segs.push(["PO1", String(l.line), qtyOut(l.qty), l.uom ?? "EA", fromMinor(l.unitMinor), "PE", ...ids(l)]);
+    const ids: string[] = [];
+    for (const q of idOrder) {
+      const v = q === "VN" ? l.vendorSku : q === "UP" ? l.upc : l.ourSku;
+      if (v) ids.push(q, v);
+    }
+    segs.push(["PO1", String(l.line), qtyOut(l.qty), l.uom ?? "EA", fromMinor(l.unitMinor), "PE", ...ids]);
     if (l.description) segs.push(["PID", "F", "08", "", "", l.description]);
     for (const o of l.options ?? []) segs.push(["PID", "F", "73", "", "", o]);
-    if (l.customerOrder) segs.push(["REF", "CO", l.customerOrder]);
+    if (l.customerOrder && refs.includes("CO")) segs.push(["REF", "CO", l.customerOrder]);
     hash += l.qty;
   }
   segs.push(["CTT", String(p.lines.length), qtyOut(hash)]);
@@ -297,13 +327,22 @@ export function parse850(segs: Segment[]): Po850 & { errors: string[] } {
   const errors: string[] = [];
   const beg = find(segs, "BEG");
   if (!beg) errors.push("the 850 has no BEG segment");
-  const n1 = segs.findIndex((s) => s[0] === "N1" && el(s, 1) === "ST");
+  const partyOf = (code: string): Address | null => {
+    const i = segs.findIndex((s) => s[0] === "N1" && el(s, 1) === code);
+    if (i < 0) return null;
+    const rest = segs.slice(i + 1);
+    const stop = rest.findIndex((s) => !["N2", "N3", "N4", "REF", "PER"].includes(s[0]));
+    const mine = stop < 0 ? rest : rest.slice(0, stop);
+    const n3 = mine.find((s) => s[0] === "N3"), n4 = mine.find((s) => s[0] === "N4");
+    return { name: el(segs[i], 2), code: el(segs[i], 4) || undefined, address1: el(n3, 1) || undefined, city: el(n4, 1) || undefined, state: el(n4, 2) || undefined, postal: el(n4, 3) || undefined };
+  };
   const lines: PoLine850[] = [];
   let cur: PoLine850 | null = null;
   for (const s of segs) {
     if (s[0] === "PO1") {
       const unit = toMinor(el(s, 4));
-      cur = { line: Number(el(s, 1)), qty: num(el(s, 2)) ?? NaN, uom: el(s, 3), unitMinor: unit ?? 0n, ...itemIds(s, 6), options: [] };
+      const x = itemIds(s, 6);
+      cur = { line: Number(el(s, 1)), qty: num(el(s, 2)) ?? NaN, uom: el(s, 3), unitMinor: unit ?? 0n, ...x, options: [] };
       if (!Number.isFinite(cur.qty) || cur.qty <= 0) errors.push(`line ${el(s, 1)} has no quantity`);
       if (unit == null) errors.push(`line ${el(s, 1)} has no price`);
       lines.push(cur);
@@ -314,21 +353,26 @@ export function parse850(segs: Segment[]): Po850 & { errors: string[] } {
   const ctt = find(segs, "CTT");
   if (ctt && Number(el(ctt, 1)) !== lines.length) errors.push(`CTT says ${el(ctt, 1)} lines, but the order has ${lines.length}`);
   if (!lines.length) errors.push("the 850 has no PO1 lines");
-  const n4 = n1 >= 0 ? segs.slice(n1).find((s) => s[0] === "N4") : undefined;
+  const st = partyOf("ST");
+  const dtm = (q: string) => x12Date(el(segs.find((s) => s[0] === "DTM" && el(s, 1) === q), 2));
+  const td5 = find(segs, "TD5"), per = find(segs, "PER");
+  const perVal = (q: string) => { if (!per) return undefined; for (let i = 3; i + 1 < per.length; i += 2) if (el(per, i) === q) return el(per, i + 1); return undefined; };
   return {
     poNumber: el(beg, 3), date: x12Date(el(beg, 5)) ?? "", purpose: el(beg, 1) as "00", orderType: el(beg, 2) as "SA",
     vendorAccount: el(segs.find((s) => s[0] === "REF" && el(s, 1) === "IA"), 2) || null,
-    requestedOn: x12Date(el(segs.find((s) => s[0] === "DTM" && el(s, 1) === "002"), 2)),
+    requestedOn: dtm("002"), shipBy: dtm("010"), cancelAfter: dtm("001"), fob: el(find(segs, "FOB"), 1) || null,
+    td5: td5 ? { scac: el(td5, 3) || undefined, method: el(td5, 4) || undefined, routing: el(td5, 5) || undefined } : null,
+    contact: per ? { name: el(per, 2) || undefined, phone: perVal("TE"), email: perVal("EM") } : null,
     note: el(find(segs, "MSG"), 1) || null,
-    shipTo: { code: n1 >= 0 ? el(segs[n1], 4) : "", name: n1 >= 0 ? el(segs[n1], 2) : "", address1: el(n1 >= 0 ? segs.slice(n1).find((s) => s[0] === "N3") : undefined, 1) || undefined,
-      city: el(n4, 1) || undefined, state: el(n4, 2) || undefined, postal: el(n4, 3) || undefined },
+    shipTo: { code: st?.code ?? "", name: st?.name ?? "", address1: st?.address1, city: st?.city, state: st?.state, postal: st?.postal },
+    billTo: partyOf("BT"), vendor: partyOf("VN"),
     lines, errors,
   };
 }
 
 // ---------------------------------------------------------------- 855 --
 
-export type AckLine855 = { line?: number; vendorSku?: string; status: string; qty?: number | null; date?: string | null };
+export type AckLine855 = { line?: number; vendorSku?: string; status: string; code?: string; qty?: number | null; date?: string | null; unitMinor?: bigint | null };
 export type Ack855 = { poNumber: string; ackType: string; date: string | null; vendorRef?: string | null; shipDate?: string | null; lines: AckLine855[] };
 export const ACK_LINE_CODES: Record<string, string> = {
   IA: "accept", AC: "accept", IB: "backorder", BP: "backorder", IC: "change", IQ: "change", IP: "change", IS: "change", DR: "change", IR: "reject", ID: "reject", R1: "reject", R2: "reject",
@@ -338,7 +382,7 @@ export function build855(a: Ack855): Segment[] {
   const segs: Segment[] = [["BAK", "00", a.ackType, a.poNumber, dateOut(a.date ?? undefined), "", "", "", a.vendorRef ?? ""]];
   if (a.shipDate) segs.push(["DTM", "068", dateOut(a.shipDate)]);
   for (const l of a.lines) {
-    segs.push(["PO1", l.line != null ? String(l.line) : "", l.qty != null ? qtyOut(l.qty) : "", "EA", "", "", ...(l.vendorSku ? ["VN", l.vendorSku] : [])]);
+    segs.push(["PO1", l.line != null ? String(l.line) : "", l.qty != null ? qtyOut(l.qty) : "", "EA", l.unitMinor != null ? fromMinor(l.unitMinor) : "", l.unitMinor != null ? "PE" : "", ...(l.vendorSku ? ["VN", l.vendorSku] : [])]);
     segs.push(["ACK", l.status, l.qty != null ? qtyOut(l.qty) : "", "EA", l.date ? "068" : "", dateOut(l.date ?? undefined)]);
   }
   segs.push(["CTT", String(a.lines.length)]);
@@ -364,7 +408,8 @@ export function parse855(segs: Segment[]): Ack855 & { errors: string[] } {
       const lineNo = po1 && el(po1, 1) ? Number(el(po1, 1)) : undefined;
       const date = x12Date(el(s, 5)) ?? null;
       if (el(s, 5) && !date) errors.push(`line ${lineNo ?? "?"} has a date that is not a date`);
-      lines.push({ line: lineNo, vendorSku: idsHere.vendorSku, status: ACK_LINE_CODES[code] ?? code, qty: num(el(s, 2)), date: date ?? hdrShip });
+      lines.push({ line: lineNo, vendorSku: idsHere.vendorSku, status: ACK_LINE_CODES[code] ?? code, code, qty: num(el(s, 2)), date: date ?? hdrShip,
+        unitMinor: po1 && el(po1, 4) ? toMinor(el(po1, 4)) : null });
       if (lineNo == null && !idsHere.vendorSku) errors.push("an acknowledged line names neither our line number nor the vendor's item");
     }
   }
@@ -467,7 +512,7 @@ export function build810(v: Invoice810): Segment[] {
     if (l.description) segs.push(["PID", "F", "08", "", "", l.description]);
   }
   segs.push(["TDS", String(v.totalMinor)]);
-  for (const ch of v.charges) segs.push(["SAC", "C", ch.code, "", "", String(ch.amountMinor), "", "", "", "", "", "", "", "", "", ch.description]);
+  for (const ch of v.charges) segs.push(["SAC", ch.amountMinor < 0n ? "A" : "C", ch.code, "", "", String(ch.amountMinor < 0n ? -ch.amountMinor : ch.amountMinor), "", "", "", "", "", "", "", "", "", ch.description]);
   segs.push(["CTT", String(v.lines.length)]);
   return segs;
 }
@@ -494,10 +539,13 @@ export function parse810(segs: Segment[]): Invoice810 & { errors: string[] } {
       lines.push(cur);
     } else if (s[0] === "PID" && cur) cur.description = el(s, 5);
   }
-  const charges = all(segs, "SAC").filter((s) => el(s, 1) === "C").map((s) => {
-    const amt = /^-?\d+$/.test(el(s, 5)) ? BigInt(el(s, 5)) : null;        // SAC05 is N2: cents
-    if (amt == null) errors.push(`the ${el(s, 2) || "charge"} charge has no amount`);
-    return { code: el(s, 2), description: el(s, 15) || (el(s, 2) === "D240" ? "Freight" : `Charge ${el(s, 2)}`), amountMinor: amt ?? 0n };
+  // SAC*C is a charge, SAC*A an allowance (it takes the total down); SAC05 is N2, cents.
+  const charges = all(segs, "SAC").filter((s) => ["C", "A"].includes(el(s, 1))).map((s) => {
+    const amt = /^\d+$/.test(el(s, 5)) ? BigInt(el(s, 5)) : null;
+    const allowance = el(s, 1) === "A";
+    if (amt == null) errors.push(`the ${el(s, 2) || (allowance ? "allowance" : "charge")} ${allowance ? "allowance" : "charge"} has no amount`);
+    return { code: el(s, 2), description: el(s, 15) || (el(s, 2) === "D240" ? "Freight" : allowance ? `Allowance ${el(s, 2)}` : `Charge ${el(s, 2)}`),
+      amountMinor: allowance ? -(amt ?? 0n) : amt ?? 0n };
   });
   const tds = find(segs, "TDS");
   const total = tds && /^-?\d+$/.test(el(tds, 1)) ? BigInt(el(tds, 1)) : null;     // TDS01 is N2: cents
@@ -617,18 +665,29 @@ export function parse846(segs: Segment[]): Inventory846 & { errors: string[] } {
 
 // ---------------------------------------------------------------- 997 --
 
+/** AK5 rejection codes (X12 997 element 718), each valid on its own without an AK3/AK4. */
+export const AK5_CODES: Record<string, string> = {
+  "1": "transaction set not supported", "2": "transaction set trailer missing", "3": "transaction set control number in header and trailer do not match",
+  "4": "number of included segments does not match actual count", "5": "one or more segments in error", "6": "missing or invalid transaction set identifier",
+  "7": "missing or invalid transaction set control number", "23": "transaction set control number not unique within the functional group",
+};
+
 export type Ack997 = {
   functionalId: string; groupControl: string;
-  sets: { type: string; control: string; accepted: boolean; notes?: string[] }[];
+  sets: { type: string; control: string; accepted: boolean; code?: string | null; notes?: string[] }[];
   status: "A" | "E" | "P" | "R"; included: number; received: number; accepted: number;
 };
 
+/**
+ * A 997 is a syntax acknowledgment: each set accepted (AK5*A) or rejected with
+ * its AK5 code; AK9 counts the group. No AK3/AK4 is sent, since the codes
+ * stand on their own and every required element of what is sent is filled.
+ */
 export function build997(a: Ack997): Segment[] {
   const segs: Segment[] = [["AK1", a.functionalId, a.groupControl]];
   for (const s of a.sets) {
     segs.push(["AK2", s.type, s.control]);
-    for (const n of (s.notes ?? []).slice(0, 5)) segs.push(["AK3", "", "", "", "8"], ["AK4", "", "", "", n.slice(0, 99)]);
-    segs.push(["AK5", s.accepted ? "A" : "R", ...(s.accepted ? [] : ["5"])]);
+    segs.push(s.accepted ? ["AK5", "A"] : ["AK5", "R", s.code && AK5_CODES[s.code] ? s.code : "5"]);
   }
   segs.push(["AK9", a.status, String(a.included), String(a.received), String(a.accepted)]);
   return segs;
@@ -642,26 +701,44 @@ export function parse997(segs: Segment[]): Ack997 & { errors: string[] } {
   let cur: Ack997["sets"][number] | null = null;
   for (const s of segs) {
     if (s[0] === "AK2") { cur = { type: el(s, 1), control: el(s, 2), accepted: false, notes: [] }; sets.push(cur); }
+    else if (s[0] === "AK3" && cur) cur.notes!.push(`segment ${el(s, 1)}${el(s, 2) ? ` at ${el(s, 2)}` : ""} in error${el(s, 4) ? ` (code ${el(s, 4)})` : ""}`);
     else if (s[0] === "AK4" && cur && el(s, 4)) cur.notes!.push(el(s, 4));
-    else if (s[0] === "AK5" && cur) cur.accepted = ["A", "E"].includes(el(s, 1));
+    else if (s[0] === "AK5" && cur) {
+      cur.accepted = ["A", "E"].includes(el(s, 1));
+      if (!cur.accepted && !["R", "M", "W", "X"].includes(el(s, 1))) errors.push(`${el(s, 1) || "a blank"} is not an AK5 status`);
+      cur.code = el(s, 2) || null;
+      for (const k of [2, 3, 4, 5, 6]) if (el(s, k)) cur.notes!.push(AK5_CODES[el(s, k)] ?? `code ${el(s, k)}`);
+    }
   }
   const ak9 = find(segs, "AK9");
   if (!ak9) errors.push("the 997 has no AK9 segment");
   const st = el(ak9, 1) as Ack997["status"];
   if (ak9 && !["A", "E", "P", "R", "M", "W", "X"].includes(st)) errors.push(`${st || "a blank"} is not a 997 group status`);
+  if (ak9 && Number(el(ak9, 2)) !== sets.length && sets.length) errors.push(`AK9 counts ${el(ak9, 2)} sets, but the 997 answers ${sets.length}`);
   return { functionalId: el(ak1, 1), groupControl: el(ak1, 2), sets, status: st, included: Number(el(ak9, 2)) || 0, received: Number(el(ak9, 3)) || 0,
     accepted: Number(el(ak9, 4)) || 0, errors };
 }
 
-/** The 997 that answers one inbound group: each set accepted or rejected with its reasons. */
-export function ackFor(group: ParsedGroup, verdicts: Map<string, string[]>): Ack997 {
+/** The 997 that answers one inbound group: each set accepted, or rejected with its AK5 code (syntax only; a business refusal is ours to hold, not the 997's). */
+export function ackFor(group: ParsedGroup, verdicts: Map<string, string | null>): Ack997 {
   const sets = group.sets.map((s) => {
-    const notes = verdicts.get(s.control) ?? [...s.errors];
-    return { type: s.type, control: s.control, accepted: notes.length === 0, notes };
+    const code = verdicts.has(s.control) ? verdicts.get(s.control)! : syntaxCode(s);
+    return { type: s.type, control: s.control, accepted: code == null, code };
   });
   const ok = sets.filter((s) => s.accepted).length;
   return { functionalId: group.functionalId, groupControl: group.control, sets,
     status: group.errors.length ? "R" : ok === sets.length ? "A" : ok ? "P" : "R", included: sets.length, received: sets.length, accepted: ok };
+}
+
+/** The AK5 code for a set's syntax problems, or null when it is sound. */
+export function syntaxCode(s: ParsedSet, parseErrors: string[] = []): string | null {
+  if (!FUNCTIONAL_ID[s.type]) return "1";
+  if (s.errors.some((e) => /has no SE/.test(e))) return "2";
+  if (s.errors.some((e) => /^SE02/.test(e))) return "3";
+  if (s.errors.some((e) => /^SE01/.test(e))) return "4";
+  if (!/^\d{4,9}$/.test(s.control)) return "7";
+  if (s.errors.length || parseErrors.length) return "5";
+  return null;
 }
 
 /** Read one set by its type. */

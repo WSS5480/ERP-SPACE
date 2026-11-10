@@ -114,7 +114,8 @@ export async function runDueCrm(now: Date) {
  * drop folder, a VAN or EDI service (or SFTP / AS2, which say plainly that
  * they are not built yet) is polled for new files, and its queued documents
  * (850s, 997s) are sent. Each partner runs in its own transaction; a failure
- * is recorded on that partner's status line. Order-status APIs (the
+ * is recorded on that partner's status line. Each inbound file and each
+ * outbound send is its own transaction. Order-status APIs (the
  * acknowledgments feeds, whose "shipped" rows become ship notices) keep
  * their own schedules in runDueVendorFeeds.
  */
@@ -128,8 +129,9 @@ export async function runDueEdi(_now: Date, env: EdiEnv = liveEdiEnv(), only?: {
   const out: { vendor: string; ok: boolean; note: string }[] = [];
   for (const r of rows.rows) {
     try {
-      const res = await tx({ kind: "system", label: "scheduler" }, (cl) =>
-        pollPartner(cl, { tenantId: r.tenant_id, entityId: r.entity_id, actor: { kind: "system", label: "scheduler" } }, env, r.id));
+      // Each file in and each document out commits on its own (see pollPartner), so nothing is lost or sent twice.
+      const actor = { kind: "system" as const, label: "scheduler" };
+      const res = await pollPartner((fn) => tx(actor, fn), { tenantId: r.tenant_id, entityId: r.entity_id, actor }, env, r.id);
       out.push({ vendor: r.vendor, ok: res.ok, note: res.note });
     } catch (e) {
       out.push({ vendor: r.vendor, ok: false, note: (e as Error).message });

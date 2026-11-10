@@ -287,10 +287,12 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
             detail: [`${Number(l.quantity)} ordered`, Number(l.cancelled_qty) ? `${Number(l.cancelled_qty)} cut` : null, Number(l.received) ? `${Number(l.received)} received` : null,
               `${openQty} open`, `${money(l.unit_price_minor)} each`, Number(l.landed_minor) ? `+ ${money(l.landed_minor)} landed` : null,
               l.expected_on ? `due ${shortDay(l.expected_on)}` : null, l.sku].filter(Boolean).join(' · '),
-            why: l.customers && l.customers.length ? `For ${l.customers.map((c) => `${c.customer || 'a customer'} (${c.order})`).join(', ')}; their order shows this date.` : null });
+            why: [l.price_review_note ? `${l.price_review_note}: was ${money(l.price_changed_from)}, now ${money(l.unit_price_minor)}. Review it.` : null,
+              l.customers && l.customers.length ? `For ${l.customers.map((c) => `${c.customer || 'a customer'} (${c.order})`).join(', ')}; their order shows this date.` : null].filter(Boolean).join(' ') || null,
+            acts: l.price_review_note ? [el('button', { class: 'btn small', type: 'button', onclick: (e) => act(e.currentTarget, () => post(`/edi/po-lines/${l.id}/price-reviewed`, {}), 'Price change reviewed', { close: again }) }, 'Price reviewed')] : null });
         }))),
         x.sent.length ? section('Sent to vendor', `${x.sent.length}`, null, el('div', { class: 'panel' }, x.sent.map((t) => item({
-          title: `${cap(t.method)} · ${t.destination || ''}`, badge: chip(t.status === 'sent' ? 'good' : t.status === 'prepared' ? 'neutral' : 'critical', t.status === 'failed' ? 'fail' : 'ok', cap(t.status)),
+          title: `${({ edi: 'EDI', api: 'API' })[t.method] || cap(t.method)} · ${t.destination || ''}`, badge: chip(t.status === 'sent' ? 'good' : t.status === 'prepared' ? 'neutral' : 'critical', t.status === 'failed' ? 'fail' : 'ok', cap(t.status)),
           detail: [t.detail, t.vendor_ref ? `their ref ${t.vendor_ref}` : null, t.by_name, shortDay(String(t.sent_at).slice(0, 10))].filter(Boolean).join(' · ') })))) : null,
         trail ? trailSection(trail) : null,
         x.landed.length ? section('Landed cost', null, null, el('div', { class: 'panel' }, x.landed.map((c) => item({

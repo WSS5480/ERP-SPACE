@@ -5,12 +5,13 @@
 // vendor against freight minimums, submit, approve, PO, send).
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
 import { ModuleError, need, requireRole, str, uuid, int, minor } from "./kit.ts";
-import { q } from "../../packages/core/db.ts";
+import { q, tx } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
 import * as edi from "../../packages/core/edi.ts";
 import * as so from "../../packages/core/store_orders.ts";
 import * as x12 from "../../packages/core/x12.ts";
-import { PurchasingError } from "../../packages/core/purchasing.ts";
+import * as pur from "../../packages/core/purchasing.ts";
+const { PurchasingError } = pur;
 import { FeedError } from "../../packages/core/vendor_feeds.ts";
 import { CatalogError } from "../../packages/core/catalog.ts";
 import { BillError } from "../../packages/core/invoice.ts";
@@ -140,6 +141,7 @@ export const module: ErpModule = {
       if (d.send_on_approval !== undefined) draft.send_on_approval = d.send_on_approval !== false;
       if (d.documents !== undefined) draft.documents = strMap(d.documents);
       if (d.transport_config !== undefined) draft.transport_config = strMap(d.transport_config);
+      if (d.options !== undefined) draft.options = d.options;
       const id = await refuse(() => edi.savePartner(c, sc(co, a), ediEnv(), draft));
       return { id, secrets: await edi.partnerSecretStatus(c, co.id, id) };
     });
@@ -150,7 +152,9 @@ export const module: ErpModule = {
     });
     coPost(`/edi/partners/${ID}/poll`, async (c, co, a, _b, m) => {
       await requireRole(c, co, a, BUY, "checking a vendor's EDI mailbox");
-      return refuse(() => edi.pollPartner(c, sc(co, a), ediEnv(), m[2]));
+      // Each file and each send commits on its own transaction, not the request's, so one failure cannot undo the files already taken in.
+      const s = sc(co, a);
+      return refuse(() => edi.pollPartner((fn) => tx(s.actor, fn), s, ediEnv(), m[2]));
     });
     coPost(`/edi/partners/${ID}/poll-status`, async (c, co, a, _b, m) => {
       await requireRole(c, co, a, BUY, "asking a vendor's API for order status");
@@ -165,8 +169,12 @@ export const module: ErpModule = {
 
     // ---------------------------------------------------------- documents
     coPost("/edi/upload", async (c, co, a, b) => {
-      await requireRole(c, co, a, INTAKE, "taking in a vendor's EDI file");
+      await requireRole(c, co, a, [...INTAKE, "store_manager"], "taking in a vendor's EDI file");
       need(typeof b.text === "string" && b.text.trim(), "choose the EDI file first");
+      // Each document type has its own people: an A/P clerk takes bills (810), not acknowledgments or catalogs.
+      for (const ty of edi.typesIn(b.text as string)) {
+        await requireRole(c, co, a, edi.UPLOAD_ROLES[ty] ?? BUY, `taking in ${x12.DOC_NAMES[ty] ? `a ${ty} (${x12.DOC_NAMES[ty].toLowerCase()})` : `a ${ty || "blank"} document`}`);
+      }
       return refuse(() => edi.receiveFile(c, sc(co, a), ediEnv(), { text: b.text as string, filename: str(b.filename, 200) || null, partnerId: uuid(b.partnerId) }));
     });
     coPost(`/edi/documents/${ID}/retry`, async (c, co, a, _b, m) => {
@@ -180,6 +188,11 @@ export const module: ErpModule = {
     coPost(`/edi/pos/${ID}/send`, async (c, co, a, _b, m) => {
       await requireRole(c, co, a, BUY, "sending a purchase order");
       return refuse(() => edi.sendOrder(c, sc(co, a), ediEnv(), m[2]));
+    });
+    coPost(`/edi/po-lines/${ID}/price-reviewed`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, BUY, "reviewing a vendor's price change");
+      await refuse(() => pur.clearPriceReview(c, sc(co, a), m[2]));
+      return { ok: true };
     });
     coPost(`/edi/pos/${ID}/send-850`, async (c, co, a, _b, m) => {
       await requireRole(c, co, a, BUY, "sending a purchase order by EDI");
@@ -202,8 +215,9 @@ export const module: ErpModule = {
       return refuse(() => so.submitStoreOrder(c, sc(co, a), m[2]));
     });
     coPost(`/edi/store-orders/${ID}/back`, async (c, co, a, b, m) => {
-      await requireRole(c, co, a, [...STORE, ...DECIDE], "sending a store order back to draft");
-      return refuse(() => so.returnToDraft(c, sc(co, a), m[2], str(b.reason, 300)));
+      const held = await requireRole(c, co, a, [...STORE, ...DECIDE], "sending a store order back to draft");
+      const decider = held.has("owner") || DECIDE.some((r) => held.has(r));
+      return refuse(() => so.returnToDraft(c, sc(co, a), m[2], str(b.reason, 300), decider));
     });
     coPost(`/edi/store-orders/${ID}/approve`, async (c, co, a, b, m) => {
       const held = await requireRole(c, co, a, DECIDE, "approving a store order");

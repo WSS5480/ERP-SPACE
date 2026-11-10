@@ -83,7 +83,7 @@ async function poDetail(c: Client, co: Company, id: string) {
   if (!po) return null;
   const lines = await q(c, `
     select pol.id, pol.seq, pol.description, pol.quantity, pol.cancelled_qty, pol.unit_price_minor, pol.landed_minor, pol.vendor_sku,
-           pol.category, pol.config, pol.expected_on::text, pol.ack_status, pol.agreement_ref, p.sku, p.id product_id,
+           pol.category, pol.config, pol.expected_on::text, pol.ack_status, pol.agreement_ref, p.sku, p.id product_id, pol.price_review_note, pol.price_changed_from,
            coalesce((select sum(g.quantity) from goods_receipt_line g where g.purchase_order_line_id = pol.id), 0) received,
            (select json_agg(json_build_object('order', so.number, 'orderId', so.id, 'customer', cu.name, 'expected', k.expected_on))
               from po_line_sales_line k join sales_order_line sl on sl.id = k.sales_order_line_id

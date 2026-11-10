@@ -172,6 +172,27 @@ async function matchTemplate(
     : { ok: false, reason: `outside the ${t[0].tolerance_bps / 100}% band` };
 }
 
+/** A number from the company's settings, with a default. */
+async function settingNumber(c: Client, entityId: string, key: string, dflt: number): Promise<number> {
+  const r = await q<{ value: unknown }>(c, `select value from entity_setting where entity_id = $1 and key = $2`, [entityId, key]);
+  const n = Number(r[0]?.value);
+  return r.length && Number.isFinite(n) ? n : dflt;
+}
+const usd = (m: bigint) => { const neg = m < 0n, a = neg ? -m : m; return `${neg ? "-" : ""}$${(a / 100n).toLocaleString("en-US")}.${String(a % 100n).padStart(2, "0")}`; };
+
+/** How far a billed unit price may sit from the PO price, in basis points (setting payables.price_tolerance_bps, default 1%). */
+export const PRICE_TOLERANCE_BPS = 100;
+
+/**
+ * The three-way match for every merchandise bill, however it came in: per PO
+ * line, the quantity billed may not pass what was received less what earlier
+ * bills already billed, and the billed unit price must sit within the
+ * company's tolerance of the PO price. Charges that are not PO lines
+ * (freight, fuel) may not pass the landed cost recorded on the PO plus the
+ * setting payables.charge_limit_minor (default 0). Allowances (negative
+ * lines) always pass. A miss sends the bill to the exception queue, where
+ * the controller or owner must look before it can be approved.
+ */
 async function matchMerchandise(
   c: Client,
   scope: Scope,
@@ -179,26 +200,49 @@ async function matchMerchandise(
   poId: string | null
 ): Promise<{ ok: boolean; reason: string }> {
   if (!poId) return { ok: false, reason: "merchandise invoice with no purchase order" };
-  const rows = await q<{ description: string; ordered: string; received: string; invoiced: string }>(
+  const tol = await settingNumber(c, scope.entityId, "payables.price_tolerance_bps", PRICE_TOLERANCE_BPS);
+  const chargeLimit = BigInt(Math.round(await settingNumber(c, scope.entityId, "payables.charge_limit_minor", 0)));
+  const rows = await q<{ description: string; unit: string; received: string; billed_qty: string; billed_amount: string; priced_qty: string | null;
+    before_qty: string }>(
     c,
-    `select pol.description,
-            pol.quantity                                   as ordered,
-            coalesce(sum(distinct grl.quantity), 0)        as received,
-            count(il.id)                                   as invoiced
-       from purchase_order_line pol
+    `select pol.description, pol.unit_price_minor::text unit,
+            coalesce((select sum(g.quantity) from goods_receipt_line g where g.purchase_order_line_id = pol.id), 0) received,
+            sum(coalesce(il.quantity, il.amount_minor::numeric / nullif(pol.unit_price_minor, 0))) billed_qty,
+            sum(il.amount_minor) billed_amount,
+            sum(il.quantity) priced_qty,
+            coalesce((select sum(coalesce(o.quantity, o.amount_minor::numeric / nullif(pol.unit_price_minor, 0)))
+                        from invoice_line o join invoice oi on oi.id = o.invoice_id
+                       where o.purchase_order_line_id = pol.id and oi.id <> $1 and oi.entity_id = $2 and oi.status <> 'rejected'), 0) before_qty
+       from invoice_line il
+       join purchase_order_line pol on pol.id = il.purchase_order_line_id
        join purchase_order po on po.id = pol.purchase_order_id and po.entity_id = $2
-       left join goods_receipt_line grl on grl.purchase_order_line_id = pol.id
-       left join invoice_line il on il.purchase_order_line_id = pol.id and il.invoice_id = $1
-      where pol.purchase_order_id = $3
-      group by pol.id, pol.description, pol.quantity`,
+      where il.invoice_id = $1 and pol.purchase_order_id = $3
+      group by pol.id, pol.description, pol.unit_price_minor`,
     [invoiceId, scope.entityId, poId]
   );
-  const short = rows.filter((r) => Number(r.received) < Number(r.ordered) && Number(r.invoiced) > 0);
-  if (short.length > 0)
-    return {
-      ok: false,
-      reason: `invoiced but not received: ${short.map((s) => s.description).join(", ")}`,
-    };
+  const problems: string[] = [];
+  const short = rows.filter((r) => Number(r.billed_qty ?? 0) > Number(r.received) - Number(r.before_qty) + 0.0005);
+  if (short.length) problems.push(`invoiced but not received: ${short.map((r) => `${r.description} (billed ${Number(Number(r.billed_qty).toFixed(3))}, received ${Number(r.received)}${Number(r.before_qty) ? `, billed before ${Number(Number(r.before_qty).toFixed(3))}` : ""})`).join(", ")}`);
+  for (const r of rows) {
+    const unit = BigInt(r.unit);
+    const qty = Number(r.billed_qty ?? 0);
+    if (!(qty > 0)) continue;
+    const billedUnit = BigInt(Math.round(Number(r.billed_amount) / qty));
+    const off = billedUnit > unit ? billedUnit - unit : unit - billedUnit;
+    if (off * 10000n > unit * BigInt(Math.round(tol)) && off > 0n) problems.push(`billed at ${usd(billedUnit)} each against ${usd(unit)} on the purchase order: ${r.description}`);
+  }
+  const extra = await q<{ charges: string; landed: string; before: string }>(c, `
+    select coalesce(sum(il.amount_minor) filter (where il.purchase_order_line_id is null and il.amount_minor > 0), 0) charges,
+           coalesce((select sum(amount_minor) from po_landed_cost lc where lc.entity_id = $2 and lc.purchase_order_id = $3), 0) landed,
+           coalesce((select sum(o.amount_minor) from invoice_line o join invoice oi on oi.id = o.invoice_id
+                      where oi.entity_id = $2 and oi.purchase_order_id = $3 and oi.id <> $1 and oi.status <> 'rejected'
+                        and o.purchase_order_line_id is null and o.amount_minor > 0), 0) before
+      from invoice_line il where il.invoice_id = $1`, [invoiceId, scope.entityId, poId]);
+  const charges = BigInt(extra[0]?.charges ?? 0), allowed = BigInt(extra[0]?.landed ?? 0) - BigInt(extra[0]?.before ?? 0) + chargeLimit;
+  if (charges > 0n && charges > (allowed > 0n ? allowed : 0n)) {
+    problems.push(`charges of ${usd(charges)} are more than the purchase order expects (${usd(allowed > 0n ? allowed : 0n)} of freight and other landed cost)`);
+  }
+  if (problems.length) return { ok: false, reason: problems.join("; ") };
   return { ok: true, reason: "three-way match clean" };
 }
 
@@ -336,7 +380,7 @@ export async function enterVendorBill(c: Client, scope: Scope, b: VendorBill, ma
     select id, seq, gl_account_id, description, quantity, cancelled_qty from purchase_order_line where purchase_order_id = $1 and entity_id = $2`, [po.id, scope.entityId]);
   const freight = (await q<{ id: string }>(c, `select id from gl_account where tenant_id = $1 and code = '5030' /* unscoped: chart is tenant-wide */`, [scope.tenantId]))[0];
   let sum = 0n;
-  const rows: { gl: string; pol: string | null; desc: string; amount: bigint }[] = [];
+  const rows: { gl: string; pol: string | null; desc: string; amount: bigint; qty: number | null; unit: bigint | null }[] = [];
   for (const l of b.lines) {
     const pl = pls.find((x) => x.id === l.poLineId);
     needBill(pl, `the bill names a line that is not on ${po.number}`);
@@ -344,23 +388,28 @@ export async function enterVendorBill(c: Client, scope: Scope, b: VendorBill, ma
     needBill(l.qty <= Number(pl!.quantity) - Number(pl!.cancelled_qty), `line ${pl!.seq} is billed for ${l.qty}, more than the ${Number(pl!.quantity) - Number(pl!.cancelled_qty)} ordered`);
     const amount = BigInt(Math.round(l.qty * Number(l.unitMinor)));
     sum += amount;
-    rows.push({ gl: pl!.gl_account_id, pol: pl!.id, desc: (l.description || pl!.description).slice(0, 200), amount });
+    rows.push({ gl: pl!.gl_account_id, pol: pl!.id, desc: (l.description || pl!.description).slice(0, 200), amount, qty: l.qty, unit: l.unitMinor });
   }
   for (const ch of b.charges ?? []) {
     if (ch.amountMinor === 0n) continue;
-    needBill(freight, "the chart has no 5030 freight-in account for the bill's charges; apply a setup pack in Business setup");
     sum += ch.amountMinor;
-    rows.push({ gl: freight!.id, pol: null, desc: ch.description.slice(0, 200), amount: ch.amountMinor });
+    if (ch.amountMinor < 0n) {      // an allowance takes the cost of the goods down, where the goods are coded
+      rows.push({ gl: pls[0].gl_account_id, pol: null, desc: ch.description.slice(0, 200), amount: ch.amountMinor, qty: null, unit: null });
+      continue;
+    }
+    needBill(freight, "the chart has no 5030 freight-in account for the bill's charges; apply a setup pack in Business setup");
+    rows.push({ gl: freight!.id, pol: null, desc: ch.description.slice(0, 200), amount: ch.amountMinor, qty: null, unit: null });
   }
+  needBill(sum > 0n, "the bill comes to nothing or less; a credit is entered as a credit memo");
   needBill(sum === b.totalMinor, "the bill's total is not the sum of its lines and charges");
   const inv = await one<{ id: string }>(c, `
     insert into invoice (tenant_id, entity_id, vendor_id, kind, reference, invoice_date, due_date, total_minor, confidence_bps, purchase_order_id, created_by)
     values ($1,$2,$3,'merchandise',$4,$5::date,$5::date + $6::int,$7,10000,$8,$9) returning id`,
     [scope.tenantId, scope.entityId, b.vendorId, b.reference.trim().slice(0, 60), b.invoiceDate, b.termsDays ?? ve.terms_days, b.totalMinor.toString(), po.id, makerId]);
   for (const [i, r] of rows.entries()) {
-    await c.query(`insert into invoice_line (invoice_id, seq, gl_account_id, profit_object_id, purchase_order_line_id, description, amount_minor)
-                   select $1,$2,$3,$4,$5,$6,$7 where exists (select 1 from invoice where id = $1 and entity_id = $8)`,
-      [inv.id, i + 1, r.gl, po.profit_object_id, r.pol, r.desc, r.amount.toString(), scope.entityId]);
+    await c.query(`insert into invoice_line (invoice_id, seq, gl_account_id, profit_object_id, purchase_order_line_id, description, amount_minor, quantity, unit_price_minor)
+                   select $1,$2,$3,$4,$5,$6,$7,$9,$10 where exists (select 1 from invoice where id = $1 and entity_id = $8)`,
+      [inv.id, i + 1, r.gl, po.profit_object_id, r.pol, r.desc, r.amount.toString(), scope.entityId, r.qty, r.unit?.toString() ?? null]);
   }
   await audit(c, scope, { table: "invoice", rowId: inv.id, action: "insert", after: { reference: b.reference, po: po.number, total: b.totalMinor.toString(), lines: rows.length } });
   const out = await runGates(c, scope, inv.id, makerId);
@@ -370,7 +419,8 @@ export async function enterVendorBill(c: Client, scope: Scope, b: VendorBill, ma
       [scope.tenantId, rows.map((r) => r.gl)])).map((x) => [x.id, x.code]));
     journalId = await post(c, scope, {
       date: b.invoiceDate, sourceType: "invoice", sourceId: inv.id, description: `Bill ${b.reference.trim()} on ${po.number}`,
-      lines: [...rows.map((r) => ({ code: codes.get(r.gl)!, debit: r.amount, profitObjectId: po.profit_object_id, memo: r.desc })), { code: "2010", credit: b.totalMinor }],
+      lines: [...rows.map((r) => (r.amount >= 0n ? { code: codes.get(r.gl)!, debit: r.amount, profitObjectId: po.profit_object_id, memo: r.desc }
+        : { code: codes.get(r.gl)!, credit: -r.amount, profitObjectId: po.profit_object_id, memo: r.desc })), { code: "2010", credit: b.totalMinor }],
     });
   }
   return { invoiceId: inv.id, status: out.status, reason: out.reason, journalId };
