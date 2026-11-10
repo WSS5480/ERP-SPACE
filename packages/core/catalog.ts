@@ -736,6 +736,36 @@ export async function setListPrices(c: Client, s: Scope, listId: string, items: 
   await audit(c, s, { table: "price_list_item", rowId: listId, action: "update", after: items.map((i) => ({ ...i, priceMinor: i.priceMinor?.toString() ?? null })) });
 }
 
+/**
+ * Price a whole category on a list by rule: cost plus a markup, or retail
+ * less a discount (trade pricing). A category of null is the list's catch-all.
+ * A product priced on the list itself keeps that price. Setting a rule again
+ * replaces it; `active: false` retires it (the row is kept).
+ */
+export async function savePriceRule(c: Client, s: Scope, listId: string, r: { category?: string | null; basis: string; bps: number; active?: boolean }) {
+  const l = await q<{ code: string }>(c, `select code from price_list where id = $1 and entity_id = $2`, [listId, s.entityId]);
+  need(l.length, "no such price list");
+  need(["cost_plus", "retail_less"].includes(r.basis), "a rule is cost plus a markup, or retail less a discount");
+  need(Number.isInteger(r.bps) && r.bps >= 0 && r.bps <= (r.basis === "retail_less" ? 9000 : 100000),
+    r.basis === "retail_less" ? "a discount off retail is between 0% and 90%" : "a markup on cost is between 0% and 1000%");
+  const cat = String(r.category ?? "").trim() || null;
+  if (cat) need((await q(c, `select 1 from product where entity_id = $1 and category = $2 limit 1`, [s.entityId, cat])).length, `no product is in the ${cat} category`);
+  await c.query(`update price_list_rule set active = false, updated_by = $4, updated_at = now()
+                  where entity_id = $1 and price_list_id = $2 and coalesce(category, '') = coalesce($3, '') and active`, [s.entityId, listId, cat, s.actor.label]);
+  let id: string | null = null;
+  if (r.active !== false) {
+    id = (await one<{ id: string }>(c, `insert into price_list_rule (entity_id, price_list_id, category, basis, bps, updated_by) values ($1,$2,$3,$4,$5,$6) returning id`,
+      [s.entityId, listId, cat, r.basis, r.bps, s.actor.label])).id;
+  }
+  await audit(c, s, { table: "price_list_rule", rowId: id ?? listId, action: "update", after: { list: l[0].code, category: cat, basis: r.basis, bps: r.bps, active: r.active !== false } });
+  return id;
+}
+
+export async function priceRules(c: Client, entityId: string, listId: string) {
+  return q<{ id: string; category: string | null; basis: string; bps: number }>(c, `select id, category, basis, bps from price_list_rule
+     where entity_id = $1 and price_list_id = $2 and active order by category nulls last`, [entityId, listId]);
+}
+
 export type PromoIn = { name: string; kind: string; pctBps?: number | null; amountMinor?: bigint | null; productId?: string | null;
   vendorId?: string | null; category?: string | null; startsOn: string; endsOn: string; respectMap?: boolean };
 

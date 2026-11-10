@@ -20,6 +20,7 @@
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor, type PostLine } from "./posting.ts";
 import { format, mulBps } from "./money.ts";
+import { lineSplits, accrueReferrals } from "./trade_commission.ts";
 
 export class WorkforceError extends Error {}
 const need = (cond: unknown, msg: string): asserts cond => { if (!cond) throw new WorkforceError(msg); };
@@ -377,7 +378,9 @@ export function rateFor(plan: { rate_bps: number; tiers: { min: bigint; rate: nu
 }
 
 /** Each salesperson's share of an order: the split rows, or the order's salesperson for all of it. */
-async function splitsOf(c: Client, entityId: string, orderId: string, salespersonId: string | null) {
+async function splitsOf(c: Client, entityId: string, orderId: string, salespersonId: string | null, lineId: string | null = null) {
+  // A line's own split (primary rep and internal designer, trade module) replaces the order's salespeople for that line.
+  if (lineId) { const own = await lineSplits(c, entityId, lineId); if (own.length) return own; }
   const r = await q<{ app_user_id: string; split_bps: number }>(c,
     `select app_user_id, split_bps from sales_order_salesperson where entity_id = $1 and sales_order_id = $2 order by split_bps desc, app_user_id`, [entityId, orderId]);
   if (r.length) return r;
@@ -413,7 +416,7 @@ export async function accrueCommissions(c: Client, scope: Scope, opts: { orderId
   const ids: string[] = [];
   let earned = 0, spiffs = 0, chargebacks = 0, skipped = 0;
   for (const l of lines) {
-    const splits = await splitsOf(c, scope.entityId, l.order_id, l.salesperson_id);
+    const splits = await splitsOf(c, scope.entityId, l.order_id, l.salesperson_id, l.line_id);
     if (!splits.length) { skipped++; continue; }
     const net = B(l.net_minor);
     const cost = BigInt(Math.round(Number(l.qty) * Number(l.cost_minor ?? 0)));
@@ -496,7 +499,9 @@ export async function accrueCommissions(c: Client, scope: Scope, opts: { orderId
     await c.query(`update commission_event set journal_entry_id = $2 where entity_id = $3 and id = any($1)`, [ids, je, scope.entityId]);
   }
   const total = fresh.reduce((a, f) => a + f.amount, 0n);
-  return { earned, spiffs, chargebacks, skipped, totalMinor: total, journalEntryId: je };
+  // An outside trade referral on the same lines earns (or gives back) its payable at the same moment.
+  const referrals = await accrueReferrals(c, scope, opts);
+  return { earned, spiffs, chargebacks, skipped, totalMinor: total, journalEntryId: je, referrals };
 }
 
 /**

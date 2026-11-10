@@ -108,6 +108,20 @@ export async function priceConfigured(c: Client, entityId: string, productId: st
     if (li) {
       const v = BigInt(li.price_minor) + optionsDelta;
       if (v < final) { final = v; listUsed = li.code; }
+    } else {
+      // No price of its own on the list: the list's rule for the product's category (or its catch-all rule),
+      // cost plus a markup or retail less a discount, on the configured cost and ticket.
+      const rule = (await q<{ basis: string; bps: number; code: string }>(c, `
+        select r.basis, r.bps, l.code from price_list l join price_list_rule r on r.price_list_id = l.id and r.entity_id = l.entity_id and r.active
+         where l.entity_id = $1 and l.code = $2 and l.active and (r.category = $3 or r.category is null)
+           and coalesce($4::date, current_date) between coalesce(l.starts_on, '-infinity') and coalesce(l.ends_on, 'infinity')
+         order by (r.category is null) limit 1`, [entityId, String(popts.priceList).toUpperCase(), p.category, on]))[0];
+      if (rule) {
+        const c0 = cost < 0n ? 0n : cost;
+        const v = rule.basis === "cost_plus" ? c0 + (c0 * BigInt(rule.bps) + 5000n) / 10000n
+          : ticket - (ticket * BigInt(rule.bps) + 5000n) / 10000n;
+        if (v < final) { final = v < 0n ? 0n : v; listUsed = rule.code; }
+      }
     }
   }
   const mapMinor = p.map_minor == null ? null : BigInt(p.map_minor);

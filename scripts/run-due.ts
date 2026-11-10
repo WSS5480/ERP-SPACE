@@ -18,6 +18,8 @@ import { processQueue, captureAbandonedCarts } from "../packages/core/crm.ts";
 import { runDueReports } from "../packages/core/reports.ts";
 import { pollPartner, liveEdiEnv, type EdiEnv } from "../packages/core/edi.ts";
 import { expireHolds } from "../packages/core/pos.ts";
+import { runFollowUps } from "../packages/core/projects.ts";
+import { accrueReferrals } from "../packages/core/trade_commission.ts";
 
 /** Does a five-field cron expression match this minute (UTC)? */
 export function cronMatches(expr: string, d: Date): boolean {
@@ -103,6 +105,11 @@ export async function runDueCrm(now: Date) {
         return { ...q, carts: typeof carts === "number" ? carts : Number((carts as { added?: number })?.added ?? 0) };
       });
       out.push({ entityId: co.id, ...r });
+      // Clienteling follow-ups (trade module) go on the same task list, and referral commission waiting on
+      // payment is earned once paid -- in their own transaction, so a problem there never holds up the messages.
+      const sc = { tenantId: co.tenant_id, entityId: co.id, actor: { kind: "system" as const, label: "scheduler" } };
+      await tx({ kind: "system", label: "scheduler" }, async (cl) => { await runFollowUps(cl, sc, now); await accrueReferrals(cl, sc); })
+        .catch((e) => out.push({ entityId: co.id, sent: 0, stopped: 0, carts: 0, note: `follow-ups: ${(e as Error).message}` }));
     } catch (e) {
       out.push({ entityId: co.id, sent: 0, stopped: 0, carts: 0, note: (e as Error).message });
     }
