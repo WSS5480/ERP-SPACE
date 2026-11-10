@@ -46,7 +46,7 @@
 
   // The cart lives in memory while the screen is open.
   let cart = null;
-  const newCart = () => ({ kind: 'sale', customer: null, addressId: '', promisedOn: '', lines: [], primary: S.person ? S.person.id : '', second: '', secondPct: 50,
+  const newCart = () => ({ kind: 'sale', customer: null, addressId: '', promisedOn: '', delivery: null, lines: [], primary: S.person ? S.person.id : '', second: '', secondPct: 50,
     taxExemptRef: '', notes: '', overrideReason: '' });
 
   async function screen(sub) {
@@ -61,6 +61,48 @@
   // ================================================================== sell
   async function sellTab(setup) {
     if (!cart) cart = newCart();
+    // ---- delivery day: the salesperson books it here; the delivery manager confirms and locks it
+    const delBox = el('div');
+    const hasDelivery = () => cart.lines.some((l) => l.fulfillment === 'delivery' && !l.isFee);
+    function drawDelivery() {
+      if (!hasDelivery()) { cart.delivery = null; delBox.replaceChildren(); return; }
+      const pick = el('button', { class: 'btn' + (cart.delivery ? '' : ' primary'), type: 'button', onclick: () => deliveryDialog() },
+        cart.delivery ? 'Change day' : 'Pick delivery day');
+      delBox.replaceChildren(el('div', { class: 'panel' }, item({
+        title: cart.delivery ? `${dayLabel(cart.delivery.day)} · ${cart.delivery.label}` : 'No delivery day yet',
+        detail: !cart.addressId ? 'Pick the customer and their address first.'
+          : cart.delivery ? `${cart.delivery.zone} · booked when the sale is placed; the delivery manager confirms it`
+          : 'Pick a day with room while the customer is here.',
+        badge: cart.delivery ? chip('good', 'ok', 'Picked') : chip('warning', 'clock', 'To pick'),
+        acts: cart.addressId ? [pick, cart.delivery ? el('button', { class: 'btn small', type: 'button', onclick: () => { cart.delivery = null; drawDelivery(); } }, 'Clear') : null].filter(Boolean) : null })));
+    }
+    function deliveryDialog() {
+      const d = openDialog('Pick delivery day', cart.customer ? cart.customer.name : '');
+      const out = el('div');
+      fillDialog(d, async () => {
+        const items = cart.lines.filter((l) => l.fulfillment === 'delivery').map((l) => `${l.productId}:${l.qty}`).join(',');
+        const a = await coApi(`/fleet/availability?address=${encodeURIComponent(cart.addressId)}&items=${encodeURIComponent(items)}&days=21`);
+        const open = a.slots.filter((x) => x.fits && !x.locked);
+        const byDay = new Map();
+        for (const x of a.slots) { if (!byDay.has(x.day)) byDay.set(x.day, []); byDay.get(x.day).push(x); }
+        const days = [...byDay.entries()].map(([day, list]) => {
+          const locked = list.some((x) => x.locked);
+          return el('div', { class: 'field' }, el('span', { text: `${dayLabel(day)}${locked ? ' · locked by the delivery manager' : ''}` }),
+            el('div', { class: 'toolbar' }, list.map((x) => {
+              const ok = x.fits && !x.locked;
+              const left = x.caps.stops != null ? `${Math.max(x.caps.stops - x.used.stops, 0)} left` : 'open';
+              const b = el('button', { class: 'btn', type: 'button', disabled: !ok || null,
+                onclick: () => { cart.delivery = { day: x.day, windowId: x.windowId, label: x.label, zone: a.zone.name }; cart.promisedOn = x.day; d.close(); drawDelivery(); E.render(); } },
+                el('b', { text: x.label }), el('span', { class: 'sub', text: x.locked ? 'locked' : x.fits ? left : 'full' }));
+              b.style.minHeight = '48px';
+              return b;
+            })));
+        });
+        return frag(el('p', { class: 'lead', text: `${a.zone.name} · ${plural(a.size.pieces, 'piece')} · about ${a.size.labor} crew minutes at the door.` }),
+          open.length ? null : empty('No open windows', 'Every window in the next three weeks is full, locked or closed. Ask the delivery manager.', true),
+          ...days, out);
+      });
+    }
     const open = setup.registers.filter((r) => r.session_id);
     if (!open.length) return section('No register is open', null, null, el('div', { class: 'panel' },
       empty('Open a register first.', 'Payments go into a drawer session, so a cashier or manager opens one on the Register tab.', true),
@@ -77,8 +119,10 @@
       if (cart.customer) {
         const c = cart.customer;
         const addr = select((c.addresses || []).map((a) => [a.id, `${a.label}: ${a.line1}, ${a.city} ${a.state}`]), cart.addressId || ((c.addresses || [])[0] || {}).id || '', 'No address');
+        if (cart.addressId !== addr.value) cart.delivery = null;
         cart.addressId = addr.value;
-        addr.addEventListener('change', () => { cart.addressId = addr.value; });
+        drawDelivery();
+        addr.addEventListener('change', () => { cart.addressId = addr.value; cart.delivery = null; drawDelivery(); });
         const exempt = input({ value: cart.taxExemptRef, placeholder: 'Certificate number', maxlength: '60' });
         exempt.addEventListener('input', () => { cart.taxExemptRef = exempt.value; });
         custBox.replaceChildren(item({ title: c.name, detail: [c.number, c.phone, c.email].filter(Boolean).join(' · '),
@@ -129,12 +173,13 @@
       const est = cart.lines.reduce((a, l) => a + l.estimate, 0);
       const addOn = (id, label, f) => id ? el('button', { class: 'btn small', type: 'button', onclick: async (e) => {
         const p = (await coApi(`/pos/products/${id}`));
-        cart.lines.push({ productId: id, name: p.name, sku: p.sku, desc: p.name, qty: 1, choices: {}, fulfillment: f, discountPct: 0, estimate: Number(p.price_minor) });
+        cart.lines.push({ productId: id, name: p.name, sku: p.sku, desc: p.name, qty: 1, choices: {}, fulfillment: f, discountPct: 0, estimate: Number(p.price_minor), isFee: true });
         drawCart(); void e;
       } }, label) : null;
       cartBox.replaceChildren(...(rows.length ? rows : [empty('The cart is empty.', 'Search above and tap a product.', true)]),
         pad(el('div', {}, el('div', { class: 'toolbar' }, addOn(setup.settings.deliveryProductId, 'Add delivery fee', 'delivery'), addOn(setup.settings.protectionProductId, 'Add protection plan', 'delivery'),
           el('span', { class: 'grow' }), el('b', { text: `${money(est)} before tax` })))));
+      drawDelivery();
     }
     drawCart();
 
@@ -157,7 +202,8 @@
     const out = outBox();
     const go2 = el('button', { class: 'btn primary', type: 'button', onclick: () => run(go2, out, () => post('/pos/orders', {
       kind: cart.kind, locationId: sess.location_id, sessionId: sess.session_id, customerId: cart.customer ? cart.customer.id : null,
-      shipAddressId: cart.addressId || null, promisedOn: cart.promisedOn || null, taxExemptRef: cart.taxExemptRef || null, notes: cart.notes, overrideReason: cart.overrideReason || undefined,
+      shipAddressId: cart.addressId || null, promisedOn: cart.promisedOn || null,
+      delivery: cart.delivery ? { day: cart.delivery.day, windowId: cart.delivery.windowId } : null, taxExemptRef: cart.taxExemptRef || null, notes: cart.notes, overrideReason: cart.overrideReason || undefined,
       salespeople: cart.second && cart.second !== cart.primary ? [{ id: cart.primary, splitPct: 100 - cart.secondPct }, { id: cart.second, splitPct: cart.secondPct }] : cart.primary ? [{ id: cart.primary, splitPct: 100 }] : [],
       lines: cart.lines.map((l) => ({ productId: l.productId, qty: l.qty, choices: l.choices, fulfillment: l.fulfillment, discountPct: l.discountPct || undefined })) }),
       null, (r) => { const k = cart.kind; cart = newCart(); E.render(); openOrder(r.id, k !== 'quote' && !r.pendingOverrides.length ? 'checkout' : null); }) },
@@ -167,7 +213,7 @@
       section('Register', store.name ? `${store.name}, tax ${(store.tax_rate_bps / 100).toFixed(2)}%` : null, null, el('div', { class: 'toolbar' }, el('div', { class: 'grow' }, sessSel))),
       el('div', { class: 'two' },
         el('div', {}, section('Customer', null, null, custBox), section('Add items', null, null, el('div', { class: 'toolbar' }, el('div', { class: 'grow' }, pq)), pres)),
-        el('div', {}, section('Cart', null, null, cartBox),
+        el('div', {}, section('Cart', null, null, cartBox), section('Delivery', null, null, delBox),
           section('Details', null, null, el('div', { class: 'panel' }, pad(el('div', {}, kind,
             el('div', { class: 'form-grid' }, field('Promised date', promised, { hint: 'Delivery and pickup.' }), field('Salesperson', primary),
               field('Split with', second), field('Their share %', split), isManager(setup) ? field('Override reason', ovr, { wide: true, hint: 'Fill in to allow a discount past the limit or a price below cost yourself.' }) : null,
@@ -331,7 +377,7 @@
     const pad2 = mode === 'checkout' ? sigPad() : null;
     const b = el('button', { class: 'btn primary', type: 'button', onclick: () => run(b, out, () => post(`/pos/orders/${o.id}/${mode}`, { sessionId: getSess(), tenders: t.values(),
       signature: pad2 && pad2.signed() ? pad2.data() : undefined, signedName: o.customer || '' }),
-      (r) => [mode === 'checkout' ? `Placed: ${words(r.status)}.` : 'Payment taken.', r.changeMinor && Number(r.changeMinor) ? `Change due ${money(r.changeMinor)}.` : null,
+      (r) => [mode === 'checkout' ? `Placed: ${words(r.status)}.` : 'Payment taken.', r.delivery ? (r.delivery.booked ? `Delivery ${r.delivery.number} booked for ${shortDay(r.delivery.day)}${r.delivery.confirmed ? ' and confirmed' : ', waiting for the delivery manager to confirm'}.` : r.delivery.note) : null, r.changeMinor && Number(r.changeMinor) ? `Change due ${money(r.changeMinor)}.` : null,
         Number(r.balanceMinor) > 0 ? `${money(r.balanceMinor)} still owed.` : 'Paid in full.', r.onOrder ? `${plural(r.onOrder, 'line')} on order with the vendor.` : null,
         r.handedOver ? `${plural(r.handedOver, 'line')} handed over.` : null].filter(Boolean).join(' '),
       async () => { await after(); E.render(); }) }, mode === 'checkout' ? 'Place the order' : 'Take it');

@@ -8,7 +8,7 @@
 // Routing maths is in routing.ts and has no database in it.
 
 import { createHash, randomBytes } from "node:crypto";
-import { q, one, type Client, type Scope } from "./db.ts";
+import { q, one, audit, type Client, type Scope } from "./db.ts";
 import * as inventory from "./inventory.ts";
 import { postReceipt, invoiceFulfilment } from "./ar.ts";
 import { accrueCommissions } from "./workforce.ts";
@@ -485,7 +485,8 @@ export async function availability(c: Client, entityId: string, zoneId: string, 
            (extract(hour from w.ends)*60 + extract(minute from w.ends))::int end_min,
            w.stops_cap, w.pieces_cap, w.cube_cap::float cube_cap, w.labor_min_cap,
            coalesce(u.n,0)::int n, coalesce(u.pcs,0)::int pcs, coalesce(u.cube,0)::float cube, coalesce(u.lab,0)::int lab,
-           exists (select 1 from delivery_blackout b where b.entity_id = $1 and b.day = d.day and (b.zone_id is null or b.zone_id = $2)) blackout
+           exists (select 1 from delivery_blackout b where b.entity_id = $1 and b.day = d.day and (b.zone_id is null or b.zone_id = $2)) blackout,
+           exists (select 1 from delivery_day_lock k where k.entity_id = $1 and k.day = d.day and k.unlocked_at is null) locked
       from d cross join delivery_window w
       left join lateral (select count(*) n, sum(s.pieces) pcs, sum(s.cube_ft) cube, sum(s.service_min) lab
                            from delivery_stop s
@@ -501,8 +502,29 @@ export async function availability(c: Client, entityId: string, zoneId: string, 
     const fits = (caps.stops == null || used.stops + 1 <= caps.stops) && (caps.pieces == null || used.pieces + size.pieces <= caps.pieces)
       && (caps.cube == null || used.cube + size.cube <= caps.cube + 1e-9) && (caps.labor == null || used.labor + size.labor <= caps.labor);
     const full = caps.stops != null && used.stops >= caps.stops;
-    return { day: String(r.day), windowId: String(r.window_id), label: String(r.label), startMin: n(r.start_min), endMin: n(r.end_min), used, caps, fits, full };
+    return { day: String(r.day), windowId: String(r.window_id), label: String(r.label), startMin: n(r.start_min), endMin: n(r.end_min), used, caps, fits, full, locked: !!r.locked };
   });
+}
+
+/** Open windows for a cart at the register: the zone comes from the address, the size from what is going on the truck. */
+export async function availabilityForCart(c: Client, entityId: string, addressId: string, items: { productId: string; qty: number }[], days = 21) {
+  need(isId(addressId), "pick the delivery address first");
+  const a = await q<{ postal: string; stairs: number }>(c, `select postal, stairs from customer_address where entity_id = $1 and id = $2`, [entityId, addressId]);
+  need(a.length, "pick the delivery address first");
+  const zone = await zoneForPostal(c, entityId, a[0].postal);
+  need(zone, `postal code ${a[0].postal} is outside every delivery zone; add it to a zone in Delivery, or make it a pickup`);
+  const ids = items.map((x) => x.productId).filter(isId);
+  const prods = ids.length ? await q<{ id: string; pieces: number; cube: number }>(c, `
+    select id, coalesce((attributes->>'pieces')::int, 1) pieces, coalesce(cubic_ft, 0)::float cube from product
+     where entity_id = $1 and id = any($2) and kind = any($3) and ship_class <> 'none'`, [entityId, ids, STOCKED]) : [];
+  let pieces = 0, cube = 0;
+  for (const it of items) { const p = prods.find((x) => x.id === it.productId); if (p) { pieces += p.pieces * Math.max(1, n(it.qty)); cube += p.cube * Math.max(1, n(it.qty)); } }
+  const s = await settings(c, entityId);
+  const labor = Math.round(R.serviceMinutes({ id: "", at: { lng: 0, lat: 0 }, pieces, stairs: a[0].stairs }, cfgOf(s)));
+  const now = await localNow(c, s.tz);
+  const size = { pieces, cube, labor };
+  const zrow = await q<{ name: string }>(c, `select name from delivery_zone where entity_id = $1 and id = $2`, [entityId, zone.id]);
+  return { zone: { id: zone.id, name: zrow[0]?.name ?? "" }, size, slots: await availability(c, entityId, zone.id, addDays(now.day, s.leadDays), days, size) };
 }
 
 // --------------------------------------------------------------- queue --
@@ -556,7 +578,71 @@ export type BookInput = {
   override?: string; pickupLines?: { description: string; qty?: number; orderLineId?: string }[];
   /** a dispatcher may book today; the customer link honours the lead time */
   allowToday?: boolean;
+  /** a dispatcher, store manager or owner: books on locked days, and the stop is confirmed at once */
+  manager?: boolean;
+  /** where the booking came from (the register, the customer's link, or dispatch) */
+  from?: "dispatch" | "sale" | "customer_link";
 };
+
+// ------------------------------------------------------ confirm and lock --
+
+/** Whether the delivery manager has locked a day. */
+export async function dayLock(c: Client, entityId: string, day: string) {
+  const r = await q<{ id: string; locked_at: string; by: string | null }>(c, `
+    select k.id, k.locked_at::text as locked_at, u.name as "by" from delivery_day_lock k left join app_user u on u.id = k.locked_by
+     where k.entity_id = $1 and k.day = $2 and k.unlocked_at is null`, [entityId, day]);
+  return r[0] ?? null;
+}
+async function needUnlocked(c: Client, entityId: string, day: string | null, manager: boolean) {
+  if (manager || !day) return;
+  const k = await dayLock(c, entityId, day);
+  need(!k, `deliveries for ${dayWords(day)} are locked by the delivery manager${k?.by ? ` (${k.by})` : ""}; pick another day or ask them`);
+}
+
+/** The delivery manager confirms a stop booked at the sale or by the customer. */
+export async function confirmStop(c: Client, scope: Scope, stopId: string) {
+  const st = await stopRow(c, scope.entityId, stopId);
+  need(st.status === "scheduled", `stop ${st.number} is ${st.status}`);
+  await c.query(`update delivery_stop set confirmed_at = coalesce(confirmed_at, now()), confirmed_by = coalesce(confirmed_by, $3)
+                  where entity_id = $1 and id = $2`, [scope.entityId, stopId, scope.actor.id || null]);
+  return { ok: true, number: st.number };
+}
+
+/** Lock a day: every stop still waiting that day is confirmed, and sales and the customer link can no longer book, move or cancel on it. */
+export async function lockDay(c: Client, scope: Scope, day: string) {
+  need(DAY.test(day), "pick a day");
+  const cur = await dayLock(c, scope.entityId, day);
+  need(!cur, `${dayWords(day)} is already locked`);
+  const r = await c.query(`update delivery_stop set confirmed_at = now(), confirmed_by = $3
+                            where entity_id = $1 and scheduled_on = $2 and status = 'scheduled' and confirmed_at is null`,
+    [scope.entityId, day, scope.actor.id || null]);
+  await c.query(`insert into delivery_day_lock (entity_id, day, locked_by) values ($1,$2,$3)`, [scope.entityId, day, scope.actor.id || null]);
+  await audit(c, scope, { table: "delivery_day_lock", rowId: scope.entityId, action: "insert", after: { day, confirmed: r.rowCount } });
+  return { day, confirmed: r.rowCount ?? 0 };
+}
+
+export async function unlockDay(c: Client, scope: Scope, day: string, reason: string) {
+  need(DAY.test(day), "pick a day");
+  need(reason.trim(), "say why the day is being opened again");
+  const cur = await dayLock(c, scope.entityId, day);
+  need(cur, `${dayWords(day)} is not locked`);
+  await c.query(`update delivery_day_lock set unlocked_at = now(), unlocked_by = $3, unlock_reason = $4 where entity_id = $1 and id = $2`,
+    [scope.entityId, cur!.id, scope.actor.id || null, reason.trim().slice(0, 300)]);
+  return { day, unlocked: true };
+}
+
+/** Stops still waiting on the delivery manager, from today on. */
+export async function toConfirm(c: Client, entityId: string) {
+  return q(c, `
+    select s.id, s.number, s.scheduled_on::text scheduled_on, w.label window_label, z.name zone_name, s.booked_from, s.pieces,
+           cu.name customer, a.city, so.number order_number, u.name booked_by
+      from delivery_stop s
+      left join delivery_window w on w.id = s.window_id left join delivery_zone z on z.id = s.zone_id
+      left join customer cu on cu.id = s.customer_id left join customer_address a on a.id = s.address_id
+      left join sales_order so on so.id = s.sales_order_id left join app_user u on u.id = s.created_by
+     where s.entity_id = $1 and s.status = 'scheduled' and s.confirmed_at is null and s.scheduled_on >= current_date - 1
+     order by s.scheduled_on, w.starts, s.number limit 200`, [entityId]);
+}
 
 async function checkSlot(c: Client, entityId: string, s: Settings, zone: { id: string; days: number[] }, day: string, windowId: string, allowToday: boolean) {
   need(DAY.test(day), "pick a delivery day");
@@ -623,6 +709,7 @@ export async function bookStop(c: Client, scope: Scope, b: BookInput) {
     need(zone, `postal code ${a[0].postal} is outside every delivery zone; add it to a zone, or book a will-call`);
     need(b.day && b.windowId, "pick a day and a window");
     await checkSlot(c, scope.entityId, s, zone, b.day, b.windowId, b.allowToday === true);
+    await needUnlocked(c, scope.entityId, b.day, b.manager === true);
   } else if (b.day) {
     need(DAY.test(b.day), "pick the pickup day");
   }
@@ -657,11 +744,14 @@ export async function bookStop(c: Client, scope: Scope, b: BookInput) {
   const number = await nextNo(c, scope.entityId, "delivery", "D-");
   const st = await one<{ id: string }>(c, `
     insert into delivery_stop (entity_id, number, kind, sales_order_id, customer_id, address_id, dc_location_id, zone_id, window_id,
-                               scheduled_on, pieces, cube_ft, weight_lb, service_min, over_capacity_ok, override_reason, notes, problem, created_by)
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,nullif($16,''),nullif($17,''),nullif($18,''),$19) returning id`,
+                               scheduled_on, pieces, cube_ft, weight_lb, service_min, over_capacity_ok, override_reason, notes, problem, created_by,
+                               booked_from, confirmed_at, confirmed_by)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,nullif($16,''),nullif($17,''),nullif($18,''),$19,
+            $20, case when $21 then now() end, case when $21 then $19::uuid end) returning id`,
     [scope.entityId, number, kind, orderId, customerId, kind === "will_call" ? null : addressId, dc, zone?.id ?? null,
      kind === "will_call" ? null : b.windowId, b.day ?? null, pieces, Math.round(cube * 10) / 10, Math.round(weight), svc,
-     !!override, override, (b.notes ?? "").trim().slice(0, 500), (b.problem ?? "").trim().slice(0, 500), scope.actor.id || null]);
+     !!override, override, (b.notes ?? "").trim().slice(0, 500), (b.problem ?? "").trim().slice(0, 500), scope.actor.id || null,
+     b.from ?? "dispatch", b.manager === true]);
   for (const l of lines) {
     await c.query(`insert into delivery_stop_line (entity_id, stop_id, sales_order_line_id, description, qty, pieces) values ($1,$2,$3,$4,$5,$6)`,
       [scope.entityId, st.id, l.id, l.description, l.qty, l.pieces]);
@@ -678,8 +768,8 @@ async function stopRow(c: Client, entityId: string, stopId: string) {
   need(isId(stopId), "no such stop");
   const r = await q<{ id: string; number: string; kind: string; status: string; route_id: string | null; route_status: string | null;
     zone_id: string | null; sales_order_id: string | null; scheduled_on: string | null; window_id: string | null; customer_id: string | null;
-    dc_location_id: string; driver_id: string | null; helper_id: string | null }>(c, `
-    select s.id, s.number, s.kind, s.status, s.route_id, r.status route_status, s.zone_id, s.sales_order_id, s.scheduled_on::text scheduled_on,
+    dc_location_id: string; driver_id: string | null; helper_id: string | null; confirmed_at: string | null }>(c, `
+    select s.id, s.number, s.kind, s.status, s.route_id, r.status route_status, s.confirmed_at::text confirmed_at, s.zone_id, s.sales_order_id, s.scheduled_on::text scheduled_on,
            s.window_id, s.customer_id, s.dc_location_id, r.driver_id, r.helper_id
       from delivery_stop s left join delivery_route r on r.id = s.route_id
      where s.entity_id = $1 and s.id = $2 for update of s`, [entityId, stopId]);
@@ -687,9 +777,14 @@ async function stopRow(c: Client, entityId: string, stopId: string) {
   return r[0];
 }
 
-export async function reschedule(c: Client, scope: Scope, stopId: string, day: string, windowId: string, allowToday: boolean, override = "") {
+export async function reschedule(c: Client, scope: Scope, stopId: string, day: string, windowId: string, allowToday: boolean, override = "", manager = allowToday) {
   const st = await stopRow(c, scope.entityId, stopId);
   need(st.status === "scheduled", `stop ${st.number} is ${st.status}; only a scheduled stop moves`);
+  if (!manager) {
+    need(!st.confirmed_at, `stop ${st.number} is confirmed by the delivery manager; ask them to move it`);
+    await needUnlocked(c, scope.entityId, st.scheduled_on, false);
+    await needUnlocked(c, scope.entityId, day, false);
+  }
   need(st.kind !== "will_call", "a will-call has no window; change its day instead");
   need(!st.route_status || st.route_status === "draft" || st.route_status === "cancelled", `stop ${st.number} is on a loaded truck; unlock the route first`);
   const s = await settings(c, scope.entityId);
@@ -697,15 +792,21 @@ export async function reschedule(c: Client, scope: Scope, stopId: string, day: s
   need(z.length, "that stop has no zone");
   await checkSlot(c, scope.entityId, s, z[0], day, windowId, allowToday);
   await c.query(`update delivery_stop set scheduled_on = $3, window_id = $4, route_id = null, seq = null, eta_min = null,
-                        over_capacity_ok = $5, override_reason = nullif($6,'')
-                  where entity_id = $1 and id = $2`, [scope.entityId, stopId, day, windowId, !!override.trim(), override.trim()]);
+                        over_capacity_ok = $5, override_reason = nullif($6,''),
+                        confirmed_at = case when $7 then coalesce(confirmed_at, now()) end,
+                        confirmed_by = case when $7 then coalesce(confirmed_by, $8::uuid) end
+                  where entity_id = $1 and id = $2`, [scope.entityId, stopId, day, windowId, !!override.trim(), override.trim(), manager, scope.actor.id || null]);
   await notify(c, scope, stopId, "rescheduled");
   return { ok: true };
 }
 
-export async function cancelStop(c: Client, scope: Scope, stopId: string, reason: string) {
+export async function cancelStop(c: Client, scope: Scope, stopId: string, reason: string, manager = true) {
   const st = await stopRow(c, scope.entityId, stopId);
   need(reason.trim(), "say why the stop is cancelled");
+  if (!manager) {
+    need(!st.confirmed_at, `stop ${st.number} is confirmed by the delivery manager; ask them to cancel it`);
+    await needUnlocked(c, scope.entityId, st.scheduled_on, false);
+  }
   need(st.status === "scheduled", `stop ${st.number} is ${st.status}; it cannot be cancelled now`);
   need(!st.route_status || ["draft", "cancelled"].includes(st.route_status), `stop ${st.number} is on a loaded truck; unlock the route first`);
   await c.query(`update delivery_stop set status = 'cancelled', cancel_reason = $3, route_id = null, seq = null where entity_id = $1 and id = $2`,
@@ -721,7 +822,7 @@ export async function stops(c: Client, entityId: string, day: string, dcId?: str
     select s.id, s.number, s.kind, s.status, s.scheduled_on::text scheduled_on, w.label window_label, z.name zone_name,
            s.pieces, s.cube_ft::float cube_ft, s.service_min, s.route_id, r.number route_number, s.seq, s.eta_min,
            cu.name customer, a.id address_id, a.line1, a.city, a.postal, so.number order_number, s.over_capacity_ok,
-           (a.geo is not null) has_geo, a.geo_source, a.geo_error, a.geo[1] lat, a.geo[0] lng
+           s.confirmed_at is not null confirmed, s.booked_from, (a.geo is not null) has_geo, a.geo_source, a.geo_error, a.geo[1] lat, a.geo[0] lng
       from delivery_stop s
       left join delivery_window w on w.id = s.window_id
       left join delivery_zone z on z.id = s.zone_id
@@ -777,7 +878,9 @@ export async function publicView(c: Client, token: string) {
                              where l.entity_id = $1 and l.sales_order_id = $2 and p.ship_class <> 'none' and l.line_status <> 'cancelled' order by l.seq`,
     [k.entity_id, k.sales_order_id]);
   const cur = await q<{ id: string; number: string; day: string; label: string; status: string; locked: boolean }>(c, `
-    select s.id, s.number, s.scheduled_on::text as day, w.label, s.status, coalesce(r.status in ('locked','in_progress','completed'), false) locked
+    select s.id, s.number, s.scheduled_on::text as day, w.label, s.status,
+           (coalesce(r.status in ('locked','in_progress','completed'), false) or s.confirmed_at is not null
+            or exists (select 1 from delivery_day_lock k where k.entity_id = s.entity_id and k.day = s.scheduled_on and k.unlocked_at is null)) locked
       from delivery_stop s left join delivery_window w on w.id = s.window_id left join delivery_route r on r.id = s.route_id
      where s.entity_id = $1 and s.sales_order_id = $2 and s.kind = 'delivery' and s.status in ('scheduled','arrived')
      order by s.created_at desc limit 1`, [k.entity_id, k.sales_order_id]);
@@ -786,7 +889,7 @@ export async function publicView(c: Client, token: string) {
   const now = await localNow(c, s.tz);
   const ready = await bookableLines(c, k.entity_id, k.sales_order_id, null, ["reserved", "ready"]);
   const size = { pieces: ready.reduce((a, l) => a + n(l.pieces), 0), cube: ready.reduce((a, l) => a + n(l.cube), 0), labor: 0 };
-  const slots = zone ? (await availability(c, k.entity_id, zone.id, addDays(now.day, s.leadDays), 14, size)).filter((x) => x.fits)
+  const slots = zone ? (await availability(c, k.entity_id, zone.id, addDays(now.day, s.leadDays), 14, size)).filter((x) => x.fits && !x.locked)
     .map((x) => ({ day: x.day, windowId: x.windowId, label: x.label })) : [];
   const booked = cur[0] ?? null;
   return {
@@ -803,8 +906,8 @@ export async function publicPick(c: Client, token: string, day: string, windowId
   const scope: Scope = { tenantId: k.tenant_id, entityId: k.entity_id, actor: { kind: "system", label: "customer (self-schedule link)" } };
   const cur = await q<{ id: string }>(c, `select id from delivery_stop where entity_id = $1 and sales_order_id = $2 and kind = 'delivery' and status = 'scheduled'
                                           order by created_at desc limit 1`, [k.entity_id, k.sales_order_id]);
-  const out = cur.length ? (await reschedule(c, scope, cur[0].id, day, windowId, false), { id: cur[0].id })
-    : await bookStop(c, scope, { kind: "delivery", orderId: k.sales_order_id, day, windowId });
+  const out = cur.length ? (await reschedule(c, scope, cur[0].id, day, windowId, false, "", false), { id: cur[0].id })
+    : await bookStop(c, scope, { kind: "delivery", orderId: k.sales_order_id, day, windowId, from: "customer_link" });
   await c.query(`update delivery_link set used_at = now() where entity_id = $1 and token_sha256 = $2`, [k.entity_id, sha(token)]);
   const v = await q<{ number: string; label: string }>(c, `select s.number, w.label from delivery_stop s join delivery_window w on w.id = s.window_id
                                                         where s.entity_id = $1 and s.id = $2`, [k.entity_id, out.id]);

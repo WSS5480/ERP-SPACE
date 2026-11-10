@@ -207,7 +207,8 @@ export const module: ErpModule = {
         lines: lines(b.lines), salespeople: (Array.isArray(b.salespeople) ? b.salespeople : []).map((x: Record<string, unknown>) =>
           ({ id: uuid(x.id) ?? "", splitBps: Math.round(Number(x.splitPct ?? (Number(x.splitBps ?? 0) / 100)) * 100) })),
         taxExemptRef: str(b.taxExemptRef, 60) || null, notes: str(b.notes) || undefined, shipAddressId: uuid(b.shipAddressId),
-        promisedOn: day(b.promisedOn), overrideReason: str(b.overrideReason) || undefined });
+        promisedOn: day(b.promisedOn), overrideReason: str(b.overrideReason) || undefined,
+        delivery: b.delivery && typeof b.delivery === "object" ? { day: str((b.delivery as Record<string, unknown>).day, 10), windowId: str((b.delivery as Record<string, unknown>).windowId, 40) } : null });
     }));
     coPost(`/pos/orders/${ID}/lines`, safe(async (c, co, a, b, m) => {
       const roles = await requireRole(c, co, a, SELL, "changing a sale");
@@ -226,9 +227,10 @@ export const module: ErpModule = {
       return pos.convertQuote(c, sc(co, a), m[2]);
     }));
     coPost(`/pos/orders/${ID}/checkout`, safe(async (c, co, a, b, m) => {
-      await requireRole(c, co, a, SELL, "checking out a sale");
+      const held = await requireRole(c, co, a, SELL, "checking out a sale");
       return pos.checkout(c, sc(co, a), m[2], { sessionId: uuid(b.sessionId), tenders: tenders(b.tenders),
-        signatureDataUrl: typeof b.signature === "string" ? b.signature : undefined, signedName: str(b.signedName, 120) });
+        signatureDataUrl: typeof b.signature === "string" ? b.signature : undefined, signedName: str(b.signedName, 120),
+        deliveryManager: ["owner", "store_manager", "dispatcher"].some((r) => held.has(r)) });
     }));
     coPost(`/pos/orders/${ID}/pay`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, TILL.concat("sales"), "taking a payment");

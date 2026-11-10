@@ -10,11 +10,14 @@ import * as inv from "../../packages/core/inventory.ts";
 import { module } from "../../server/modules/pos.ts";
 import { module as invModule } from "../../server/modules/inventory.ts";
 import { module as purModule } from "../../server/modules/purchasing.ts";
+import { module as fleetModule } from "../../server/modules/fleet.ts";
 import { routesOf, companyOf } from "./inventory.ts";
 
 const R = routesOf(module as never);
 const RI = routesOf(invModule as never);
 const RP = routesOf(purModule as never);
+const RF = routesOf(fleetModule as never);
+const RAY = "55555555-0000-0000-0000-000000000014";     // dispatcher
 const DC = "33333333-0000-0000-0000-0000000000dc";
 const LUIS = "55555555-0000-0000-0000-000000000012";     // cashier
 const MARIA = "55555555-0000-0000-0000-000000000011";    // sales
@@ -91,6 +94,41 @@ export async function run(t: T) {
       tenders: [{ method: "card", amount: "10", reference: "4111111111111111" }] }), /last four digits/);
     await t.throws("card: cannot be more than is owed", () => R.post(t, MARIA, `/pos/orders/${dv.id}/pay`, { sessionId: ses.id,
       tenders: [{ method: "card", amount: "99999" }] }), /cannot be more than the/);
+
+    // ------------------------------------------- delivery booked at the sale
+    const addr = (await read<{ id: string }>(`select id from customer_address where entity_id = $1 and customer_id = $2 order by id limit 1`, [ENTITY, CUST.ALICIA]))[0].id;
+    const av = await RF.get(t, `/fleet/availability?address=${addr}&items=${P.SOFA}:1&days=21`) as { zone: { name: string }; slots: { day: string; windowId: string; label: string; fits: boolean; locked: boolean }[] };
+    const open = av.slots.filter((x) => x.fits && !x.locked);
+    t.ok("at the sale: the salesperson sees open windows for the customer's zone, sized from the cart", !!av.zone.name && open.length > 1, `${open.length} open`);
+    const slotA = open[0], slotB = open.find((x) => x.day !== slotA.day)!;
+    const bs = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.ALICIA, shipAddressId: addr,
+      delivery: { day: slotA.day, windowId: slotA.windowId }, lines: [{ productId: P.SOFA, qty: 1, fulfillment: "delivery" }] }) as { id: string };
+    const bso = await R.post(t, MARIA, `/pos/orders/${bs.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "300.00", reference: "4242" }] }) as Awaited<ReturnType<typeof pos.checkout>>;
+    const stopA = (await read<{ id: string; scheduled_on: string; confirmed_at: string | null; booked_from: string }>(`select id, scheduled_on::text scheduled_on, confirmed_at, booked_from from delivery_stop
+      where entity_id = $1 and sales_order_id = $2 and status = 'scheduled'`, [ENTITY, bs.id]))[0];
+    t.ok("at the sale: placing it books the stop on the picked day, waiting for the delivery manager", !!bso.delivery?.booked && stopA?.scheduled_on === slotA.day
+      && !stopA.confirmed_at && stopA.booked_from === "sale" && (await view(bs.id)).promised_on === slotA.day, JSON.stringify(bso.delivery));
+    await RF.post(t, MARIA, `/fleet/stops/${stopA.id}/reschedule`, { day: slotB.day, windowId: slotB.windowId });
+    t.ok("before it is confirmed, the salesperson can still move it", (await read<{ d: string }>(`select scheduled_on::text d from delivery_stop where id = $1 and entity_id = $2`, [stopA.id, ENTITY]))[0].d === slotB.day);
+    await t.throws("only the delivery manager confirms", () => RF.post(t, MARIA, `/fleet/stops/${stopA.id}/confirm`), /dispatcher|store manager/);
+    await RF.post(t, RAY, `/fleet/stops/${stopA.id}/confirm`);
+    await t.throws("once confirmed, the salesperson cannot move it", () => RF.post(t, MARIA, `/fleet/stops/${stopA.id}/reschedule`, { day: slotA.day, windowId: slotA.windowId }), /confirmed by the delivery manager/);
+    await t.throws("once confirmed, the salesperson cannot cancel it", () => RF.post(t, MARIA, `/fleet/stops/${stopA.id}/cancel`, { reason: "customer asked" }), /confirmed by the delivery manager/);
+    const lk = await RF.post(t, RAY, "/fleet/days/lock", { day: slotA.day }) as { confirmed: number };
+    t.ok("locking a day confirms what is still waiting on it", typeof lk.confirmed === "number");
+    const av2 = await RF.get(t, `/fleet/availability?address=${addr}&items=${P.SOFA}:1&days=21`) as typeof av;
+    t.ok("a locked day shows as locked at the register", av2.slots.filter((x) => x.day === slotA.day).every((x) => x.locked));
+    const bl = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.ALICIA, shipAddressId: addr,
+      delivery: { day: slotA.day, windowId: slotA.windowId }, lines: [{ productId: P.SOFA, qty: 1, fulfillment: "delivery" }] }) as { id: string };
+    await t.throws("a sale cannot book a locked day", () => R.post(t, MARIA, `/pos/orders/${bl.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "300.00", reference: "4242" }] }),
+      /locked by the delivery manager/);
+    await t.throws("opening a locked day needs a reason", () => RF.post(t, RAY, "/fleet/days/unlock", { day: slotA.day }), /say why/);
+    await RF.post(t, RAY, "/fleet/days/unlock", { day: slotA.day, reason: "extra truck" });
+    const blo = await R.post(t, MARIA, `/pos/orders/${bl.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "300.00", reference: "4242" }] }) as Awaited<ReturnType<typeof pos.checkout>>;
+    t.ok("once opened again, the sale books it", !!blo.delivery?.booked);
+    for (const o of [bs.id, bl.id]) await R.post(t, MGR, `/pos/orders/${o}/cancel`, { reason: "check cleanup", sessionId: ses.id, refundMethod: "card", reference: "4242" });
+    const liveStops = await read<{ n: string }>(`select count(*) n from delivery_stop where entity_id = $1 and sales_order_id = any($2) and status <> 'cancelled'`, [ENTITY, [bs.id, bl.id]]);
+    t.ok("cancelling the sale cancels its booked delivery", liveStops[0].n === "0");
 
     // ------------------------------------------------------- manager override
     const ov = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.BRIAN,

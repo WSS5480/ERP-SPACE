@@ -16,6 +16,7 @@ import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor } from "./posting.ts";
 import { priceConfigured, type Choice } from "./pricing.ts";
 import { reserveOrder, fulfilLines, releaseLines, restock, returnToDamage, unitCost } from "./inventory.ts";
+import * as fleet from "./fleet.ts";
 import { postReceipt, invoiceFulfilment, chargeRoom } from "./ar.ts";
 import { providerNamed } from "./shop.ts";
 import { accrueCommissions } from "./workforce.ts";
@@ -183,7 +184,9 @@ export type LineIn = { productId: string; qty: number; choices?: Choice[]; fulfi
 
 export type OrderIn = { kind: "sale" | "quote" | "layaway"; locationId: string; customerId?: string | null; sessionId?: string | null;
   lines: LineIn[]; salespeople?: { id: string; splitBps: number }[]; taxExemptRef?: string | null; notes?: string;
-  shipAddressId?: string | null; promisedOn?: string | null; overrideReason?: string };
+  shipAddressId?: string | null; promisedOn?: string | null; overrideReason?: string;
+  /** the delivery day and window the salesperson picked; booked when the sale is placed */
+  delivery?: { day: string; windowId: string } | null };
 
 type OrderRow = { id: string; number: string; status: string; location_id: string; customer_id: string | null; total_minor: string; paid_minor: string;
   kind: string; quote_expires_on: string | null; tax_exempt_ref: string | null; paid_off_at: string | null; layaway_schedule: unknown;
@@ -443,6 +446,7 @@ async function validatePeople(c: Client, scope: Scope, sp: { id: string; splitBp
 
 export async function createOrder(c: Client, scope: Scope, roles: Set<string>, e: OrderIn) {
   need(["sale", "quote", "layaway"].includes(e.kind), "a POS order is a sale, a quote or a layaway");
+  if (e.delivery?.day && /^\d{4}-\d{2}-\d{2}$/.test(e.delivery.day)) e = { ...e, promisedOn: e.delivery.day };   // the picked day is the promise
   const loc = await locationOf(c, scope.entityId, e.locationId);
   need(["store", "outlet"].includes(loc.kind), `${loc.name} is not a store`);
   need(e.lines?.length, "add something to sell");
@@ -464,9 +468,15 @@ export async function createOrder(c: Client, scope: Scope, roles: Set<string>, e
   const number = await nextNo(c, scope.entityId, "order", "SO-");
   const so = await one<{ id: string }>(c, `insert into sales_order (entity_id, number, channel, location_id, customer_id, status, notes, created_by)
     values ($1,$2,'pos',$3,$4,'draft',$5,$6) returning id`, [scope.entityId, number, loc.id, customer?.id ?? null, e.notes ?? null, scope.actor.id]);
-  await c.query(`insert into pos_order (sales_order_id, entity_id, kind, quote_expires_on, tax_exempt_ref, register_session_id, created_by)
-    values ($1,$2,$3,$4,$5,$6,$7)`, [so.id, scope.entityId, e.kind, e.kind === "quote" ? addDays(today(), set.quoteValidDays) : null, exemptRef,
-    e.sessionId ?? null, scope.actor.id]);
+  const dl = e.delivery && /^\d{4}-\d{2}-\d{2}$/.test(e.delivery.day) && /^[0-9a-f-]{36}$/i.test(e.delivery.windowId) ? e.delivery : null;
+  if (dl) {
+    const w = await q(c, `select 1 from delivery_window where entity_id = $1 and id = $2 and active`, [scope.entityId, dl.windowId]);
+    need(w.length, "that delivery window is not offered any more; pick the day again");
+  }
+  await c.query(`insert into pos_order (sales_order_id, entity_id, kind, quote_expires_on, tax_exempt_ref, register_session_id, created_by, delivery_day, delivery_window_id)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [so.id, scope.entityId, e.kind, e.kind === "quote" ? addDays(today(), set.quoteValidDays) : null, exemptRef,
+    e.sessionId ?? null, scope.actor.id, dl?.day ?? null, dl?.windowId ?? null]);
+  if (dl) await c.query(`update sales_order set promised_on = $3 where id = $1 and entity_id = $2`, [so.id, scope.entityId, dl.day]);
   const sp = e.salespeople?.length ? e.salespeople : [{ id: scope.actor.id!, splitBps: 10000 }];
   await validatePeople(c, scope, sp);
   for (const p of sp) await c.query(`insert into sales_order_salesperson (entity_id, sales_order_id, app_user_id, split_bps) values ($1,$2,$3,$4)`,
@@ -654,7 +664,8 @@ async function settleStatus(c: Client, scope: Scope, orderId: string) {
  * Place a sale or a layaway: reserve stock (what cannot be covered goes on
  * order for purchasing), take the tenders, and hand over take-with goods.
  */
-export async function checkout(c: Client, scope: Scope, orderId: string, e: { sessionId: string | null; tenders: Tender[]; signatureDataUrl?: string; signedName?: string }) {
+export async function checkout(c: Client, scope: Scope, orderId: string, e: { sessionId: string | null; tenders: Tender[]; signatureDataUrl?: string; signedName?: string;
+  deliveryManager?: boolean }) {
   const o = await orderOf(c, scope.entityId, orderId);
   need(o.status === "draft", `${o.number} is already ${o.status}`);
   need(o.kind !== "quote", `${o.number} is a quote; convert it to a sale first`);
@@ -673,6 +684,7 @@ export async function checkout(c: Client, scope: Scope, orderId: string, e: { se
       left join product p on p.id = l.product_id
      where l.entity_id = $1 and l.sales_order_id = $2 and pl.fulfillment = 'carry' and l.line_status not in ('cancelled','fulfilled')`, [scope.entityId, orderId]);
   for (const l of carry) if (STOCKED.includes(l.kind ?? "")) need(l.line_status === "reserved", `${l.sku} is not in stock here to take with; make it pickup or delivery`);
+  const delivery = await bookAtSale(c, scope, orderId, e.deliveryManager === true);
   const tendered = await takeTenders(c, scope, o, e.sessionId, e.tenders ?? []);
   const after = await orderOf(c, scope.entityId, orderId);
   const paid = BigInt(after.paid_minor), total = BigInt(after.total_minor);
@@ -704,7 +716,29 @@ export async function checkout(c: Client, scope: Scope, orderId: string, e: { se
     onOrder: res.shortLines }, sourceRef: "pos checkout" });
   return { number: o.number, status: fin.status, totalMinor: BigInt(fin.total_minor), paidMinor: BigInt(fin.paid_minor),
     balanceMinor: BigInt(fin.total_minor) - BigInt(fin.paid_minor), changeMinor: tendered.changeMinor, receipts: tendered.receipts,
-    reserved: res.reserved, onOrder: res.shortLines, handedOver: handed.lines };
+    reserved: res.reserved, onOrder: res.shortLines, handedOver: handed.lines, delivery };
+}
+
+/**
+ * The day the salesperson picked becomes a booked stop when the sale is placed, waiting for the
+ * delivery manager to confirm. Goods still on order are not booked: the order keeps the requested
+ * day, and dispatch books it (or texts the customer the link) once they arrive.
+ */
+async function bookAtSale(c: Client, scope: Scope, orderId: string, manager: boolean) {
+  const r = await q<{ day: string | null; window_id: string | null }>(c, `select delivery_day::text as day, delivery_window_id as window_id from pos_order
+    where sales_order_id = $1 and entity_id = $2`, [orderId, scope.entityId]);
+  if (!r[0]?.day || !r[0].window_id) return null;
+  const lines = await q<{ id: string; line_status: string }>(c, `
+    select l.id, l.line_status from sales_order_line l join pos_line pl on pl.sales_order_line_id = l.id join product p on p.id = l.product_id
+     where l.entity_id = $1 and l.sales_order_id = $2 and pl.fulfillment = 'delivery' and p.kind = any($3) and l.line_status not in ('cancelled','fulfilled')`,
+    [scope.entityId, orderId, STOCKED]);
+  if (!lines.length) return null;
+  const ready = lines.filter((l) => l.line_status === "reserved" || l.line_status === "ready").map((l) => l.id);
+  const waiting = lines.length - ready.length;
+  if (!ready.length) return { booked: false, day: r[0].day, waiting, note: "The goods are on order; the day is kept on the sale and booked when they arrive." };
+  const st = await fleet.bookStop(c, scope, { kind: "delivery", orderId, lineIds: ready, day: r[0].day, windowId: r[0].window_id,
+    manager, allowToday: manager, from: "sale" });
+  return { booked: true, number: st.number, day: r[0].day, waiting, confirmed: manager };
 }
 
 /** A further payment: a deposit, a layaway instalment, the balance at pickup. */
@@ -765,6 +799,15 @@ export async function cancelOrder(c: Client, scope: Scope, orderId: string, e: {
   const paid = BigInt(o.paid_minor);
   if (paid > 0n) need(e.refundMethod, `${usd(paid)} was paid; say how it is refunded`);
   await releaseLines(c, scope.entityId, orderId, "all");
+  // a booked delivery goes with the order
+  const stops = await q<{ id: string; number: string; route_status: string | null }>(c, `select s.id, s.number, r.status route_status from delivery_stop s
+     left join delivery_route r on r.id = s.route_id where s.entity_id = $1 and s.sales_order_id = $2 and s.status = 'scheduled'`, [scope.entityId, orderId]);
+  for (const st of stops) {
+    need(!st.route_status || ["draft", "cancelled"].includes(st.route_status), `delivery ${st.number} is on a loaded truck; unlock the route first`);
+    await c.query(`update delivery_stop set status = 'cancelled', cancel_reason = $3, route_id = null, seq = null where entity_id = $1 and id = $2`,
+      [scope.entityId, st.id, `order cancelled: ${String(e.reason).trim()}`.slice(0, 300)]);
+    await c.query(`update delivery_stop_line set outcome = 'cancelled' where entity_id = $1 and stop_id = $2 and outcome = 'pending'`, [scope.entityId, st.id]);
+  }
   await c.query(`update sales_order_line set line_status = 'cancelled' where entity_id = $1 and sales_order_id = $2 and line_status <> 'cancelled'`, [scope.entityId, orderId]);
   if (paid > 0n) {
     // Refund what was paid; the order's total drops to zero first so the refund is what is owed back.

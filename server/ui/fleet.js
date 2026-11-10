@@ -143,8 +143,25 @@
   const noPointChip = () => chip('critical', 'warn', 'No map point');
 
   // ---------------------------------------------------------- schedule
+  const isDeliveryManager = () => !!(S.person && S.person.roles.some((r) => ['owner', 'dispatcher', 'store_manager'].includes(r)));
   async function scheduleScreen() {
-    const [queue, stops] = await Promise.all([coApi('/fleet/queue'), coApi(`/fleet/stops?day=${st.day}`)]);
+    const mgr = isDeliveryManager();
+    const [queue, stops, lockR, waiting] = await Promise.all([coApi('/fleet/queue'), coApi(`/fleet/stops?day=${st.day}`), coApi(`/fleet/days/lock?day=${st.day}`),
+      mgr ? coApi('/fleet/to-confirm') : Promise.resolve([])]);
+    const lock = lockR.lock;
+    const FROM = { sale: 'booked at the sale', customer_link: 'picked by the customer', dispatch: 'booked by dispatch' };
+    const confirmBtn = (x) => btn('Confirm', (e) => act(e.currentTarget, () => post(`/fleet/stops/${x.id}/confirm`), `${x.number} confirmed`), { small: true, primary: true });
+    const waitItems = waiting.map((x) => item({ title: `${x.number} · ${x.customer || ''}`, badge: chip('warning', 'clock', 'To confirm'),
+      detail: [dayLabel(x.scheduled_on), x.window_label, x.zone_name, x.city, plural(x.pieces, 'piece'), x.order_number, FROM[x.booked_from], x.booked_by ? `by ${x.booked_by}` : null].filter(Boolean).join(' · '),
+      acts: [confirmBtn(x), btn('Move', () => rescheduleDialog({ ...x, zone_name: x.zone_name }), { small: true })] }));
+    const lockBtn = !mgr ? null : lock
+      ? btn('Open the day again', async (e) => {
+          const why = await askReason({ title: `Open ${dayLabel(st.day)} again`, sub: 'Sales and customers can book and move stops on it again', label: 'Why', confirm: 'Open it' });
+          if (why == null) return;
+          await act(e.currentTarget, () => post('/fleet/days/unlock', { day: st.day, reason: why }), 'Day opened');
+        }, { small: true })
+      : btn('Confirm all and lock day', (e) => act(e.currentTarget, () => post('/fleet/days/lock', { day: st.day }),
+          (r) => `${dayLabel(st.day)} locked${r.confirmed ? `; ${plural(r.confirmed, 'stop')} confirmed` : ''}`), { small: true, primary: true });
     const q = queue.map((o) => item({
       title: `${o.number} · ${o.customer}`, amount: money(o.balance_minor),
       badge: !o.zone_name ? chip('critical', 'warn', 'No zone') : !o.has_geo && o.geo_error ? noPointChip() : chip('neutral', 'info', o.zone_name),
@@ -153,10 +170,11 @@
       acts: [btn('Book', () => bookDialog(o), { small: true, primary: true }), btn('Send link', (e) => sendLink(e.currentTarget, o), { small: true }),
         ...(!o.has_geo && o.geo_error ? mapFixActs(o.address_id, `${o.customer} · ${o.line1}, ${o.city}`) : [])] }));
     const s = stops.map((x) => item({
-      title: `${x.number} · ${x.customer || ''}`, badge: x.address_id && !x.has_geo && x.status === 'scheduled' ? noPointChip() : stopChip(x.status),
+      title: `${x.number} · ${x.customer || ''}`, badge: x.address_id && !x.has_geo && x.status === 'scheduled' ? noPointChip()
+        : x.status === 'scheduled' && !x.confirmed ? chip('warning', 'clock', 'To confirm') : stopChip(x.status),
       why: x.address_id && !x.has_geo ? `Not on the map${x.geo_error ? ': ' + x.geo_error : ''}. It cannot be routed until it is.` : null,
       detail: [KIND[x.kind], x.window_label, x.zone_name, x.city, x.route_number ? `${x.route_number} #${x.seq}` : 'not routed', x.over_capacity_ok ? 'over capacity (override)' : null].filter(Boolean).join(' · '),
-      acts: x.status === 'scheduled' && x.kind !== 'will_call' ? [btn('Move', () => rescheduleDialog(x), { small: true }), btn('Cancel…', () => cancelStop(x), { small: true }),
+      acts: x.status === 'scheduled' && x.kind !== 'will_call' && (mgr || (!x.confirmed && !lock)) ? [mgr && !x.confirmed ? confirmBtn(x) : null, btn('Move', () => rescheduleDialog(x), { small: true }), btn('Cancel…', () => cancelStop(x), { small: true }),
         ...(x.address_id && !x.has_geo ? mapFixActs(x.address_id, `${x.customer || ''} · ${x.line1 || ''}, ${x.city || ''}`) : [])] : null }));
     return frag(
       section('Ready to schedule', queue.length ? plural(queue.length, 'order') : null,
@@ -164,7 +182,11 @@
         queue.length ? panel(capped(q, 12, 'orders')) : empty('Nothing waiting', 'Delivery orders appear here once the warehouse reserves their goods.', true)),
       el('div', { class: 'toolbar' }, dayPicker(), el('span', { class: 'grow' }),
         btn('Send day-before texts', (e) => act(e.currentTarget, () => post('/fleet/messages/day-before', { day: st.day }), (r) => `${plural(r.sent, 'reminder')} sent`), { small: true })),
-      section(`Booked for ${dayLabel(st.day)}`, stops.length ? plural(stops.length, 'stop') : null, null, stops.length ? panel(s) : empty('Nothing booked that day', null, true)));
+      mgr && waitItems.length ? section('Waiting to confirm', plural(waitItems.length, 'stop'), null, panel(capped(waitItems, 12, 'stops'))) : null,
+      section(`Booked for ${dayLabel(st.day)}`, [stops.length ? plural(stops.length, 'stop') : null, lock ? `locked${lock.by ? ' by ' + lock.by : ''}` : null].filter(Boolean).join(' · ') || null,
+        lockBtn ? [lockBtn] : null,
+        lock ? el('div', {}, el('p', { class: 'muted', text: 'This day is locked: sales and the customer link cannot book, move or cancel on it.' }), stops.length ? panel(s) : empty('Nothing booked that day', null, true))
+          : stops.length ? panel(s) : empty('Nothing booked that day', null, true)));
   }
 
   async function sendLink(b, o) {

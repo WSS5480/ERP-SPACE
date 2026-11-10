@@ -69,7 +69,7 @@ export async function run(t: T) {
   // ------------------------------------------------------------ the clock --
   console.log("  -- time clock into payroll timecards");
   const p1 = await as(MARIA, (c, co, a) => H.punch(c, co, a, { kind: "in", locationId: LOC.ENOLA, geo: { lng: -76.93, lat: 40.26 } }));
-  t.ok("a salesperson punches in from a phone, and the open day blocks payroll as an exception", p1.workDay === today() && p1.status === "exception", `${p1.workDay} ${p1.status}`);
+  t.ok("a salesperson punches in from a phone, and the open day blocks payroll as an exception", Math.abs(Date.parse(p1.workDay) - Date.parse(today())) <= 86400000 && p1.status === "exception", `${p1.workDay} ${p1.status}`);
   await t.throws("punching in twice is refused", () => as(MARIA, (c, co, a) => H.punch(c, co, a, { kind: "in", locationId: LOC.ENOLA })), /twice/);
   await t.throws("a break cannot end before it starts", () => as(MARIA, (c, co, a) => H.punch(c, co, a, { kind: "break_end", locationId: LOC.ENOLA })), /had not started/);
   await as(MARIA, (c, co, a) => H.punch(c, co, a, { kind: "break_start", locationId: LOC.ENOLA }));

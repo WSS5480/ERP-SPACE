@@ -235,7 +235,8 @@ export async function run(t0: T) {
   t.ok("seven deliveries booked for the day", Object.keys(booked).length === 7);
   await t.throws("booking an order that is already on a stop is refused, naming the stop",
     () => post(P.RAY, "/fleet/stops", { orderId: SO(1), day: D, windowId: am.windowId }), /already booked on D-/);
-  const conf = await one<{ n: number }>(`select count(*)::int n from customer_message where entity_id = $1 and kind = 'confirmation'`, [ENTITY]);
+  const conf = await one<{ n: number }>(`select count(*)::int n from customer_message where entity_id = $1 and kind = 'confirmation'
+    and stop_id in (select id from delivery_stop where entity_id = $1 and booked_from = 'dispatch')`, [ENTITY]);
   t.ok("each booking logged a confirmation message", conf.n === 7);
   // a service call and a returns pickup ride the same trucks
   const chenAddr = (await one<{ id: string }>(`select id from customer_address where entity_id = $1 and customer_id = '88888888-0000-0000-0000-000000000003'`, [ENTITY])).id;

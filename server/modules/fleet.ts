@@ -178,7 +178,7 @@ export const module: ErpModule = {
       return plain(() => F.deliveryQueue(c, co.id));
     });
     coGet("/fleet/availability", async (c, co, url, _m, p) => {
-      canRead(await viewer(c, co, p), [...STAFF, "sales"], "delivery availability");
+      canRead(await viewer(c, co, p), [...STAFF, "sales", "cashier"], "delivery availability");
       return plain(async () => {
         const order = uuid(url.searchParams.get("order"));
         const from = dayParam(url) ?? await today(c, co);
@@ -187,6 +187,12 @@ export const module: ErpModule = {
           const ob = await F.orderBooking(c, co.id, order);
           need(ob.zone, `postal code ${ob.order.postal ?? "(none)"} is outside every delivery zone`);
           return { order: ob.order, zone: ob.zone, size: ob.size, lines: ob.lines, slots: await F.availability(c, co.id, ob.zone.id, from, days, ob.size) };
+        }
+        const address = uuid(url.searchParams.get("address"));
+        if (address) {
+          const items = (url.searchParams.get("items") ?? "").split(",").slice(0, 100).map((x) => x.split(":"))
+            .map(([id, qty]) => ({ productId: id, qty: Number(qty) || 1 }));
+          return F.availabilityForCart(c, co.id, address, items, days);
         }
         const zone = uuid(url.searchParams.get("zone"));
         need(zone, "pick a zone or an order");
@@ -227,6 +233,7 @@ export const module: ErpModule = {
         dcLocationId: uuid(b.dcLocationId) ?? undefined, override,
         pickupLines: Array.isArray(b.pickupLines) ? b.pickupLines as { description: string }[] : undefined,
         allowToday: !!(held.has("owner") || DISPATCH.some((r) => held.has(r))),
+        manager: !!(held.has("owner") || DISPATCH.some((r) => held.has(r))),
       }));
     });
     coPost(`/fleet/stops/${ID}/reschedule`, async (c, co, a, b, m) => {
@@ -234,11 +241,32 @@ export const module: ErpModule = {
       const override = str(b.override);
       const disp = held.has("owner") || DISPATCH.some((r) => held.has(r));
       need(!override || disp, "booking past a window's capacity is for a dispatcher or a manager");
-      return plain(() => F.reschedule(c, scopeOf(co, a), m[2], str(b.day, 10), str(b.windowId, 40), disp, override));
+      return plain(() => F.reschedule(c, scopeOf(co, a), m[2], str(b.day, 10), str(b.windowId, 40), disp, override, disp));
     });
     coPost(`/fleet/stops/${ID}/cancel`, async (c, co, a, b, m) => {
-      await requireRole(c, co, a, BOOK, "cancelling a stop");
-      return plain(() => F.cancelStop(c, scopeOf(co, a), m[2], str(b.reason)));
+      const held = await requireRole(c, co, a, BOOK, "cancelling a stop");
+      return plain(() => F.cancelStop(c, scopeOf(co, a), m[2], str(b.reason), held.has("owner") || DISPATCH.some((r) => held.has(r))));
+    });
+    // the delivery manager confirms what sales and customers booked, and locks days
+    coPost(`/fleet/stops/${ID}/confirm`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, DISPATCH, "confirming a delivery");
+      return plain(() => F.confirmStop(c, scopeOf(co, a), m[2]));
+    });
+    coPost("/fleet/days/lock", async (c, co, a, b) => {
+      await requireRole(c, co, a, DISPATCH, "locking a delivery day");
+      return plain(() => F.lockDay(c, scopeOf(co, a), str(b.day, 10)));
+    });
+    coPost("/fleet/days/unlock", async (c, co, a, b) => {
+      await requireRole(c, co, a, DISPATCH, "opening a locked delivery day");
+      return plain(() => F.unlockDay(c, scopeOf(co, a), str(b.day, 10), str(b.reason, 300)));
+    });
+    coGet("/fleet/days/lock", async (c, co, url, _m, p) => {
+      canRead(await viewer(c, co, p), [...STAFF, "sales", "cashier"], "a delivery day");
+      return plain(async () => ({ lock: await F.dayLock(c, co.id, dayParam(url) ?? await today(c, co)) }));
+    });
+    coGet("/fleet/to-confirm", async (c, co, _url, _m, p) => {
+      canRead(await viewer(c, co, p), STAFF, "deliveries waiting to confirm");
+      return plain(() => F.toConfirm(c, co.id));
     });
     // where an address is on the map: look it up again, or place it by hand
     coPost(`/fleet/addresses/${ID}/locate`, async (c, co, a, _b, m) => {
