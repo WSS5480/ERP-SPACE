@@ -33,20 +33,37 @@ select distinct entity_id, 'group', true, 'migration 0035' from entity_module
 on conflict do nothing;
 
 -- ------------------------------------------------------- the accounts --
--- Every client that has a chart gets the four inter-company accounts, used by each of its companies.
-insert into gl_account (tenant_id, code, name, account_type, normal_balance)
-select t.id, a.code, a.name, a.type, a.nb
-  from tenant t
-  cross join (values ('1195', 'Due from related companies', 'asset', 'D'),
-                     ('2190', 'Due to related companies', 'liability', 'C'),
-                     ('4090', 'Inter-company sales', 'revenue', 'C'),
-                     ('5090', 'Inter-company cost of sales', 'expense', 'D')) a(code, name, type, nb)
- where exists (select 1 from gl_account g where g.tenant_id = t.id)
-on conflict (tenant_id, code) do nothing;
-insert into entity_gl_account (entity_id, gl_account_id)
-select e.id, g.id from entity e join gl_account g on g.tenant_id = e.tenant_id
- where g.code in ('1195','2190','4090','5090')
-on conflict do nothing;
+-- Every client that has a chart gets the four inter-company accounts and 6800
+-- (where differences both companies agree to write off go), used by each of its
+-- companies. Decision (Nov 10 2026, review): a code already in a chart with a
+-- different account type is never silently reused. The migration leaves it as
+-- it is and raises a NOTICE naming the client, the code and what it is; the
+-- group module then refuses to post for that client, in a sentence saying which
+-- code to move, until someone renumbers that account in Books -> Chart of
+-- accounts and the group's account is added.
+do $$
+declare t record; a record; cur text;
+begin
+  for t in select id, name from tenant where exists (select 1 from gl_account g where g.tenant_id = tenant.id) loop
+    for a in select * from (values ('1195', 'Due from related companies', 'asset', 'D'),
+                                   ('2190', 'Due to related companies', 'liability', 'C'),
+                                   ('4090', 'Inter-company sales', 'revenue', 'C'),
+                                   ('5090', 'Inter-company cost of sales', 'expense', 'D'),
+                                   ('6800', 'Other operating', 'expense', 'D')) v(code, name, type, nb) loop
+      select account_type into cur from gl_account where tenant_id = t.id and code = a.code;
+      if cur is null then
+        insert into gl_account (tenant_id, code, name, account_type, normal_balance) values (t.id, a.code, a.name, a.type, a.nb);
+      elsif cur <> a.type then
+        raise notice 'client % (%): account % is already a % account, not % as group accounting needs (%). It was left as it is; group accounting refuses to post for this client until it is renumbered.',
+          t.name, t.id, a.code, cur, a.type, a.name;
+        continue;
+      end if;
+      insert into entity_gl_account (entity_id, gl_account_id)
+      select e.id, g.id from entity e join gl_account g on g.tenant_id = e.tenant_id and g.code = a.code where e.tenant_id = t.id
+      on conflict do nothing;
+    end loop;
+  end loop;
+end $$;
 
 -- ------------------------------------------------------ sibling links --
 alter table customer add column related_entity_id uuid references entity(id);
@@ -62,6 +79,8 @@ create table group_setting (
   transfer_basis  text not null default 'cost' check (transfer_basis in ('cost','cost_plus')),
   markup_bps      integer not null default 0 check (markup_bps between 0 and 10000),
   updated_by      uuid references app_user(id),
+  -- above this a write-off of an inter-company difference to 6800 needs the owner; 0 = always the owner
+  writeoff_cap_minor bigint not null default 0 check (writeoff_cap_minor >= 0),
   updated_at      timestamptz not null default now(),
   check (transfer_basis = 'cost_plus' or markup_bps = 0)
 );
@@ -88,12 +107,15 @@ create table ic_document (
   from_entry_id       uuid references journal_entry(id),
   to_entry_id         uuid references journal_entry(id),
   status              text not null default 'open' check (status in ('open','settled')),
+  paid_minor          bigint not null default 0,                -- settled so far (part-paid while open)
   settlement_id       uuid,
   doc_date            date not null default current_date,
   created_by          uuid references app_user(id),
   created_at          timestamptz not null default now(),
   unique (from_entity_id, number),              -- numbered in the selling company
-  check (from_entity_id <> to_entity_id)
+  check (from_entity_id <> to_entity_id),
+  check (paid_minor between 0 and amount_minor),
+  check (status = 'open' or paid_minor = amount_minor)
 );
 create index ic_document_from on ic_document (from_entity_id, status);
 create index ic_document_to on ic_document (to_entity_id, status);
@@ -169,4 +191,29 @@ create table ic_ledger (
 );
 create index ic_ledger_pair on ic_ledger (entity_id, counterparty_entity_id, occurred_on);
 create trigger ic_ledger_frozen before update or delete on ic_ledger
+  for each row execute function no_change_rows();
+
+-- ------------------------------------------------- markup still in stock --
+-- The markup on goods bought from a sibling (transfer price less the seller's
+-- cost), per holder, product and the company the markup came from. It comes in
+-- when goods land ('in', and 'carry_in' for markup they already carried from an
+-- earlier sibling) and goes out, at the share of the holder's stock that
+-- leaves, when the goods are sold, written off or counted short ('out'), or
+-- move on to another sibling ('carry_out'). The sum is the markup still on hand:
+-- what the group view takes out of inventory and earnings.
+create table ic_markup_move (
+  id             bigserial primary key,
+  entity_id      uuid not null references entity(id),
+  from_entity_id uuid not null references entity(id),
+  product_id     uuid not null references product(id),
+  qty            numeric(14,6) not null,
+  markup_minor   bigint not null,
+  kind           text not null check (kind in ('in','out','carry_in','carry_out')),
+  document_id    uuid references ic_document(id),
+  transfer_id    uuid references inv_transfer(id),
+  occurred_on    date not null default current_date,
+  created_at     timestamptz not null default now()
+);
+create index ic_markup_move_holder on ic_markup_move (entity_id, product_id);
+create trigger ic_markup_move_frozen before update or delete on ic_markup_move
   for each row execute function no_change_rows();

@@ -256,14 +256,20 @@ export const module: ErpModule = {
     }));
 
     // ---- transfers
+    // To another of the client's companies the engine asks for the owner or a controller in both
+    // (it makes a sale and a bill); within the company it is warehouse work, as before.
+    const acrossTo = async (c: Client, co: Company, locationId: string | null) => !!locationId && !!(await q(c,
+      `select 1 from location l join entity e on e.id = l.entity_id where l.id = $1 and e.tenant_id = $2 and l.entity_id <> $3 /* unscoped: a sister company's location */`,
+      [locationId, co.tenantId, co.id])).length;
     coPost("/inventory/transfers", safe(async (c, co, a, b) => {
-      await requireRole(c, co, a, WAREHOUSE, "starting a transfer");
+      if (!(await acrossTo(c, co, uuid(b.toId)))) await requireRole(c, co, a, WAREHOUSE, "starting a transfer");
       const lines = (Array.isArray(b.lines) ? b.lines : []).map((l: Record<string, unknown>) => ({ productId: uuid(l.productId) ?? "", qty: num(l.qty), labels: labels(l.labels),
         salesOrderLineId: uuid(l.salesOrderLineId) }));
       return inv.createTransfer(c, sc(co, a), { fromId: uuid(b.fromId) ?? "", toId: uuid(b.toId) ?? "", lines, note: str(b.note) || undefined });
     }));
     coPost(`/inventory/transfers/${ID}/ship`, safe(async (c, co, a, _b, m) => {
-      await requireRole(c, co, a, WAREHOUSE, "shipping a transfer");
+      const t = await q<{ to_entity_id: string | null }>(c, `select to_entity_id from inv_transfer where id = $1 and entity_id = $2`, [m[2], co.id]);
+      if (!t[0]?.to_entity_id) await requireRole(c, co, a, WAREHOUSE, "shipping a transfer");
       return inv.shipTransfer(c, sc(co, a), m[2]);
     }));
     coPost(`/inventory/transfers/${ID}/receive`, safe(async (c, co, a, b, m) => {

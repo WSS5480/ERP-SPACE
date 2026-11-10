@@ -120,7 +120,7 @@ export const DATASETS: Dataset[] = [
     // Across companies: every company of the client that $1 belongs to. Only a controller in
     // every one of them (or the owner) may use it -- reports.ts grants the role for that.
     id: "group_gl", label: "Group ledger lines (all companies)", folder: "Finance", modules: [], roles: [GROUP],
-    description: "Every posted journal line in each of the client's companies, with the company, so a report can compare or total them. Inter-company accounts are flagged.",
+    description: "Every posted journal line in each of the client's open companies, with the company, so a report can compare or total them. Inter-company accounts are flagged.",
     dateField: "posted_on", detail: ["company", "posted_on", "account", "description", "debit", "credit"],
     fields: [
       F("company", "Company", "text"), F("posted_on", "Posting date", "date"), F("period", "Period", "text", { hint: "YYYY-MM" }),
@@ -140,7 +140,7 @@ export const DATASETS: Dataset[] = [
                       when ga.account_type = 'expense' then jl.debit_minor - jl.credit_minor else 0 end as amount
             from journal_line jl
             join journal_entry je on je.id = jl.journal_entry_id
-            join entity e on e.id = je.entity_id and e.tenant_id = (select me.tenant_id from entity me where me.id = $1)
+            join entity e on e.id = je.entity_id and e.status <> 'closed' and e.tenant_id = (select me.tenant_id from entity me where me.id = $1)
             join gl_account ga on ga.id = jl.gl_account_id and ga.tenant_id = e.tenant_id
             left join profit_object po on po.id = jl.profit_object_id and po.entity_id = je.entity_id
            /* unscoped: every company of the client that company $1 belongs to */`,

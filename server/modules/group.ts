@@ -41,13 +41,16 @@ export const module: ErpModule = {
 
     // ---- overview: the companies, the settings, links, the net check and recent documents
     coGet("/group", (c: Client, co, _u, _m, personId) => refuse(async () => {
+      // Only what this person may see: the companies they are owner or controller of.
       const mine = await g.viewable(c, co.tenantId, personId);
       const all = await g.companies(c, co.tenantId);
       const ids = mine.map((x) => x.id);
       const net = ids.length ? await g.netCheck(c, co.tenantId, ids) : null;
+      const links = await g.links(c, co.tenantId);
       return plain({
-        companies: all, viewable: mine, canSeeAll: mine.length === all.length, settings: await g.settings(c, co.tenantId),
-        links: await g.links(c, co.tenantId),
+        total: all.length, companies: mine, viewable: mine, canSeeAll: mine.length === all.length,
+        settings: ids.length ? await g.settings(c, co.tenantId) : null,
+        links: { ...links, companies: mine, pairs: links.pairs.filter((p) => ids.includes(p.companyId) && ids.includes(p.siblingId)) },
         net, documents: ids.length ? await g.documents(c, co.tenantId, ids, 40) : [], settlements: ids.length ? await g.settlements(c, co.tenantId, ids, 10) : [],
       });
     }));
@@ -81,14 +84,21 @@ export const module: ErpModule = {
     }));
 
     // ---- where stock can go across companies (the inventory transfer form uses this)
-    coGet("/group/locations", (c, co) => refuse(async () => ({ locations: await g.siblingLocations(c, { tenantId: co.tenantId, entityId: co.id,
-      actor: { kind: "user", label: "read" } }) })));
+    // Only to someone who may move stock there: the owner, or a controller in this company and that one.
+    coGet("/group/locations", (c, co, _u, _m, personId) => refuse(async () => {
+      const mine = (await g.viewable(c, co.tenantId, personId)).map((x) => x.id);
+      if (!mine.includes(co.id)) return { locations: [] };
+      const all = await g.siblingLocations(c, { tenantId: co.tenantId, entityId: co.id, actor: { kind: "user", label: "read" } });
+      return { locations: all.filter((l) => mine.includes(String(l.entity_id))) };
+    }));
 
     coPost("/group/settings", async (c, co, a, b) => {
       const all = await g.companies(c, co.tenantId);
       await refuse(() => g.requireGroupRole(c, co.tenantId, a.personId, all.map((x) => x.id), "setting the transfer price"));
       const pct = Number(b.markupPct ?? 0);
-      return refuse(() => g.saveSettings(c, sc(co, a), { basis: str(b.basis, 20), markupBps: Number.isFinite(pct) ? Math.round(pct * 100) : NaN }));
+      const cap = b.writeoffCap === undefined || b.writeoffCap === null || b.writeoffCap === "" ? null : minor(b.writeoffCap);
+      return plain(await refuse(() => g.saveSettings(c, sc(co, a), { basis: str(b.basis, 20), markupBps: Number.isFinite(pct) ? Math.round(pct * 100) : NaN,
+        writeoffCapMinor: cap })));
     });
 
     coPost("/group/links", async (c, co, a) => {

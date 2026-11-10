@@ -63,7 +63,7 @@
     if (sub && ['view', 'ic', 'settings'].includes(sub)) F.tab = sub;
     if (!S.person) return frag(head('Group', null, 'Back office'), el('div', { class: 'panel' }, empty('Pick who you are first.', 'The group view is for the owner and the companies’ controllers.', true)));
     const d = await coApi('/group');
-    if (d.companies.length < 2) {
+    if (d.total < 2) {
       return frag(head('Group', null, 'Back office'), el('div', { class: 'panel' }, empty('This client has one company.',
         'Group accounting starts when a second company is set up under the same client: consolidated statements, inter-company billing and settling.', true)));
     }
@@ -77,7 +77,7 @@
     const body = F.tab === 'ic' ? icTab(d) : F.tab === 'settings' ? settingsTab(d) : await viewTab(d);
     const billBtn = el('button', { class: 'btn primary', type: 'button', onclick: () => openBill(d) }, 'Bill a sibling company');
     return frag(head('Group', [billBtn], 'Back office'),
-      el('p', { class: 'lead', text: `${plural(d.companies.length, 'company', 'companies')} under ${S.co.tenant_name || 'this client'}. Inter-company balances are eliminated from the combined total; each company keeps its own books.` }),
+      el('p', { class: 'lead', text: `${plural(d.total, 'company', 'companies')} under ${S.co.tenant_name || 'this client'}. Inter-company balances are eliminated from the combined total; each company keeps its own books.` }),
       tabs, body);
   }
 
@@ -122,7 +122,7 @@
       tile({ label: 'Due from / to eliminated', value: money(el0.dueFromMinor), suffix: B(el0.dueFromMinor) === B(el0.dueToMinor) ? ' each' : ` / ${money(el0.dueToMinor)}` }));
     const warn = bc.balanced ? null : resultBox('serious', 'warn', 'The combined balance sheet is off',
       `Between these companies, due from and due to differ by ${money(bc.combinedMinor)}. Open Inter-company to see which pair, then settle it.`);
-    const margin = B(el0.marginInStockMinor) !== 0n ? el('p', { class: 'foot', text: `Margin on goods sold between them (${money(el0.marginInStockMinor)}) is taken out of inventory and earnings, as still in stock. At cost (the default transfer price) there is none.` }) : null;
+    const margin = B(el0.marginInStockMinor) !== 0n ? el('p', { class: 'foot', text: `Markup on goods bought from a sibling and still in stock (${money(el0.marginInStockMinor)}) is taken out of inventory and earnings; markup on goods since sold outside the group or written off (${money(el0.markupRealizedMinor)} in this period) is taken out of cost of goods. At cost (the default transfer price) there is none.` }) : null;
     const pnl = v.groups.filter((g) => g.statement === 'pnl');
     const bs = v.groups.filter((g) => g.statement === 'bs');
     const niRow = { label: 'Net income', ...ni };
@@ -210,7 +210,8 @@
   }
 
   function docItem(x) {
-    const st = x.status === 'settled' ? chip('good', 'ok', 'Settled') : chip('warning', 'clock', 'Open');
+    const st = x.status === 'settled' ? chip('good', 'ok', 'Settled')
+      : B(x.paid_minor) > 0n ? chip('warning', 'clock', `Part-paid, ${money(B(x.amount_minor) - B(x.paid_minor))} left`) : chip('warning', 'clock', 'Open');
     return item({ title: `${x.number} · ${x.from_name} → ${x.to_name}`, amount: money(x.amount_minor), badge: st,
       detail: [x.description, x.kind === 'goods' ? `cost ${money(x.cost_minor)}${x.basis === 'cost_plus' ? ` + ${(x.markup_bps / 100).toFixed(2).replace(/\.00$/, '')}%` : ''}` : 'charge',
         x.invoice_number ? `invoice ${x.invoice_number}` : null, x.bill_reference ? `bill ${x.bill_reference}` : null,
@@ -222,14 +223,14 @@
     const payer = payerIsA ? p.a : p.b, payee = payerIsA ? p.b : p.a;
     const owes = B(payer.netMinor) < 0n ? -B(payer.netMinor) : 0n;
     const dlg = openDialog(`Settle ${p.a.name} and ${p.b.name}`, `${payer.name} pays ${payee.name}`);
-    const amt = input({ inputmode: 'decimal', value: (Number(owes) / 100).toFixed(2), 'aria-label': 'Amount paid' });
+    const amt = input({ inputmode: 'decimal', value: (Number(owes) / 100).toFixed(2), 'aria-label': 'Amount paid', disabled: p.balanced ? null : true });
     const why = el('textarea', { rows: '2', maxlength: '300', placeholder: p.balanced ? 'Optional' : 'Why the two books differ' });
     const err = el('div');
-    const go2 = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go2, () => post('/group/settle', { a: p.a.id, with: p.b.id, amount: amt.value, reason: why.value }),
-      (r) => `${r.number}: ${r.payer} paid ${r.payee} ${money(r.amountMinor)}; ${plural(r.documents, 'document')} settled.`, { errorInto: errInto(err), close: dlg.close }) }, 'Record the payment');
+    const go2 = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go2, () => post('/group/settle', { a: p.a.id, with: p.b.id, amount: p.balanced ? amt.value : null, reason: why.value }),
+      (r) => `${r.number}: ${r.payer} paid ${r.payee} ${money(r.amountMinor)}; ${plural(r.documents, 'document')} settled${B(r.leftOpenMinor) > 0n ? `, ${money(r.leftOpenMinor)} still open` : ''}.`, { errorInto: errInto(err), close: dlg.close }) }, 'Record the payment');
     dlg.body.append(
-      p.balanced ? resultBox('good', 'ok', 'The two books agree', `${payer.name} owes ${payee.name} ${money(owes)}. The payment clears both sides and marks their open invoices and bills paid.`)
-        : resultBox('serious', 'warn', `The books differ by ${money(p.differenceMinor)}`, `${payer.name}’s books say it owes ${money(owes)}; ${payee.name}’s say it is owed ${money(payee.netMinor)}. Whatever the payment does not cover is written off to 6800 in the book it sits in, so give a reason.`),
+      p.balanced ? resultBox('good', 'ok', 'The two books agree', `${payer.name} owes ${payee.name} ${money(owes)}. Paying all of it clears both sides and marks their open invoices and bills paid; paying less leaves the rest open, and the oldest documents are paid first.`)
+        : resultBox('serious', 'warn', `The books differ by ${money(p.differenceMinor)}`, `${payer.name}’s books say it owes ${money(owes)}, so that is the payment; ${payee.name}’s say it is owed ${money(payee.netMinor)}. The difference is written off to 6800 in the book it sits in: give a reason. Over the group’s write-off limit only the owner can.`),
       el('div', { class: 'form-grid' }, field('Amount paid', amt, `From ${payer.name}’s operating account to ${payee.name}’s`), field('Reason', why, null, true)),
       el('div', { class: 'dlg-acts' }, go2, el('button', { class: 'btn', type: 'button', onclick: dlg.close }, 'Cancel')), err);
   }
@@ -277,18 +278,20 @@
 
   // ============================================================ settings
   function settingsTab(d) {
-    const st = d.settings;
+    const st = d.settings || { basis: 'cost', markupBps: 0, writeoffCapMinor: '0' };
+    const cap = input({ inputmode: 'decimal', value: (Number(st.writeoffCapMinor || 0) / 100).toFixed(2), 'aria-label': 'Write-off limit' });
     const basis = select([['cost', 'Cost (average cost when it leaves)'], ['cost_plus', 'Cost plus a markup']], st.basis);
     const pct = input({ inputmode: 'decimal', value: st.basis === 'cost_plus' ? String(st.markupBps / 100) : '', placeholder: '10', disabled: st.basis === 'cost' ? true : null });
     basis.onchange = () => { pct.disabled = basis.value === 'cost'; };
     const err = el('div');
-    const save = el('button', { class: 'btn primary', type: 'button', onclick: () => act(save, () => post('/group/settings', { basis: basis.value, markupPct: pct.value || 0 }),
-      'Transfer price saved', { errorInto: errInto(err) }) }, 'Save');
+    const save = el('button', { class: 'btn primary', type: 'button', onclick: () => act(save, () => post('/group/settings', { basis: basis.value, markupPct: pct.value || 0, writeoffCap: cap.value }),
+      'Group settings saved', { errorInto: errInto(err) }) }, 'Save');
     const link = el('button', { class: 'btn', type: 'button', onclick: () => act(link, () => post('/group/links'),
       (r) => (r.customers || r.vendorLinks ? `${plural(r.customers, 'customer')} and ${plural(r.vendorLinks, 'vendor link')} added` : 'Every company is already linked')) }, 'Link them now');
     return frag(
-      section('Transfer price', 'for stock moving between companies', null, el('div', { class: 'panel' },
-        el('div', { class: 'form-grid' }, field('Priced at', basis), field('Markup %', pct, 'Applies to new transfers')),
+      section('Transfer price and write-offs', 'for stock moving between companies', null, el('div', { class: 'panel' },
+        el('div', { class: 'form-grid' }, field('Priced at', basis), field('Markup %', pct, 'Applies to new transfers'),
+          field('Write-off limit', cap, 'A controller may write off an inter-company difference up to this to 6800; above it, only the owner. Only the owner changes it.')),
         el('div', { class: 'dlg-acts' }, save), err)),
       section('Sibling links', d.links.complete ? 'every company is linked' : 'made on first use, or now', [link],
         el('div', { class: 'panel' }, d.links.pairs.map((p) => item({ title: `${p.company} → ${p.sibling}`,

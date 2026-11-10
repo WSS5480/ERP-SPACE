@@ -23,8 +23,10 @@
 // Every movement here in 1195 and 2190 is also one ic_ledger row naming the
 // company on the other side, so a pair's balances are sums of that table.
 // Eliminations: 1195 and 2190 between included companies, 4090 and 5090 from
-// the pairs' documents, and the margin on goods sold between them (transfer
-// price less cost) out of inventory and earnings -- read as still in stock.
+// the pairs' documents, and the markup on goods sold between them: the part
+// still in a buyer's stock comes out of inventory and earnings; the part that
+// has left the group (sold outside, written off) comes out of the buyers' cost
+// of goods (ic_markup_move, released by inventory as the stock leaves).
 
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor, type PostLine } from "./posting.ts";
@@ -99,24 +101,58 @@ export async function viewable(c: Client, tenantId: string, personId: string | n
 
 // ------------------------------------------------------------ settings --
 
-export type Settings = { basis: "cost" | "cost_plus"; markupBps: number };
+export type Settings = { basis: "cost" | "cost_plus"; markupBps: number; writeoffCapMinor: bigint };
 
 export async function settings(c: Client, tenantId: string): Promise<Settings> {
-  const r = await q<{ transfer_basis: "cost" | "cost_plus"; markup_bps: number }>(c,
-    `select transfer_basis, markup_bps from group_setting where tenant_id = $1 ${T}`, [tenantId]);
-  return r.length ? { basis: r[0].transfer_basis, markupBps: Number(r[0].markup_bps) } : { basis: "cost", markupBps: 0 };
+  const r = await q<{ transfer_basis: "cost" | "cost_plus"; markup_bps: number; writeoff_cap_minor: string }>(c,
+    `select transfer_basis, markup_bps, writeoff_cap_minor::text from group_setting where tenant_id = $1 ${T}`, [tenantId]);
+  return r.length ? { basis: r[0].transfer_basis, markupBps: Number(r[0].markup_bps), writeoffCapMinor: B(r[0].writeoff_cap_minor) }
+    : { basis: "cost", markupBps: 0, writeoffCapMinor: 0n };
 }
 
-export async function saveSettings(c: Client, s: Scope, x: { basis: string; markupBps: number }) {
+/** The transfer price, and the write-off limit (only the owner changes that). */
+export async function saveSettings(c: Client, s: Scope, x: { basis: string; markupBps: number; writeoffCapMinor?: bigint | null }) {
   need(x.basis === "cost" || x.basis === "cost_plus", "the transfer price is cost, or cost plus a markup");
   const m = x.basis === "cost" ? 0 : Math.trunc(Number(x.markupBps));
   need(x.basis === "cost" || (Number.isFinite(m) && m > 0 && m <= 10000), "a markup is more than 0% and at most 100%");
   const before = await settings(c, s.tenantId);
-  await c.query(`insert into group_setting (tenant_id, transfer_basis, markup_bps, updated_by) values ($1,$2,$3,$4)
+  const cap = x.writeoffCapMinor ?? before.writeoffCapMinor;
+  need(cap >= 0n, "the write-off limit cannot be negative");
+  if (cap !== before.writeoffCapMinor) need((await standing(c, s.tenantId, s.actor.id || null)).owner, "only the owner sets the write-off limit");
+  await c.query(`insert into group_setting (tenant_id, transfer_basis, markup_bps, writeoff_cap_minor, updated_by) values ($1,$2,$3,$4,$5)
                  on conflict (tenant_id) do update set transfer_basis = excluded.transfer_basis, markup_bps = excluded.markup_bps,
-                   updated_by = excluded.updated_by, updated_at = now()`, [s.tenantId, x.basis, m, s.actor.id || null]);
-  await audit(c, s, { table: "group_setting", rowId: s.tenantId, action: "update", before, after: { basis: x.basis, markupBps: m } });
-  return { basis: x.basis, markupBps: m };
+                   writeoff_cap_minor = excluded.writeoff_cap_minor, updated_by = excluded.updated_by, updated_at = now()`,
+    [s.tenantId, x.basis, m, cap.toString(), s.actor.id || null]);
+  await audit(c, s, { table: "group_setting", rowId: s.tenantId, action: "update", before: { ...before, writeoffCapMinor: before.writeoffCapMinor.toString() },
+    after: { basis: x.basis, markupBps: m, writeoffCapMinor: cap.toString() } });
+  return { basis: x.basis, markupBps: m, writeoffCapMinor: cap };
+}
+
+/** A write-off to 6800 of an inter-company difference: the owner, or within the group's write-off limit. */
+async function requireWriteOff(c: Client, s: Scope, amount: bigint) {
+  const a = amount < 0n ? -amount : amount;
+  if (a === 0n) return;
+  if ((await standing(c, s.tenantId, s.actor.id || null)).owner) return;
+  const cap = (await settings(c, s.tenantId)).writeoffCapMinor;
+  need(a <= cap, cap === 0n ? `writing off ${$(a)} to ${DIFFERENCE} is for the owner (the group has no write-off limit for controllers)`
+    : `writing off ${$(a)} to ${DIFFERENCE} is over the group's write-off limit of ${$(cap)}; only the owner can`);
+}
+
+/**
+ * The accounts group accounting posts to must be in the client's chart with the right type. A code
+ * already used for something else is never reused (migration 0035 leaves it and says so); posting is
+ * refused until that account is renumbered and the group's is added.
+ */
+const NEEDED: [string, string, string][] = [["1195", "asset", "Due from related companies"], ["2190", "liability", "Due to related companies"],
+  ["4090", "revenue", "Inter-company sales"], ["5090", "expense", "Inter-company cost of sales"], ["6800", "expense", "Other operating"]];
+async function checkChart(c: Client, tenantId: string) {
+  const r = await q<{ code: string; account_type: string; name: string }>(c, `select code, account_type, name from gl_account where tenant_id = $1 and code = any($2) ${T}`,
+    [tenantId, NEEDED.map((x) => x[0])]);
+  for (const [code, type, name] of NEEDED) {
+    const a = r.find((x) => x.code === code);
+    need(a, `the chart has no account ${code} (${name}); add it as ${type === "asset" || type === "expense" ? "an" : "a"} ${type} account in Books → Chart of accounts`);
+    need(a.account_type === type, `account ${code} in this chart is ${a.name}, a ${a.account_type} account; group accounting needs ${code} as ${name} (${type}). Renumber ${a.name} in Books → Chart of accounts, then add ${code}`);
+  }
 }
 
 /** What a sibling pays for goods that cost this much. */
@@ -222,6 +258,7 @@ async function ledgerRow(c: Client, s: Scope, r: { entityId: string; counterpart
 async function recordPair(c: Client, s: Scope, x: { kind: "goods" | "service"; fromId: string; toId: string; description: string; lines: DocLine[];
   fromLocationId: string | null; toLocationId: string | null; transferId?: string | null; toTransferId?: string | null; basis: string; markupBps: number }) {
   need(x.fromId !== x.toId, "a company does not bill itself");
+  await checkChart(c, s.tenantId);
   const from = await companyIn(c, s.tenantId, x.fromId), to = await companyIn(c, s.tenantId, x.toId);
   const amount = x.lines.reduce((a, l) => a + l.netMinor, 0n);
   const cost = x.lines.reduce((a, l) => a + l.costMinor, 0n);
@@ -292,8 +329,10 @@ export async function completeAcross(c: Client, s: Scope, transferId: string) {
       select l.product_id, l.qty, l.value_minor, p.sku, p.name, p.kind, p.brand, p.category, p.subcategory, p.collection, p.color, p.description, p.price_minor,
              p.taxable, p.serialized, p.ship_class, p.cubic_ft, p.weight_lb, p.barcode
         from inv_transfer_line l join product p on p.id = l.product_id where l.entity_id = $1 and l.transfer_id = $2 order by p.sku`, [s.entityId, transferId]);
+    await checkChart(c, s.tenantId);
     const landed: { productId: string; qty: number; valueMinor: bigint }[] = [];
     const docLines: DocLine[] = [];
+    const byProduct = new Map<string, string>();     // sender's product → the sibling's
     for (const l of lines) {
       const cost = B(l.value_minor), qty = Number(l.qty);
       const price = transferPrice(cost, st);
@@ -305,15 +344,27 @@ export async function completeAcross(c: Client, s: Scope, transferId: string) {
           cubicFt: l.cubic_ft === null ? null : Number(l.cubic_ft), weightLb: l.weight_lb === null ? null : Number(l.weight_lb), barcode: l.barcode },
           { status: B(l.price_minor) > 0n || ["service", "fee"].includes(l.kind) ? "active" : "draft" });
       }
+      byProduct.set(l.product_id, pid);
       landed.push({ productId: pid, qty, valueMinor: price });
       docLines.push({ sku: l.sku, description: l.name, qty, netMinor: price, costMinor: cost });
     }
     const land = await landAcross(c, ts, { fromEntityId: s.entityId, fromLocationId: t.from_location_id, toLocationId: t.to_location_id,
       senderNumber: t.number, lines: landed });
     const amount = docLines.reduce((a, l) => a + l.netMinor, 0n);
-    if (amount === 0n) return { toCompany: to.name, toTransferNumber: land.number, document: null };
-    const doc = await recordPair(c, s, { kind: "goods", fromId: s.entityId, toId: to.id, description: `Transfer ${t.number}`, lines: docLines,
+    const doc = amount === 0n ? null : await recordPair(c, s, { kind: "goods", fromId: s.entityId, toId: to.id, description: `Transfer ${t.number}`, lines: docLines,
       fromLocationId: t.from_location_id, toLocationId: t.to_location_id, transferId: t.id, toTransferId: land.transferId, basis: st.basis, markupBps: st.markupBps });
+    // The markup now in the sibling's stock: this sale's (price less cost), plus whatever these goods already carried from an earlier sibling.
+    for (const [i, l] of lines.entries()) {
+      const m = docLines[i].netMinor - docLines[i].costMinor;
+      if (m !== 0n) await c.query(`insert into ic_markup_move (entity_id, from_entity_id, product_id, qty, markup_minor, kind, document_id, transfer_id) values ($1,$2,$3,$4,$5,'in',$6,$7)`,
+        [to.id, s.entityId, byProduct.get(l.product_id), Number(l.qty), m.toString(), doc?.documentId ?? null, land.transferId]);
+    }
+    const carried = await q<{ product_id: string; from_entity_id: string; qty: string; m: string }>(c, `
+      select product_id, from_entity_id, sum(qty)::text qty, sum(markup_minor)::text m from ic_markup_move
+       where entity_id = $1 and transfer_id = $2 and kind = 'carry_out' group by 1, 2`, [s.entityId, t.id]);
+    for (const r of carried) await c.query(`insert into ic_markup_move (entity_id, from_entity_id, product_id, qty, markup_minor, kind, document_id, transfer_id)
+        values ($1,$2,$3,$4,$5,'carry_in',$6,$7)`, [to.id, r.from_entity_id, byProduct.get(r.product_id), -Number(r.qty), (-B(r.m)).toString(), doc?.documentId ?? null, land.transferId]);
+    if (!doc) return { toCompany: to.name, toTransferNumber: land.number, document: null };
     return { toCompany: to.name, toTransferNumber: land.number, document: doc.number, documentId: doc.documentId, amountMinor: doc.amountMinor,
       invoiceNumber: doc.invoiceNumber };
   } catch (e) {
@@ -339,6 +390,8 @@ export async function adjust(c: Client, s: Scope, x: { counterpartyId: string; k
   need(reason.length >= 3, "say why this is booked on one side only");
   const code = (x.offsetCode ?? "").trim() || DIFFERENCE;
   need(!IC_CODES.includes(code), `${code} is an inter-company account; book the other side to an ordinary account`);
+  await checkChart(c, s.tenantId);
+  if (code === DIFFERENCE) await requireWriteOff(c, s, x.amountMinor);
   const acct = await q<{ is_postable: boolean; active: boolean }>(c, `select is_postable, active from gl_account where tenant_id = $1 and code = $2 ${T}`, [s.tenantId, code]);
   need(acct.length && acct[0].is_postable && acct[0].active, `there is no postable account ${code} in the chart`);
   const date = today();
@@ -414,13 +467,14 @@ export async function netCheck(c: Client, tenantId: string, only: string[] | nul
 
 // ------------------------------------------------------------- settle --
 
-/** Lines that bring a company's 1195 and 2190 with one sibling to zero, and the ledger rows that go with them. */
-function clearing(bal: Bal, other: string): PostLine[] {
+/** Lines that bring a company's 1195 and 2190 with one sibling to the target balances (natural signs). */
+function clearing(bal: Bal, other: string, target: Bal = { from: 0n, to: 0n }): PostLine[] {
   const out: PostLine[] = [];
-  if (bal.from > 0n) out.push({ code: IC.DUE_FROM, credit: bal.from, memo: `settled with ${other}` });
-  if (bal.from < 0n) out.push({ code: IC.DUE_FROM, debit: -bal.from, memo: `settled with ${other}` });
-  if (bal.to > 0n) out.push({ code: IC.DUE_TO, debit: bal.to, memo: `settled with ${other}` });
-  if (bal.to < 0n) out.push({ code: IC.DUE_TO, credit: -bal.to, memo: `settled with ${other}` });
+  const df = bal.from - target.from, dt = bal.to - target.to;
+  if (df > 0n) out.push({ code: IC.DUE_FROM, credit: df, memo: `settled with ${other}` });
+  if (df < 0n) out.push({ code: IC.DUE_FROM, debit: -df, memo: `settled with ${other}` });
+  if (dt > 0n) out.push({ code: IC.DUE_TO, debit: dt, memo: `settled with ${other}` });
+  if (dt < 0n) out.push({ code: IC.DUE_TO, credit: -dt, memo: `settled with ${other}` });
   return out;
 }
 const sideTotal = (ls: PostLine[]) => ls.reduce((a, l) => a + (l.debit ?? 0n) - (l.credit ?? 0n), 0n);
@@ -433,15 +487,22 @@ async function bankOf(c: Client, entityId: string, name: string) {
 }
 
 /**
- * Settle a pair: the company that owes pays the other what its own books say
- * it owes (or the amount named), both sides' 1195 and 2190 with each other go
- * to zero, and their open documents are paid. When the two books disagree,
- * the difference is written off to 6800 in whichever book it sits, and that
- * needs a reason.
+ * Settle a pair: the company that owes pays the other.
+ *
+ * When the two books agree, the payment is what is owed or less. Less leaves
+ * the rest open: documents the company that owes was itself owed are netted
+ * off, the payment goes to the oldest of the others, and one may be left
+ * part-paid. More than is owed is refused. Nothing is written off.
+ *
+ * When the two books disagree, the payment is what the paying company's own
+ * books say it owes; both sides then go to zero, the difference is written
+ * off to 6800 in the book it sits in, and that needs a reason and the owner
+ * (or a difference within the group's write-off limit).
  */
 export async function settle(c: Client, s: Scope, x: { aId: string; bId: string; amountMinor?: bigint | null; reason?: string | null }) {
   const a = await companyIn(c, s.tenantId, x.aId), b = await companyIn(c, s.tenantId, x.bId);
   need(a.id !== b.id, "settling is between two different companies");
+  await checkChart(c, s.tenantId);
   // One settlement at a time per client.
   await c.query(`select pg_advisory_xact_lock(hashtext($1))`, [`ic:${s.tenantId}`]);
   const bal = await balances(c, s.tenantId);
@@ -451,50 +512,82 @@ export async function settle(c: Client, s: Scope, x: { aId: string; bId: string;
   const aPays = aNet < 0n || (aNet === 0n && bNet > 0n);
   const [payer, payee, payerBal, payeeBal] = aPays ? [a, b, ab, ba] : [b, a, ba, ab];
   const owes = -(payerBal.from - payerBal.to);                 // what the payer's books say it owes
-  const cash = x.amountMinor ?? (owes > 0n ? owes : 0n);
-  need(cash >= 0n, "the amount paid cannot be negative");
+  const owed = payeeBal.from - payeeBal.to;                     // what the payee's books say it is owed
+  const agree = owes === owed;
+  const reason = (x.reason ?? "").trim();
+  let cash: bigint, rest = 0n;
+  if (agree) {
+    cash = x.amountMinor ?? owes;
+    need(cash >= 0n, "the amount paid cannot be negative");
+    need(cash <= owes, `${payer.name} owes ${payee.name} ${$(owes)}; a payment of more than that is refused`);
+    need(cash > 0n || owes === 0n, "the amount paid has to be more than zero");
+    rest = owes - cash;
+  } else {
+    cash = owes > 0n ? owes : 0n;
+    need(x.amountMinor == null || x.amountMinor === cash, `the two books differ, so the payment is what ${payer.name}'s own books say it owes (${$(cash)}); book the missing side first to settle another amount`);
+    need(reason.length >= 3, `the two companies' books differ (${payer.name} says it owes ${$(cash)}, ${payee.name} says it is owed ${$(owed > 0n ? owed : 0n)}); say why before settling, and the difference is written off to ${DIFFERENCE}`);
+  }
   const date = today();
   const id = (await one<{ id: string }>(c, `select gen_random_uuid()::text id /* unscoped: no table */`)).id;
   const number = (await one<{ n: string }>(c, `select next_doc_no($1, 'ic_settlement', 'ICS-') n /* unscoped: numbering keyed by entity argument */`, [payer.id])).n;
 
+  // What is left open: the payer still owes `rest` (in 2190), the payee is still owed it (in 1195).
+  const payerTarget: Bal = { from: 0n, to: rest }, payeeTarget: Bal = { from: rest, to: 0n };
   const payerBank = cash > 0n ? await bankOf(c, payer.id, payer.name) : null;
   const payeeBank = cash > 0n ? await bankOf(c, payee.id, payee.name) : null;
-  const payerLines = [...clearing(payerBal, payee.name), ...(payerBank ? [{ code: payerBank.code, credit: cash, bankAccountId: payerBank.id, memo: `paid to ${payee.name}` }] : [])];
-  const payeeLines = [...clearing(payeeBal, payer.name), ...(payeeBank ? [{ code: payeeBank.code, debit: cash, bankAccountId: payeeBank.id, memo: `paid by ${payer.name}` }] : [])];
+  const payerLines = [...clearing(payerBal, payee.name, payerTarget), ...(payerBank ? [{ code: payerBank.code, credit: cash, bankAccountId: payerBank.id, memo: `paid to ${payee.name}` }] : [])];
+  const payeeLines = [...clearing(payeeBal, payer.name, payeeTarget), ...(payeeBank ? [{ code: payeeBank.code, debit: cash, bankAccountId: payeeBank.id, memo: `paid by ${payer.name}` }] : [])];
   const payerDiff = -sideTotal(payerLines), payeeDiff = -sideTotal(payeeLines);   // > 0: a cost written off; < 0: a gain
-  const reason = (x.reason ?? "").trim();
   if (payerDiff !== 0n || payeeDiff !== 0n) {
-    need(reason.length >= 3, `the two companies' books differ (${payer.name} says it owes ${$(owes > 0n ? owes : 0n)}, ${payee.name} says it is owed ${$(payeeBal.from - payeeBal.to)}); say why before settling, and the difference is written off to ${DIFFERENCE}`);
+    need(!agree, "the settlement does not balance");
+    await requireWriteOff(c, s, (payerDiff < 0n ? -payerDiff : payerDiff) > (payeeDiff < 0n ? -payeeDiff : payeeDiff) ? payerDiff : payeeDiff);
   }
   const plug = (d: bigint): PostLine[] => d > 0n ? [{ code: DIFFERENCE, debit: d, memo: "inter-company difference written off" }]
     : d < 0n ? [{ code: DIFFERENCE, credit: -d, memo: "inter-company difference written off" }] : [];
-  const desc = `${number}: ${payer.name} settles with ${payee.name}${reason ? ` (${reason})` : ""}`;
+  const desc = `${number}: ${payer.name} ${rest > 0n ? "pays part of what it owes" : "settles with"} ${payee.name}${reason ? ` (${reason})` : ""}`;
   const payerLinesAll = [...payerLines, ...plug(payerDiff)], payeeLinesAll = [...payeeLines, ...plug(payeeDiff)];
   const payerEntry = payerLinesAll.length ? await post(c, scopeFor(s, payer.id), { date, sourceType: "intercompany", sourceId: id, description: desc, lines: payerLinesAll }) : null;
   const payeeEntry = payeeLinesAll.length ? await post(c, scopeFor(s, payee.id), { date, sourceType: "intercompany", sourceId: id, description: desc, lines: payeeLinesAll }) : null;
   await c.query(`insert into ic_settlement (id, tenant_id, number, payer_entity_id, payee_entity_id, amount_minor, payer_difference_minor, payee_difference_minor,
                    reason, payer_entry_id, payee_entry_id, settled_on, created_by) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
     [id, s.tenantId, number, payer.id, payee.id, cash.toString(), payerDiff.toString(), payeeDiff.toString(), reason || null, payerEntry, payeeEntry, date, s.actor.id || null]);
-  for (const [who, other, bl, je] of [[payer, payee, payerBal, payerEntry], [payee, payer, payeeBal, payeeEntry]] as const) {
+  for (const [who, other, bl, tg, je] of [[payer, payee, payerBal, payerTarget, payerEntry], [payee, payer, payeeBal, payeeTarget, payeeEntry]] as const) {
     if (!je) continue;
-    await ledgerRow(c, s, { entityId: who.id, counterpartyId: other.id, code: IC.DUE_FROM, amount: -bl.from, date, kind: "settlement", settlementId: id, journalEntryId: je, memo: number });
-    await ledgerRow(c, s, { entityId: who.id, counterpartyId: other.id, code: IC.DUE_TO, amount: bl.to, date, kind: "settlement", settlementId: id, journalEntryId: je, memo: number });
+    await ledgerRow(c, s, { entityId: who.id, counterpartyId: other.id, code: IC.DUE_FROM, amount: -(bl.from - tg.from), date, kind: "settlement", settlementId: id, journalEntryId: je, memo: number });
+    await ledgerRow(c, s, { entityId: who.id, counterpartyId: other.id, code: IC.DUE_TO, amount: bl.to - tg.to, date, kind: "settlement", settlementId: id, journalEntryId: je, memo: number });
   }
-  const docs = await q<{ id: string; from_entity_id: string; to_entity_id: string }>(c, `
-    update ic_document set status = 'settled', settlement_id = $4 where tenant_id = $1 and status = 'open'
-       and ((from_entity_id = $2 and to_entity_id = $3) or (from_entity_id = $3 and to_entity_id = $2))
-    returning id, from_entity_id, to_entity_id /* unscoped: the pair's documents, by tenant */`, [s.tenantId, a.id, b.id, id]);
+
+  // The documents: all of them when nothing is left; else the payer's own are netted off and the payment goes to the oldest of the payee's.
+  const open = await q<{ id: string; from_entity_id: string; to_entity_id: string; amount_minor: string; paid_minor: string }>(c, `
+    select id, from_entity_id, to_entity_id, amount_minor::text, paid_minor::text from ic_document where tenant_id = $1 and status = 'open'
+       and ((from_entity_id = $2 and to_entity_id = $3) or (from_entity_id = $3 and to_entity_id = $2)) order by created_at, number for update ${T}`, [s.tenantId, a.id, b.id]);
+  const settled: typeof open = [];
+  let partial: { id: string; paid: bigint } | null = null;
+  if (rest === 0n) settled.push(...open);
+  else {
+    settled.push(...open.filter((d) => d.from_entity_id === payer.id));
+    let budget = payeeBal.from - payeeTarget.from;          // how much less the payer now owes the payee
+    for (const d of open.filter((x2) => x2.from_entity_id === payee.id)) {
+      const left = B(d.amount_minor) - B(d.paid_minor);
+      if (budget <= 0n) break;
+      if (budget >= left) { settled.push(d); budget -= left; }
+      else { partial = { id: d.id, paid: B(d.paid_minor) + budget }; budget = 0n; }
+    }
+  }
+  if (settled.length) await c.query(`update ic_document set status = 'settled', settlement_id = $2, paid_minor = amount_minor where tenant_id = $1 and id = any($3)`,
+    [s.tenantId, id, settled.map((d) => d.id)]);
+  if (partial) await c.query(`update ic_document set paid_minor = $3 where tenant_id = $1 and id = $2`, [s.tenantId, partial.id, partial.paid.toString()]);
   const how = `settled by ${number}`;
   let invoices = 0, bills = 0;
   for (const e of [a, b]) {
-    invoices += await settleSiblingInvoices(c, scopeFor(s, e.id), docs.filter((d) => d.from_entity_id === e.id).map((d) => d.id));
-    bills += await settleSiblingBills(c, scopeFor(s, e.id), docs.filter((d) => d.to_entity_id === e.id).map((d) => d.id), how);
+    invoices += await settleSiblingInvoices(c, scopeFor(s, e.id), settled.filter((d) => d.from_entity_id === e.id).map((d) => d.id));
+    bills += await settleSiblingBills(c, scopeFor(s, e.id), settled.filter((d) => d.to_entity_id === e.id).map((d) => d.id), how);
   }
   await audit(c, scopeFor(s, payer.id), { table: "ic_settlement", rowId: id, action: "insert",
-    after: { number, payer: payer.name, payee: payee.name, cash: cash.toString(), payerDiff: payerDiff.toString(), payeeDiff: payeeDiff.toString(), documents: docs.length },
-    reason: reason || undefined });
-  return { id, number, payer: payer.name, payee: payee.name, amountMinor: cash, payerDifferenceMinor: payerDiff, payeeDifferenceMinor: payeeDiff,
-    documents: docs.length, invoices, bills };
+    after: { number, payer: payer.name, payee: payee.name, cash: cash.toString(), leftOpen: rest.toString(), payerDiff: payerDiff.toString(), payeeDiff: payeeDiff.toString(),
+      documents: settled.length, partlyPaid: partial ? 1 : 0 }, reason: reason || undefined });
+  return { id, number, payer: payer.name, payee: payee.name, amountMinor: cash, leftOpenMinor: rest, payerDifferenceMinor: payerDiff, payeeDifferenceMinor: payeeDiff,
+    documents: settled.length, partlyPaid: partial ? 1 : 0, invoices, bills };
 }
 
 // -------------------------------------------------------- consolidation --
@@ -508,6 +601,7 @@ export const SECTIONS: { id: Section; label: string; statement: "pnl" | "bs" }[]
 const sectionOf = (type: string, code: string): Section =>
   type === "revenue" ? "revenue" : type === "expense" ? (code.startsWith("5") ? "cost" : code.startsWith("6") ? "opex" : "other") : (type as Section);
 const EARNINGS = "earnings";
+const MARKUP = "markup";
 
 type Amounts = Record<string, bigint>;
 type Line = { code: string; name: string; byCompany: Amounts; sumMinor: bigint; eliminatedMinor: bigint; combinedMinor: bigint; intercompany: boolean };
@@ -540,19 +634,32 @@ export async function consolidate(c: Client, tenantId: string, x: { companyIds: 
     select l.account_code code, sum(l.amount_minor)::text s from ic_ledger l
      where l.entity_id = any($1::uuid[]) and l.counterparty_entity_id = any($1::uuid[]) and l.occurred_on <= $2::date group by 1
      /* unscoped: the included companies, all of this client */`, [ids, x.asOf]);
-  const docs = await q<{ sales: string; cost: string; margin: string }>(c, `
-    select coalesce(sum(amount_minor) filter (where doc_date between $3::date and $4::date), 0)::text sales,
-           coalesce(sum(case when kind = 'goods' then cost_minor else amount_minor end) filter (where doc_date between $3::date and $4::date), 0)::text cost,
-           coalesce(sum(case when kind = 'goods' then amount_minor - cost_minor else 0 end) filter (where doc_date <= $5::date), 0)::text margin
-      from ic_document where tenant_id = $1 and from_entity_id = any($2::uuid[]) and to_entity_id = any($2::uuid[]) ${T}`, [tenantId, ids, x.from, x.to, x.asOf]);
+  const docs = await q<{ sales: string; cost: string; goods_margin: string }>(c, `
+    select coalesce(sum(amount_minor), 0)::text sales,
+           coalesce(sum(case when kind = 'goods' then cost_minor else amount_minor end), 0)::text cost,
+           coalesce(sum(case when kind = 'goods' then amount_minor - cost_minor else 0 end), 0)::text goods_margin
+      from ic_document where tenant_id = $1 and from_entity_id = any($2::uuid[]) and to_entity_id = any($2::uuid[])
+       and doc_date between $3::date and $4::date ${T}`, [tenantId, ids, x.from, x.to]);
+  // Markup on goods bought from an included sibling that is still in an included company's stock, on a day.
+  const onHand = async (day: string) => B((await q<{ m: string }>(c, `
+    select coalesce(sum(markup_minor), 0)::text m from ic_markup_move
+     where entity_id = any($1::uuid[]) and from_entity_id = any($1::uuid[]) and occurred_on <= $2::date
+     /* unscoped: the included companies, all of this client */`, [ids, day]))[0].m);
+  const dayBefore = new Date(Date.parse(x.from + "T00:00:00Z") - 86_400_000).toISOString().slice(0, 10);
+  const inStockAsOf = await onHand(x.asOf);
+  const inStockChange = (await onHand(x.to)) - (await onHand(dayBefore));
+  // Markup that reached outside the group in the range (sold, written off, counted short): it sits in the
+  // buyers' cost of goods at transfer price; at group cost it was never spent.
+  const realized = B(docs[0].goods_margin) - inStockChange;
   const sub = (code: string) => B(ledger.find((r) => r.code === code)?.s);
   const elim: Record<string, bigint> = {
     [IC.DUE_FROM]: sub(IC.DUE_FROM),              // asset, natural debit
     [IC.DUE_TO]: -sub(IC.DUE_TO),                 // liability, natural credit
     [IC.SALES]: B(docs[0].sales),
     [IC.COST]: B(docs[0].cost),
-    "1300": B(docs[0].margin),                    // margin on goods between them, still in stock
-    [EARNINGS]: B(docs[0].margin),
+    [MARKUP]: realized,                           // out of the buyers' cost of goods sold or written off
+    "1300": inStockAsOf,                          // markup still in stock
+    [EARNINGS]: inStockAsOf,
   };
 
   const lines = new Map<string, Line & { section: Section }>();
@@ -579,8 +686,8 @@ export async function consolidate(c: Client, tenantId: string, x: { companyIds: 
   for (const id of ids) earn.byCompany[id] += earnings[id];
   for (const [k, amt] of Object.entries(elim)) {
     if (amt === 0n) continue;
-    const sec: Section = k === IC.DUE_FROM || k === "1300" ? "asset" : k === IC.DUE_TO ? "liability" : k === IC.SALES ? "revenue" : k === IC.COST ? "cost" : "equity";
-    const name = k === EARNINGS ? earn.name : (await q<{ name: string }>(c, `select name from gl_account where tenant_id = $1 and code = $2 ${T}`, [tenantId, k]))[0]?.name ?? k;
+    const sec: Section = k === IC.DUE_FROM || k === "1300" ? "asset" : k === IC.DUE_TO ? "liability" : k === IC.SALES ? "revenue" : k === IC.COST || k === MARKUP ? "cost" : "equity";
+    const name = k === EARNINGS ? earn.name : k === MARKUP ? "Inter-company markup in goods sold or written off" : (await q<{ name: string }>(c, `select name from gl_account where tenant_id = $1 and code = $2 ${T}`, [tenantId, k]))[0]?.name ?? k;
     lineFor(sec, k, name).eliminatedMinor += amt;
   }
   for (const l of lines.values()) { l.sumMinor = sumOf(l.byCompany); l.combinedMinor = l.sumMinor - l.eliminatedMinor; }
@@ -607,7 +714,7 @@ export async function consolidate(c: Client, tenantId: string, x: { companyIds: 
     companies: cos, from: x.from, to: x.to, asOf: x.asOf,
     groups, netIncome,
     eliminations: { dueFromMinor: elim[IC.DUE_FROM], dueToMinor: elim[IC.DUE_TO], salesMinor: elim[IC.SALES], costMinor: elim[IC.COST], marginInStockMinor: elim["1300"],
-      totalPnlMinor: netIncome.eliminatedMinor },
+      markupRealizedMinor: realized, totalPnlMinor: netIncome.eliminatedMinor },
     balanceCheck: { byCompany: Object.fromEntries(ids.map((id) => [id, check((x) => x.byCompany[id])])), combinedMinor: outOfBalance, balanced: outOfBalance === 0n },
   };
 }
@@ -616,7 +723,7 @@ export async function consolidate(c: Client, tenantId: string, x: { companyIds: 
 
 export async function documents(c: Client, tenantId: string, only: string[], limit = 50) {
   return q(c, `
-    select d.id, d.number, d.kind, d.description, d.amount_minor::text, d.cost_minor::text, d.basis, d.markup_bps, d.status, d.doc_date::text,
+    select d.id, d.number, d.kind, d.description, d.amount_minor::text, d.cost_minor::text, d.paid_minor::text, d.basis, d.markup_bps, d.status, d.doc_date::text,
            d.from_entity_id, fe.name from_name, d.to_entity_id, te.name to_name, ci.number invoice_number, i.reference bill_reference, i.status bill_status,
            ft.number transfer_number, tt.number to_transfer_number, st.number settlement_number
       from ic_document d join entity fe on fe.id = d.from_entity_id join entity te on te.id = d.to_entity_id

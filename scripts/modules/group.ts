@@ -100,7 +100,12 @@ export async function run(t: T) {
   const steveView = await g.get<{ companies: unknown[] }>("/group/view", PEOPLE.STEVE);
   t.ok("roles: the owner sees the whole group", steveView.companies.length === 2);
   const tinaOverview = await g.get<{ viewable: unknown[] }>("/group", TINA, "", TX);
-  t.ok("roles: the overview lists only what the person may see", tinaOverview.viewable.length === 1);
+  t.ok("roles: the overview lists only what the person may see", tinaOverview.viewable.length === 1 && (tinaOverview as { companies: unknown[] }).companies.length === 1);
+  type Locs = { locations: { entity_id: string }[] };
+  t.ok("roles: other companies' locations go only to someone who may ship there",
+    !(await g.get<Locs>("/group/locations", DEE)).locations.length && !(await g.get<Locs>("/group/locations", TINA, "", TX)).locations.length
+    && (await g.get<Locs>("/group/locations", PEOPLE.CONTROLLER)).locations.every((l) => l.entity_id === TX)
+    && (await g.get<Locs>("/group/locations", PEOPLE.CONTROLLER)).locations.length === 2);
 
   // ------------------------------------------------------------ sibling links
   const l0 = await g.get<{ links: { complete: boolean } }>("/group", PEOPLE.STEVE);
@@ -144,9 +149,15 @@ export async function run(t: T) {
 
   // ------------------------------------------------------------ cross-company transfer
   const txBefore = await onHand(t, TX, pick.sku, TYL), dcBefore = await onHand(t, ENTITY, pick.sku, DC);
-  const across = await inventory.post<{ id: string; number: string }>("/inventory/transfers", DEE, { fromId: DC, toId: TYL, lines: [{ productId: pick.id, qty: 3 }] });
+  await t.throws("across: a warehouse hand cannot start a transfer to another company (it makes a sale and a bill)", () =>
+    inventory.post("/inventory/transfers", DEE, { fromId: DC, toId: TYL, lines: [{ productId: pick.id, qty: 3 }] }), /owner, or a controller in every company/);
+  await t.throws("across: nor a controller of the Texas company alone", () => asPerson(t, TINA, (c, co, a) =>
+    inv.createTransfer(c, { tenantId: co.tenantId, entityId: ENTITY, actor: { kind: "user", id: a.personId, label: "check" } }, { fromId: DC, toId: TYL, lines: [{ productId: pick.id, qty: 1 }] })),
+    /owner, or a controller in every company|not a controller in Demo/);
+  const across = await inventory.post<{ id: string; number: string }>("/inventory/transfers", PEOPLE.CONTROLLER, { fromId: DC, toId: TYL, lines: [{ productId: pick.id, qty: 3 }] });
+  await t.throws("across: a warehouse hand cannot ship one either", () => inventory.post("/inventory/transfers/:id/ship", DEE, {}, across.id), /owner, or a controller in every company/);
   const sent = await inventory.post<{ number: string; valueMinor: bigint; document: string; documentId: string; amountMinor: bigint; toCompany: string; toTransferNumber: string }>(
-    "/inventory/transfers/:id/ship", DEE, {}, across.id);
+    "/inventory/transfers/:id/ship", PEOPLE.CONTROLLER, {}, across.id);
   const cost = B(sent.valueMinor), price = cost + bps(cost, 1000);
   t.ok("across: shipping to a Texas store makes an inter-company document at cost plus 10%", !!sent.document && sent.toCompany === "Demo Furniture Texas, LLC"
     && B(sent.amountMinor) === price && cost > 0n, `${cost} → ${sent.amountMinor}`);
@@ -181,8 +192,8 @@ export async function run(t: T) {
        and (select count(distinct unit_id) from inv_piece x where x.entity_id = p.entity_id and x.product_id = p.id and x.location_id = $2 and x.status = 'in_stock' and x.sales_order_line_id is null) >= 1
      order by p.sku limit 1`, [ENTITY, DC]))[0];
   if (ser) {
-    const s1 = await inventory.post<{ id: string }>("/inventory/transfers", DEE, { fromId: DC, toId: TYL, lines: [{ productId: ser.id, qty: 1 }] });
-    const s2 = await inventory.post<{ document: string; documentId: string }>("/inventory/transfers/:id/ship", DEE, {}, s1.id);
+    const s1 = await inventory.post<{ id: string }>("/inventory/transfers", PEOPLE.STEVE, { fromId: DC, toId: TYL, lines: [{ productId: ser.id, qty: 1 }] });
+    const s2 = await inventory.post<{ document: string; documentId: string }>("/inventory/transfers/:id/ship", PEOPLE.STEVE, {}, s1.id);
     const pcs = await sql<{ n: string }>(t, `select count(*)::text n from inv_piece x join product p on p.id = x.product_id where x.entity_id = $1 and p.sku = $2 and x.location_id = $3 and x.status = 'in_stock'`,
       [TX, ser.sku, TYL]);
     const gone = await sql<{ n: string }>(t, `select count(*)::text n from inv_piece where entity_id = $1 and transfer_id = $2 and status = 'delivered'`, [ENTITY, s1.id]);
@@ -210,7 +221,7 @@ export async function run(t: T) {
   t.ok("bill: and Texas bills Demo the other way (the owner may)", B(back.amountMinor) === 4000n);
 
   // ------------------------------------------------------------ net to zero
-  const expectDemo = price + 25000n - 4000n + (ser ? B((await sql<{ a: string }>(t, `select coalesce(sum(amount_minor),0)::text a from ic_document where from_entity_id = $1 and kind = 'goods' and id <> $2`, [ENTITY, sent.documentId]))[0].a) : 0n);
+  let expectDemo = price + 25000n - 4000n + (ser ? B((await sql<{ a: string }>(t, `select coalesce(sum(amount_minor),0)::text a from ic_document where from_entity_id = $1 and kind = 'goods' and id <> $2`, [ENTITY, sent.documentId]))[0].a) : 0n);
   type Net = { pairs: { a: { id: string; netMinor: string }; b: { id: string; netMinor: string }; differenceMinor: string; balanced: boolean; openDocuments: number }[];
     ties: { id: string; ties: boolean; untrackedMinor: string }[]; allBalanced: boolean };
   const n1 = await g.get<Net>("/group/net", PEOPLE.CONTROLLER);
@@ -260,12 +271,37 @@ export async function run(t: T) {
   t.ok("view: one company alone has nothing to eliminate (its sibling is not included)",
     vt.groups.flatMap((x) => x.accounts).every((l) => B(l.eliminatedMinor) === 0n && B(l.combinedMinor) === B(l.sumMinor)));
 
+  // ------------------------------------------------------------ part payment
+  await t.throws("settle: paying more than is owed is refused", () => g.post("/group/settle", PEOPLE.CONTROLLER, { with: TX, amount: ((Number(expectDemo) + 1) / 100).toFixed(2) }),
+    /a payment of more than that is refused/);
+  const part = await g.post<{ amountMinor: string; leftOpenMinor: string; payeeDifferenceMinor: string; payerDifferenceMinor: string; partlyPaid: number; documents: number }>(
+    "/group/settle", PEOPLE.CONTROLLER, { with: TX, amount: "100.00" });
+  t.ok("settle: a part payment leaves the rest open and writes nothing off", B(part.amountMinor) === 10000n && B(part.leftOpenMinor) === expectDemo - 10000n
+    && B(part.payeeDifferenceMinor) === 0n && B(part.payerDifferenceMinor) === 0n, JSON.stringify(part));
+  expectDemo -= 10000n;
+  const nPart = await g.get<Net>("/group/net", PEOPLE.STEVE);
+  const demoLeft = nPart.pairs[0].a.id === ENTITY ? B(nPart.pairs[0].a.netMinor) : B(nPart.pairs[0].b.netMinor);
+  t.ok("settle: the pair still nets to zero and shows what is left", nPart.pairs[0].balanced && demoLeft === expectDemo, String(demoLeft));
+  const partDocs = await sql<{ status: string; paid_minor: string; amount_minor: string; from_entity_id: string }>(t,
+    `select status, paid_minor::text, amount_minor::text, from_entity_id from ic_document where from_entity_id = any($1) order by created_at`, [[ENTITY, TX]]);
+  t.ok("settle: Texas's own charge to Demo is netted off, the oldest Demo document paid, and one left part-paid",
+    partDocs.filter((d) => d.from_entity_id === TX).every((d) => d.status === "settled") && part.partlyPaid === 1
+    && partDocs.some((d) => d.status === "open" && B(d.paid_minor) > 0n && B(d.paid_minor) < B(d.amount_minor)), JSON.stringify(partDocs.map((d) => [d.status, d.paid_minor, d.amount_minor])));
+  const openBills = await sql<{ n: string }>(t, `select count(*)::text n from invoice where entity_id = $1 and ic_document_id is not null and status = 'approved'`, [TX]);
+  t.ok("settle: the bills of documents not fully paid stay open in Texas", Number(openBills[0].n) >= 1, openBills[0].n);
+
   // ------------------------------------------------------------ out of balance, then settle
   await t.throws("one side: an AP clerk cannot book it", () => g.post("/group/adjust", PEOPLE.CLERK, { counterparty: TX, kind: "charge", amount: "1", reason: "x x x" }), /controller/);
   await t.throws("one side: the other leg cannot be an inter-company account", () => g.post("/group/adjust", TINA,
     { counterparty: ENTITY, kind: "credit", amount: "15.00", offsetCode: "4090", reason: "freight credit" }, TX), /inter-company account/);
   await t.throws("one side: it needs a reason", () => g.post("/group/adjust", TINA, { counterparty: ENTITY, kind: "credit", amount: "15.00", reason: "" }, TX), /say why/);
-  await g.post("/group/adjust", TINA, { counterparty: ENTITY, kind: "credit", amount: "15.00", offsetCode: "6800", reason: "Freight Demo agreed to charge, not billed yet" }, TX);
+  const credit = { counterparty: ENTITY, kind: "credit", amount: "15.00", offsetCode: "6800", reason: "Freight Demo agreed to charge, not billed yet" };
+  await t.throws("write-off: with no limit set, a controller cannot write off to 6800", () => g.post("/group/adjust", TINA, credit, TX), /is for the owner/);
+  await t.throws("write-off: only the owner sets the limit", () => g.post("/group/settings", PEOPLE.CONTROLLER, { basis: "cost_plus", markupPct: 10, writeoffCap: "20.00" }), /only the owner sets/);
+  const capSet = await g.post<{ writeoffCapMinor: string }>("/group/settings", PEOPLE.STEVE, { basis: "cost_plus", markupPct: 10, writeoffCap: "20.00" });
+  t.ok("write-off: the owner sets a $20 limit", B(capSet.writeoffCapMinor) === 2000n);
+  await t.throws("write-off: over the limit only the owner can", () => g.post("/group/adjust", TINA, { ...credit, amount: "25.00" }, TX), /over the group's write-off limit/);
+  await g.post("/group/adjust", TINA, credit, TX);
   const n2 = await g.get<Net>("/group/net", PEOPLE.STEVE);
   t.ok("net: a one-sided entry puts the pair out of balance by exactly that much", !n2.pairs[0].balanced && B(n2.pairs[0].differenceMinor) === -1500n && !n2.allBalanced,
     n2.pairs[0].differenceMinor);
@@ -277,6 +313,8 @@ export async function run(t: T) {
 
   await t.throws("settle: a controller of one company cannot settle the pair", () => g.post("/group/settle", TINA, { with: ENTITY }, TX), /not a controller in Demo Furniture Co/);
   await t.throws("settle: when the books differ it needs a reason", () => g.post("/group/settle", PEOPLE.CONTROLLER, { with: TX }), /books differ.*say why/);
+  await t.throws("settle: when the books differ, the payment is what the payer's books say", () => g.post("/group/settle", PEOPLE.CONTROLLER, { with: TX, amount: "1.00", reason: "try" }),
+    /own books say it owes/);
   const demoBank0 = (await sql<{ b: string }>(t, `select ledger_balance_minor::text b from bank_position where entity_id = $1 and purpose = 'operating'`, [ENTITY]))[0];
   const txBank0 = (await sql<{ b: string }>(t, `select ledger_balance_minor::text b from bank_position where entity_id = $1 and purpose = 'operating'`, [TX]))[0];
   const done = await g.post<{ number: string; payer: string; payee: string; amountMinor: string; payeeDifferenceMinor: string; payerDifferenceMinor: string; documents: number; invoices: number; bills: number }>(
@@ -331,4 +369,69 @@ export async function run(t: T) {
   await t.throws("report: nor an AP clerk", () => runAs(PEOPLE.CLERK, ENTITY, { dataset: "group_gl", columns: [{ id: "n", field: "net" }] }), /controller in every company/);
   const rio = await runAs(RIO_OWNER, RIO_ENTITY, { dataset: "group_gl", columns: [{ id: "c", field: "company" }] });
   t.ok("report: another client sees only its own company", (rio.rows as Record<string, unknown>[]).every((r) => r.c === "Rio Freight Lines, LLC"));
+
+  // ------------------------------------------------------------ markup once the goods leave the buyer
+  // The group's earnings move by what the goods cost the group, not by the transfer price: a write-off
+  // costs the group its cost; a sale outside earns the sale less the cost; markup on what is left stays out.
+  const candidates = await sql<{ id: string; sku: string }>(t, `
+    select p.id, p.sku from stock_level s join product p on p.id = s.product_id
+     where s.entity_id = $1 and s.location_id = $2 and not p.serialized and p.kind = 'stock' and s.on_hand - s.reserved - s.held >= 3
+       and not exists (select 1 from product x where x.entity_id = $3 and x.sku = p.sku)
+     order by p.sku limit 3`, [ENTITY, DC, TX]);
+  if (candidates.length < 3) { t.ok("markup: three products to move", false, `${candidates.length} found`); return; }
+  type V = { netIncome: { combinedMinor: string; sumMinor: string; eliminatedMinor: string }; eliminations: { marginInStockMinor: string; markupRealizedMinor: string };
+    balanceCheck: { balanced: boolean } };
+  const view = () => g.get<V>("/group/view", PEOPLE.STEVE, `from=${today}&to=${today}&asOf=${today}`);
+  const moveOver = async (productId: string, qty: number) => {
+    const tr = await inventory.post<{ id: string }>("/inventory/transfers", PEOPLE.CONTROLLER, { fromId: DC, toId: TYL, lines: [{ productId, qty }] });
+    const r = await inventory.post<{ valueMinor: bigint; amountMinor: bigint }>("/inventory/transfers/:id/ship", PEOPLE.CONTROLLER, {}, tr.id);
+    return { cost: B(r.valueMinor), price: B(r.amountMinor) };
+  };
+  const txProductOf = async (sku: string) => (await sql<{ id: string }>(t, `select id from product where entity_id = $1 and sku = $2`, [TX, sku]))[0].id;
+  const txScope = (a: { personId: string }) => ({ tenantId: "11111111-1111-1111-1111-111111111111", entityId: TX, actor: { kind: "user" as const, id: a.personId, label: "check" } });
+  const sellInTexas = (sku: string, qty: number, unitMinor: bigint) => asPerson(t, PEOPLE.STEVE, async (c, _co, a) => {
+    const pid = await txProductOf(sku);
+    const total = (BigInt(qty) * unitMinor).toString();
+    const so = (await c.query<{ id: string }>(`insert into sales_order (entity_id, number, channel, location_id, status, fulfillment, subtotal_minor, total_minor)
+      values ($1, 'TXS-' || substr(gen_random_uuid()::text, 1, 8), 'pos', $2, 'open', 'carry', $3, $3) returning id`, [TX, TYL, total])).rows[0].id;
+    await c.query(`insert into sales_order_line (entity_id, sales_order_id, seq, sku, description, qty, unit_price_minor, line_status, fulfil_from_id, product_id)
+      values ($1,$2,1,$3,'check sale',$4,$5,'reserved',$6,$7)`, [TX, so, sku, qty, unitMinor.toString(), TYL, pid]);
+    const f = await inv.fulfilLines(c, TX, so, "all");
+    await ar.invoiceFulfilment(c, txScope(a), so, "all", f.costMinor);
+  }, TX);
+  const writeOffInTexas = (sku: string, qty: number) => asPerson(t, PEOPLE.STEVE, async (c, _co, a) =>
+    inv.adjust(c, txScope(a), { locationId: TYL, productId: await txProductOf(sku), qty: -qty, reasonCode: "damaged_beyond_repair", note: "check" }), TX);
+  const niOf = (v: V) => B(v.netIncome.combinedMinor);
+
+  // written off: 3 across at cost plus 10%, all 3 written off in Texas
+  const [w, sd, pt] = candidates;
+  const w0 = await view();
+  const wm = await moveOver(w.id, 3);
+  await writeOffInTexas(w.sku, 3);
+  const w1 = await view();
+  t.ok("markup: written off in Texas, the group loses what the goods cost it, not the transfer price", niOf(w1) - niOf(w0) === -wm.cost && wm.price > wm.cost,
+    `${niOf(w1) - niOf(w0)} vs −${wm.cost} (price ${wm.price})`);
+  t.ok("markup: nothing of it is left in stock, and it is taken out of cost of goods instead",
+    B(w1.eliminations.marginInStockMinor) === B(w0.eliminations.marginInStockMinor) && B(w1.eliminations.markupRealizedMinor) - B(w0.eliminations.markupRealizedMinor) === wm.price - wm.cost);
+
+  // sold in the same period: 2 across, both sold to a Texas customer at $90.00
+  const sm = await moveOver(sd.id, 2);
+  await sellInTexas(sd.sku, 2, 9000n);
+  const s1 = await view();
+  t.ok("markup: sold outside the group in the same period, the group earns the sale less its cost", niOf(s1) - niOf(w1) === 18000n - sm.cost,
+    `${niOf(s1) - niOf(w1)} vs ${18000n - sm.cost}`);
+  t.ok("markup: and none of that markup stays in stock", B(s1.eliminations.marginInStockMinor) === B(w1.eliminations.marginInStockMinor));
+
+  // partly sold: 3 across, 1 sold at $90.00; two-thirds of the markup is still in stock
+  const pm = await moveOver(pt.id, 3);
+  await sellInTexas(pt.sku, 1, 9000n);
+  const p1v = await view();
+  const left = (pm.price - pm.cost) * 2n / 3n;
+  const inStock = B(p1v.eliminations.marginInStockMinor) - B(s1.eliminations.marginInStockMinor);
+  const earned = niOf(p1v) - niOf(s1);
+  t.ok("markup: partly sold, two-thirds of the markup stays out of inventory and earnings", inStock - left <= 1n && left - inStock <= 1n, `${inStock} vs ${left}`);
+  t.ok("markup: and the group earns the sale less a third of the cost", earned - (9000n - pm.cost / 3n) <= 1n && (9000n - pm.cost / 3n) - earned <= 1n,
+    `${earned} vs ${9000n - pm.cost / 3n}`);
+  t.ok("markup: the combined balance sheet still balances", p1v.balanceCheck.balanced);
+  t.ok("markup: inventory still ties in Texas", (await read(t, (c) => inv.tieOut(c, TX))).ties);
 }
