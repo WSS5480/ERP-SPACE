@@ -142,7 +142,8 @@
         for (const [k, f] of Object.entries(sFields)) f.hidden = !SECRETS[transport.value].includes(k);
         note.replaceChildren(transport.value === 'sftp' || transport.value === 'as2'
           ? resultBox('warning', 'warn', `${transport.value.toUpperCase()} is not built yet`, 'The settings and password are kept, and a poll or send says so plainly. Until it is, use a drop folder, a VAN, or download and upload by hand.')
-          : transport.value === 'dropfolder' && !list.dropDirSet ? resultBox('warning', 'warn', 'No drop directory on the server', 'Set ERP_EDI_DROP_DIR in the service environment; partner folders sit under it.') : '');
+          : transport.value === 'dropfolder' && !list.dropDirSet ? resultBox('warning', 'warn', 'No drop directory on the server', 'Set ERP_EDI_DROP_DIR in the service environment; partner folders sit under it.')
+          : transport.value === 'dropfolder' ? el('p', { class: 'muted', text: `Vendor files go in <drop directory>/${E.S.co.id}/<folder>/in; what we send is written to …/<folder>/out.` }) : '');
       };
       transport.onchange = syncT; syncT();
       // 850 layout: parties, routing, dates, item ids and references this vendor wants.

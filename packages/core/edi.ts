@@ -678,7 +678,7 @@ export function maskIsa(raw: string): string {
  */
 /** Who may take in which documents by hand: an A/P clerk takes bills (810) only. */
 export const UPLOAD_ROLES: Record<string, string[]> = {
-  "810": ["ap_clerk", "buyer"], "855": ["buyer", "store_manager"], "856": ["buyer", "store_manager"], "846": ["buyer", "store_manager"],
+  "810": ["ap_clerk", "buyer"], "855": ["buyer"], "856": ["buyer", "store_manager"], "846": ["buyer", "store_manager"],
   "832": ["buyer"], "997": ["buyer", "store_manager", "ap_clerk"],
 };
 /** A person taking in a file must hold the roles for every document type in it (the owner holds all). The scheduler takes in what its partners send. */

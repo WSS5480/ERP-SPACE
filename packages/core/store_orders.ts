@@ -49,7 +49,7 @@ export type FreightCheck = { rule: string; measure: string; have: string; minimu
 const norm = (v: string | null | undefined) => String(v ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 /** The names one rule pools: "Dining, Bedroom / Youth and Accents" is four. */
 export function ruleNames(value: string | null | undefined): string[] {
-  return String(value ?? "").split(/[,;/]|\band\b|\bor\b/i).map((x) => x.trim()).filter((x) => x && !/^total$/i.test(x));
+  return String(value ?? "").split(/[,;/]|\band\b|\bor\b/i).map((x) => x.trim()).filter((x) => x && !/^total\b/i.test(x));
 }
 /**
  * The catalog app's loose match: case and punctuation ignored, a trailing S

@@ -203,8 +203,9 @@ export async function run(t: T) {
   const salesOrder = await read(t, async (c) => (await q<{ id: string }>(c, `select sales_order_id id from sales_order_line where id = $1 and entity_id = $2`, [LAMP_LINE, ENTITY]))[0].id);
   const ack855 = fromVendor(COASTER_ID, "P", 502, [{ type: "855", control: 1, segments: x12.build855({ poNumber: spPo.number, ackType: "AC", date: day(0), vendorRef: "COA-SO-1",
     lines: [{ vendorSku: "CO-LAMP-X", status: "IB", qty: 1, date: day(40) }] }) }]);
-  await t.throws("roles: an A/P clerk takes bills, not acknowledgments", () => r.post("/edi/upload", PEOPLE.CLERK, { text: ack855, filename: "855.edi" }), /taking in a 855 .* needs one of: buyer, store manager/);
-  const got855 = await r.post<edi.Received>("/edi/upload", STORE_MGR, { text: ack855, filename: "855.edi" });
+  await t.throws("roles: an A/P clerk takes bills, not acknowledgments", () => r.post("/edi/upload", PEOPLE.CLERK, { text: ack855, filename: "855.edi" }), /taking in a 855 .* needs one of: buyer/);
+  await t.throws("roles: a store manager cannot take in acknowledgments either (a reject cancels the PO)", () => r.post("/edi/upload", STORE_MGR, { text: ack855, filename: "855.edi" }), /needs one of: buyer/);
+  const got855 = await r.post<edi.Received>("/edi/upload", BUYER, { text: ack855, filename: "855.edi" });
   const eta = await read(t, (c) => pur.etaForOrder(c, ENTITY, salesOrder));
   const lampEta = eta.find((x) => x.sales_order_line_id === LAMP_LINE);
   t.ok("855 in: applied through acknowledgePO; the vendor's mapped item finds the line; the backorder date reaches the customer's order",

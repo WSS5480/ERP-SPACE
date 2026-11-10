@@ -189,7 +189,7 @@ export const PRICE_TOLERANCE_BPS = 100;
  * bills already billed, and the billed unit price must sit within the
  * company's tolerance of the PO price. Charges that are not PO lines
  * (freight, fuel) may not pass the landed cost recorded on the PO plus the
- * setting payables.charge_limit_minor (default 0). Allowances (negative
+ * setting payables.charge_limit_minor (default $250). Allowances (negative
  * lines) always pass. A miss sends the bill to the exception queue, where
  * the controller or owner must look before it can be approved.
  */
@@ -201,11 +201,12 @@ async function matchMerchandise(
 ): Promise<{ ok: boolean; reason: string }> {
   if (!poId) return { ok: false, reason: "merchandise invoice with no purchase order" };
   const tol = await settingNumber(c, scope.entityId, "payables.price_tolerance_bps", PRICE_TOLERANCE_BPS);
-  const chargeLimit = BigInt(Math.round(await settingNumber(c, scope.entityId, "payables.charge_limit_minor", 0)));
+  // freight a vendor bills that the PO did not record: allowed up to this much per bill (default $250), above it a person looks
+  const chargeLimit = BigInt(Math.round(await settingNumber(c, scope.entityId, "payables.charge_limit_minor", 25000)));
   const rows = await q<{ description: string; unit: string; received: string; billed_qty: string; billed_amount: string; priced_qty: string | null;
-    before_qty: string }>(
+    before_qty: string; review: string | null }>(
     c,
-    `select pol.description, pol.unit_price_minor::text unit,
+    `select pol.description, pol.unit_price_minor::text unit, pol.price_review_note review,
             coalesce((select sum(g.quantity) from goods_receipt_line g where g.purchase_order_line_id = pol.id), 0) received,
             sum(coalesce(il.quantity, il.amount_minor::numeric / nullif(pol.unit_price_minor, 0))) billed_qty,
             sum(il.amount_minor) billed_amount,
@@ -217,10 +218,13 @@ async function matchMerchandise(
        join purchase_order_line pol on pol.id = il.purchase_order_line_id
        join purchase_order po on po.id = pol.purchase_order_id and po.entity_id = $2
       where il.invoice_id = $1 and pol.purchase_order_id = $3
-      group by pol.id, pol.description, pol.unit_price_minor`,
+      group by pol.id, pol.description, pol.unit_price_minor, pol.price_review_note`,
     [invoiceId, scope.entityId, poId]
   );
   const problems: string[] = [];
+  // a price the vendor changed by acknowledgment is not agreed until a buyer clears it
+  const unreviewed = rows.filter((r) => r.review);
+  if (unreviewed.length) problems.push(`the vendor changed the price and a buyer has not agreed it yet: ${unreviewed.map((r) => r.description).join(", ")}`);
   const short = rows.filter((r) => Number(r.billed_qty ?? 0) > Number(r.received) - Number(r.before_qty) + 0.0005);
   if (short.length) problems.push(`invoiced but not received: ${short.map((r) => `${r.description} (billed ${Number(Number(r.billed_qty).toFixed(3))}, received ${Number(r.received)}${Number(r.before_qty) ? `, billed before ${Number(Number(r.before_qty).toFixed(3))}` : ""})`).join(", ")}`);
   for (const r of rows) {
