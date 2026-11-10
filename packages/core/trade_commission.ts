@@ -80,6 +80,12 @@ export async function setLineCommission(c: Client, scope: Scope, lineId: string,
       const isDesigner = await q(c, `select 1 from role_grant g join app_user u on u.id = g.app_user_id where g.app_user_id = $1 and g.role in ('designer','sales','store_manager','owner')
           and (g.entity_id = $2 or (g.entity_id is null and u.tenant_id = $3))`, [designer, scope.entityId, scope.tenantId]);
       need(isDesigner.length, "the designer named has no designer or sales role here");
+      // A share with no plan to earn it would be lost at hand-over: refuse it now instead.
+      const plan = await q<{ id: string }>(c, `select a.app_user_id id from commission_assignment a join commission_plan p on p.id = a.plan_id and p.active
+          where a.entity_id = $1 and a.app_user_id = any($2::uuid[]) and a.effective_from <= current_date and (a.effective_to is null or a.effective_to >= current_date)`,
+        [scope.entityId, [primary, designer]]);
+      for (const [who, label] of [[designer, "the designer"], [primary!, "the primary rep"]] as const)
+        need(plan.some((x) => x.id === who), `${label} has no commission plan, so their share would be lost; assign one in Time and commissions first`);
       await c.query(`update sales_order_line_split set replaced_at = now() where entity_id = $1 and sales_order_line_id = $2 and replaced_at is null`, [scope.entityId, lineId]);
       await c.query(`insert into sales_order_line_split (entity_id, sales_order_line_id, app_user_id, role, split_bps, set_by) values ($1,$2,$3,'primary',$4,$6), ($1,$2,$5,'designer',$7,$6)`,
         [scope.entityId, lineId, primary, 10000 - sb, designer, scope.actor.id || null, sb]);
@@ -128,18 +134,23 @@ export async function accrueReferrals(c: Client, scope: Scope, opts: { orderId?:
   const lines = await q<{ line_id: string; order_id: string; location_id: string; earned_on: string; net_minor: string; qty: string; cost_minor: string | null;
     trade_account_id: string; vendor_id: string | null; rate_bps: number; basis: string }>(c, `
     select l.id line_id, so.id order_id, so.location_id, coalesce(i.invoice_date, current_date)::text earned_on,
-           coalesce(il.net_minor, round(l.qty * l.unit_price_minor)::bigint - l.discount_minor)::text net_minor, l.qty::text, p.cost_minor::text,
+           coalesce(il.net_minor, round(l.qty * l.unit_price_minor)::bigint - l.discount_minor)::text net_minor, l.qty::text,
+           -- the cost recorded on the line when it was sold (the configurator's, or the register's), not today's product cost
+           coalesce((ol.config->'cfg'->>'unitCostMinor')::bigint, opl.unit_cost_minor, (l.config->'cfg'->>'unitCostMinor')::bigint, pl.unit_cost_minor, p.cost_minor)::text cost_minor,
            r.trade_account_id, t.vendor_id, r.rate_bps, r.basis
       from sales_order_line l
       join sales_order so on so.id = l.sales_order_id and so.entity_id = l.entity_id
       left join pos_line pl on pl.sales_order_line_id = l.id and pl.entity_id = l.entity_id
+      left join sales_order_line ol on ol.id = pl.original_line_id and ol.entity_id = l.entity_id
+      left join pos_line opl on opl.sales_order_line_id = pl.original_line_id and opl.entity_id = l.entity_id
       join sales_order_line_referral r on r.sales_order_line_id = coalesce(pl.original_line_id, l.id) and r.entity_id = l.entity_id and r.replaced_at is null
       join trade_account t on t.id = r.trade_account_id and t.entity_id = l.entity_id
       left join customer_invoice_line il on il.sales_order_line_id = l.id
       left join customer_invoice i on i.id = il.invoice_id
       left join product p on p.id = l.product_id
      where l.entity_id = $1 and ($2::uuid is null or so.id = $2)
-       and ((l.qty > 0 and il.id is not null and l.line_status = 'fulfilled' and ($3 = false or so.paid_minor >= so.total_minor))
+       -- 'once paid': the line's invoice has nothing open (an on-account order is paid through A/R, not on the order), or the order is paid in full
+       and ((l.qty > 0 and il.id is not null and l.line_status = 'fulfilled' and ($3 = false or i.status = 'paid' or so.paid_minor >= so.total_minor))
          or (l.qty < 0 and l.line_status = 'returned' and l.product_id is not null))
        and not exists (select 1 from trade_referral_event ev where ev.entity_id = $1 and ev.sales_order_line_id = l.id)
      order by so.ordered_at, l.seq`, [scope.entityId, opts.orderId ?? null, onPaid]);

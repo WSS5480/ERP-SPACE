@@ -196,8 +196,10 @@ async function readBody(req: http.IncomingMessage, limit = MAX_BODY): Promise<Bu
   return Buffer.concat(chunks);
 }
 
-async function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
-  const raw = await readBody(req, 256 * 1024);
+/** JSON bodies are 256 KB unless a route asks for more (room photos: 3 MB), never more than MAX_BODY. */
+export const JSON_LIMIT = 256 * 1024;
+async function readJson(req: http.IncomingMessage, limit = JSON_LIMIT): Promise<Record<string, unknown>> {
+  const raw = await readBody(req, Math.min(limit, MAX_BODY - 1));
   if (!raw.length) return {};
   try {
     const v = JSON.parse(raw.toString("utf8"));
@@ -421,9 +423,9 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
 }
 
 /** A change to one company, done as a named person, in one transaction. */
-function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body: Record<string, unknown>, m: RegExpMatchArray) => Promise<unknown>) {
+function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body: Record<string, unknown>, m: RegExpMatchArray) => Promise<unknown>, opts: { maxBody?: number } = {}) {
   route("POST", new RegExp(`^${CO}${tail}$`), "token", async (req, _url, m, who) => {
-    const body = await readJson(req);
+    const body = await readJson(req, opts.maxBody);
     const c0 = await pool.connect();
     let co: views.Company;
     let actor: Actor;
@@ -447,12 +449,12 @@ const todayStr = () => new Date().toISOString().slice(0, 10);
 // above applies to it. Public routes (the web store) get their own door that
 // carries no token and no session, and can only reach what the module exposes.
 const publicRoute = (method: "GET" | "POST", path: RegExp,
-  fn: (req: http.IncomingMessage, url: URL, m: RegExpMatchArray, body: Record<string, unknown>) => Promise<[number, unknown]>) =>
+  fn: (req: http.IncomingMessage, url: URL, m: RegExpMatchArray, body: Record<string, unknown>) => Promise<[number, unknown]>, opts: { maxBody?: number } = {}) =>
   route(method, path, "none", async (req, url, m) => {
     let body: Record<string, unknown> = {};
     if (method === "POST") {
       if (req.headers["x-erp-shop"] !== "1") throw new HttpError(403, "this request did not come from the store's own page");
-      body = await readJson(req);
+      body = await readJson(req, opts.maxBody);
     }
     const [s, out] = await fn(req, url, m, body);
     // A page or asset goes out through the app's own responses, with every header and the CSP.

@@ -224,9 +224,8 @@
     const photoIn = el('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp', 'aria-label': 'Add a photo' });
     photoIn.addEventListener('change', async () => {
       const file = photoIn.files && photoIn.files[0]; if (!file) return;
-      const r = new FileReader();
-      r.onload = () => act(photoIn, () => post(`/trade/projects/${id}/photos`, { dataUrl: r.result, caption: file.name }), 'Photo added');
-      r.readAsDataURL(file);
+      try { const dataUrl = await resizeImage(file); act(photoIn, () => post(`/trade/projects/${id}/photos`, { dataUrl, caption: file.name.replace(/\.[a-z]+$/i, '') }), 'Photo added'); }
+      catch (e) { toast(friendly(e), 'critical'); }
     });
     return frag(head(p.name, acts, `Room project ${p.number}`),
       tilesRow(tile({ label: 'Items', value: money(p.itemsTotalMinor) }), tile({ label: 'Budget', value: p.budget_minor ? money(p.budget_minor) : '—', word: !p.budget_minor }),

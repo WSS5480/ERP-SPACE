@@ -66,27 +66,45 @@ async function viewGuard(c: Client, co: Company, personId: string | null) {
 }
 
 // ------------------------------------------------------------ rate limits --
+// In memory, per process. The client address: x-forwarded-for is trusted only
+// as far as ERP_TRUSTED_PROXY_HOPS says. Render's proxy appends the address it
+// saw to x-forwarded-for, so the default (1) takes exactly the rightmost hop,
+// the one that proxy added; anything to its left was written by the client and
+// is ignored. 0 trusts no header (the socket address); 2 is two proxies, etc.
+// Codes, checks and applications are also limited per email, whatever the address.
 const hits = new Map<string, number[]>();
-export const LIMITS = { apply: { max: 5, ms: 60 * 60_000 }, code: { max: 6, ms: 15 * 60_000 }, verify: { max: 20, ms: 15 * 60_000 }, portal: { max: 600, ms: 10 * 60_000 } };
-function clientIp(req: http.IncomingMessage): string {
-  const xf = String(req.headers["x-forwarded-for"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  return xf.length ? xf[xf.length - 1] : (req.socket?.remoteAddress ?? "?");
+export const LIMITS = { apply: { max: 5, ms: 60 * 60_000 }, code: { max: 6, ms: 15 * 60_000 }, verify: { max: 20, ms: 15 * 60_000 }, portal: { max: 600, ms: 10 * 60_000 },
+  applyEmail: { max: 3, ms: 60 * 60_000 }, codeEmail: { max: 5, ms: 15 * 60_000 }, verifyEmail: { max: 10, ms: 15 * 60_000 } };
+export function proxyHops(): number {
+  const n = Number(process.env.ERP_TRUSTED_PROXY_HOPS ?? "1");
+  return Number.isInteger(n) && n >= 0 && n <= 5 ? n : 1;
 }
-function limited(req: http.IncomingMessage, bucket: keyof typeof LIMITS): boolean {
+export function clientIp(req: http.IncomingMessage, hops = proxyHops()): string {
+  const sock = req.socket?.remoteAddress ?? "?";
+  if (hops === 0) return sock;
+  const xf = String(req.headers["x-forwarded-for"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  return xf.length >= hops ? xf[xf.length - hops] : sock;
+}
+function hit(key: string, bucket: keyof typeof LIMITS): boolean {
   const { max, ms } = LIMITS[bucket];
-  const now = Date.now(), key = `${bucket}:${clientIp(req)}`;
-  const list = (hits.get(key) ?? []).filter((t) => now - t < ms);
-  if (list.length >= max) { hits.set(key, list); return true; }
-  list.push(now); hits.set(key, list);
-  if (hits.size > 20_000) for (const [k, v] of hits) if (!v.some((t) => now - t < ms)) hits.delete(k);
+  const now = Date.now(), k = `${bucket}:${key}`;
+  const list = (hits.get(k) ?? []).filter((t) => now - t < ms);
+  if (list.length >= max) { hits.set(k, list); return true; }
+  list.push(now); hits.set(k, list);
+  if (hits.size > 20_000) for (const [x, v] of hits) if (!v.some((t) => now - t < ms)) hits.delete(x);
   return false;
 }
+const limited = (req: http.IncomingMessage, bucket: keyof typeof LIMITS) => hit(clientIp(req), bucket);
+/** Per email (lower-cased), so many addresses cannot hammer one account; the same answer whether or not it has one. */
+const limitedEmail = (email: unknown, bucket: "applyEmail" | "codeEmail" | "verifyEmail") => hit(String(email ?? "").trim().toLowerCase().slice(0, 120) || "-", bucket);
 export const _resetLimits = () => hits.clear();
 const TOO_MANY: [number, unknown] = [429, { error: "Too many tries from here. Wait a few minutes and try again." }];
 const NO_STORE: [number, unknown] = [404, { error: "There is no trade program at this address." }];
 const SIGN_IN: [number, unknown] = [401, { error: "Sign in to the trade portal again." }];
 const ipHash = (req: http.IncomingMessage, entityId: string) => createHash("sha256").update(`${entityId}|${clientIp(req)}`).digest("hex");
 
+/** Room photo uploads: a resized photo as a data URL, up to 3 MB of JSON (other routes keep 256 KB). */
+export const PHOTO_BODY = 3 * 1024 * 1024;
 const moneyOrNull = (v: unknown): bigint | null => (v == null || v === "" ? null : minor(v));
 
 export const module: ErpModule = {
@@ -118,11 +136,11 @@ export const module: ErpModule = {
       } catch (e) { const why = refused(e); if (why) return [422, { error: why }]; throw e; }
     };
     // Open doors: apply, ask for a code, check it.
-    kit.publicRoute("POST", new RegExp(`${API}\\/apply$`), (req, _url, m, b) => limited(req, "apply") ? Promise.resolve(TOO_MANY)
+    kit.publicRoute("POST", new RegExp(`${API}\\/apply$`), (req, _url, m, b) => limited(req, "apply") || limitedEmail(b.email, "applyEmail") ? Promise.resolve(TOO_MANY)
       : run(req, m[1], async (c, site) => [200, await trade.submitApplication(c, site, b as trade.ApplicationIn, ipHash(req, site.entity_id))]));
-    kit.publicRoute("POST", new RegExp(`${API}\\/code$`), (req, _url, m, b) => limited(req, "code") ? Promise.resolve(TOO_MANY)
+    kit.publicRoute("POST", new RegExp(`${API}\\/code$`), (req, _url, m, b) => limited(req, "code") || limitedEmail(b.email, "codeEmail") ? Promise.resolve(TOO_MANY)
       : run(req, m[1], async (c, site) => [200, await trade.requestCode(c, site, b.email, ipHash(req, site.entity_id))]));
-    kit.publicRoute("POST", new RegExp(`${API}\\/verify$`), (req, _url, m, b) => limited(req, "verify") ? Promise.resolve(TOO_MANY)
+    kit.publicRoute("POST", new RegExp(`${API}\\/verify$`), (req, _url, m, b) => limited(req, "verify") || limitedEmail(b.email, "verifyEmail") ? Promise.resolve(TOO_MANY)
       : run(req, m[1], async (c, site) => {
         // A wrong code is answered, not thrown, so the count of tries is kept.
         const r = await trade.verifyCode(c, site, b.email, b.code);
@@ -131,7 +149,8 @@ export const module: ErpModule = {
 
     // Signed-in doors.
     const session = (req: http.IncomingMessage) => String(req.headers["x-trade-session"] ?? "");
-    const signedIn = (method: "GET" | "POST", tail: string, fn: (c: Client, site: shop.Site, s: trade.Session, url: URL, m: RegExpMatchArray, b: Record<string, unknown>) => Promise<unknown>) =>
+    const signedIn = (method: "GET" | "POST", tail: string, fn: (c: Client, site: shop.Site, s: trade.Session, url: URL, m: RegExpMatchArray, b: Record<string, unknown>) => Promise<unknown>,
+      opts: { maxBody?: number } = {}) =>
       kit.publicRoute(method, new RegExp(`${API}${tail}$`), (req, url, m, b) => limited(req, "portal") ? Promise.resolve(TOO_MANY)
         : run(req, m[1], async (c, site) => {
           const tok = session(req);
@@ -140,7 +159,7 @@ export const module: ErpModule = {
           await trade.touchSession(c, site, tok);
           const out = await fn(c, site, s, url, m, b);
           return out == null ? [404, { error: "That isn't in your account." }] : [200, out];
-        }));
+        }), opts);
     const ID = "([0-9a-fA-F-]{36})";
     kit.publicRoute("POST", new RegExp(`${API}\\/signout$`), (req, _url, m) => run(req, m[1], async (c, site) => { await trade.signOut(c, site, session(req)); return [200, { ok: true }]; }));
     signedIn("GET", "\\/me", (c, site, s) => trade.me(c, site, s));
@@ -158,14 +177,15 @@ export const module: ErpModule = {
       trade.addProjectItem(c, site, s, m[2], { productId: String(b.productId ?? ""), choices: shop.parseChoices(b.choices), qty: int(b.qty, 1), note: b.note }).then((id) => ({ id })));
     signedIn("POST", `\\/projects\\/${ID}\\/items\\/${ID}`, (c, site, s, _u, m, b) =>
       trade.setProjectItem(c, site, s, m[2], m[3], { qty: b.qty == null ? undefined : int(b.qty, 1), remove: b.remove === true }).then(() => ({ ok: true })));
-    signedIn("POST", `\\/projects\\/${ID}\\/photos`, (c, site, s, _u, m, b) => trade.addProjectPhoto(c, site, s, m[2], b.dataUrl, b.caption).then((id) => ({ id })));
+    signedIn("POST", `\\/projects\\/${ID}\\/photos`, (c, site, s, _u, m, b) => trade.addProjectPhoto(c, site, s, m[2], b.dataUrl, b.caption).then((id) => ({ id })), { maxBody: PHOTO_BODY });
     signedIn("POST", `\\/projects\\/${ID}\\/photos\\/${ID}\\/remove`, (c, site, s, _u, m) => trade.removeProjectPhoto(c, site, s, m[2], m[3]).then(() => ({ ok: true })));
     signedIn("POST", "\\/quote", (c, site, s, _u, _m, b) => trade.quoteOrder(c, site, s, orderIn(b)));
     signedIn("POST", "\\/order", (c, site, s, _u, _m, b) => trade.placeOrder(c, site, s, orderIn(b)));
     signedIn("GET", "\\/orders", (c, site, s) => trade.orders(c, site, s));
     signedIn("GET", `\\/orders\\/${ID}`, (c, site, s, _u, m) => trade.order(c, site, s, m[2]));
     signedIn("GET", "\\/invoices", (c, site, s) => trade.invoices(c, site, s));
-    signedIn("POST", `\\/invoices\\/${ID}\\/pay`, (c, site, s, _u, m, b) => trade.payInvoice(c, site, s, m[2], { amountMinor: moneyOrNull(b.amount), paymentToken: b.paymentToken }));
+    signedIn("POST", `\\/invoices\\/${ID}\\/pay`, (c, site, s, _u, m, b) => trade.payInvoice(c, site, s, m[2], { amountMinor: moneyOrNull(b.amount), paymentToken: b.paymentToken, key: b.key }));
+    signedIn("POST", "\\/sectional-price", (c, site, s, _u, _m, b) => trade.sectionalPrice(c, site, s, String(b.productId ?? ""), shop.parseBuild(b.build)));
     signedIn("POST", "\\/sheet", (c, site, s, _u, _m, b) => trade.sheetLink(c, site, s, { orderId: uuid(b.orderId), productId: uuid(b.productId) }, createLink));
 
     // ======================================================= back office
@@ -267,7 +287,7 @@ export const module: ErpModule = {
     kit.coPost("/trade/projects/([0-9a-fA-F-]{36})/photos", async (c, co, a, b, m) => {
       await requireRole(c, co, a, ROLES.projects, "adding a photo to a room project");
       return { id: await bo(() => projects.addPhoto(c, scopeOf(co, a), m[2], b.dataUrl, b.caption)) };
-    });
+    }, { maxBody: PHOTO_BODY });
     kit.coPost("/trade/projects/([0-9a-fA-F-]{36})/photos/([0-9a-fA-F-]{36})/remove", async (c, co, a, _b, m) => {
       await requireRole(c, co, a, ROLES.projects, "removing a photo");
       await bo(() => projects.removePhoto(c, scopeOf(co, a), m[2], m[3]));

@@ -280,11 +280,11 @@ export function parseBuild(v: unknown): sectionals.Build | null {
 }
 
 /** A sectional's price for a shopper: the pieces, the cover, the plan. No cost, no vendor codes. */
-export async function pubSectionalPrice(c: Client, site: Site, productId: string, build: sectionals.Build | null) {
+export async function pubSectionalPrice(c: Client, site: Site, productId: string, build: sectionals.Build | null, priceList: string | null = null) {
   const p = await webProduct(c, site.entity_id, productId);
   need(p, "That product is not available online.");
   need(build, "Choose a layout or the pieces.");
-  const priced = await sectionals.priceBuild(c, site.entity_id, p!.id, build!);
+  const priced = await sectionals.priceBuild(c, site.entity_id, p!.id, build!, { priceList });
   const avail = await availabilityFor(c, site, { ...p!, kind: priced.special ? "configurable" : "stock" } as ProdRow, priced.leadDays);
   return { ...sectionals.pricedView(priced, true), availability: avail };
 }
@@ -449,7 +449,7 @@ async function priceLines(c: Client, site: Site, lines: LineIn[], locs: Map<stri
     need(p, "Something in the cart is no longer sold online. Remove it and try again.");
     if (await sectionals.isFamily(c, site.entity_id, p!.id)) {
       need(l.sectional, `Choose the pieces of the ${p!.name}.`);
-      const built = await sectionals.priceBuild(c, site.entity_id, p!.id, l.sectional!);
+      const built = await sectionals.priceBuild(c, site.entity_id, p!.id, l.sectional!, { priceList });
       const availability = await availabilityFor(c, site, { ...p!, kind: built.special ? "configurable" : "stock" } as ProdRow, built.leadDays, locs);
       const setIndex = out.length;
       out.push({
@@ -741,6 +741,8 @@ export async function quote(c: Client, site: Site, inp: CheckoutIn) {
     merchandiseMinor: b.lines.reduce((a, l) => a + l.unitPriceMinor * BigInt(l.qty), 0n).toString(),
     taxMinor: b.taxMinor.toString(), taxRateBps: b.rateBps, totalMinor: b.totalMinor.toString(), promisedOn: b.promisedOn,
     coupon: b.coupon ? { code: b.coupon.code, label: b.coupon.label, discountMinor: b.coupon.discountMinor.toString() } : null,
+    /** a resale certificate exempted at least one jurisdiction here (it only does in its own state) */
+    resaleExempt: b.lines.some((l) => l.taxRows.some((r) => r.exemptReason === "resale")),
   };
 }
 
@@ -856,6 +858,8 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
     // On account: what is owed, plus what is on order and not yet billed, plus this order, must fit under the limit.
     if (trade.onAccount) {
       const { creditCheck } = await import("./ar.ts");
+      // The customer row is the lock: two on-account orders at once queue here, so the second sees the first as on order.
+      await c.query(`select id from customer where id = $1 and entity_id = $2 for update`, [customerId, site.entity_id]);
       const pending = await one<{ s: string }>(c, `
         select coalesce(sum(greatest(so.total_minor - so.paid_minor - coalesce((select sum(i.charged_minor) from customer_invoice i
                  where i.entity_id = so.entity_id and i.sales_order_id = so.id), 0), 0)), 0)::text s

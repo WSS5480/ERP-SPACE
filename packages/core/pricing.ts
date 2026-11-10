@@ -90,6 +90,42 @@ export function promoPrice(p: Promo, configured: bigint, baseTicket: bigint, map
   return out < 0n ? 0n : out;
 }
 
+/**
+ * A price list's price for one configured item (the trade module's rules):
+ * the product's own price on the list (plus the options' retail deltas), else
+ * the list's rule for the category (or its catch-all): cost plus X%, or retail
+ * less Y%. A cost-plus rule on an item with no cost does not price it at
+ * nothing: it falls back to the list's retail-less rule, or to retail. A rule
+ * never prices below cost unless the list says it may (allow_below_cost).
+ * Null when the list does not price it; the caller keeps the lower price.
+ * Sectional pieces (configurator.priceBuild) use the same, per piece.
+ */
+export async function listPrice(c: Client, entityId: string, priceList: string, e: { productId: string; category: string | null; ticketMinor: bigint;
+  costMinor: bigint; optionsDeltaMinor?: bigint; on?: string | null }): Promise<{ priceMinor: bigint; code: string } | null> {
+  const code = String(priceList).toUpperCase();
+  const live = `l.entity_id = $1 and l.code = $2 and l.active and coalesce($3::date, current_date) between coalesce(l.starts_on, '-infinity') and coalesce(l.ends_on, 'infinity')`;
+  const li = (await q<{ price_minor: string; code: string }>(c, `select i.price_minor, l.code from price_list l join price_list_item i on i.price_list_id = l.id
+     where ${live} and i.product_id = $4`, [entityId, code, e.on ?? null, e.productId]))[0];
+  if (li) return { priceMinor: BigInt(li.price_minor) + (e.optionsDeltaMinor ?? 0n), code: li.code };
+  const rules = await q<{ basis: string; bps: number; code: string; category: string | null; allow_below_cost: boolean }>(c, `
+    select r.basis, r.bps, l.code, r.category, l.allow_below_cost from price_list l join price_list_rule r on r.price_list_id = l.id and r.entity_id = l.entity_id and r.active
+     where ${live} and (r.category = $4 or r.category is null) order by (r.category is null)`, [entityId, code, e.on ?? null, e.category]);
+  if (!rules.length) return null;
+  const cost = e.costMinor < 0n ? 0n : e.costMinor;
+  const ticket = e.ticketMinor;
+  let rule = rules[0];
+  if (rule.basis === "cost_plus" && cost <= 0n) {
+    // No cost to mark up: the list's retail-less rule for it, else retail (no list price).
+    const alt = rules.find((r) => r.basis === "retail_less");
+    if (!alt) return null;
+    rule = alt;
+  }
+  let v = rule.basis === "cost_plus" ? cost + (cost * BigInt(rule.bps) + 5000n) / 10000n : ticket - (ticket * BigInt(rule.bps) + 5000n) / 10000n;
+  if (!rule.allow_below_cost && cost > 0n && v < cost) v = cost;
+  if (v < 0n) v = 0n;
+  return { priceMinor: v, code: rule.code };
+}
+
 export async function priceConfigured(c: Client, entityId: string, productId: string, choices: Choice[] = [], popts: PriceOpts = {}): Promise<Configured> {
   const p = (await q<{ id: string; sku: string; name: string; kind: string; price_minor: string; cost_minor: string; status: string;
                        map_minor: string | null; vendor_id: string | null; category: string | null }>(c,
@@ -153,29 +189,8 @@ export async function priceConfigured(c: Client, entityId: string, productId: st
   let final = ticket;
   let listUsed: string | null = null;
   if (popts.priceList) {
-    const li = (await q<{ price_minor: string; code: string }>(c, `
-      select i.price_minor, l.code from price_list l join price_list_item i on i.price_list_id = l.id
-       where l.entity_id = $1 and l.code = $2 and l.active and i.product_id = $3
-         and coalesce($4::date, current_date) between coalesce(l.starts_on, '-infinity') and coalesce(l.ends_on, 'infinity')`,
-      [entityId, String(popts.priceList).toUpperCase(), productId, on]))[0];
-    if (li) {
-      const v = BigInt(li.price_minor) + optionsDelta;
-      if (v < final) { final = v; listUsed = li.code; }
-    } else {
-      // No price of its own on the list: the list's rule for the product's category (or its catch-all rule),
-      // cost plus a markup or retail less a discount, on the configured cost and ticket.
-      const rule = (await q<{ basis: string; bps: number; code: string }>(c, `
-        select r.basis, r.bps, l.code from price_list l join price_list_rule r on r.price_list_id = l.id and r.entity_id = l.entity_id and r.active
-         where l.entity_id = $1 and l.code = $2 and l.active and (r.category = $3 or r.category is null)
-           and coalesce($4::date, current_date) between coalesce(l.starts_on, '-infinity') and coalesce(l.ends_on, 'infinity')
-         order by (r.category is null) limit 1`, [entityId, String(popts.priceList).toUpperCase(), p.category, on]))[0];
-      if (rule) {
-        const c0 = cost < 0n ? 0n : cost;
-        const v = rule.basis === "cost_plus" ? c0 + (c0 * BigInt(rule.bps) + 5000n) / 10000n
-          : ticket - (ticket * BigInt(rule.bps) + 5000n) / 10000n;
-        if (v < final) { final = v < 0n ? 0n : v; listUsed = rule.code; }
-      }
-    }
+    const lp = await listPrice(c, entityId, popts.priceList, { productId, category: p.category, ticketMinor: ticket, costMinor: cost, optionsDeltaMinor: optionsDelta, on });
+    if (lp && lp.priceMinor < final) { final = lp.priceMinor; listUsed = lp.code; }
   }
   const mapMinor = p.map_minor == null ? null : BigInt(p.map_minor);
   const promos = await q<Promo>(c, `

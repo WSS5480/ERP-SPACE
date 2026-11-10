@@ -77,6 +77,7 @@ async function busy(btn, fn) {
   try { return await fn(); } finally { btn.disabled = false; btn.textContent = was; }
 }
 const btn = (label, onclick, primary) => el('button', { type: 'button', class: 'btn' + (primary ? ' primary' : ''), onclick }, label);
+const smallBtn = (label, onclick) => el('button', { type: 'button', class: 'btn tr-small', onclick }, label);
 const go = (hash) => { if (location.hash === hash) render(); else location.hash = hash; };
 const CARDS = [['tok_test_visa_4242', 'Visa ending 4242 (test: approves)'], ['tok_test_mastercard_4444', 'Mastercard ending 4444 (test: approves)'], ['tok_test_decline', 'Card ending 0002 (test: declines)']];
 const STATUS = { draft: 'Not placed', open: 'Confirmed', fulfilling: 'Partly delivered', fulfilled: 'Complete', closed: 'Complete', cancelled: 'Cancelled' };
@@ -255,10 +256,10 @@ function resizeImage(file) {
       const img = new Image();
       img.onerror = () => reject(new Error('That file is not a photo.'));
       img.onload = () => {
-        const max = 1280, k = Math.min(1, max / Math.max(img.width, img.height));
+        const max = 1600, k = Math.min(1, max / Math.max(img.width, img.height));
         const cv = document.createElement('canvas'); cv.width = Math.round(img.width * k); cv.height = Math.round(img.height * k);
         cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
-        resolve(cv.toDataURL('image/jpeg', 0.82));
+        resolve(cv.toDataURL('image/jpeg', 0.8));
       };
       img.src = r.result;
     };
@@ -295,7 +296,7 @@ async function pageProject(id) {
     q.addEventListener('change', async () => { try { await post(`/projects/${id}/items/${it.id}`, { qty: Number(q.value) }); render(); } catch (x) { showErr(err, x); } });
     return el('div', { class: 'tr-item' }, el('div', { class: 'tr-row' }, el('span', { class: 't', text: it.description }), el('span', { class: 'amt', text: it.lineMinor ? money(it.lineMinor) : '' })),
       el('span', { class: 'd', text: [cap(it.stage), it.unitPriceMinor ? `${money(it.unitPriceMinor)} each` : it.problem, it.orderNumber ? `order ${it.orderNumber}` : null].filter(Boolean).join(' · ') }),
-      it.stage === 'bought' ? null : el('div', { class: 'tr-acts' }, field('Qty', q), btn('Remove', async () => { try { await post(`/projects/${id}/items/${it.id}`, { remove: true }); render(); } catch (x) { showErr(err, x); } })));
+      it.stage === 'bought' ? null : el('div', { class: 'tr-acts tr-itemacts' }, field('Qty', q), smallBtn('Remove', async () => { try { await post(`/projects/${id}/items/${it.id}`, { remove: true }); render(); } catch (x) { showErr(err, x); } })));
   })) : el('p', { class: 'tr-muted', text: 'Nothing yet. Add pieces from the catalog.' });
   setMain(wrap(el('a', { href: '#/projects', text: '‹ Projects' }), el('h1', { text: p.name }), el('p', { class: 'tr-muted', text: [p.number, p.client_name, p.quoted_at ? 'quoted ' + day(p.quoted_at) : null].filter(Boolean).join(' · ') }),
     card(el('h2', { text: 'Pieces' }), items, row('Total at trade prices', money(p.itemsTotalMinor)), p.budget_minor ? row('Budget', money(p.budget_minor)) : null,
@@ -384,8 +385,9 @@ async function pageInvoices() {
   const items = d.invoices.map((i) => {
     const open = Number(i.openMinor) > 0;
     const cardSel = select(CARDS, CARDS[0][0], { 'aria-label': 'Card' });
+    const key = newId();   // one key per invoice on this page: a second press of the same payment is refused, not charged
     const pay = btn(`Pay ${money(i.openMinor)}`, async (e) => {
-      try { const r = await busy(e.currentTarget, () => post(`/invoices/${i.id}/pay`, { paymentToken: cardSel.value })); ME = null; toast(`Paid ${money(r.paidMinor)} · ${r.card}`); render(); } catch (x) { showErr(err, x); }
+      try { const r = await busy(e.currentTarget, () => post(`/invoices/${i.id}/pay`, { paymentToken: cardSel.value, key })); ME = null; toast(`Paid ${money(r.paidMinor)} · ${r.card}`); render(); } catch (x) { showErr(err, x); }
     }, true);
     return el('div', { class: 'tr-item' }, el('div', { class: 'tr-row' }, el('span', { class: 't', text: `${i.number}${i.order_number ? ' · ' + i.order_number : ''}` }), el('span', { class: 'amt', text: money(i.total_minor) })),
       el('span', { class: 'd', text: `${day(i.invoice_date)} · due ${day(i.due_date)}` }), el('span', {}, open ? chip(i.pastDue ? 'bad' : 'warn', `${money(i.openMinor)} open${i.pastDue ? ', past due' : ''}`) : chip('good', 'Paid')),

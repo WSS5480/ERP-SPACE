@@ -100,7 +100,7 @@ Data is placed with textContent only, never innerHTML.
 | tax and selling rules (extends setup, pos, ar, reports) | 0037 | 0023 | Setup (Sales tax), Back office (Reports → Sales tax filing) |
 | ops (truck loading manifest and lanes, haul-away and recycling, vendor debit memos, time off and holidays; extends fleet, payables, workforce) | 0039, 0041 | 0025 | Operations (Loading dock, Haul-away), Back office (Debit memos, Time off) |
 | lots (serial numbers and dye lots, label printing, finance company settlements; extends inventory, edi, catalog tags, ar) | 0045 | 0028 | Operations (Serials and lots, Labels), Back office (Finance settlements) |
-| trade (trade and designer accounts, the trade portal, room projects and follow-ups, the designer as a commission role; extends crm, catalog, tax, ar, shop, workforce) | 0044 | 0027 | Retail (Trade accounts, Room projects) |
+| trade (trade and designer accounts, the trade portal, room projects and follow-ups, the designer as a commission role; extends crm, catalog, tax, ar, shop, workforce) | 0044, 0047 | 0027 | Retail (Trade accounts, Room projects) |
 | configurator (sectionals, fabric/leather grades and swatches, option rules, condition grades; extends catalog, pos, inventory, shop, edi) | 0043 | 0026 | Retail (Sectionals), Operations (As-is grades) |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
@@ -190,6 +190,27 @@ sale); a return line follows the line it returns. An outside referral
 delivered (or once paid: `trade.referral_on`), given back on a return or a
 cancel; `billReferrals` turns what is owed into a bill from the account's
 vendor, coded to 2160, through the payables gates.
+
+Review fixes (migration 0047, Nov 10 2026). An on-account order locks the
+customer row before it sums what is on order, so two at once cannot both pass
+the limit. Apply, ask-for-a-code and check-a-code answer the same whether or
+not the email has an account (apply never shows a number; staff see it). Client
+addresses: `ERP_TRUSTED_PROXY_HOPS` (default 1) is how many proxies append to
+x-forwarded-for; Render's proxy appends the address it saw, so with 1 only the
+rightmost hop counts and anything a client wrote to its left is ignored; 0 uses
+the socket address. Codes, checks and applications are also limited per email.
+Routes may take a bigger JSON body (`coPost`/`publicRoute` option `maxBody`);
+only the room photo routes do (3 MB), and both screens resize photos to 1600 px
+JPEG 0.8. A session ends after two idle hours. "Once paid" referral means the
+line's invoice is paid (on account, through A/R) or the order is paid in full,
+and uses the cost recorded on the line. A cost-plus rule on an item with no
+cost falls back to the list's retail-less rule, else retail; rules never price
+below cost unless `price_list.allow_below_cost`. Sectional builds take the
+account's list per piece (`configurator.priceBuild(..., { priceList })`). A
+portal invoice payment carries a key from the page (`trade_invoice_payment`):
+the customer and invoice are locked and the balance checked before the card is
+asked, and the same key twice is refused before any charge. A designer (or rep)
+with no commission plan cannot be given a line split.
 
 ## Group accounting
 

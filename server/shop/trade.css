@@ -49,3 +49,7 @@ a.tr-item:hover{background:var(--soft)}
 .tr-muted{color:var(--muted);font-size:14px}
 .tr-opening{display:grid;grid-template-columns:1fr 1fr;gap:8px;border:1px dashed var(--line);border-radius:10px;padding:10px}
 @media (min-width:640px){.tr-opening{grid-template-columns:repeat(4,1fr) auto}}
+.btn.tr-small{min-height:40px;padding:0 14px;font-size:14px;font-weight:600}
+.tr-itemacts{align-items:flex-end}
+.tr-itemacts .tr-field{flex:0 1 110px}
+@media (max-width:420px){.tr-acts .btn.tr-small{min-height:38px;padding:0 12px}}

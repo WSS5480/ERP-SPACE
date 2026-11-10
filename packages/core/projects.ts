@@ -123,7 +123,7 @@ export async function addPhoto(c: Client, scope: Scope, id: string, dataUrl: unk
   await projectRow(c, scope.entityId, id, v);
   const d = typeof dataUrl === "string" ? dataUrl.trim() : "";
   need(/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(d), "A photo is a PNG, JPEG or WebP picture.");
-  need(d.length <= 1_500_000, "That photo is too large; keep it under about 1 MB.");
+  need(d.length <= 2_900_000, "That photo is too large; keep it under about 2 MB.");
   const n = Number((await one<{ n: string }>(c, `select count(*) n from room_project_photo where entity_id = $1 and project_id = $2 and removed_at is null`, [scope.entityId, id])).n);
   need(n < 24, "A project holds 24 photos; remove one first.");
   return (await one<{ id: string }>(c, `insert into room_project_photo (entity_id, project_id, data_url, caption) values ($1,$2,$3,$4) returning id`,

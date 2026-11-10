@@ -21,6 +21,8 @@ export type CoGet = (
 export type CoPost = (
   tail: string,
   fn: (c: Client, co: Company, a: Actor, body: Record<string, unknown>, m: RegExpMatchArray) => Promise<unknown>,
+  /** maxBody: a larger JSON body for this route only (room photos); 256 KB otherwise */
+  opts?: { maxBody?: number },
 ) => void;
 
 /** A public route (the web store). No token, no session; it must never return back-office data. */
@@ -28,6 +30,7 @@ export type PublicRoute = (
   method: "GET" | "POST",
   path: RegExp,
   fn: (req: http.IncomingMessage, url: URL, m: RegExpMatchArray, body: Record<string, unknown>) => Promise<[number, unknown]>,
+  opts?: { maxBody?: number },
 ) => void;
 
 /**

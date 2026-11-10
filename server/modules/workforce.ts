@@ -50,7 +50,7 @@ export const H = {
                                   from pay_period pp join pay_group pg on pg.id = pp.pay_group_id and pg.entity_id = $1
                                  where pp.status in ('open','timecards_approved','built','released','posted') order by pp.ends_on desc, pg.name limit 30`, [co.id]);
     const sellers = await q(c, `select distinct u.id, u.name from app_user u join role_grant g on g.app_user_id = u.id
-                                 where (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $2)) and g.role in ('sales','store_manager','owner')
+                                 where (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $2)) and g.role in ('sales','store_manager','designer','owner')
                                  order by u.name`, [co.id, co.tenantId]);
     const mine = await myEmployee(c, co, personId);
     const roles = personId ? [...(await rolesOf(c, co, personId))] : [];

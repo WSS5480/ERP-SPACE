@@ -44,6 +44,8 @@ export const CODE_MAX_TRIES = 5;
 export const CODES_PER_WINDOW = 3;
 export const CODE_WINDOW_MIN = 15;
 export const SESSION_HOURS = 12;
+/** A session not used for this long ends (last_seen_at), even inside its 12 hours. */
+export const SESSION_IDLE_MIN = 120;
 
 // ============================================================== the seam
 
@@ -91,7 +93,9 @@ export async function submitApplication(c: Client, site: shop.Site, a: Applicati
   // One open application per email; an account already open answers the same, so this tells a stranger nothing new.
   const open = await q(c, `select 1 from trade_application where entity_id = $1 and lower(email) = $2 and status = 'pending'`, [site.entity_id, email]);
   const acct = await q(c, `select 1 from trade_account where entity_id = $1 and lower(email) = $2`, [site.entity_id, email]);
-  if (open.length || acct.length) return { received: true, number: null as string | null };
+  // The same answer whether or not the email already applied or trades here, and never the number: staff see that.
+  const thanks = { received: true, message: "Thanks. We'll be in touch." };
+  if (open.length || acct.length) return thanks;
   const recent = await one<{ n: string }>(c, `select count(*) n from trade_application where entity_id = $1 and ip_hash = $2 and created_at > now() - interval '1 hour'`,
     [site.entity_id, ipHash ?? "-"]);
   need(Number(recent.n) < 5, "Too many applications from here. Try again in an hour.");
@@ -100,7 +104,7 @@ export async function submitApplication(c: Client, site: shop.Site, a: Applicati
       address, notes, ip_hash) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
     [site.entity_id, number, company, kind, contact, email, phone || null, clean(a.website, 200) || null, resale || null, resale ? st : null, resale && exp ? exp : null,
      JSON.stringify(address.line1 ? address : {}), clean(a.notes, 1000) || null, ipHash]);
-  return { received: true, number };
+  return thanks;
 }
 
 export async function applications(c: Client, entityId: string, status = "pending") {
@@ -308,7 +312,8 @@ export async function requestCode(c: Client, site: shop.Site, emailIn: unknown, 
   await c.query(`select id from trade_account where id = $1 and entity_id = $2 for update`, [a.id, site.entity_id]);
   const recent = await one<{ n: string }>(c, `select count(*) n from trade_login_code where entity_id = $1 and trade_account_id = $2
       and created_at > $3::timestamptz - make_interval(mins => $4)`, [site.entity_id, a.id, at, CODE_WINDOW_MIN]);
-  need(Number(recent.n) < CODES_PER_WINDOW, `Too many codes asked for. Wait ${CODE_WINDOW_MIN} minutes, then ask again.`);
+  // Over the limit: no code, and the same answer as ever (the route also limits by email, whoever asks).
+  if (Number(recent.n) >= CODES_PER_WINDOW) return sent;
   // Only the newest code works.
   await c.query(`update trade_login_code set expires_at = least(expires_at, $3::timestamptz) where entity_id = $1 and trade_account_id = $2 and used_at is null`, [site.entity_id, a.id, at]);
   const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
@@ -319,6 +324,7 @@ export async function requestCode(c: Client, site: shop.Site, emailIn: unknown, 
   return sent;
 }
 
+export const CODE_REFUSED = "That code didn't work. Check it, or ask for a new one: a code works once, for 10 minutes.";
 export type VerifyResult = { ok: true; token: string; expiresAt: string; account: { company: string; contact: string } } | { ok: false; error: string };
 
 /**
@@ -331,18 +337,18 @@ export async function verifyCode(c: Client, site: shop.Site, emailIn: unknown, c
   const code = clean(codeIn, 12).replace(/\s/g, "");
   if (!EMAIL.test(email) || !/^\d{6}$/.test(code)) return { ok: false, error: "Enter your email and the six-digit code from it." };
   const a = await accountByEmail(c, site.entity_id, email);
-  const none: VerifyResult = { ok: false, error: "That code has expired or was never sent. Ask for a new one." };
+  // One answer for every failure: no account, no code, expired, used, wrong, or too many tries.
+  const none: VerifyResult = { ok: false, error: CODE_REFUSED };
   if (!a || a.status !== "active") return none;
   const k = (await q<{ id: string; code_sha256: string; expires_at: string; attempts: number; live: boolean }>(c, `
     select id, code_sha256, expires_at, attempts, expires_at > $3::timestamptz live from trade_login_code
      where entity_id = $1 and trade_account_id = $2 and used_at is null order by created_at desc limit 1 for update`, [site.entity_id, a.id, at]))[0];
   if (!k || !k.live) return none;
-  if (k.attempts >= CODE_MAX_TRIES) return { ok: false, error: "Too many wrong tries for that code. Ask for a new one." };
+  if (k.attempts >= CODE_MAX_TRIES) return none;
   const want = Buffer.from(k.code_sha256, "hex"), got = Buffer.from(codeHash(a.id, code), "hex");
   if (want.length !== got.length || !timingSafeEqual(want, got)) {
     await c.query(`update trade_login_code set attempts = attempts + 1 where id = $1 and entity_id = $2`, [k.id, site.entity_id]);
-    const left = CODE_MAX_TRIES - k.attempts - 1;
-    return { ok: false, error: left > 0 ? `That code is not right. ${left} ${left === 1 ? "try" : "tries"} left.` : "That code is not right, and it no longer works. Ask for a new one." };
+    return none;
   }
   await c.query(`update trade_login_code set used_at = $3 where id = $1 and entity_id = $2`, [k.id, site.entity_id, at]);
   const token = randomBytes(32).toString("base64url");
@@ -362,7 +368,8 @@ export async function sessionFor(c: Client, site: shop.Site, token: unknown): Pr
     select s.id, t.id account_id, t.customer_id, pl.code price_list, t.company_name, t.email, t.contact_name, t.rep_id
       from trade_session s join trade_account t on t.id = s.trade_account_id and t.entity_id = s.entity_id
       left join price_list pl on pl.id = t.price_list_id and pl.active
-     where s.token_sha256 = $1 and s.entity_id = $2 and s.revoked_at is null and s.expires_at > now() and t.status = 'active'`, [sha(token), site.entity_id]))[0];
+     where s.token_sha256 = $1 and s.entity_id = $2 and s.revoked_at is null and s.expires_at > now() and t.status = 'active'
+       and s.last_seen_at > now() - make_interval(mins => $3)`, [sha(token), site.entity_id, SESSION_IDLE_MIN]))[0];
   if (!r) return null;
   return { accountId: r.account_id, customerId: r.customer_id, entityId: site.entity_id, priceList: r.price_list, company: r.company_name, email: r.email, contact: r.contact_name, repId: r.rep_id };
 }
@@ -488,7 +495,8 @@ export async function quoteOrder(c: Client, site: shop.Site, s: Session, b: Orde
   const { inp, project } = await checkoutFor(c, site, s, b, true);
   const qt = await shop.quote(c, site, inp);
   if (project) await projects.markQuoted(c, scopeFor(site, s), project.id as string, viewer(s));
-  return { ...qt, resale: !!inp.trade?.resaleCert, onAccount: inp.trade?.onAccount ?? false, credit: await credit(c, site.entity_id, s.customerId) };
+  // Resale only where the certificate actually exempted something (its state is the destination's).
+  return { ...qt, resale: qt.resaleExempt, onAccount: inp.trade?.onAccount ?? false, credit: await credit(c, site.entity_id, s.customerId) };
 }
 
 export async function placeOrder(c: Client, site: shop.Site, s: Session, b: OrderIn, provider: shop.PaymentProvider = shop.providerFor(site), mailer?: shop.MessageProvider) {
@@ -539,32 +547,51 @@ export async function invoices(c: Client, site: shop.Site, s: Session) {
     credit: await credit(c, site.entity_id, s.customerId) };
 }
 
-/** Pay an open invoice by card, through the store's card processor, onto the account (A/R applies it to that invoice). */
-export async function payInvoice(c: Client, site: shop.Site, s: Session, invoiceId: string, b: { amountMinor?: bigint | null; paymentToken: unknown },
+/**
+ * Pay an open invoice by card, through the store's card processor, onto the
+ * account (A/R applies it to that invoice). The customer and the invoice are
+ * locked and the open balance checked before the card is touched, and the
+ * page's key makes a second press of the same payment a refusal, not a
+ * second charge.
+ */
+export async function payInvoice(c: Client, site: shop.Site, s: Session, invoiceId: string, b: { amountMinor?: bigint | null; paymentToken: unknown; key?: unknown },
   provider: shop.PaymentProvider = shop.providerFor(site)) {
   need(U.test(invoiceId), "No such invoice.");
-  const inv = (await ar.openInvoices(c, site.entity_id, s.customerId)).find((x) => x.id === invoiceId);
-  const mine = await q<{ number: string }>(c, `select number from customer_invoice where id = $1 and entity_id = $2 and customer_id = $3`, [invoiceId, site.entity_id, s.customerId]);
+  const key = String(b.key ?? "");
+  need(/^[A-Za-z0-9_-]{8,64}$/.test(key), "Refresh the page and try the payment again.");
+  const token = String(b.paymentToken ?? "");
+  need(/^[A-Za-z0-9_]{6,80}$/.test(token), "Choose a card to pay with.");
+  await c.query(`select id from customer where id = $1 and entity_id = $2 for update`, [s.customerId, site.entity_id]);
+  const fresh = await q(c, `insert into trade_invoice_payment (entity_id, trade_account_id, idem_key, invoice_id) values ($1,$2,$3,$4)
+      on conflict (trade_account_id, idem_key) do nothing returning id`, [site.entity_id, s.accountId, key, invoiceId]);
+  need(fresh.length, "That payment was already sent. Refresh to see the invoice; you were not charged twice.");
+  const mine = await q<{ number: string; sales_order_id: string | null }>(c, `select number, sales_order_id from customer_invoice where id = $1 and entity_id = $2 and customer_id = $3 for update`,
+    [invoiceId, site.entity_id, s.customerId]);
   need(mine.length, "No such invoice.");
+  const inv = (await ar.openInvoices(c, site.entity_id, s.customerId)).find((x) => x.id === invoiceId);
   need(inv && BigInt(inv.open_minor) > 0n, `Invoice ${mine[0].number} is already paid.`);
   const open = BigInt(inv!.open_minor);
   const amount = b.amountMinor ?? open;
   need(amount > 0n, "Enter an amount to pay.");
   need(amount <= open, `Invoice ${mine[0].number} has ${(Number(open) / 100).toFixed(2)} open; pay that or less.`);
-  const token = String(b.paymentToken ?? "");
-  need(/^[A-Za-z0-9_]{6,80}$/.test(token), "Choose a card to pay with.");
   const auth = await provider.authorize({ amountMinor: amount, token, reference: mine[0].number });
   if (!auth.approved) throw new TradeError(auth.reason);
   try {
     await provider.capture(auth.authRef, amount);
     const r = await ar.receivePayment(c, scopeFor(site, s), { customerId: s.customerId, amountMinor: amount, method: "card", locationId: site.web_location_id,
       reference: `${auth.brand} ending ${auth.last4}, ${provider.name} ${auth.authRef}`, channel: "web", apply: [{ invoiceId, amountMinor: amount }] });
-    await accrueReferrals(c, scopeFor(site, s), { orderId: inv!.sales_order_id });
+    await c.query(`update trade_invoice_payment set receipt_id = $3, amount_minor = $4 where entity_id = $1 and id = $2`, [site.entity_id, (fresh[0] as { id: string }).id, r.receiptId, amount.toString()]);
+    await accrueReferrals(c, scopeFor(site, s), { orderId: mine[0].sales_order_id });
     return { receipt: r.number, paidMinor: amount.toString(), card: `${auth.brand} ending ${auth.last4}` };
   } catch (e) {
     await provider.void(auth.authRef).catch(() => undefined);
     throw e;
   }
+}
+
+/** A sectional built in the portal, priced at the account's trade prices per piece. */
+export async function sectionalPrice(c: Client, site: shop.Site, s: Session, productId: string, build: Parameters<typeof shop.pubSectionalPrice>[3]) {
+  return shop.pubSectionalPrice(c, site, productId, build, s.priceList);
 }
 
 /** A tear sheet link for one of the account's orders, or a product the trade can buy. Opens /sheet/<token>. */

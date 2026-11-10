@@ -72,11 +72,12 @@ export async function run(t: T) {
   const app1 = await inTx((c) => trade.submitApplication(c, site, { companyName: "Hartley Design Studio", kind: "designer", contactName: "Jo Hartley", email: email1, phone: "717-555-0199",
     resaleNumber: `PA-RS-${uniq}`, resaleState: "PA", resaleExpires: nextYear, address: { line1: "200 Market St", city: "Harrisburg", state: "PA", postal: "17101" } }, "ip-a"));
   const again = await inTx((c) => trade.submitApplication(c, site, { companyName: "Hartley Design Studio", kind: "designer", contactName: "Jo Hartley", email: email1 }, "ip-a"));
-  t.ok("apply: an application is received and numbered; a second one for the same email makes nothing new", !!app1.number && again.received && again.number === null);
+  t.ok("apply: the answer is the same thanks every time and shows no number", JSON.stringify(app1) === JSON.stringify(again) && !("number" in app1) && /in touch/.test(app1.message));
   const app2 = await inTx((c) => trade.submitApplication(c, site, { companyName: "Riverside Staging", kind: "stager", contactName: "Sam Rivers", email: email2 }, "ip-b"));
   const pending = await inTx((c) => trade.applications(c, ENTITY, "pending"));
-  const a1 = pending.find((x) => x.number === app1.number)!, a2 = pending.find((x) => x.number === app2.number)!;
-  t.ok("review: staff see pending applications", !!a1 && !!a2);
+  const a1 = pending.find((x) => x.email === email1)!, a2 = pending.find((x) => x.email === email2)!;
+  t.ok("review: staff see pending applications, numbered, once per email", !!a1 && !!a2 && /^TA-/.test(a1.number) && pending.filter((x) => x.email === email1).length === 1);
+  t.ok("apply: a second application for the same email answered alike", JSON.stringify(app2) === JSON.stringify(app1));
 
   // ----------------------------------------------------------- roles
   await t.throws("roles: a salesperson cannot decide an application", () => as(MARIA, (c, co, a) => requireRole(c, co, a, ROLES.review, "deciding a trade application")), /needs one of: store manager, controller/);
@@ -127,13 +128,16 @@ export async function run(t: T) {
   await inTx((c) => trade.requestCode(c, site, email1, "ip-a", mail.m, past));
   const oldCode = mail.last();
   const expired = await inTx((c) => trade.verifyCode(c, site, email1, oldCode));
-  t.ok("sign-in: an expired code is refused", !expired.ok && /expired/.test((expired as { error: string }).error));
+  t.ok("sign-in: an expired code is refused", !expired.ok && (expired as { error: string }).error === trade.CODE_REFUSED);
   const stranger = await inTx((c) => trade.requestCode(c, site, `nobody-${uniq}@example.com`, "ip-z", mail.m));
-  t.ok("sign-in: an email with no account gets the same answer and no code", stranger.sent && mail.count() === 1);
+  const known = await inTx((c) => trade.requestCode(c, site, email1, "ip-a", catcher().m, past));
+  t.ok("sign-in: an email with no account gets the same answer and no code", JSON.stringify(stranger) === JSON.stringify(known) && mail.count() === 1);
+  const strangerCheck = await inTx((c) => trade.verifyCode(c, site, `nobody-${uniq}@example.com`, "123456"));
+  t.ok("sign-in: checking a code for an email with no account reads like any wrong code", !strangerCheck.ok && (strangerCheck as { error: string }).error === trade.CODE_REFUSED);
   await inTx((c) => trade.requestCode(c, site, email1, "ip-a", mail.m));
   const code = mail.last();
   const wrong = await inTx((c) => trade.verifyCode(c, site, email1, code === "000000" ? "111111" : "000000"));
-  t.ok("sign-in: a wrong code is refused and counted", !wrong.ok && /not right\. 4 tries left/.test((wrong as { error: string }).error), (wrong as { error: string }).error);
+  t.ok("sign-in: a wrong code is refused, in the same words as every other failure", !wrong.ok && (wrong as { error: string }).error === trade.CODE_REFUSED, (wrong as { error: string }).error);
   const tries = (await inTx((c) => q<{ attempts: number }>(c, `select attempts from trade_login_code where entity_id = $1 and trade_account_id = $2 order by created_at desc limit 1`, [ENTITY, ok1.tradeAccountId])))[0];
   t.ok("sign-in: the wrong try is kept even though the answer was a refusal", tries.attempts === 1);
   const good = await inTx((c) => trade.verifyCode(c, site, email1, code));
@@ -145,13 +149,15 @@ export async function run(t: T) {
   t.ok("sign-in: the code is not stored as itself, only its hash", stored.n === "0");
   await inTx((c) => trade.requestCode(c, site, email1, "ip-a", mail.m));
   await inTx((c) => trade.requestCode(c, site, email1, "ip-a", mail.m));
-  await t.throws("sign-in: no more than three codes in fifteen minutes", () => inTx((c) => trade.requestCode(c, site, email1, "ip-a", mail.m)), /Too many codes/);
+  const before4 = mail.count();
+  const fourth = await inTx((c) => trade.requestCode(c, site, email1, "ip-a", mail.m));
+  t.ok("sign-in: no more than three codes in fifteen minutes, with the same answer (no code goes out)", mail.count() === before4 && JSON.stringify(fourth) === JSON.stringify(stranger));
   const later = new Date(Date.now() + 20 * 60_000);
   await inTx((c) => trade.requestCode(c, site, email1, "ip-a", mail.m, later));
   const c5 = mail.last();
   for (let i = 0; i < 5; i++) await inTx((c) => trade.verifyCode(c, site, email1, c5 === "999999" ? "888888" : "999999", later));
   const locked = await inTx((c) => trade.verifyCode(c, site, email1, c5, later));
-  t.ok("sign-in: five wrong tries kill the code", !locked.ok && /Too many wrong tries/.test((locked as { error: string }).error));
+  t.ok("sign-in: five wrong tries kill the code", !locked.ok && (locked as { error: string }).error === trade.CODE_REFUSED);
   const s1 = (await inTx((c) => trade.sessionFor(c, site, token1)))!;
   t.ok("sign-in: the session names the account", !!s1 && s1.accountId === ok1.tradeAccountId && s1.priceList === "TRADE");
   t.ok("sign-in: a made-up token opens nothing", (await inTx((c) => trade.sessionFor(c, site, "x".repeat(43)))) === null);
@@ -213,6 +219,7 @@ export async function run(t: T) {
     recLine.taxMinor === bps(BigInt(recLine.lineMinor), 825).toString(), `${recLine.taxMinor} on ${recLine.lineMinor}`);
   const resaleAway = await inTx((c) => trade.quoteOrder(c, site, s1, { projectId: proj.id, fulfillment: "delivery", shipTo: "client", resale: true, payBy: "account", cartId: cart() }));
   t.ok("tax: a Pennsylvania resale certificate does not exempt a Texas delivery", resaleAway.lines.find((l) => l.productId === P.RECLINER)!.taxMinor === recLine.taxMinor);
+  t.ok("tax: and the quote does not call it a resale order", resaleAway.resale === false);
   t.ok("projects: quoting the project marks it quoted", !!(await inTx((c) => trade.myProject(c, site, s1, proj.id)))!.quoted_at);
 
   // ----------------------------------------------- orders on account and for resale
@@ -270,11 +277,22 @@ export async function run(t: T) {
   const mineInv = invs.invoices.find((x) => x.id === inv.invoiceId)!;
   const due = (await inTx((c) => q<{ d: string }>(c, `select (invoice_date + 30)::text d from customer_invoice where id = $1 and entity_id = $2`, [inv.invoiceId, ENTITY])))[0].d;
   t.ok("invoices: on account, the invoice is due on net 30", !!mineInv && mineInv.due_date === due && mineInv.openMinor === so1.total_minor);
-  await t.throws("invoices: another account cannot pay (or see) it", () => inTx((c) => trade.payInvoice(c, site, s2, inv.invoiceId, { paymentToken: "tok_test_visa_4242" })), /No such invoice/);
-  const paid = await inTx((c) => trade.payInvoice(c, site, s1, inv.invoiceId, { paymentToken: "tok_test_visa_4242" }));
+  await t.throws("invoices: another account cannot pay (or see) it", () => inTx((c) => trade.payInvoice(c, site, s2, inv.invoiceId, { paymentToken: "tok_test_visa_4242", key: `k-${uniq}-x` })), /No such invoice/);
+  // A double press: the same key twice at once charges once; the second is refused before the card is touched.
+  let charges = 0;
+  const counting: shop.PaymentProvider = { ...shop.TestProvider, async authorize(a) { charges++; return shop.TestProvider.authorize(a); } };
+  const payKey = `k-${uniq}-pay1`;
+  const both = await Promise.allSettled([1, 2].map(() => inTx((c) => trade.payInvoice(c, site, s1, inv.invoiceId, { paymentToken: "tok_test_visa_4242", key: payKey }, counting))));
+  const paidR = both.find((r) => r.status === "fulfilled") as PromiseFulfilledResult<Awaited<ReturnType<typeof trade.payInvoice>>> | undefined;
+  const dupR = both.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+  t.ok("invoices: a double press with one key charges the card once and refuses the other", !!paidR && !!dupR && charges === 1 && /already sent/.test(String(dupR.reason?.message)),
+    `${charges} charges; ${dupR?.reason?.message}`);
+  const paid = paidR!.value;
   const after = (await inTx((c) => q<{ status: string }>(c, `select status from customer_invoice where id = $1 and entity_id = $2`, [inv.invoiceId, ENTITY])))[0];
   t.ok("invoices: paid by card in the portal, through A/R", paid.paidMinor === so1.total_minor && after.status === "paid");
-  await t.throws("invoices: a paid invoice is not paid twice", () => inTx((c) => trade.payInvoice(c, site, s1, inv.invoiceId, { paymentToken: "tok_test_visa_4242" })), /already paid/);
+  charges = 0;
+  await t.throws("invoices: a paid invoice is not paid twice", () => inTx((c) => trade.payInvoice(c, site, s1, inv.invoiceId, { paymentToken: "tok_test_visa_4242", key: `k-${uniq}-pay2` }, counting)), /already paid/);
+  t.ok("invoices: ...and the card is never asked", charges === 0);
 
   // ------------------------------------------------------------ follow-ups
   const qt = await as(MARIA, async (c) => {
@@ -367,6 +385,102 @@ export async function run(t: T) {
   t.ok("referral: billed as a payable to the trade account's vendor, coded to 2160", billRow.vendor_id === vendorId && billRow.total_minor === owed.owed_minor);
   await t.throws("referral: nothing is billed twice", () => as(PEOPLE.CONTROLLER, (c) => tc.billReferrals(c, userScope(PEOPLE.CONTROLLER), ok1.tradeAccountId!, PEOPLE.CONTROLLER)), /nothing|no referral commission waiting/);
 
+  // ------------------------------------------------------------ review fixes
+  // A third account with a $1,000 limit, and a referral rate (it refers, too).
+  const email3 = `third-${uniq}@example.com`;
+  await inTx((c) => trade.submitApplication(c, site, { companyName: "Third Coast Hospitality", kind: "hospitality", contactName: "Pat Coast", email: email3 }, "ip-c"));
+  const a3 = (await inTx((c) => trade.applications(c, ENTITY, "pending"))).find((x) => x.email === email3)!;
+  const ok3 = await as(PEOPLE.CONTROLLER, (c) => trade.decideApplication(c, userScope(PEOPLE.CONTROLLER), a3.id, { decision: "approved", creditLimitMinor: 100000n, referralBps: 500, vendorId }, true));
+  await inTx((c) => trade.requestCode(c, site, email3, "ip-c", mail.m));
+  const s3tok = (await inTx((c) => trade.verifyCode(c, site, email3, mail.last())) as { token: string }).token;
+  const s3 = (await inTx((c) => trade.sessionFor(c, site, s3tok)))!;
+  // Two on-account orders at once, each under the limit, together over it: one goes through.
+  const race = await Promise.allSettled([1, 2].map(() => inTx((c) => trade.placeOrder(c, site, s3, { lines: [{ productId: P.LAMP, qty: 15 }], fulfillment: "delivery", shipTo: "address",
+    address: PA, payBy: "account", cartId: cart() }))));
+  const raceOk = race.filter((r) => r.status === "fulfilled").length, raceNo = race.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+  t.ok("credit: two on-account orders at once cannot both pass the limit (the customer row is locked)", raceOk === 1 && /can't go on account/.test(String(raceNo?.reason?.message)),
+    `${raceOk} placed; ${raceNo?.reason?.message ?? ""}`);
+  const owedNow = (await inTx((c) => trade.me(c, site, s3))).credit;
+  t.ok("credit: what is on order stays within the limit", BigInt(owedNow.onOrderMinor) <= 100000n);
+
+  // Referral "once paid" on an on-account order: earned when its invoice is paid through A/R, not before.
+  await inTx((c) => c.query(`insert into entity_setting (entity_id, key, value, set_by) values ($1,'trade.referral_on','"paid"','checks')
+    on conflict (entity_id, key) do update set value = excluded.value`, [ENTITY]));
+  const paidOrder = await inTx((c) => trade.placeOrder(c, site, s1, { lines: [{ productId: P.LAMP, qty: 1 }], fulfillment: "delivery", shipTo: "address", address: PA, payBy: "account", cartId: cart() }));
+  const pl = (await inTx((c) => q<{ id: string }>(c, `select id from sales_order_line where entity_id = $1 and sales_order_id = $2 and product_id = $3`, [ENTITY, paidOrder.orderId, P.LAMP])))[0].id;
+  await as(MARIA, (c) => tc.setLineCommission(c, userScope(MARIA), pl, { referralTradeAccountId: ok3.tradeAccountId }));
+  const pinv = await inTx(async (c) => {
+    const ids = (await q<{ id: string }>(c, `select id from sales_order_line where entity_id = $1 and sales_order_id = $2`, [ENTITY, paidOrder.orderId])).map((x) => x.id);
+    await c.query(`update sales_order_line set line_status = 'fulfilled' where entity_id = $1 and sales_order_id = $2`, [ENTITY, paidOrder.orderId]);
+    const { invoiceFulfilment } = await import("../../packages/core/ar.ts");
+    const r = await invoiceFulfilment(c, scope, paidOrder.orderId, ids, 0n);
+    await tc.accrueReferrals(c, scope, { orderId: paidOrder.orderId });
+    return r;
+  });
+  const before = await inTx((c) => q(c, `select 1 from trade_referral_event where entity_id = $1 and sales_order_line_id = $2`, [ENTITY, pl]));
+  await inTx((c) => trade.payInvoice(c, site, s1, pinv.invoiceId, { paymentToken: "tok_test_visa_4242", key: `k-${uniq}-paid` }));
+  const afterPay = await inTx((c) => q<{ kind: string }>(c, `select kind from trade_referral_event where entity_id = $1 and sales_order_line_id = $2`, [ENTITY, pl]));
+  t.ok("referral once paid: nothing while the on-account invoice is open, earned once it is paid", before.length === 0 && afterPay.length === 1 && afterPay[0].kind === "earned");
+  await inTx((c) => c.query(`update entity_setting set value = '"delivered"' where entity_id = $1 and key = 'trade.referral_on'`, [ENTITY]));
+
+  // Cost-plus with no cost, and the floor at cost.
+  const ROLL = new Error("rollback");
+  let fb: { noCost: bigint; floored: bigint; allowed: bigint } | null = null;
+  try {
+    await inTx(async (c) => {
+      await c.query(`update product set cost_minor = 0 where id = $1 and entity_id = $2`, [P.RECLINER, ENTITY]);
+      const noCost = (await priceConfigured(c, ENTITY, P.RECLINER, [], { priceList: "TRADE" })).unitPriceMinor;
+      await cat.savePriceRule(c, scope, listId, { category: "Accents", basis: "retail_less", bps: 9000 });
+      const floored = (await priceConfigured(c, ENTITY, P.LAMP, [], { priceList: "TRADE" })).unitPriceMinor;
+      await c.query(`update price_list set allow_below_cost = true where id = $1 and entity_id = $2`, [listId, ENTITY]);
+      const allowed = (await priceConfigured(c, ENTITY, P.LAMP, [], { priceList: "TRADE" })).unitPriceMinor;
+      fb = { noCost, floored, allowed };
+      throw ROLL;
+    });
+  } catch (e) { if (e !== ROLL) throw e; }
+  t.ok("pricing: cost-plus on an item with no cost falls back to the list's retail-less rule, not $0", fb!.noCost === 64999n - bps(64999n, 2000), String(fb!.noCost));
+  t.ok("pricing: a rule never prices below cost unless the list allows it", fb!.floored === 1900n && fb!.allowed === 5999n - bps(5999n, 9000), `${fb!.floored} / ${fb!.allowed}`);
+
+  // Sectionals at trade prices, per piece.
+  const cfgm = await import("../../packages/core/configurator.ts");
+  const FAM = "c0c00000-0000-0000-0000-000000000001";
+  const sect = await inTx(async (c) => ({ retail: await cfgm.priceBuild(c, ENTITY, FAM, { layout: "3pc-sofa-wedge-loveseat" }),
+    trade: await cfgm.priceBuild(c, ENTITY, FAM, { layout: "3pc-sofa-wedge-loveseat" }, { priceList: "TRADE" }),
+    portal: await trade.sectionalPrice(c, site, s1, FAM, { layout: "3pc-sofa-wedge-loveseat" }) }));
+  t.ok("sectionals: each piece is priced by the account's list (Living room, cost + 35%)", sect.trade.parts.every((x, i) =>
+    x.grossMinor === [sect.retail.parts[i].grossMinor, x.costMinor + bps(x.costMinor, 3500)].reduce((a, b) => (a < b ? a : b)) && x.priceList === "TRADE")
+    && sect.trade.totalMinor < sect.retail.totalMinor);
+  t.ok("sectionals: the portal prices a sectional at trade", String((sect.portal as { totalMinor: unknown }).totalMinor) === sect.trade.totalMinor.toString());
+  const sectOrder = await inTx((c) => shop.quote(c, site, { ...shop.parseCheckout({ cartId: cart(), email: s1.email, name: s1.company, fulfillment: "delivery", address: PA,
+    lines: [{ productId: FAM, qty: 1, sectional: { layout: "3pc-sofa-wedge-loveseat" } }], paymentToken: "on_account" }, true),
+    trade: { customerId: s1.customerId, priceList: "TRADE", resaleCert: null, onAccount: true, shipLabel: null, reference: null } }));
+  t.ok("sectionals: a trade checkout charges the trade price, not retail", BigInt(sectOrder.merchandiseMinor) === sect.trade.totalMinor, `${sectOrder.merchandiseMinor} vs ${sect.trade.totalMinor}`);
+
+  // A designer split needs a plan for the designer.
+  const NOPLAN = "55555555-0000-0000-0000-0000000000d2";
+  await inTx(async (c) => {
+    await c.query(`insert into app_user (id, tenant_id, name, email, status) values ($1,$2,'Lee (designer, no plan)','lee.designer@example.com','active') on conflict do nothing /* unscoped: test person */`, [NOPLAN, TENANT]);
+    await c.query(`insert into role_grant (app_user_id, entity_id, role) select $1,$2,'designer' where not exists (select 1 from role_grant where app_user_id = $1)`, [NOPLAN, ENTITY]);
+  });
+  const sale2 = await as(MARIA, async (c) => {
+    const o = await pos.createOrder(c, userScope(MARIA), new Set(["sales"]), { kind: "sale", locationId: LOC.ENOLA, customerId: ALICIA, lines: [{ productId: P.LAMP, qty: 1, fulfillment: "carry" }] });
+    return (await q<{ id: string }>(c, `select id from sales_order_line where entity_id = $1 and sales_order_id = $2 and product_id = $3`, [ENTITY, o.id, P.LAMP]))[0].id;
+  });
+  await t.throws("split: a designer with no commission plan is refused, so the share is not lost", () => as(MARIA, (c) => tc.setLineCommission(c, userScope(MARIA), sale2,
+    { primaryId: MARIA, designerId: NOPLAN, designerSplitBps: 3000 })), /no commission plan/);
+  // Sessions end after two idle hours.
+  await inTx((c) => trade.requestCode(c, site, email1, "ip-a", mail.m, new Date(Date.now() + 60 * 60_000)));
+  const idleTok = (await inTx((c) => trade.verifyCode(c, site, email1, mail.last(), new Date(Date.now() + 60 * 60_000))) as { token?: string }).token;
+  if (idleTok) await inTx((c) => c.query(`update trade_session set last_seen_at = now() - interval '3 hours' where entity_id = $1 and trade_account_id = $2 and created_at > now()`, [ENTITY, ok1.tradeAccountId]));
+  t.ok("sessions: a session idle for over two hours no longer opens the portal", !!idleTok && (await inTx((c) => trade.sessionFor(c, site, idleTok!))) === null);
+
+  // Which address counts.
+  const { clientIp } = await import("../../server/modules/trade.ts");
+  const fake = (xf: string | null) => ({ headers: xf ? { "x-forwarded-for": xf } : {}, socket: { remoteAddress: "10.0.0.9" } }) as unknown as import("node:http").IncomingMessage;
+  t.ok("addresses: one trusted proxy (Render) takes the rightmost hop only; a client-written hop is ignored",
+    clientIp(fake("6.6.6.6, 203.0.113.5"), 1) === "203.0.113.5" && clientIp(fake("6.6.6.6, 203.0.113.5"), 0) === "10.0.0.9"
+    && clientIp(fake("6.6.6.6, 198.51.100.2, 203.0.113.5"), 2) === "198.51.100.2" && clientIp(fake(null), 1) === "10.0.0.9");
+
   // ------------------------------------------------------- suspending
   await t.throws("suspending needs a reason", () => as(MGR, (c) => trade.saveAccount(c, userScope(MGR), ok2.tradeAccountId!, { status: "suspended" }, false)), /Say why/);
   await t.throws("terms need the controller", () => as(MGR, (c) => trade.saveAccount(c, userScope(MGR), ok2.tradeAccountId!, { creditLimitMinor: 100000n }, false)), /needs the controller/);
@@ -408,6 +522,18 @@ export async function run(t: T) {
     t.ok("portal: asking for codes is rate limited per address", limitedHit);
     const staff = await fetch(`${base}/api/c/${ENTITY}/trade/accounts`);
     t.ok("staff routes need sign-in", staff.status === 401);
+    _resetLimits();
+    let emailLimited = false;
+    for (let i = 0; i < 8 && !emailLimited; i++) {
+      const r = await fetch(`${base}/trade/buddys/api/code`, { method: "POST", headers: { ...H, "x-forwarded-for": `192.0.2.${i + 1}` }, body: JSON.stringify({ email: "same-one@example.com" }) });
+      if (r.status === 429) emailLimited = true;
+    }
+    t.ok("portal: codes for one email are limited whatever address asks", emailLimited);
+    _resetLimits();
+    const big = "data:image/jpeg;base64," + "A".repeat(600_000);
+    const photo = await fetch(`${base}/trade/buddys/api/projects/${proj.id}/photos`, { method: "POST", headers: { ...H, "x-trade-session": token1 }, body: JSON.stringify({ dataUrl: big, caption: "big" }) });
+    const overCap = await fetch(`${base}/trade/buddys/api/projects/${proj.id}`, { method: "POST", headers: { ...H, "x-trade-session": token1 }, body: JSON.stringify({ styleNotes: "x".repeat(600_000) }) });
+    t.ok("photos: a 600 KB photo uploads on the photo route; other routes keep the 256 KB cap", photo.status === 200 && overCap.status === 413, `${photo.status} / ${overCap.status}`);
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
   }

@@ -29,7 +29,7 @@ const safe = <A extends unknown[], R>(fn: (...a: A) => Promise<R>) => async (...
   try { return await fn(...a); } catch (e) { throw refusal(e); }
 };
 
-const SELL = ["sales", "cashier", "store_manager"];
+const SELL = ["sales", "cashier", "store_manager", "designer"];
 const TILL = ["cashier", "store_manager"];
 const MANAGER = ["store_manager"];
 const CERTS = ["store_manager", "ar_clerk", "controller"];
@@ -78,7 +78,7 @@ async function setup(c: Client, co: Company, personId: string | null) {
        where r.entity_id = $1 and r.active order by l.name, r.code`, [co.id]),
     q(c, `select id, code, name, kind, tax_rate_bps from location where entity_id = $1 and status = 'active' and kind in ('store','outlet','warehouse') order by kind desc, name`, [co.id]),
     q(c, `select distinct u.id, u.name from app_user u join role_grant g on g.app_user_id = u.id
-       where u.status = 'active' and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $2)) and g.role in ('sales','store_manager','cashier','owner')
+       where u.status = 'active' and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $2)) and g.role in ('sales','store_manager','cashier','designer','owner')
        order by u.name`, [co.id, co.tenantId]),
     pos.settings(c, co.id),
   ]);

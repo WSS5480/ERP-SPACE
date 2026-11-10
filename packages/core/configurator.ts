@@ -10,7 +10,7 @@
 // server/modules/configurator.ts.
 
 import { q, one, audit, type Client, type Scope } from "./db.ts";
-import { priceConfigured, PricingError, checkOptionRules, optionRules, type Choice, type OptionRule } from "./pricing.ts";
+import { priceConfigured, listPrice, PricingError, checkOptionRules, optionRules, type Choice, type OptionRule } from "./pricing.ts";
 import { imageByUrl, code128, createProduct, updateProduct, CatalogError, type ImageFetch } from "./catalog.ts";
 import { pieceAction, setAsIsPrice, InventoryError } from "./inventory.ts";
 
@@ -198,6 +198,8 @@ export type Part = {
   baseMinor: bigint; gradeAdderMinor: bigint; optionsMinor: bigint; grossMinor: bigint; bundleShareMinor: bigint; netMinor: bigint; costMinor: bigint;
   leadDays: number; special: boolean; options: { group: string; code: string; label: string; vendorCode: string | null; deltaMinor: string }[];
   config: Record<string, unknown>;
+  /** the price list that priced the piece (a trade account's), and its retail before the list */
+  priceList?: string | null; retailMinor?: bigint;
 };
 export type Priced = {
   familyId: string; familySku: string; familyName: string; layoutCode: string | null; layoutName: string;
@@ -212,7 +214,12 @@ async function swatchOf(c: Client, entityId: string, tableId: string, code: stri
 }
 
 /** Price a sectional build: the pieces, the cover's grade on each, each piece's options, less any bundle discount. */
-export async function priceBuild(c: Client, entityId: string, familyId: string, build: Build): Promise<Priced> {
+/**
+ * popts.priceList: a price list (a trade account's) prices each piece by its
+ * own list price or its category's rule (pricing.listPrice), on the piece's
+ * configured retail and cost; the lower of that and retail wins, per piece.
+ */
+export async function priceBuild(c: Client, entityId: string, familyId: string, build: Build, popts: { priceList?: string | null } = {}): Promise<Priced> {
   const fam = await familyRow(c, entityId, familyId);
   need(fam, "That is not a sectional this company sells.");
   need(fam!.active && fam!.status === "active", `The ${fam!.name} is not for sale.`);
@@ -300,8 +307,15 @@ export async function priceBuild(c: Client, entityId: string, familyId: string, 
     }
     try { checkOptionRules(rules, picked, label, p.piece_type); }
     catch (e) { if (e instanceof PricingError) throw new ConfigError(`${p.name}: ${e.message}`); throw e; }
-    const gross = base.unitPriceMinor + gAdd + oPrice;
+    let gross = base.unitPriceMinor + gAdd + oPrice;
     const cost = base.unitCostMinor + gCost + oCost;
+    const retail = gross;
+    let listed: string | null = null;
+    if (popts.priceList) {
+      const cat = (await q<{ category: string | null }>(c, `select category from product where id = $1 and entity_id = $2`, [p.product_id, entityId]))[0]?.category ?? null;
+      const lp = await listPrice(c, entityId, popts.priceList, { productId: p.product_id, category: cat, ticketMinor: gross, costMinor: cost, optionsDeltaMinor: gAdd + oPrice });
+      if (lp && lp.priceMinor < gross) { gross = lp.priceMinor; listed = lp.code; }
+    }
     const special = !cover || !cover.stock || chosenOpts.length > 0;
     const desc = [cover ? `${cover.name} (grade ${cover.grade})` : null, ...chosenOpts.map((o) => o.label)].filter(Boolean).join(", ");
     parts.push({
@@ -309,7 +323,7 @@ export async function priceBuild(c: Client, entityId: string, familyId: string, 
       pieceCode: p.code, pieceType: p.piece_type, position: i + 1, kind: p.kind, taxable: p.taxable, shipClass: p.ship_class,
       cubicFt: Number(p.cubic_ft ?? 0), weightLb: Number(p.weight_lb ?? 0),
       baseMinor: base.unitPriceMinor, gradeAdderMinor: gAdd, optionsMinor: oPrice, grossMinor: gross, bundleShareMinor: 0n, netMinor: gross, costMinor: cost,
-      leadDays: lead, special, options: chosenOpts, config: {},
+      leadDays: lead, special, options: chosenOpts, config: {}, priceList: listed, retailMinor: retail,
     });
   }
   const list = parts.reduce((a, x) => a + x.grossMinor, 0n);
