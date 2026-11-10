@@ -7,6 +7,7 @@
 import { type Client, type Scope, audit, one, q } from "./db.ts";
 import { openRequest } from "./approvals.ts";
 import { withinTolerance } from "./money.ts";
+import { post } from "./posting.ts";
 
 export type Status =
   | "captured" | "extracted" | "matched" | "validated" | "pending"
@@ -298,4 +299,79 @@ export async function postToLedger(c: Client, scope: Scope, invoiceId: string): 
     reason: "posted on approval",
   });
   return je.id;
+}
+
+// ------------------------------------------------ bills a vendor sends us --
+
+export class BillError extends Error {}
+const needBill = (cond: unknown, msg: string): void => { if (!cond) throw new BillError(msg); };
+
+export type VendorBillLine = { poLineId: string; qty: number; unitMinor: bigint; description?: string | null };
+export type VendorBill = {
+  vendorId: string; poId: string; reference: string; invoiceDate: string; termsDays?: number | null;
+  lines: VendorBillLine[]; charges?: { description: string; amountMinor: bigint }[]; totalMinor: bigint;
+};
+
+/**
+ * A merchandise bill the vendor sent us (an EDI 810, say), against its PO:
+ * one bill line per PO line, coded where the PO line is coded (received not
+ * invoiced), and freight or other charges to freight in. The gates run as
+ * for any bill, so the three-way match (PO, receipt, bill) decides whether
+ * it goes straight through. Approved bills post through the shared ledger.
+ */
+export async function enterVendorBill(c: Client, scope: Scope, b: VendorBill, makerId: string) {
+  needBill(makerId, "a bill needs a person who entered it");
+  needBill(b.reference && b.reference.trim(), "the bill has no number");
+  needBill(/^\d{4}-\d{2}-\d{2}$/.test(b.invoiceDate ?? ""), "the bill has no date");
+  needBill(b.lines.length, "the bill has no lines");
+  const po = (await q<{ id: string; number: string; vendor_id: string; profit_object_id: string | null }>(c,
+    `select id, number, vendor_id, profit_object_id from purchase_order where id = $1 and entity_id = $2`, [b.poId, scope.entityId]))[0];
+  needBill(po, "no such purchase order");
+  needBill(po.vendor_id === b.vendorId, `${po.number} is another vendor's order`);
+  const ve = (await q<{ terms_days: number }>(c, `select terms_days from vendor_entity where vendor_id = $1 and entity_id = $2 and status = 'active'`, [b.vendorId, scope.entityId]))[0];
+  needBill(ve, "that vendor is not set up for this company");
+  const dupe = await q(c, `select 1 from invoice where entity_id = $1 and vendor_id = $2 and reference = $3`, [scope.entityId, b.vendorId, b.reference.trim()]);
+  needBill(!dupe.length, `this vendor already has a bill numbered ${b.reference.trim()}`);
+  const pls = await q<{ id: string; seq: number; gl_account_id: string; description: string; quantity: string; cancelled_qty: string }>(c, `
+    select id, seq, gl_account_id, description, quantity, cancelled_qty from purchase_order_line where purchase_order_id = $1 and entity_id = $2`, [po.id, scope.entityId]);
+  const freight = (await q<{ id: string }>(c, `select id from gl_account where tenant_id = $1 and code = '5030' /* unscoped: chart is tenant-wide */`, [scope.tenantId]))[0];
+  let sum = 0n;
+  const rows: { gl: string; pol: string | null; desc: string; amount: bigint }[] = [];
+  for (const l of b.lines) {
+    const pl = pls.find((x) => x.id === l.poLineId);
+    needBill(pl, `the bill names a line that is not on ${po.number}`);
+    needBill(Number.isFinite(l.qty) && l.qty > 0, `line ${pl!.seq} is billed for no quantity`);
+    needBill(l.qty <= Number(pl!.quantity) - Number(pl!.cancelled_qty), `line ${pl!.seq} is billed for ${l.qty}, more than the ${Number(pl!.quantity) - Number(pl!.cancelled_qty)} ordered`);
+    const amount = BigInt(Math.round(l.qty * Number(l.unitMinor)));
+    sum += amount;
+    rows.push({ gl: pl!.gl_account_id, pol: pl!.id, desc: (l.description || pl!.description).slice(0, 200), amount });
+  }
+  for (const ch of b.charges ?? []) {
+    if (ch.amountMinor === 0n) continue;
+    needBill(freight, "the chart has no 5030 freight-in account for the bill's charges; apply a setup pack in Business setup");
+    sum += ch.amountMinor;
+    rows.push({ gl: freight!.id, pol: null, desc: ch.description.slice(0, 200), amount: ch.amountMinor });
+  }
+  needBill(sum === b.totalMinor, "the bill's total is not the sum of its lines and charges");
+  const inv = await one<{ id: string }>(c, `
+    insert into invoice (tenant_id, entity_id, vendor_id, kind, reference, invoice_date, due_date, total_minor, confidence_bps, purchase_order_id, created_by)
+    values ($1,$2,$3,'merchandise',$4,$5::date,$5::date + $6::int,$7,10000,$8,$9) returning id`,
+    [scope.tenantId, scope.entityId, b.vendorId, b.reference.trim().slice(0, 60), b.invoiceDate, b.termsDays ?? ve.terms_days, b.totalMinor.toString(), po.id, makerId]);
+  for (const [i, r] of rows.entries()) {
+    await c.query(`insert into invoice_line (invoice_id, seq, gl_account_id, profit_object_id, purchase_order_line_id, description, amount_minor)
+                   select $1,$2,$3,$4,$5,$6,$7 where exists (select 1 from invoice where id = $1 and entity_id = $8)`,
+      [inv.id, i + 1, r.gl, po.profit_object_id, r.pol, r.desc, r.amount.toString(), scope.entityId]);
+  }
+  await audit(c, scope, { table: "invoice", rowId: inv.id, action: "insert", after: { reference: b.reference, po: po.number, total: b.totalMinor.toString(), lines: rows.length } });
+  const out = await runGates(c, scope, inv.id, makerId);
+  let journalId: string | null = null;
+  if (out.status === "approved") {
+    const codes = new Map((await q<{ id: string; code: string }>(c, `select id, code from gl_account where tenant_id = $1 and id = any($2) /* unscoped: chart is tenant-wide */`,
+      [scope.tenantId, rows.map((r) => r.gl)])).map((x) => [x.id, x.code]));
+    journalId = await post(c, scope, {
+      date: b.invoiceDate, sourceType: "invoice", sourceId: inv.id, description: `Bill ${b.reference.trim()} on ${po.number}`,
+      lines: [...rows.map((r) => ({ code: codes.get(r.gl)!, debit: r.amount, profitObjectId: po.profit_object_id, memo: r.desc })), { code: "2010", credit: b.totalMinor }],
+    });
+  }
+  return { invoiceId: inv.id, status: out.status, reason: out.reason, journalId };
 }

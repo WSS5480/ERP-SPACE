@@ -3,7 +3,7 @@
 import { harness } from "./modules/harness.ts";
 import { pool } from "../packages/core/db.ts";
 
-const ORDER = ["setup", "catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "chart", "crm", "service", "reports"];
+const ORDER = ["setup", "catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "chart", "crm", "service", "reports", "edi"];
 
 const { t, counts } = harness();
 for (const id of ORDER) {
