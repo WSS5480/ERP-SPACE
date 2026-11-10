@@ -753,7 +753,8 @@ async function bookAtSale(c: Client, scope: Scope, orderId: string, manager: boo
     return { booked: true, number: st.number, day: r[0].day, waiting, confirmed: manager };
   } catch (err) {
     await c.query("rollback to savepoint book_at_sale");
-    if (!soft || (!(err instanceof fleet.FleetError) && (err as { code?: string }).code !== "P0001")) throw err;   // only a refusal at placing is softened
+    const capacity = (err as { code?: string }).code === "P0001" && /window on .* (is full|has room|has .* left)/.test((err as Error).message);
+    if (!soft || !(err instanceof fleet.FleetError || capacity)) throw err;   // only a refusal at placing is softened
     return { booked: false, day: r[0].day, waiting, note: `The sale is placed, but the delivery is not booked because ${(err as Error).message}. Open the order to pick another day.` };
   }
 }
@@ -770,7 +771,12 @@ export async function setDeliveryDay(c: Client, scope: Scope, orderId: string, d
   }
   await c.query(`update pos_order set delivery_day = $3, delivery_window_id = $4 where sales_order_id = $1 and entity_id = $2`,
     [orderId, scope.entityId, d?.day ?? null, d?.windowId ?? null]);
-  if (d) await c.query(`update sales_order set promised_on = $3 where id = $1 and entity_id = $2`, [orderId, scope.entityId, d.day]);
+  if (d) {
+    await c.query(`update sales_order set promised_on = $3 where id = $1 and entity_id = $2`, [orderId, scope.entityId, d.day]);
+    await c.query(`update pos_line set promised_on = $3 where entity_id = $1 and sales_order_id = $2 and fulfillment = 'delivery'`, [scope.entityId, orderId, d.day]);
+  }
+  if (!d) need(o.status === "draft" || !(await q(c, `select 1 from delivery_stop where entity_id = $1 and sales_order_id = $2 and status = 'scheduled'`, [scope.entityId, orderId])).length,
+    "the delivery is booked; move it to another day, or cancel the stop in Delivery");
   if (o.status === "draft" || !d) return { kept: true, booked: false };
   // placed: move the live stop if there is one, else book it
   const live = await q<{ id: string }>(c, `select id from delivery_stop where entity_id = $1 and sales_order_id = $2 and kind = 'delivery' and status = 'scheduled'

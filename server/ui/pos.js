@@ -59,7 +59,7 @@
       const m = friendly(e);
       if (out) out.replaceChildren(resultBox('critical', 'fail', 'Not done', m)); else toast(m, 'critical');
       return null;
-    } finally { if (btn.isConnected) busy(btn, false); }
+    } finally { if (btn && btn.isConnected) busy(btn, false); }
   }
 
   // The drawer this device rings into, remembered per company.
@@ -335,8 +335,13 @@
       if (['draft', 'open', 'fulfilling'].includes(o.status) && o.kind !== 'return' && o.ship_address_id && truckLines.length && !(o.delivery_stop && o.delivery_stop.confirmed))
         acts.push(btn(o.delivery_stop || o.delivery_day ? 'Change delivery day' : 'Pick delivery day', () => pickDayDialog({ addressId: o.ship_address_id, sub: `${o.number} · ${o.customer || ''}`,
           items: truckLines.map((l) => `${l.product_id || ''}:${Number(l.qty)}`).join(','),
-          onPick: (x) => run(null, out, () => post(`/pos/orders/${id}/delivery-day`, { day: x.day, windowId: x.windowId }),
-            (r) => r.booked ? `Delivery booked for ${dayLabel(x.day)}, ${x.label}.` : (r.note || `Kept ${dayLabel(x.day)}, ${x.label}; it is booked when the sale is placed.`), reload) })));
+          onPick: async (x) => {
+            try {
+              const r = await post(`/pos/orders/${id}/delivery-day`, { day: x.day, windowId: x.windowId });
+              toast(r.booked ? `Delivery booked for ${dayLabel(x.day)}, ${x.label}.` : (r.note || `Kept ${dayLabel(x.day)}, ${x.label}; it is booked when the sale is placed.`), r.booked || !r.note ? 'good' : 'warning');
+              await reload();
+            } catch (e) { toast(friendly(e), 'critical'); }
+          } })));
       if (['draft', 'open'].includes(o.status)) acts.push(btn('Cancel', () => cancelDialog(o, reload)));
       if (o.status !== 'cancelled') acts.push(btn(o.signed_at ? 'Sign again' : 'Signature', () => signatureDialog(o, reload)));
       acts.push(btn('Receipt', () => { d.close(); go('pos', 'receipt-' + id); }));
