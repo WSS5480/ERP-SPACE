@@ -137,13 +137,13 @@ async function writeTax(c: Client, entityId: string, orderId: string, lineId: st
   else {
     for (const r of t.rows) {
       await c.query(`insert into sales_order_line_tax (entity_id, sales_order_id, sales_order_line_id, jurisdiction_id, kind, sourced, item_class, rate_bps,
-                       taxable_minor, exempt_minor, exempt_reason, tax_minor) values ($1,$2,$3,$4,'sale',$5,$6,$7,$8,$9,$10,$11)
+                       taxable_minor, exempt_minor, exempt_reason, tax_minor, owed_minor) values ($1,$2,$3,$4,'sale',$5,$6,$7,$8,$9,$10,$11,$11)
                      on conflict (sales_order_line_id, jurisdiction_id) do update set rate_bps = excluded.rate_bps, taxable_minor = excluded.taxable_minor,
-                       exempt_minor = excluded.exempt_minor, exempt_reason = excluded.exempt_reason, tax_minor = excluded.tax_minor`,
+                       exempt_minor = excluded.exempt_minor, exempt_reason = excluded.exempt_reason, tax_minor = excluded.tax_minor, owed_minor = excluded.owed_minor`,
         [entityId, orderId, lineId, r.jurisdictionId, t.sourced, t.cls, r.rateBps, r.taxableMinor.toString(), r.exemptMinor.toString(), r.exemptReason, r.taxMinor.toString()]);
     }
     const keep = t.rows.map((r) => r.jurisdictionId);
-    await c.query(`update sales_order_line_tax set taxable_minor = 0, exempt_minor = 0, exempt_reason = null, tax_minor = 0
+    await c.query(`update sales_order_line_tax set taxable_minor = 0, exempt_minor = 0, exempt_reason = null, tax_minor = 0, owed_minor = 0
                     where entity_id = $1 and sales_order_line_id = $2 and kind = 'sale' and posted_on is null and not (jurisdiction_id = any($3))`, [entityId, lineId, keep]);
   }
   await c.query(`update sales_order_line set tax_minor = $3 where entity_id = $1 and id = $2`, [entityId, lineId, t.taxMinor.toString()]);

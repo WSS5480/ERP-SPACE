@@ -668,14 +668,17 @@ export async function filing(c: Client, entityId: string, from: string, to: stri
     f.underCollectedMinor = f.owedMinor - f.netTaxMinor;
     out.push(f);
   }
-  const gl = await one<{ sales: string; other: string; remitted: string }>(c, `
-    select coalesce(sum(jl.credit_minor - jl.debit_minor) filter (where je.source_type in ('sale','refund')), 0)::text sales,
+  // tax posted before tracking by jurisdiction began (the upgrade day) has no jurisdiction rows; it is shown on its own
+  const since = (await q<{ since: string }>(c, `select since::text since from tax_tracking_start where entity_id = $1`, [entityId]))[0]?.since ?? "1900-01-01";
+  const gl = await one<{ sales: string; other: string; remitted: string; before: string }>(c, `
+    select coalesce(sum(jl.credit_minor - jl.debit_minor) filter (where je.source_type in ('sale','refund') and je.posting_date >= $4::date), 0)::text sales,
+           coalesce(sum(jl.credit_minor - jl.debit_minor) filter (where je.source_type in ('sale','refund') and je.posting_date < $4::date), 0)::text before,
            coalesce(sum(jl.credit_minor - jl.debit_minor) filter (where je.source_type not in ('sale','refund')
              and not (je.source_type in ('invoice','payment') and jl.debit_minor > 0)), 0)::text other,
            coalesce(sum(jl.debit_minor) filter (where je.source_type in ('invoice','payment') and jl.debit_minor > 0), 0)::text remitted
       from journal_line jl join journal_entry je on je.id = jl.journal_entry_id
       join gl_account g on g.id = jl.gl_account_id and g.code = '2100'
-     where je.entity_id = $1 and je.posting_date between $2::date and $3::date`, [entityId, from, to]);
+     where je.entity_id = $1 and je.posting_date between $2::date and $3::date`, [entityId, from, to, since]);
   const gaps = await q<{ state: string; postal: string; lines: number; tax: string }>(c, `
     select j.state, t.uncovered_postal postal, count(distinct t.sales_order_line_id)::int lines, sum(t.tax_minor)::text tax
       from sales_order_line_tax t join tax_jurisdiction j on j.id = t.jurisdiction_id and j.entity_id = t.entity_id
@@ -689,7 +692,7 @@ export async function filing(c: Client, entityId: string, from: string, to: stri
      where t.entity_id = $1 and t.posted_on between $2::date and $3::date and t.owed_minor <> t.tax_minor
      order by so.number, l.sku, j.code limit 200`, [entityId, from, to]);
   const collected = out.reduce((a, r) => a + r.netTaxMinor, 0n);
-  const glSales = BigInt(gl.sales), glOther = BigInt(gl.other);
+  const glSales = BigInt(gl.sales), glOther = BigInt(gl.other), glBefore = BigInt(gl.before);
   const totals = out.reduce((a, r) => ({ grossMinor: a.grossMinor + r.grossMinor, exemptMinor: a.exemptMinor + r.exemptMinor, taxableMinor: a.taxableMinor + r.taxableMinor,
     taxMinor: a.taxMinor + r.taxMinor, returnsMinor: a.returnsMinor + r.returnsMinor, returnsTaxMinor: a.returnsTaxMinor + r.returnsTaxMinor, netTaxMinor: a.netTaxMinor + r.netTaxMinor,
     owedMinor: a.owedMinor + r.owedMinor, underCollectedMinor: a.underCollectedMinor + r.underCollectedMinor }),
@@ -702,6 +705,8 @@ export async function filing(c: Client, entityId: string, from: string, to: stri
         + `The return is filed on what was owed; the lines are listed.` },
     uncoveredZips: gaps.map((g) => ({ ...g, note: `ZIP ${g.postal} in ${g.state} has no local jurisdiction set up` })),
     tie: { glSalesMinor: glSales, glOtherMinor: glOther, glRemittedMinor: BigInt(gl.remitted), collectedMinor: collected, differenceMinor: diff, ties: diff === 0n,
+      beforeTrackingMinor: glBefore, trackingSince: since,
+      beforeNote: glBefore ? `${fmt(glBefore)} of sales tax was posted before tracking by jurisdiction began on ${since}; file that part from the GL (it is not in the rows above).` : null,
       note: diff === 0n ? `Tax by jurisdiction ties to GL 2100 for the period${glOther ? ` (including ${fmt(glOther)} of other 2100 entries)` : ""}; payments to the state are left out.`
         : `GL 2100 shows ${fmt(glSales)} from sales and returns${glOther ? ` and ${fmt(glOther)} from other entries (manual or bills)` : ""} for the period, but the jurisdictions add up to ${fmt(collected)}: a difference of ${fmt(diff)} to look into before filing.` } };
 }

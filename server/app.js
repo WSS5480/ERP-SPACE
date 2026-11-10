@@ -327,7 +327,7 @@ function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + 
  * the owner sees everything. The server still checks every action on its own.
  */
 const ROLE_SCREENS = {
-  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business'],
+  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business', 'salestax', 'wms'],
   approver: ['home', 'approvals', 'storeorders', 'payables', 'memos', 'reports'],
   ap_clerk: ['home', 'payables', 'memos', 'edi', 'reports'],
   viewer: ['home', 'books', 'chart', 'reports'],

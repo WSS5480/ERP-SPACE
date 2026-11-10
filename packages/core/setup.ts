@@ -498,8 +498,15 @@ export async function saveLocation(c: Client, scope: Scope, input: {
   if (!KINDS.includes(input.kind)) throw new SetupError(`a location is one of: ${KINDS.join(", ")}`);
   const tax = Math.trunc(input.taxRateBps ?? 0);
   if (!(tax >= 0 && tax <= 2000)) throw new SetupError("the sales tax rate must be between 0% and 20%");
-  const st = (input.state ?? input.address?.state ?? "").toUpperCase() || null;
+  let st = (input.state ?? input.address?.state ?? "").toUpperCase() || null;
   if (st && !/^[A-Z]{2}$/.test(st)) throw new SetupError("the state is two letters");
+  if (!st && tax > 0 && ["store", "outlet"].includes(input.kind)) {
+    // a store that charges tax needs its state for the jurisdictions; when every other store is in one state, it is that one
+    const others = await q<{ st: string }>(c, `select distinct upper(coalesce(state, address->>'state')) st from location
+       where entity_id = $1 and kind in ('store','outlet') and coalesce(state, address->>'state') ~* '^[A-Z]{2}$' and ($2::uuid is null or id <> $2)`,
+      [scope.entityId, input.id ?? null]);
+    if (others.length === 1) st = others[0].st;   // otherwise it is saved, and the register asks for the state before it sells
+  }
   const hasGeo = typeof input.lng === "number" && typeof input.lat === "number";
   if (hasGeo && (Math.abs(input.lat!) > 90 || Math.abs(input.lng!) > 180)) throw new SetupError("that map point is off the map");
   const addr = JSON.stringify(input.address ?? {});

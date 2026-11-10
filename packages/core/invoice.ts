@@ -237,7 +237,8 @@ async function matchMerchandise(
   }
   const extra = await q<{ charges: string; landed: string; before: string }>(c, `
     select coalesce(sum(il.amount_minor) filter (where il.purchase_order_line_id is null and il.amount_minor > 0), 0) charges,
-           coalesce((select sum(amount_minor) from po_landed_cost lc where lc.entity_id = $2 and lc.purchase_order_id = $3 and lc.active), 0) landed,
+           coalesce((select sum(amount_minor) from po_landed_cost lc where lc.entity_id = $2 and lc.purchase_order_id = $3 and lc.active
+                         and lc.container_cost_id is null /* a container's freight is billed by the forwarder, not this vendor */), 0) landed,
            coalesce((select sum(o.amount_minor) from invoice_line o join invoice oi on oi.id = o.invoice_id
                       where oi.entity_id = $2 and oi.purchase_order_id = $3 and oi.id <> $1 and oi.status <> 'rejected'
                         and o.purchase_order_line_id is null and o.amount_minor > 0), 0) before

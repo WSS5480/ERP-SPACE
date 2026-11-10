@@ -392,6 +392,7 @@
         const tie = f.tie;
         out.replaceChildren(frag(
           resultBox(tie.ties ? 'good' : 'critical', tie.ties ? 'ok' : 'warn', tie.ties ? 'Ties to GL 2100' : 'Does not tie to GL 2100', tie.note),
+          tie.beforeNote ? resultBox('warning', 'warn', 'Tax from before the upgrade', tie.beforeNote) : null,
           f.collection && !f.collection.ok ? section('Tax under/over-collected', money(f.collection.underCollectedMinor), null, el('div', { class: 'panel' },
             resultBox('warning', 'warn', `Tax ${Number(f.collection.underCollectedMinor) > 0 ? 'under' : 'over'}-collected`, f.collection.note),
             f.collection.lines.map((x) => item({ title: `${x.order_number} · ${x.sku} · ${x.code}`, amount: money(x.differenceMinor),
