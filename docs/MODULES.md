@@ -95,7 +95,7 @@ Data is placed with textContent only, never innerHTML.
 | shop (omnichannel web store + customizer) | 0024 | 0018 | Retail |
 | reports (report creator and editor) | 0031 | none | Back office |
 | group (multi-company: consolidation, inter-company documents, net-to-zero and settle) | 0035 | 0021 | Back office |
-| edi (vendor EDI X12, API ordering, store orders; extends purchasing) | 0036 | none | Setup (Vendor EDI), Retail (Store orders) |
+| edi (vendor EDI X12, API ordering, store orders; extends purchasing) | 0036, 0040 | none | Setup (Vendor EDI), Retail (Store orders) |
 
 ## Group accounting
 

@@ -1,4 +1,4 @@
--- 0037_edi_review.sql
+-- 0040_edi_review.sql
 -- Fixes to the EDI module (0036) after review. 0036 has been merged and may
 -- be applied somewhere, so it is not edited; this carries the changes.
 --
@@ -83,6 +83,6 @@ create trigger edi_partner_pair_unique before insert or update on edi_partner
 alter table edi_partner add column options jsonb not null default '{}'::jsonb;
 
 -- ------------------------------------------------------- 7. off by default
-update entity_module m set enabled = false, changed_at = now(), changed_by = 'migration 0037'
+update entity_module m set enabled = false, changed_at = now(), changed_by = 'migration 0040'
  where m.module = 'edi' and m.changed_by = 'migration 0036'
    and not exists (select 1 from edi_partner p where p.entity_id = m.entity_id);
