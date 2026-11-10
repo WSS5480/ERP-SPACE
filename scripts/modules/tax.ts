@@ -436,7 +436,7 @@ export async function run(t: T) {
       const mk = async (code: string) => (await t.q<{ id: string }>(c, `insert into location (entity_id, code, name, kind, state, tax_rate_bps, address)
         values ($1,$2,$3,'store','TX',825,'{"line1":"1 Tyler Ave","city":"Harlingen","state":"TX","postal":"78550"}') returning id`, [ENTITY, code, `Harlingen ${code}`]))[0].id;
       const a = await mk("PRE1");
-      const made = (await t.q<{ n: number }>(c, `select tax_make_standins($1) n /* unscoped: the migration's own rule, for this company */`, [ENTITY]))[0].n;
+      const made = (await t.q<{ n: number }>(c, `select tax_make_standins($1, $2) n /* unscoped: the migration's own rule, for this one store */`, [ENTITY, a]))[0].n;
       const b = await mk("PRE2");   // as if added after the migration by a script, with no stand-in
       return { a, b, made };
     });

@@ -201,7 +201,7 @@ alter table customer_message add constraint customer_message_kind_check
 -- ------------------------------------- existing stores keep their rate --
 -- A store with a single rate and no jurisdiction of its own gets its stand-in now.
 -- Kept as a function: setup calls the same rule for a store saved later.
-create or replace function tax_make_standins(p_entity uuid default null) returns integer language plpgsql as $$
+create or replace function tax_make_standins(p_entity uuid default null, p_location uuid default null) returns integer language plpgsql as $$
 declare
   l record;
   jid uuid;
@@ -213,6 +213,7 @@ begin
              from location x
             where x.kind in ('store','outlet') and x.status = 'active' and x.tax_rate_bps > 0
               and (p_entity is null or x.entity_id = p_entity)
+              and (p_location is null or x.id = p_location)
               and not exists (select 1 from tax_jurisdiction j where j.for_location_id = x.id)
               and not exists (select 1 from tax_area a where a.location_id = x.id and a.active)
   loop
