@@ -20,7 +20,7 @@ const LABEL = "([A-Za-z0-9][A-Za-z0-9_-]{0,39})";
 /** Who sets up sectionals, grades, covers and rules: the buyer, as for the rest of the catalog. */
 const BUY = ["buyer"];
 /** Who prices a build for a customer: the sales floor, the register, the tablet and the web admin. */
-const SELL = ["sales", "cashier", "store_manager", "web_admin", "buyer"];
+const SELL = ["sales", "cashier", "store_manager", "web_admin", "buyer", "designer"];
 /** Who grades a piece: the people who handle as-is stock. */
 const GRADE = ["warehouse", "store_manager", "buyer"];
 /** Who sets a price by hand or changes the company's grade percentages. */

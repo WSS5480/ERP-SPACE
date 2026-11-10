@@ -26,6 +26,7 @@
 //                                                                                  and the receipt only moves it between stores)
 //   count / adjustment loss   Dr 5040 shrink and damage       Cr 1300
 //   count / adjustment gain   Dr 1300                         Cr 5040
+//   opening balance           Dr 1300                         Cr 3000 opening equity
 //   damage written off        Dr 5040                         Cr 1300
 // Receiving posts nothing: inventory reaches the ledger when the vendor's
 // merchandise invoice posts in payables (Dr 1300 Cr 2010), as it already does.
@@ -1714,7 +1715,9 @@ export async function adjust(c: Client, scope: Scope, e: { locationId: string; p
     await logMove(c, scope.entityId, { kind: "adjust", productId: p.id, qty, fromLoc: e.locationId, toLoc: e.locationId, toBin: bin, refType: "adjustment", refId: adjId,
       reason: e.reasonCode, by });
   }
-  const je = await postValue(c, scope, e.locationId, value, adjId, `Adjustment ${number}: ${e.reasonCode.replace(/_/g, " ")}`);
+  // stock that was there before the books (an opening balance) is equity, not shrink
+  const je = await postValue(c, scope, e.locationId, value, adjId, `Adjustment ${number}: ${e.reasonCode.replace(/_/g, " ")}`,
+    e.reasonCode === "opening_balance" ? "3000" : "5040");
   await c.query(`insert into inv_adjustment (id, entity_id, number, location_id, bin_id, product_id, qty, reason_code, note, labels, value_minor, journal_entry_id, by_user)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, [adjId, scope.entityId, number, e.locationId, bin, p.id, qty, e.reasonCode, e.note ?? null, labels,
     value.toString(), je, by]);

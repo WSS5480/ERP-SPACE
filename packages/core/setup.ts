@@ -117,7 +117,7 @@ export const PACKS: Pack[] = [
     reasons: RETAIL_REASONS,
     settings: {
       "pos.discount_limit_bps": 1000,           // over 10% needs a manager
-      "pos.deposit_min_bps": 3000,              // special orders need 30% down
+      "pos.deposit_min_bps": 5000,              // special orders need 50% down (owner decision 2026-11-10)
       "pos.quote_days": 14,
       "pos.layaway_days": 90,
       "pos.tenders": ["cash", "card", "check", "financing", "gift_card", "store_credit"],
@@ -272,6 +272,14 @@ export async function applyPack(c: Client, scope: Scope, packId: string, applied
     reasonsAdded += r.rowCount ?? 0;
   }
 
+  // the register reads its own settings row: a new company gets the pack's deposit and quote days (an existing row is left as set)
+  {
+    const dep = Number(pack.settings["pos.deposit_min_bps"] ?? NaN), days = Number(pack.settings["pos.quote_days"] ?? NaN);
+    if (Number.isFinite(dep) || Number.isFinite(days)) {
+      await c.query(`insert into pos_setting (entity_id, quote_valid_days, special_order_deposit_bps) values ($1, coalesce($2, 30), coalesce($3, 5000))
+                     on conflict (entity_id) do nothing`, [scope.entityId, Number.isFinite(days) ? days : null, Number.isFinite(dep) ? dep : null]);
+    }
+  }
   for (const [key, value] of Object.entries(pack.settings)) {
     const r = await c.query(
       `insert into entity_setting (entity_id, key, value, set_by, from_pack) values ($1,$2,$3,$4,true)
