@@ -451,3 +451,20 @@ Twilio or a generic HTTPS provider. Maps: Census, Google or Mapbox feed
 t=,v1=HMAC-SHA256 of "t.body"); order events are not sent yet. Card
 processors other than the test one, card terminals, Plaid, accounting and
 payroll exports, marketplaces and ad platforms store keys only.
+
+Review fixes (migration 0050, Nov 10 2026). Messages a public page causes
+(trade sign-in codes, web order confirmations, delivery texts from the
+self-schedule link) are queued in the transaction and sent after commit
+(`db.afterCommit`, `messaging.queueEmail/queueSms`, drained by
+`drainQueued`, also from `scripts/run-due.ts`); a code is held only in memory
+until it goes, so a known and an unknown email answer alike. SMTP has an
+overall deadline per send and its own STARTTLS timer; the port is always
+checked; `ERP_SMTP_ALLOW_HOSTS` limits the servers. Client-wide connection
+saves, tests and turn-offs need the role in every company and are audited by
+name only. A failed PO email keeps its log row through the savepoint rollback
+(`relog`). Existing companies that saw Group or Store orders keep
+`admin.layout = multi` (`admin_keep_layout()`). A preset that would hide
+services with open records lists them and needs `confirm`. Also through
+messaging now: CRM campaigns (consent checked again at send), store order
+decisions to the submitter, vendor feed alerts, A/R collections texts and
+emails. Review requests (`RecordOnlyReviews`) and letters stay record-only.

@@ -25,7 +25,7 @@
 import net from "node:net";
 import tls from "node:tls";
 import { createHmac, randomBytes } from "node:crypto";
-import { q, one, audit, type Client, type Scope } from "./db.ts";
+import { q, one, audit, tx, afterCommit, pool, type Client, type Scope } from "./db.ts";
 import { call, sealSecret, unsealSecret, liveEnv, FeedError, type FeedEnv } from "./vendor_feeds.ts";
 import { isPrivateIp } from "./catalog.ts";
 import { setGeocoderFor, censusGeocoder, GeocodeError, type Geocoder } from "./geocode.ts";
@@ -38,13 +38,17 @@ const need = (c: unknown, m: string): void => { if (!c) throw new ConnectionErro
 export type MsgEnv = FeedEnv & {
   smtpAllowPrivate?: boolean;     // ERP_SMTP_ALLOW_PRIVATE=1: a relay on a private network
   smtpAllowPlain?: boolean;       // ERP_SMTP_ALLOW_PLAIN=1: a relay with no TLS at all
-  smtpTimeoutMs?: number;
+  smtpTimeoutMs?: number;          // each reply
+  smtpDeadlineMs?: number;         // the whole send
+  smtpAllowHosts?: string[];       // ERP_SMTP_ALLOW_HOSTS: only these servers (they may be private)
+  smtpAllowPorts?: number[];       // checks only: the fake server's port
   smtpTls?: tls.ConnectionOptions; // checks only: trust a test certificate
 };
 export const liveMsgEnv = (): MsgEnv => ({
   ...liveEnv(),
   smtpAllowPrivate: process.env.ERP_SMTP_ALLOW_PRIVATE === "1",
   smtpAllowPlain: process.env.ERP_SMTP_ALLOW_PLAIN === "1",
+  smtpAllowHosts: (process.env.ERP_SMTP_ALLOW_HOSTS ?? "").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
 });
 let envFn: () => MsgEnv = liveMsgEnv;
 /** Checks hand in a fake network; the server uses the real one. */
@@ -230,7 +234,7 @@ function checkSettings(kind: Kind, p: Provider, raw: Record<string, unknown>) {
 }
 
 export type Place = { tenantId: string; entityId: string | null };
-export type Actor = { personId: string | null; personName: string };
+export type Actor = { personId: string | null; personName: string; fromEntityId?: string | null };
 
 /**
  * Save a connection's settings and secrets for a company or the whole client.
@@ -275,10 +279,12 @@ export async function saveConnection(c: Client, place: Place, kindId: string, pr
   }
   const have = await secretNames(c, row!);
   const missing = p!.fields.filter((f) => f.secret && f.required && !have[f.name]).map((f) => f.label.toLowerCase());
-  if (place.entityId) {
-    await audit(c, { tenantId: place.tenantId, entityId: place.entityId, actor: { kind: "user", id: who.personId ?? undefined, label: who.personName } } as Scope,
-      { table: "admin_connection", rowId: row!.id, action: before ? "update" : "insert", before, after: { provider: providerId, settings: plain, secretsChanged: typed.map(([n]) => n) } });
-  }
+  // Audited by name only: which settings and which secrets changed, never a value. A client-wide row is audited in the company it was set from.
+  const at = place.entityId ?? who.fromEntityId ?? null;
+  if (at) await audit(c, { tenantId: place.tenantId, entityId: at, actor: { kind: "user", id: who.personId ?? undefined, label: who.personName } } as Scope,
+    { table: "admin_connection", rowId: row!.id, action: before ? "update" : "insert",
+      before: before ? { provider: before.provider, settings: Object.keys(before.settings ?? {}) } : null,
+      after: { scope: place.entityId ? "company" : "client", provider: providerId, settings: Object.keys(plain), secretsChanged: typed.map(([n]) => n) } });
   return { id: row!.id, kind: kindId, provider: providerId, missing };
 }
 
@@ -288,6 +294,9 @@ export async function turnOff(c: Client, place: Place, kindId: string, who: Acto
   need(row, "there is no connection of that kind here to turn off");
   await c.query(`update admin_connection set active = false, status = 'off', updated_at = now(), updated_by = $3, updated_by_name = $4 where id = $1 and tenant_id = $2`,
     [row!.id, place.tenantId, who.personId, who.personName]);
+  const at = place.entityId ?? who.fromEntityId ?? null;
+  if (at) await audit(c, { tenantId: place.tenantId, entityId: at, actor: { kind: "user", id: who.personId ?? undefined, label: who.personName } } as Scope,
+    { table: "admin_connection", rowId: row!.id, action: "transition", before: { status: row!.status }, after: { status: "off", scope: place.entityId ? "company" : "client", kind: kindId } });
   return { id: row!.id, off: true };
 }
 
@@ -349,26 +358,42 @@ export type Envelope = { from: string; to: string[]; data: string };
 
 /** Lines starting with a dot get a second one, and every line ends CRLF (RFC 5321 4.5.2). */
 export function dotStuff(data: string): string {
-  return data.replace(/\r?\n/g, "\r\n").replace(/(^|\r\n)\./g, "$1..");
+  return data.replace(/\r\n|\r|\n/g, "\r\n").replace(/(^|\r\n)\./g, "$1..");
 }
 
 const MAIL_PORTS = new Set([25, 465, 587, 2525]);
 
 async function smtpTarget(cfg: SmtpConfig, env: MsgEnv): Promise<string> {
   const h = cfg.host.toLowerCase();
-  if (env.smtpAllowPrivate) return h;
-  if (!MAIL_PORTS.has(cfg.port)) throw new SmtpError("mail servers are reached on ports 25, 465, 587 or 2525");
+  // The port is checked always, even for a private relay.
+  if (!MAIL_PORTS.has(cfg.port) && !(env.smtpAllowPorts ?? []).includes(cfg.port)) throw new SmtpError("mail servers are reached on ports 25, 465, 587 or 2525");
+  const allow = env.smtpAllowHosts ?? [];
+  if (allow.length && !allow.includes(h)) throw new SmtpError(`${h} is not one of the mail servers this service may use (ERP_SMTP_ALLOW_HOSTS)`);
+  const trusted = env.smtpAllowPrivate || allow.includes(h);
   const named = h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal") || isPrivateIp(h);
-  if (named) throw new SmtpError("mail servers on private networks are not called");
+  if (named && !trusted) throw new SmtpError("mail servers on private networks are not called");
   if (net.isIP(h)) return h;
+  if (trusted && named) return h;
   let addrs: string[];
   try { addrs = env.resolve ? await env.resolve(h) : []; } catch { throw new SmtpError(`${h} could not be found`); }
-  if (!addrs.length || addrs.some((a) => isPrivateIp(a))) throw new SmtpError(addrs.length ? "mail servers on private networks are not called" : `${h} could not be found`);
+  if (!addrs.length) throw new SmtpError(`${h} could not be found`);
+  if (!trusted && addrs.some((a) => isPrivateIp(a))) throw new SmtpError("mail servers on private networks are not called");
   return addrs[0];
 }
 
 /** A small SMTP client: EHLO, STARTTLS, AUTH PLAIN or LOGIN, MAIL FROM, RCPT TO, DATA with dot-stuffing, QUIT; a timeout on every reply. */
 export async function smtpSend(cfg: SmtpConfig, envl: Envelope, env: MsgEnv = msgEnv()): Promise<{ id: string | null; reply: string }> {
+  const live: { sock: net.Socket | null } = { sock: null };
+  const deadline = env.smtpDeadlineMs ?? 45000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const over = new Promise<never>((_, fail) => {
+    timer = setTimeout(() => { live.sock?.destroy(); fail(new SmtpError(`the mail server took longer than ${Math.round(deadline / 1000)} s in all; the message was not sent`)); }, deadline);
+  });
+  try { return await Promise.race([smtpConversation(cfg, envl, env, live), over]); }
+  finally { clearTimeout(timer); live.sock?.destroy(); }
+}
+
+async function smtpConversation(cfg: SmtpConfig, envl: Envelope, env: MsgEnv, live: { sock: net.Socket | null }): Promise<{ id: string | null; reply: string }> {
   if (cfg.security === "none" && !env.smtpAllowPlain) throw new SmtpError("this server would be used with no encryption; pick STARTTLS or TLS (a plain relay needs ERP_SMTP_ALLOW_PLAIN=1)");
   const addr = await smtpTarget(cfg, env);
   const timeout = env.smtpTimeoutMs ?? 15000;
@@ -377,6 +402,7 @@ export async function smtpSend(cfg: SmtpConfig, envl: Envelope, env: MsgEnv = ms
     const s = cfg.security === "tls"
       ? tls.connect({ ...opts, servername: net.isIP(cfg.host) ? undefined : cfg.host, ...(env.smtpTls ?? {}) }, () => ok(s))
       : net.connect(opts, () => ok(s));
+    live.sock = s;
     s.setTimeout(timeout, () => { s.destroy(); fail(new SmtpError(`the mail server did not answer within ${Math.round(timeout / 1000)} s`)); });
     s.once("error", (e) => fail(new SmtpError(`the mail server could not be reached (${(e as Error).message})`)));
   });
@@ -424,9 +450,12 @@ export async function smtpSend(cfg: SmtpConfig, envl: Envelope, env: MsgEnv = ms
       if (!ext.some((l) => l.startsWith("STARTTLS"))) throw new SmtpError("the mail server does not offer STARTTLS; pick TLS, or check the port");
       await cmd("STARTTLS", "STARTTLS", [220]);
       detach(sock);
+      // The upgrade has its own clock: with the reply timer off, a server that stops here would otherwise hold us for ever.
       sock = await new Promise((ok, fail) => {
-        const t = tls.connect({ socket: sock, servername: net.isIP(cfg.host) ? undefined : cfg.host, ...(env.smtpTls ?? {}) }, () => ok(t));
-        t.once("error", (e) => fail(new SmtpError(`the mail server's certificate was not accepted (${e.message})`)));
+        const t = tls.connect({ socket: sock, servername: net.isIP(cfg.host) ? undefined : cfg.host, ...(env.smtpTls ?? {}) }, () => { clearTimeout(hs); ok(t); });
+        live.sock = t;
+        const hs = setTimeout(() => { t.destroy(); fail(new SmtpError(`the mail server did not finish STARTTLS within ${Math.round(timeout / 1000)} s`)); }, timeout);
+        t.once("error", (e) => { clearTimeout(hs); fail(new SmtpError(`the mail server's certificate was not accepted (${e.message})`)); });
       });
       buf = "";
       attach(sock);
@@ -462,6 +491,12 @@ export async function smtpSend(cfg: SmtpConfig, envl: Envelope, env: MsgEnv = ms
 export type Attachment = { filename: string; content: string; type?: string };
 export type Email = { to: string[]; subject: string; text: string; attachments?: Attachment[] };
 
+/** A From name: no angle brackets or quotes, quoted when plain, encoded when not ASCII. */
+export function displayName(name: string) {
+  const n = name.replace(/[\r\n<>"\\]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!n) return '""';
+  return /^[\x20-\x7e]*$/.test(n) ? `"${n}"` : `=?UTF-8?B?${Buffer.from(n).toString("base64")}?=`;
+}
 const headerWord = (s: string) => /^[\x20-\x7e]*$/.test(s) ? s : `=?UTF-8?B?${Buffer.from(s).toString("base64")}?=`;
 const wrap76 = (b64: string) => b64.replace(/.{76}/g, "$&\r\n");
 
@@ -470,7 +505,7 @@ export function buildMime(from: { name: string; address: string }, m: Email, now
   const h = (s: string) => s.replace(/[\r\n]+/g, " ");
   const domain = from.address.split("@")[1] ?? "erp.local";
   const head = [
-    `From: ${headerWord(h(from.name)).replace(/[",]/g, "")} <${h(from.address)}>`,
+    `From: ${displayName(from.name)} <${h(from.address).replace(/[<>\s]/g, "")}>`,
     `To: ${m.to.map(h).join(", ")}`,
     `Subject: ${headerWord(h(m.subject))}`,
     `Date: ${now.toUTCString().replace("GMT", "+0000")}`,
@@ -494,9 +529,8 @@ export function buildMime(from: { name: string; address: string }, m: Email, now
 }
 
 /** Send through one connection row. Throws a ConnectionError in plain words; returns the provider's message id. */
-async function sendEmailVia(c: Client, row: Row, m: Email, env: MsgEnv): Promise<string | null> {
+async function sendEmailVia(row: Row, sec: Record<string, string>, m: Email, env: MsgEnv): Promise<string | null> {
   const s = row.settings as Record<string, string>;
-  const sec = await secretsOf(c, row, env);
   const from = { name: s.fromName ?? "", address: s.fromAddress ?? "" };
   need(EMAIL.test(from.address), "the connection has no from address; add one and save");
   for (const t of m.to) need(EMAIL.test(t), `${t} is not an email address`);
@@ -530,7 +564,7 @@ async function sendEmailVia(c: Client, row: Row, m: Email, env: MsgEnv): Promise
     case "postmark": {
       need(sec.serverToken, "the Postmark server token is not saved");
       const r = await http("https://api.postmarkapp.com/email", { method: "POST", headers: { "x-postmark-server-token": sec.serverToken, accept: "application/json", "content-type": "application/json" },
-        body: JSON.stringify({ From: `${from.name} <${from.address}>`, To: m.to.join(","), Subject: m.subject, TextBody: m.text,
+        body: JSON.stringify({ From: `${displayName(from.name)} <${from.address}>`, To: m.to.join(","), Subject: m.subject, TextBody: m.text,
           ...(atts.length ? { Attachments: atts.map((a) => ({ Name: a.filename, Content: a.content, ContentType: a.type })) } : {}) }) }, "Postmark");
       return String(json(r.text).MessageID ?? "") || null;
     }
@@ -538,7 +572,7 @@ async function sendEmailVia(c: Client, row: Row, m: Email, env: MsgEnv): Promise
       need(sec.apiKey, "the Mailgun API key is not saved");
       const base = s.region === "eu" ? "https://api.eu.mailgun.net" : "https://api.mailgun.net";
       need(/^[a-z0-9.-]+$/i.test(s.domain ?? ""), "the Mailgun sending domain is not a domain");
-      const form = new URLSearchParams({ from: `${from.name} <${from.address}>`, to: m.to.join(","), subject: m.subject, text: m.text });
+      const form = new URLSearchParams({ from: `${displayName(from.name)} <${from.address}>`, to: m.to.join(","), subject: m.subject, text: m.text });
       const r = await http(`${base}/v3/${s.domain}/messages`, { method: "POST", headers: { authorization: `Basic ${Buffer.from(`api:${sec.apiKey}`).toString("base64")}`, "content-type": "application/x-www-form-urlencoded" },
         body: form.toString() }, "Mailgun");
       return String(json(r.text).id ?? "") || null;
@@ -546,7 +580,7 @@ async function sendEmailVia(c: Client, row: Row, m: Email, env: MsgEnv): Promise
     case "resend": {
       need(sec.apiKey, "the Resend API key is not saved");
       const r = await http("https://api.resend.com/emails", { method: "POST", headers: { authorization: `Bearer ${sec.apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ from: `${from.name} <${from.address}>`, to: m.to, subject: m.subject, text: m.text,
+        body: JSON.stringify({ from: `${displayName(from.name)} <${from.address}>`, to: m.to, subject: m.subject, text: m.text,
           ...(atts.length ? { attachments: atts.map((a) => ({ filename: a.filename, content: a.content })) } : {}) }) }, "Resend");
       return String(json(r.text).id ?? "") || null;
     }
@@ -554,9 +588,8 @@ async function sendEmailVia(c: Client, row: Row, m: Email, env: MsgEnv): Promise
   throw new ConnectionError(`${row.provider} is not an email provider`);
 }
 
-async function sendSmsVia(c: Client, row: Row, to: string, body: string, env: MsgEnv): Promise<string | null> {
+async function sendSmsVia(row: Row, sec: Record<string, string>, to: string, body: string, env: MsgEnv): Promise<string | null> {
   const s = row.settings as Record<string, string>;
-  const sec = await secretsOf(c, row, env);
   const num = to.replace(/[\s().-]/g, "");
   need(PHONE.test(num), `${to} is not a phone number`);
   const e164 = num.startsWith("+") ? num : num.length === 10 ? `+1${num}` : `+${num}`;
@@ -592,7 +625,7 @@ async function mark(c: Client, row: Row, ok: boolean, error: string | null) {
 }
 
 export type Outbound = { purpose: string; redact?: string[]; resendable?: boolean; sourceTable?: string; sourceId?: string | null; createdBy?: string | null; resendOf?: string | null };
-export type SendResult = { id: string; status: "sent" | "failed" | "logged"; providerRef: string | null; error: string | null; provider: string };
+export type SendResult = { id: string; status: "sent" | "failed" | "logged" | "queued"; providerRef: string | null; error: string | null; provider: string };
 
 function redactBody(text: string, redact: string[] = []) {
   let out = text;
@@ -627,7 +660,7 @@ export async function sendEmail(c: Client, entityId: string, m: Email, o: Outbou
   const to = m.to.join(", ");
   if (!row) return logRow(c, entityId, "email", to, m.subject, m.text, o, null, "logged", null, "no email is connected, so this was logged and not sent");
   try {
-    const ref = await sendEmailVia(c, row, m, env);
+    const ref = await sendEmailVia(row, await secretsOf(c, row, env), m, env);
     await mark(c, row, true, null);
     return logRow(c, entityId, "email", to, m.subject, m.text, { ...o, resendable: o.resendable !== false && !m.attachments?.length }, row, "sent", ref, null);
   } catch (e) {
@@ -641,7 +674,7 @@ export async function sendSms(c: Client, entityId: string, to: string, body: str
   const row = via !== undefined ? via : await connectionFor(c, entityId, "sms");
   if (!row) return logRow(c, entityId, "sms", to, null, body, o, null, "logged", null, "no text provider is connected, so this was logged and not sent");
   try {
-    const ref = await sendSmsVia(c, row, to, body, env);
+    const ref = await sendSmsVia(row, await secretsOf(c, row, env), to, body, env);
     await mark(c, row, true, null);
     return logRow(c, entityId, "sms", to, null, body, o, row, "sent", ref, null);
   } catch (e) {
@@ -669,10 +702,122 @@ export async function mailerFor(c: Client, entityId: string, purpose: string, en
   return {
     async send(m: { to: string; subject: string; text: string; attachments: { filename: string; content: string }[] }) {
       const r = await sendEmail(c, entityId, { to: [m.to], subject: m.subject, text: m.text, attachments: m.attachments }, { purpose }, env, row);
-      if (r.status !== "sent") throw new Error(r.error ?? "not sent");
+      if (r.status !== "sent") {
+        // A caller that rolls back to a savepoint would lose the log row and the Failing status; relog() writes them again.
+        const err = new Error(r.error ?? "not sent") as Error & { relog?: (c2: Client) => Promise<void> };
+        err.relog = async (c2) => {
+          await mark(c2, row, false, r.error);
+          await logRow(c2, entityId, "email", m.to, m.subject, m.text, { purpose }, row, "failed", null, r.error);
+        };
+        throw err;
+      }
       return { id: r.providerRef ?? r.id };
     },
   };
+}
+
+// ================================================================== outbox
+//
+// A message a public page causes (a trade sign-in code, a web order's
+// confirmation, a delivery text from a self-schedule link) is never sent
+// inside the request's transaction: the row is queued there, and sent after
+// the commit, in the background, so the answer never waits on (or times) the
+// network. scripts/run-due.ts drains whatever a restart left behind. A code
+// is kept only in this process's memory until it goes; the row has it as ******.
+
+const PENDING = new Map<string, string>();
+let inflight = 0;
+const idlers: (() => void)[] = [];
+
+/** Queue an email to go after this transaction commits. With none connected it is logged, not sent, at once. */
+export async function queueEmail(c: Client, entityId: string, m: Email, o: Outbound): Promise<SendResult> {
+  const row = await connectionFor(c, entityId, "email");
+  if (!row) return logRow(c, entityId, "email", m.to.join(", "), m.subject, m.text, o, null, "logged", null, "no email is connected, so this was logged and not sent");
+  const r = await logRow(c, entityId, "email", m.to.join(", "), m.subject, m.text, o, row, "queued", null, null);
+  if (o.redact?.length) PENDING.set(r.id, m.text);
+  afterCommit(c, () => drainQueued({ ids: [r.id] }));
+  return r;
+}
+
+export async function queueSms(c: Client, entityId: string, to: string, body: string, o: Outbound, via?: Row | null): Promise<SendResult> {
+  const row = via !== undefined ? via : await connectionFor(c, entityId, "sms");
+  if (!row) return logRow(c, entityId, "sms", to, null, body, o, null, "logged", null, "no text provider is connected, so this was logged and not sent");
+  const r = await logRow(c, entityId, "sms", to, null, body, o, row, "queued", null, null);
+  if (o.redact?.length) PENDING.set(r.id, body);
+  afterCommit(c, () => drainQueued({ ids: [r.id] }));
+  return r;
+}
+
+/** Queue by the customer route (text, else email); the source row (customer_message) is updated when it goes. */
+export async function queueTo(c: Client, entityId: string, route: { channel: "sms" | "email"; to: string; row: Row }, subject: string, body: string, o: Outbound) {
+  if (route.channel === "sms") return queueSms(c, entityId, route.to, body, o, route.row);
+  const r = await logRow(c, entityId, "email", route.to, subject, body, o, route.row, "queued", null, null);
+  afterCommit(c, () => drainQueued({ ids: [r.id] }));
+  return r;
+}
+
+type Claimed = { id: string; entity_id: string; channel: "email" | "sms" | "webhook"; to_addr: string; subject: string | null; body: string; redacted: boolean;
+  connection_id: string | null; source_table: string | null; source_id: string | null };
+
+/** Send what is queued: the given ids, or everything due (a restart's leftovers, from run-due). Network calls happen outside any transaction. */
+export async function drainQueued(opts: { ids?: string[]; entityId?: string; limit?: number } = {}, env: MsgEnv = msgEnv()) {
+  inflight++;
+  let sent = 0, failed = 0;
+  try {
+    const claimed = await tx({ kind: "system", label: "outbox" }, (c) => q<Claimed>(c, `
+      update outbound_message set status = 'sending', claimed_at = now(), attempts = attempts + 1
+       where id in (select id from outbound_message
+                     where (status = 'queued' or (status = 'sending' and claimed_at < now() - interval '10 minutes'))
+                       and ($1::uuid[] is null or id = any($1)) and ($2::uuid is null or entity_id = $2)
+                     order by created_at limit $3 for update skip locked)
+      returning id, entity_id, channel, to_addr, subject, body, redacted, connection_id, source_table, source_id /* unscoped: the outbox, by id or all due */`,
+      [opts.ids ?? null, opts.entityId ?? null, opts.limit ?? 200]));
+    for (const m of claimed) (await sendClaimed(m, env)) ? sent++ : failed++;
+  } finally {
+    inflight--;
+    if (!inflight) for (const f of idlers.splice(0)) f();
+  }
+  return { sent, failed };
+}
+
+async function sendClaimed(m: Claimed, env: MsgEnv): Promise<boolean> {
+  let ref: string | null = null, error: string | null = null, row: Row | null = null;
+  const body = m.redacted ? PENDING.get(m.id) : m.body;
+  PENDING.delete(m.id);
+  const c0 = await pool.connect();
+  let sec: Record<string, string> = {};
+  try {
+    row = (await q<Row>(c0, `select ${COLS} from admin_connection where id = $1 and active /* unscoped: the connection the message was queued on */`, [m.connection_id]))[0] ?? null;
+    if (row) sec = await secretsOf(c0, row, env);
+  } catch (e) { error = (e as Error).message; }
+  finally { c0.release(); }
+  if (!error) {
+    if (body === undefined) error = "the service restarted before this went out; it carried a sign-in code, so ask for a new one";
+    else if (!row) error = "the connection was turned off before this went out";
+    else {
+      try {
+        ref = m.channel === "sms" ? await sendSmsVia(row, sec, m.to_addr, body, env)
+          : await sendEmailVia(row, sec, { to: m.to_addr.split(/,\s*/), subject: m.subject ?? "", text: body }, env);
+      } catch (e) { if (!(e instanceof ConnectionError)) error = `could not send (${(e as Error).message})`; else error = e.message; }
+    }
+  }
+  const ok = !error;
+  await tx({ kind: "system", label: "outbox" }, async (c) => {
+    await c.query(`update outbound_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end where id = $1 and entity_id = $2`,
+      [m.id, m.entity_id, ok ? "sent" : "failed", ref, error?.slice(0, 500) ?? null]);
+    if (row) await mark(c, row, ok, error);
+    if (m.source_table === "customer_message" && m.source_id) {
+      await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end where id = $1 and entity_id = $2`,
+        [m.source_id, m.entity_id, ok ? "sent" : "failed", ref, error?.slice(0, 300) ?? null]);
+    }
+  });
+  return ok;
+}
+
+/** Resolves once every send started after a commit has finished (checks wait on it). */
+export async function idle() {
+  await new Promise((r) => setImmediate(r));
+  while (inflight) await new Promise<void>((r) => idlers.push(r));
 }
 
 // =================================================================== tests
@@ -776,9 +921,12 @@ setGeocoderFor(async (c, entityId) => {
 
 // ============================================================ message log
 
-export async function messageLog(c: Client, entityId: string, limit = 100) {
+/** What the web store and marketing send: all the web admin sees in the log. */
+export const WEB_PURPOSES = ["trade_code", "web_order", "campaign"];
+export async function messageLog(c: Client, entityId: string, limit = 100, purposes: string[] | null = null) {
   return q(c, `select id, channel, purpose, to_addr, subject, body, redacted, resendable, provider, status, provider_ref, error, created_at, sent_at, resend_of
-                 from outbound_message where entity_id = $1 order by created_at desc limit $2`, [entityId, Math.min(500, Math.max(1, limit))]);
+                 from outbound_message where entity_id = $1 and ($3::text[] is null or purpose = any($3)) order by created_at desc limit $2`,
+    [entityId, Math.min(500, Math.max(1, limit)), purposes]);
 }
 
 /** Send a logged message again (never one that carried a code, an attachment or a webhook). */

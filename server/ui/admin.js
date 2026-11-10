@@ -18,9 +18,11 @@
   }
 
   // ================================================================ services
-  let applyAll = false;
+  // "Apply to all my companies" belongs to the company it was ticked in; another company starts unticked.
+  let applyAll = false, applyAllCo = null;
   async function screenServices() {
     const d = await coApi('/admin/services');
+    if (applyAllCo !== E.S.co.id) { applyAll = false; applyAllCo = E.S.co.id; }
     const can = manages();
     const many = d.companies.length > 1;
     const L = d.layout;
@@ -76,24 +78,36 @@
     return el('label', { class: 'li check-row' }, box,
       el('div', { class: 't' }, el('span', { text: s.name }), ' ', badge),
       el('div', { class: 'd', text: s.description }),
-      facts.length ? el('div', { class: 'd fine', text: facts.join(' ') }) : null);
+      facts.length ? el('div', { class: 'f', text: facts.join(' ') }) : null);
   }
 
-  function confirmPreset(p, d) {
-    const dlg = openDialog(`Use ${p.name.toLowerCase()}?`, applyAll && d.companies.length > 1 ? `All ${d.companies.length} companies` : E.S.co.name);
+  async function confirmPreset(p, d) {
+    const all = applyAll && d.companies.length > 1;
+    const dlg = openDialog(`Use ${p.name.toLowerCase()}?`, all ? `All ${d.companies.length} companies` : E.S.co.name);
     const names = new Map(d.services.map((s) => [s.id, s.name]));
     const out = el('div');
+    const openBox = el('div', {}, E.loadingNode('Checking for open work…'));
+    const ok = el('input', { type: 'checkbox' });
+    const go = el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, async () => {
+      const r = await post('/admin/services/preset', { preset: p.id, allCompanies: all, confirm: ok.checked });
+      await refreshNav(); return r;
+    }, (r) => `${p.name} applied${r.companies > 1 ? ` to ${r.companies} companies` : ''}.${r.notes.length ? ' ' + r.notes.join(' ') : ''}`,
+    { close: dlg.close, errorInto: (x) => out.replaceChildren(resultBox('critical', 'fail', 'Not applied', E.friendly(x))) }) }, 'Apply');
     dlg.body.append(
       el('p', { class: 'lead', text: p.blurb }),
       el('p', { text: `On: ${p.services.map((x) => names.get(x) || x).join(', ')}. Everything else is switched off (hidden, never deleted).` }),
       p.pack ? el('p', { class: 'fine', text: isOwner() ? 'The matching setup pack also adds the accounts, pick lists and defaults it needs. It only ever adds.' : 'Only the owner adds the matching setup pack’s accounts and defaults; you set the switches.' }) : null,
-      out,
-      el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: dlg.close }, 'Cancel'),
-        el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, async () => {
-          const r = await post('/admin/services/preset', { preset: p.id, allCompanies: applyAll });
-          await refreshNav(); return r;
-        }, (r) => `${p.name} applied${r.companies > 1 ? ` to ${r.companies} companies` : ''}.${r.notes.length ? ' ' + r.notes.join(' ') : ''}`,
-        { close: dlg.close, errorInto: (x) => out.replaceChildren(resultBox('critical', 'fail', 'Not applied', E.friendly(x))) }) }, 'Apply')));
+      openBox, out,
+      el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: dlg.close }, 'Cancel'), go));
+    try {
+      const r = await coApi(`/admin/services/preset-check?preset=${encodeURIComponent(p.id)}${all ? '&all=1' : ''}`);
+      if (!r.open.length) { openBox.replaceChildren(el('p', { class: 'fine', text: 'Nothing it switches off has open work.' })); ok.checked = true; return; }
+      go.disabled = true;
+      ok.addEventListener('change', () => { go.disabled = !ok.checked; });
+      openBox.replaceChildren(resultBox('warning', 'warn', 'These still have open work', 'Their records stay and keep working, but their screens hide until you turn them back on.'),
+        el('div', { class: 'panel' }, r.open.map((o) => item({ title: o.name, detail: `${o.count} ${o.what}${all ? ` · ${o.company}` : ''}` }))),
+        el('label', { class: 'li check-row' }, ok, el('div', { class: 't', text: 'Switch them off anyway' })));
+    } catch (x) { openBox.replaceChildren(resultBox('critical', 'fail', 'Could not check', E.friendly(x))); go.disabled = true; }
   }
 
   // ============================================================= connections
@@ -202,7 +216,7 @@
     const STAT = { sent: ['good', 'ok', 'Sent'], failed: ['critical', 'fail', 'Failed'], logged: ['neutral', 'info', 'Logged, not sent'], queued: ['warning', 'hold', 'Queued'] };
     const banner = !d.email || !d.sms ? resultBox('warning', 'info', 'Some messages are logged, not sent',
       `${!d.email ? 'No email is connected' : ''}${!d.email && !d.sms ? ' and ' : ''}${!d.sms ? (d.email ? 'No text provider is connected' : 'no text provider') : ''}: those messages are kept here and nothing goes out. Set them up under Connections.`) : null;
-    return frag(banner, section('Emails and texts', plural(d.messages.length, 'message'), null, el('div', { class: 'panel' }, d.messages.length ? d.messages.map((m) => {
+    return frag(banner, d.webOnly ? el('p', { class: 'fine', text: 'Showing what the web store and marketing sent.' }) : null, section('Emails and texts', plural(d.messages.length, 'message'), null, el('div', { class: 'panel' }, d.messages.length ? d.messages.map((m) => {
       const [tone, ic, word] = STAT[m.status] || STAT.queued;
       return item({ title: `${m.channel === 'sms' ? 'Text' : m.channel === 'email' ? 'Email' : 'Webhook'} to ${m.to_addr}`,
         detail: [m.subject, m.purpose.replace(/_/g, ' '), m.provider !== 'none' ? m.provider : null, m.provider_ref ? `id ${m.provider_ref}` : null,

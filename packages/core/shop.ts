@@ -11,6 +11,7 @@
 // What a shopper sees is built field by field (pub* functions below). Cost,
 // vendor, vendor codes and margin never leave this file on a public path.
 
+import * as messaging from "./messaging.ts";
 import { q, one, type Client, type Scope } from "./db.ts";
 import { priceConfigured, PricingError, type Choice } from "./pricing.ts";
 import { reserveOrder, InventoryError } from "./inventory.ts";
@@ -826,6 +827,28 @@ export const RecordOnlyMessages: MessageProvider = {
     return "recorded";
   },
 };
+/**
+ * The default: through Admin, Connections when the channel is connected,
+ * queued and sent after the order commits (the checkout never waits on it);
+ * the shop log keeps its masked line either way. Not connected: record only.
+ */
+export const ConnectedMessages: MessageProvider = {
+  name: "connected",
+  async send(c, m) {
+    if (!m.customerId || !(await messaging.isConnected(c, m.entityId, m.channel))) return RecordOnlyMessages.send(c, m);
+    const cu = (await q<{ email: string | null; phone: string | null }>(c, `select email, phone from customer where id = $1 and entity_id = $2`, [m.customerId, m.entityId]))[0];
+    const to = m.channel === "email" ? cu?.email : cu?.phone;
+    if (!to) return RecordOnlyMessages.send(c, m);
+    const o = { purpose: "web_order", sourceTable: "sales_order", sourceId: m.orderId };
+    const r = m.channel === "email"
+      ? await messaging.queueEmail(c, m.entityId, { to: [to], subject: m.body.split(":")[0].slice(0, 80) || "Your order", text: m.body }, o)
+      : await messaging.queueSms(c, m.entityId, to, m.body, o);
+    await c.query(`insert into shop_message (entity_id, site_id, sales_order_id, customer_id, channel, to_ref, template, body, provider, status)
+                   values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'recorded')`,
+      [m.entityId, m.siteId, m.orderId, m.customerId, m.channel, m.toRef, m.template, m.body.slice(0, 600), r.provider]);
+    return "recorded";
+  },
+};
 /** The review seam: ask a buyer to review what they bought. 'record' only files the request. */
 export interface ReviewProvider { name: string; request(c: Client, r: { entityId: string; productId: string; orderId: string; customerId: string }): Promise<void> }
 export const RecordOnlyReviews: ReviewProvider = {
@@ -860,7 +883,7 @@ export type Placed = { duplicate: boolean; order: Awaited<ReturnType<typeof orde
  * first, so a double submit returns the first order instead of a second one.
  */
 export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scope: Scope,
-  provider: PaymentProvider = providerFor(site), messages: MessageProvider = RecordOnlyMessages, reviews: ReviewProvider = RecordOnlyReviews): Promise<Placed> {
+  provider: PaymentProvider = providerFor(site), messages: MessageProvider = ConnectedMessages, reviews: ReviewProvider = RecordOnlyReviews): Promise<Placed> {
   need(scope.entityId === site.entity_id, "That store belongs to another company.");
   const trade = inp.trade ?? null;
   const channel = trade ? "b2b" : "web";

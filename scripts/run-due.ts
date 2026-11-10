@@ -10,6 +10,7 @@
 // Paid plans only on Render. On the free trial, POST /api/connections/{id}/run
 // does the same thing for one connection on demand.
 
+import { drainQueued, idle } from "../packages/core/messaging.ts";
 import { pool, tx } from "../packages/core/db.ts";
 import { ingest, loadConnection } from "../packages/core/connections.ts";
 import "../packages/core/statements.ts";
@@ -213,6 +214,10 @@ async function main() {
   const reports = await runDueReports(pool, tx);
   for (const r of reports.runs) console.log(`report ${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
   console.log(`${reports.due} scheduled reports were due`);
+  // The outbox: anything queued after a commit that a restart kept from going (Admin, Connections).
+  const out = await drainQueued({ limit: 1000 });
+  await idle();
+  console.log(`outbox: ${out.sent} sent, ${out.failed} failed`);
   await pool.end();
 }
 

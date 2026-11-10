@@ -957,7 +957,7 @@ let providerSet = false;
 export function setMessageProvider(p: MessageProvider) { provider = p; providerSet = true; }
 
 type Route = { channel: "sms" | "email"; to: string; name: string;
-  send(c: Client, entityId: string, m: OutboundMessage, messageId: string): Promise<{ ok: boolean; ref?: string; error?: string }> };
+  send(c: Client, entityId: string, m: OutboundMessage, messageId: string): Promise<{ ok: boolean; queued?: boolean; ref?: string; error?: string }> };
 /**
  * How a customer message goes. A text provider or email connected in Admin,
  * Connections sends it (and logs it there); with neither, the message is kept
@@ -966,12 +966,11 @@ type Route = { channel: "sms" | "email"; to: string; name: string;
 async function messageRouteFor(c: Client, entityId: string, phone: string | null, email: string | null): Promise<Route> {
   const via = providerSet ? null : await messaging.customerRoute(c, entityId, phone, email);
   if (via) {
+    // Queued now, sent after the commit (this can run from a customer's self-schedule link); the row is updated when it goes.
     return { channel: via.channel, to: via.to, name: via.row.provider, async send(c2, e, m, messageId) {
       const o = { purpose: m.kind === "tear_sheet" ? "tear_sheet" : "customer_" + m.kind, sourceTable: "customer_message", sourceId: messageId };
-      const r = via.channel === "sms"
-        ? await messaging.sendSms(c2, e, via.to, m.body, o, messaging.msgEnv(), via.row)
-        : await messaging.sendEmail(c2, e, { to: [via.to], subject: m.body.split(":")[0].slice(0, 80) || "A message from us", text: m.body }, o, messaging.msgEnv(), via.row);
-      return r.status === "sent" ? { ok: true, ref: r.providerRef ?? r.id } : { ok: false, error: r.error ?? "not sent" };
+      const r = await messaging.queueTo(c2, e, via, m.body.split(":")[0].slice(0, 80) || "A message from us", m.body, o);
+      return { ok: r.status !== "failed", queued: r.status === "queued", ref: r.providerRef ?? undefined, error: r.error ?? undefined };
     } };
   }
   const channel: "sms" | "email" = phone ? "sms" : "email";
@@ -1014,7 +1013,7 @@ async function notify(c: Client, scope: Scope, stopId: string | null, kind: stri
   if (!to) return;
   try {
     const r = await route.send(c, scope.entityId, { channel, to, body, kind }, row.id);
-    await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end
+    if (!r.queued) await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end
                     where entity_id = $1 and id = $2`, [scope.entityId, row.id, r.ok ? "sent" : "failed", r.ref ?? null, r.error ?? null]);
   } catch (e) {
     await c.query(`update customer_message set status = 'failed', error = $3 where entity_id = $1 and id = $2`,
@@ -1037,7 +1036,7 @@ export async function messageCustomer(c: Client, scope: Scope, m: { customerId: 
   if (!to) return row.id;
   try {
     const r = await route.send(c, scope.entityId, { channel, to, body, kind }, row.id);
-    await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end
+    if (!r.queued) await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end
                     where entity_id = $1 and id = $2`, [scope.entityId, row.id, r.ok ? "sent" : "failed", r.ref ?? null, r.error ?? null]);
   } catch (e) {
     await c.query(`update customer_message set status = 'failed', error = $3 where entity_id = $1 and id = $2`,

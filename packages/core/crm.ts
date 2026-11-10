@@ -16,6 +16,7 @@
 //     through pos.createOrder); the merge is the one deliberate exception and
 //     only repoints customer references, inside one transaction, with a record.
 
+import * as messaging from "./messaging.ts";
 import { randomBytes } from "node:crypto";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { createOrder, PosError } from "./pos.ts";
@@ -904,7 +905,22 @@ export interface CampaignProvider { name: string; send(m: { channel: Channel; to
 export const RecordProvider: CampaignProvider = { name: "record", async send() { return { ok: true }; } };
 
 /** Send whatever is due. Consent is checked again here: an opt-out after the campaign was built still stops the message. */
-export async function processQueue(c: Client, entityId: string, provider: CampaignProvider = RecordProvider, at: Date = new Date()) {
+/**
+ * Campaigns through Admin, Connections: the real address is read from the
+ * customer (the message row keeps it masked). A channel that is not connected
+ * is recorded only, as before. Consent was checked by the caller just before.
+ */
+async function connectedSend(c: Client, entityId: string, m: { id: string; customer_id: string | null; channel: Channel; subject: string | null; body: string }) {
+  if (!m.customer_id || !(await messaging.isConnected(c, entityId, m.channel))) return { ok: true, name: RecordProvider.name, error: undefined as string | undefined };
+  const cu = (await q<{ email: string | null; phone: string | null }>(c, `select email, phone from customer where id = $1 and entity_id = $2`, [m.customer_id, entityId]))[0];
+  const to = m.channel === "email" ? cu?.email : cu?.phone;
+  if (!to) return { ok: false, name: "none", error: `no ${m.channel === "email" ? "email address" : "mobile number"} on file` };
+  const o = { purpose: "campaign", sourceTable: "crm_message", sourceId: m.id };
+  const r = m.channel === "email" ? await messaging.sendEmail(c, entityId, { to: [to], subject: m.subject ?? "", text: m.body }, o) : await messaging.sendSms(c, entityId, to, m.body, o);
+  return { ok: r.status === "sent", name: r.provider, error: r.error ?? undefined };
+}
+
+export async function processQueue(c: Client, entityId: string, provider?: CampaignProvider, at: Date = new Date()) {
   const due = await q<{ id: string; customer_id: string | null; channel: Channel; to_ref: string; subject: string | null; body: string; campaign_id: string | null }>(c,
     `select id, customer_id, channel, to_ref, subject, body, campaign_id from crm_message where entity_id = $1 and status = 'queued' and send_after <= $2
       order by send_after limit 1000 for update skip locked`, [entityId, at]);
@@ -914,9 +930,9 @@ export async function processQueue(c: Client, entityId: string, provider: Campai
       const gate = await canMarket(c, entityId, m.customer_id, m.channel);
       if (!gate.ok) { await c.query(`update crm_message set status = 'suppressed', reason = $3 where id = $1 and entity_id = $2`, [m.id, entityId, gate.reason]); stopped++; continue; }
     }
-    const r = await provider.send({ channel: m.channel, toRef: m.to_ref, subject: m.subject, body: m.body });
+    const r = provider ? { ...(await provider.send({ channel: m.channel, toRef: m.to_ref, subject: m.subject, body: m.body })), name: provider.name } : await connectedSend(c, entityId, m);
     await c.query(`update crm_message set status = $3, sent_at = now(), reason = $4, provider = $5 where id = $1 and entity_id = $2`,
-      [m.id, entityId, r.ok ? "sent" : "failed", r.ok ? null : clean(r.error, 200) || "the provider refused it", provider.name]);
+      [m.id, entityId, r.ok ? "sent" : "failed", r.ok ? null : clean(r.error, 200) || "the provider refused it", r.name]);
     if (r.ok) sent++;
   }
   await c.query(`update crm_campaign k set status = 'sent', sent_at = coalesce(sent_at, now()) where k.entity_id = $1 and k.status = 'scheduled'

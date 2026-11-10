@@ -7,6 +7,7 @@
 // special-order rules all apply; the PO then goes to the vendor by the
 // trading partner's channel (EDI 850, the vendor's API, email or a file).
 
+import * as messaging from "./messaging.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import * as pur from "./purchasing.ts";
 
@@ -240,7 +241,18 @@ export async function approveStoreOrder(c: Client, s: Scope, id: string, a: { no
     if (!refused(e)) throw e;
     sent = { channel: "none", status: "not sent", detail: `approved and placed, but not sent: ${(e as Error).message}` };
   }
+  await tellSubmitter(c, s, o, `Store order ${o.number} was approved`, `Store order ${o.number} was approved and placed as purchase order ${placed.number}.${a.note?.trim() ? ` Note: ${a.note.trim().slice(0, 300)}` : ""}`);
   return { number: o.number, po: { ...placed, totalMinor: placed.totalMinor.toString() }, sent };
+}
+
+/** Email whoever submitted (else built) the order, through Admin, Connections; logged, not sent, when no email is connected. Queued until commit. */
+async function tellSubmitter(c: Client, s: Scope, o: Row, subject: string, text: string) {
+  const who = o.submitted_by ?? o.created_by;
+  if (!who) return;
+  const u = (await q<{ email: string | null }>(c, `select u.email from app_user u join entity e on e.tenant_id = u.tenant_id where u.id = $1 and e.id = $2
+     /* unscoped: a person of this company's client */`, [who, s.entityId]))[0];
+  if (!u?.email) return;
+  await messaging.queueEmail(c, s.entityId, { to: [u.email], subject, text }, { purpose: "store_order", sourceTable: "store_order", sourceId: o.id });
 }
 
 export async function rejectStoreOrder(c: Client, s: Scope, id: string, reason: string) {
@@ -250,6 +262,7 @@ export async function rejectStoreOrder(c: Client, s: Scope, id: string, reason: 
   need(!s.actor.id || (o.submitted_by !== s.actor.id && o.created_by !== s.actor.id), "whoever built or submitted a store order cannot also decide it");
   await c.query(`update store_order set status = 'rejected', decided_by = $3, decided_at = now(), decision_note = $4 where id = $1 and entity_id = $2`, [id, s.entityId, s.actor.id || null, reason.trim().slice(0, 300)]);
   await audit(c, s, { table: "store_order", rowId: id, action: "transition", before: { status: "submitted" }, after: { status: "rejected" }, reason });
+  await tellSubmitter(c, s, o, `Store order ${o.number} was turned down`, `Store order ${o.number} was turned down: ${reason.trim().slice(0, 300)}`);
   return { number: o.number };
 }
 

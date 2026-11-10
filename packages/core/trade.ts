@@ -52,7 +52,7 @@ export const SESSION_IDLE_MIN = 120;
 // ============================================================== the seam
 
 /** How a sign-in code reaches the person. 'record' files that a code went out (never the code) and sends nothing. */
-export interface CodeMailer { name: string; send(c: Client, m: { entityId: string; siteId: string | null; customerId: string; to: string; subject: string; body: string }): Promise<void> }
+export interface CodeMailer { name: string; send(c: Client, m: { entityId: string; siteId: string | null; customerId: string; to: string; subject: string; body: string; code?: string }): Promise<void> }
 export const RecordOnlyMailer: CodeMailer = {
   name: "record",
   async send(c, m) {
@@ -63,25 +63,20 @@ export const RecordOnlyMailer: CodeMailer = {
 };
 
 /**
- * The default: through the company's email connection (Admin, Connections),
- * logged there with the code redacted. With no email connected, today's
- * record-only behaviour: filed, not sent.
+ * The default: through the company's email connection (Admin, Connections).
+ * The email is queued in this transaction and sent after it commits, so an
+ * account that exists answers as fast as one that does not; the log keeps the
+ * code as ******. With no email connected: filed, not sent, as before.
  */
 export const ConnectedMailer: CodeMailer = {
   name: "connected",
   async send(c, m) {
-    if (!(await messaging.isConnected(c, m.entityId, "email"))) {
-      await RecordOnlyMailer.send(c, m);
-      const code = /\b\d{6}\b/.exec(m.body)?.[0];
-      await messaging.sendEmail(c, m.entityId, { to: [m.to], subject: m.subject, text: m.body }, { purpose: "trade_code", redact: code ? [code] : [], sourceTable: "trade_account" }, messaging.msgEnv(), null);
-      return;
-    }
-    const code = /\b\d{6}\b/.exec(m.body)?.[0];
-    const r = await messaging.sendEmail(c, m.entityId, { to: [m.to], subject: m.subject, text: m.body }, { purpose: "trade_code", redact: code ? [code] : [] });
+    const redact = m.code ? [m.code] : [];
+    const r = await messaging.queueEmail(c, m.entityId, { to: [m.to], subject: m.subject, text: m.body }, { purpose: "trade_code", redact, sourceTable: "trade_account" });
+    if (r.status === "logged") { await RecordOnlyMailer.send(c, m); return; }
     await c.query(`insert into shop_message (entity_id, site_id, customer_id, channel, to_ref, template, body, provider, status)
-                   values ($1,$2,$3,'email',$4,'trade_code',$5,$6,$7)`,
-      [m.entityId, m.siteId, m.customerId, shop.maskEmail(m.to), r.status === "sent" ? "A trade portal sign-in code was emailed. The code is not kept." : `A sign-in code could not be emailed: ${r.error ?? "not sent"}`,
-       r.provider, r.status === "sent" ? "sent" : "failed"]);
+                   values ($1,$2,$3,'email',$4,'trade_code','A trade portal sign-in code was queued to email. The code is not kept.',$5,'recorded')`,
+      [m.entityId, m.siteId, m.customerId, shop.maskEmail(m.to), r.provider]);
   },
 };
 
@@ -345,7 +340,7 @@ export async function requestCode(c: Client, site: shop.Site, emailIn: unknown, 
   await c.query(`insert into trade_login_code (entity_id, trade_account_id, code_sha256, expires_at, ip_hash, created_at) values ($1,$2,$3,$4,$5,$6)`,
     [site.entity_id, a.id, codeHash(a.id, code), new Date(at.getTime() + CODE_TTL_MIN * 60_000), ipHash, at]);
   await mailer.send(c, { entityId: site.entity_id, siteId: site.id, customerId: a.customer_id, to: a.email,
-    subject: `Your ${site.display_name} trade sign-in code`, body: `Your sign-in code is ${code}. It works for ${CODE_TTL_MIN} minutes. If you did not ask for it, ignore this email.` });
+    code, subject: `Your ${site.display_name} trade sign-in code`, body: `Your sign-in code is ${code}. It works for ${CODE_TTL_MIN} minutes. If you did not ask for it, ignore this email.` });
   return sent;
 }
 

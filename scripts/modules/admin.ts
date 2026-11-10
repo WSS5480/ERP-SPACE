@@ -32,9 +32,9 @@ function routes(t: T, mod: { register: (k: never) => void }) {
   const gets = new Map<string, Fn>(), posts = new Map<string, Fn>();
   mod.register({ coGet: (tail: string, fn: Fn) => gets.set(tail, fn), coPost: (tail: string, fn: Fn) => posts.set(tail, fn), publicRoute: () => {} } as never);
   return {
-    get: async <R = Record<string, unknown>>(tail: string, personId: string | null, m: string[] = []): Promise<R> => {
+    get: async <R = Record<string, unknown>>(tail: string, personId: string | null, m: string[] = [], query = ""): Promise<R> => {
       const c = await t.pool.connect();
-      try { const co = await t.company(); return await gets.get(tail)!(c, co, new URL("http://x/"), ["", co.id, ...m], personId) as R; }
+      try { const co = await t.company(); return await gets.get(tail)!(c, co, new URL("http://x/" + query), ["", co.id, ...m], personId) as R; }
       finally { c.release(); }
     },
     post: <R = Record<string, unknown>>(tail: string, personId: string, body: Record<string, unknown>, m: string[] = []): Promise<R> =>
@@ -106,8 +106,9 @@ function fakeSmtp(auth: "PLAIN" | "LOGIN", user: string, pass: string) {
 
 export async function run(t: T) {
   const net0 = fakeNet();
+  const ports: number[] = [];
   const env = (): msg.MsgEnv => ({ fetch: net0.fetch, secret: () => "", sleep: async () => {}, resolve: async () => ["93.184.216.34"],
-    secretKey: KEY, smtpAllowPrivate: true, smtpAllowPlain: true, smtpTimeoutMs: 3000 });
+    secretKey: KEY, smtpAllowPrivate: true, smtpAllowPlain: true, smtpTimeoutMs: 3000, smtpAllowPorts: ports });
   msg.useMsgEnv(env);
   const sql = async <R = Record<string, unknown>>(text: string, params: unknown[]): Promise<R[]> => {
     const c = await t.pool.connect();
@@ -133,7 +134,8 @@ export async function run(t: T) {
   const ROLE_SCREENS = new Function("return " + /const ROLE_SCREENS = (\{[\s\S]*?\n\});/.exec(appJs)![1])() as Record<string, string[]>;
   t.ok("roles: controllers get Services and Connections; the web admin gets Connections", ROLE_SCREENS.controller.includes("services") && ROLE_SCREENS.controller.includes("connections")
     && ROLE_SCREENS.web_admin.includes("connections") && !ROLE_SCREENS.sales.includes("connections"));
-  t.ok("roles: no new Pentex", !/Pentex/.test(appJs) && !ui.some((f) => /Pentex/.test(readFileSync(ROOT + "server/ui/" + f, "utf8"))));
+  const oldName = new RegExp(["Pen", "tex"].join(""));   // the company's old name never comes back on a screen
+  t.ok("names: the old company name is on no screen", !oldName.test(appJs) && !ui.some((f) => oldName.test(readFileSync(ROOT + "server/ui/" + f, "utf8"))));
 
   // turn a service off: hidden from the menu, its API still answers
   await A.post("/admin/services/switch", PEOPLE.STEVE, { service: "inventory", enabled: true });
@@ -169,7 +171,13 @@ export async function run(t: T) {
     && single.hidden.group === "only one company here");
   const rioL = await inTx((c) => svc.layoutOf(c, RIO_ENTITY));
   const rioS = await inTx((c) => svc.effectiveServices(c, RIO_ENTITY));
-  t.ok("single company: a client with one company does not see Group", rioL.companies === 1 && !rioS.on.includes("group"), JSON.stringify(rioL));
+  const rioSet = await sql<{ set_by: string }>(`select set_by from entity_setting where entity_id = $1 and key = 'admin.layout'`, [RIO_ENTITY]);
+  t.ok("kept: a one-company client that saw Group before 0049 still sees it (0050)", rioL.companies === 1 && rioL.mode === "multi" && rioS.on.includes("group")
+    && /migration 0050/.test(rioSet[0]?.set_by ?? ""), JSON.stringify(rioL));
+  const fresh = svc.computeState([...MODULE_IDS], { ...rioL, mode: "auto", multiCompany: false, multiStore: rioL.locations > 1, single: rioL.locations <= 1 });
+  t.ok("single company: a new one-company client does not see Group", !fresh.on.includes("group"));
+  const keepAgain = await inTx(async (c) => Number((await q<{ n: number }>(c, `select admin_keep_layout() n /* unscoped: the 0050 keep, run again */`, []))[0].n));
+  t.ok("kept: running the keep again changes nothing", keepAgain === 0);
   const ours = await inTx((c) => svc.layoutOf(c, ENTITY));
   t.ok("several: two companies and several stores show Group and store orders", ours.multiCompany && ours.multiStore && back.on.includes("group"));
   await t.throws("layout: only the owner overrides it", () => A.post("/admin/services/layout", PEOPLE.CONTROLLER, { mode: "single" }), /needs one of: owner/);
@@ -193,7 +201,12 @@ export async function run(t: T) {
   t.ok("screen: a card says what depends on it", fl.children.includes("Loading dock") && view.services.find((s) => s.id === "inventory")!.usedBy.includes("Point of sale") && view.presets.length === 5);
 
   // presets and apply to all companies
-  const pr = await A.post<{ companies: number; state: svc.ServiceState }>("/admin/services/preset", PEOPLE.STEVE, { preset: "delivery" });
+  const chk = await A.get<{ open: { service: string; count: number }[] }>("/admin/services/preset-check", PEOPLE.CONTROLLER, [], "?preset=delivery");
+  t.ok("preset: the check route answers", Array.isArray(chk.open));
+  const openWork = await inTx((c) => svc.presetCheck(c, [{ id: ENTITY, name: "Enola" }], "delivery"));
+  t.ok("preset: what it would hide with open work is listed", openWork.some((o) => o.service === "purchasing" || o.service === "ar") && openWork.every((o) => o.count > 0), JSON.stringify(openWork));
+  await t.throws("preset: switching off services with open records needs a confirmation", () => A.post("/admin/services/preset", PEOPLE.STEVE, { preset: "delivery" }), /still have open records: .*Confirm/);
+  const pr = await A.post<{ companies: number; state: svc.ServiceState; openHidden: unknown[] }>("/admin/services/preset", PEOPLE.STEVE, { preset: "delivery", confirm: true });
   t.ok("preset: Delivery company shows delivery and hides the store", pr.state.on.includes("fleet") && pr.state.on.includes("haulaway") && !pr.state.on.includes("pos") && !pr.state.on.includes("catalog"));
   const all = await A.post<{ companies: number }>("/admin/services/preset", PEOPLE.STEVE, { preset: "furniture", allCompanies: true });
   const sib = (await sql<{ id: string }>(`select id from entity where tenant_id = $1 and id <> $2 and status <> 'closed' /* unscoped: the sister company */`, [TENANT, ENTITY]))[0].id;
@@ -204,7 +217,10 @@ export async function run(t: T) {
 
   // ======================================================== connections
   t.ok("smtp: dot-stuffing doubles a leading dot and ends lines CRLF", msg.dotStuff("a\n.b\n..c\r\nd") === "a\r\n..b\r\n...c\r\nd");
+  t.ok("smtp: a lone CR or LF becomes CRLF before stuffing", msg.dotStuff("a\rb\n.c") === "a\r\nb\r\n..c");
+  t.ok("smtp: the From name is quoted and loses angle brackets", msg.displayName('Bob <evil@x> "B"') === '"Bob evil@x B"');
   const plain = await fakeSmtp("PLAIN", "mailer", "pw-123");
+  ports.push(plain.port);
   const sent1 = await msg.smtpSend({ host: "127.0.0.1", port: plain.port, security: "none", user: "mailer", password: "pw-123" },
     { from: "store@example.com", to: ["a@example.com", "b@example.com"], data: msg.buildMime({ name: "Store", address: "store@example.com" },
       { to: ["a@example.com"], subject: "Hi", text: "Line one\n.hidden line\n..two dots\nend" }) }, env());
@@ -212,18 +228,36 @@ export async function run(t: T) {
   t.ok("smtp: the message on the wire is dot-stuffed", plain.got.data.includes("\r\n..hidden line\r\n") && plain.got.data.includes("\r\n...two dots\r\n") && plain.got.data.includes("Subject: Hi"));
   plain.close();
   const login = await fakeSmtp("LOGIN", "u2", "p2");
+  ports.push(login.port);
   await msg.smtpSend({ host: "127.0.0.1", port: login.port, security: "none", user: "u2", password: "p2" }, { from: "s@example.com", to: ["x@example.com"], data: "Subject: x\r\n\r\nhello" }, env());
   t.ok("smtp: AUTH LOGIN when that is all the server offers", login.got.user === "u2" && login.got.pass === "p2");
   await t.throws("smtp: a wrong password is said plainly", () => msg.smtpSend({ host: "127.0.0.1", port: login.port, security: "none", user: "u2", password: "nope" },
     { from: "s@example.com", to: ["x@example.com"], data: "x" }, env()), /did not accept the user name and password/);
   await t.throws("smtp: STARTTLS asked of a server that does not offer it is refused", () => msg.smtpSend({ host: "127.0.0.1", port: login.port, security: "starttls" },
     { from: "s@example.com", to: ["x@example.com"], data: "x" }, env()), /does not offer STARTTLS/);
+  await t.throws("smtp: the port is checked even for a private relay", () => msg.smtpSend({ host: "127.0.0.1", port: login.port, security: "none" },
+    { from: "s@example.com", to: ["x@example.com"], data: "x" }, { ...env(), smtpAllowPorts: [] }), /ports 25, 465, 587 or 2525/);
+  await t.throws("smtp: with ERP_SMTP_ALLOW_HOSTS set, other servers are refused", () => msg.smtpSend({ host: "smtp.other.example", port: 587, security: "tls" },
+    { from: "s@example.com", to: ["x@example.com"], data: "x" }, { ...env(), smtpAllowPrivate: false, smtpAllowHosts: ["relay.example.com"] }), /ERP_SMTP_ALLOW_HOSTS/);
   login.close();
   await t.throws("smtp: no TLS is refused unless allowed", () => msg.smtpSend({ host: "127.0.0.1", port: login.port, security: "none" },
     { from: "s@example.com", to: ["x@example.com"], data: "x" }, { ...env(), smtpAllowPlain: false }), /no encryption/);
   await t.throws("smtp: private addresses are refused in production", () => msg.smtpSend({ host: "127.0.0.1", port: 587, security: "tls" },
     { from: "s@example.com", to: ["x@example.com"], data: "x" }, { ...env(), smtpAllowPrivate: false }), /private networks/);
+  // a server that says yes to STARTTLS and then goes quiet: the upgrade has its own clock
+  const stall = net.createServer((sk) => { sk.write("220 hi\r\n"); sk.on("data", (d) => { const l = d.toString();
+    if (/^EHLO/i.test(l)) sk.write("250-x\r\n250 STARTTLS\r\n"); else if (/^STARTTLS/i.test(l)) sk.write("220 go ahead\r\n"); }); sk.on("error", () => {}); });
+  await new Promise<void>((ok) => stall.listen(0, "127.0.0.1", () => ok()));
+  ports.push((stall.address() as net.AddressInfo).port);
+  const t0 = Date.now();
+  await t.throws("smtp: a STARTTLS upgrade that never finishes times out", () => msg.smtpSend({ host: "127.0.0.1", port: (stall.address() as net.AddressInfo).port, security: "starttls" },
+    { from: "s@example.com", to: ["x@example.com"], data: "x" }, { ...env(), smtpTimeoutMs: 300 }), /did not finish STARTTLS|took longer/);
+  t.ok("smtp: and it gave up promptly", Date.now() - t0 < 3000);
+  stall.close();
   const silent = net.createServer(() => {}); await new Promise<void>((ok) => silent.listen(0, "127.0.0.1", () => ok()));
+  ports.push((silent.address() as net.AddressInfo).port);
+  await t.throws("smtp: each send has an overall deadline", () => msg.smtpSend({ host: "127.0.0.1", port: (silent.address() as net.AddressInfo).port, security: "none" },
+    { from: "s@example.com", to: ["x@example.com"], data: "x" }, { ...env(), smtpTimeoutMs: 5000, smtpDeadlineMs: 250 }), /took longer than/);
   await t.throws("smtp: a server that never answers times out", () => msg.smtpSend({ host: "127.0.0.1", port: (silent.address() as net.AddressInfo).port, security: "none" },
     { from: "s@example.com", to: ["x@example.com"], data: "x" }, { ...env(), smtpTimeoutMs: 300 }), /stopped answering|did not answer/);
   silent.close();
@@ -280,11 +314,36 @@ export async function run(t: T) {
   cv = await A.get("/admin/connections", PEOPLE.CONTROLLER);
   t.ok("scope: a company with no own setting uses the client's", cv.kinds.find((k) => k.id === "email")!.using === "client" && cv.kinds.find((k) => k.id === "email")!.status === "connected");
   t.ok("secrets: a GET says set and nothing more", cv.kinds.find((k) => k.id === "email")!.client.secrets.apiKey === "set");
+  const aud = await sql<{ after: { scope: string; settings: string[]; secretsChanged: string[] } }>(`select after from audit_event where entity_id = $1 and table_name = 'admin_connection' order by at desc limit 5`, [ENTITY]).catch(() => [] as never[]);
+  const audC = aud.find((x) => x.after?.scope === "client");
+  t.ok("audit: a client-wide save is audited by name, never by value", !!audC && audC.after.secretsChanged.includes("apiKey") && !JSON.stringify(aud).includes("SG.good-key") && !JSON.stringify(aud).includes("orders@example.com"));
+  // a controller of this company only may not test the client's connection
+  const ONLY = "55555555-0000-0000-0000-0000000000a9";
+  await inTx(async (c) => {
+    await c.query(`insert into app_user (id, tenant_id, name, email, status) values ($1,$2,'One-company controller','one@example.com','active') on conflict do nothing /* unscoped: test person */`, [ONLY, TENANT]);
+    await c.query(`insert into role_grant (app_user_id, entity_id, role) select $1,$2,'controller' where not exists (select 1 from role_grant where app_user_id = $1) /* unscoped: test grant */`, [ONLY, ENTITY]);
+  });
+  await t.throws("scope: testing the client's connection needs the role in every company", () => A.post("/admin/connections/test", ONLY, { kind: "email", scope: "client", to: "me@example.com" }), /for the whole client .* too/);
+  // a failed PO email keeps its log row through the savepoint rollback
+  await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "sendgrid", scope: "client", settings: { fromName: "Buddy's", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.bad-key" } });
+  const poTo = `vendor-${randomBytes(3).toString("hex")}@example.com`;
+  const failedRows = await inTx(async (c) => {
+    const ml = (await msg.mailerFor(c, ENTITY, "purchase_order"))!;
+    await c.query("savepoint send");
+    try { await ml.send({ to: poTo, subject: "PO 1", text: "x", attachments: [] }); }
+    catch (e) { await c.query("rollback to savepoint send"); await (e as { relog: (c: Client) => Promise<void> }).relog(c); }
+    return q<{ status: string }>(c, `select status from outbound_message where entity_id = $1 and purpose = 'purchase_order' and to_addr = $2`, [ENTITY, poTo]);
+  });
+  t.ok("purchase orders: a failed email stays in the log after the rollback", failedRows.length === 1 && failedRows[0].status === "failed");
+  await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "sendgrid", scope: "client", settings: { fromName: "Buddy's", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.good-key" } });
 
   // trade code through the connection
   if (acct) {
     const n0 = net0.log.length;
-    await inTx((c) => trade.requestCode(c, site, acct.email, "ip-adm", undefined, future(60)));
+    let inside = -1;
+    await inTx(async (c) => { await trade.requestCode(c, site, acct.email, "ip-adm", undefined, future(60)); inside = net0.log.length - n0; });
+    t.ok("trade code: nothing goes on the network inside the request's transaction", inside === 0);
+    await msg.idle();
     const call = net0.log.slice(n0).find((r) => r.url.includes("sendgrid"));
     const code = call ? /(\d{6})/.exec(JSON.parse(call.body).content[0].value)?.[1] : null;
     const row = (await sql<{ status: string; body: string; provider: string }>(`select status, body, provider from outbound_message where entity_id = $1 and purpose = 'trade_code' order by created_at desc limit 1`, [site.entity_id]))[0];
@@ -294,6 +353,7 @@ export async function run(t: T) {
 
   // a company's own SMTP setting wins over the client's
   const relay = await fakeSmtp("PLAIN", "relay", "relay-pw");
+  ports.push(relay.port);
   const saved = await A.post<{ missing: string[] }>("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "smtp", scope: "company",
     settings: { host: "127.0.0.1", port: relay.port, security: "none", user: "relay", fromName: "Enola store", fromAddress: "enola@example.com" }, secrets: { password: "relay-pw" } });
   t.ok("smtp: saved with nothing missing", saved.missing.length === 0);
@@ -311,6 +371,7 @@ export async function run(t: T) {
   const cust = (await sql<{ id: string }>(`select id from customer where entity_id = $1 and phone is not null limit 1`, [ENTITY]))[0];
   const cmId = await t.as(PEOPLE.STEVE, (c, co) => fleet.messageCustomer(c, { tenantId: co.tenantId, entityId: ENTITY, actor: { kind: "user", id: PEOPLE.STEVE, label: "x" } },
     { customerId: cust.id, body: "your delivery is booked" }));
+  await msg.idle();
   const cm = (await sql<{ status: string; provider: string; provider_ref: string; channel: string }>(`select status, provider, provider_ref, channel from customer_message where entity_id = $1 and id = $2`, [ENTITY, cmId]))[0];
   t.ok("sms: a customer message goes out by text through the connection", cm.status === "sent" && cm.provider === "twilio" && cm.channel === "sms" && cm.provider_ref !== null);
   await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "sms", provider: "https", settings: { url: "https://sms.example.com/send", idField: "messageId" }, secrets: { authToken: "gen-key" } });
@@ -326,6 +387,19 @@ export async function run(t: T) {
   const tsig = /t=(\d+),v1=/.exec(hk.headers["x-erp-signature"])![1];
   t.ok("webhooks: the test carries an HMAC signature of time.body", wh.ok && hk.headers["x-erp-signature"] === msg.signWebhook("whsec_1", hk.body, Number(tsig)));
 
+  // a web order confirmation: queued with the order, sent after the commit (back on the client's SendGrid once the company's relay is off)
+  await A.post("/admin/connections/off", PEOPLE.STEVE, { kind: "email", scope: "company" });
+  const webCust = (await sql<{ id: string }>(`select id from customer where entity_id = $1 and email is not null and phone is null limit 1`, [ENTITY]))[0];
+  if (webCust) {
+    const n1 = net0.log.length;
+    await inTx((c) => shop.ConnectedMessages.send(c, { entityId: ENTITY, siteId: site.id, orderId: null, customerId: webCust.id, channel: "email", toRef: "m***@example.com",
+      template: "order_confirmed", body: "Buddy's: order W-1 is confirmed." }));
+    await msg.idle();
+    const wr = (await sql<{ status: string }>(`select status from outbound_message where entity_id = $1 and purpose = 'web_order' order by created_at desc limit 1`, [ENTITY]))[0];
+    t.ok("web orders: the confirmation goes through the email connection after commit", wr?.status === "sent", JSON.stringify(wr));
+    t.ok("web orders: by the provider", wr?.status === "sent" && net0.log.slice(n1).some((r) => r.url.includes("sendgrid")));
+  } else t.ok("web orders: a customer with an email to test with", false);
+
   // the message log, resend, and no GET returns a secret
   const log = await A.get<{ messages: { id: string; purpose: string; resendable: boolean; status: string; body: string }[] }>("/admin/messages", PEOPLE.CONTROLLER);
   const again = log.messages.find((m) => m.purpose === "test" && m.resendable && m.status === "sent");
@@ -333,15 +407,19 @@ export async function run(t: T) {
   t.ok("log: a sent message can be sent again", rs.status === "sent");
   const codeMsg = log.messages.find((m) => m.purpose === "trade_code");
   if (codeMsg) await t.throws("log: a sign-in code is never resent", () => A.post(`/admin/messages/([0-9a-fA-F-]{36})/resend`, PEOPLE.STEVE, {}, [codeMsg.id]), /cannot be sent again/);
+  if (WEB) {
+    const wl = await A.get<{ webOnly: boolean; messages: { purpose: string }[] }>("/admin/messages", WEB);
+    t.ok("log: the web admin sees only web store and marketing messages", wl.webOnly && wl.messages.length > 0 && wl.messages.every((m) => msg.WEB_PURPOSES.includes(m.purpose)));
+  }
   const everything = JSON.stringify([await A.get("/admin/connections", PEOPLE.STEVE), await A.get("/admin/connections", PEOPLE.CONTROLLER), WEB ? await A.get("/admin/connections", WEB) : null,
     await A.get("/admin/messages", PEOPLE.STEVE), await A.get("/admin/services", PEOPLE.STEVE), await S.get("/setup/modules", null), await S.get("/setup/business", null)]);
   t.ok("secrets: no GET returns a key, token or password", !["SG.good-key", "SG.bad-key", "relay-pw", "tw-token", "gen-key", "whsec_1", "pk_SECRET_klaviyo"].some((s) => everything.includes(s))
     && !/ciphertext|"iv"/.test(everything));
-  const sealed = await sql<{ n: string }>(`select count(*) n from admin_connection_secret where tenant_id = $1 and convert_from(ciphertext, 'LATIN1') like '%good-key%' /* unscoped: the client's secrets */`, [TENANT]);
+  const sealed = await sql<{ n: string }>(`select count(*) n from admin_connection_secret where tenant_id = $1 and position(convert_to('good-key', 'UTF8') in ciphertext) > 0 /* unscoped: the client's secrets */`, [TENANT]);
   t.ok("secrets: stored sealed, not in the clear", sealed[0].n === "0");
 
   // turn everything off again (kept, never deleted), so nothing else sends
-  for (const [kind, scope] of [["email", "company"], ["email", "client"], ["sms", "company"], ["webhooks", "company"]]) await A.post("/admin/connections/off", PEOPLE.STEVE, { kind, scope });
+  for (const [kind, scope] of [["email", "client"], ["sms", "company"], ["webhooks", "company"]]) await A.post("/admin/connections/off", PEOPLE.STEVE, { kind, scope });
   if (WEB) await A.post("/admin/connections/off", WEB, { kind: "klaviyo", scope: "company" });
   const offNow = await inTx((c) => msg.isConnected(c, ENTITY, "email"));
   const kept = await sql<{ n: string }>(`select count(*) n from admin_connection where tenant_id = $1 /* unscoped: the client's connections */`, [TENANT]);

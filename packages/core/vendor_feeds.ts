@@ -1250,9 +1250,12 @@ export async function runFeed(c: Client, s: Scope, feedId: string, env: FeedEnv,
                         consecutive_failures = case when $3 then 0 else consecutive_failures + 1 end where id = $1 and entity_id = $2`,
     [f.id, s.entityId, res.ok, res.note]);
   // Tell a person once when a feed starts failing, not on every retry.
-  if (!res.ok && f.last_ok !== false && env.mailer && typeof f.options.alertEmail === "string" && /@/.test(f.options.alertEmail)) {
+  // The checks' own mailer, else the company's email connection (Admin, Connections); with neither, the run log has it.
+  const mailer = !res.ok && f.last_ok !== false && typeof f.options.alertEmail === "string" && /@/.test(f.options.alertEmail)
+    ? env.mailer ?? await (await import("./messaging.ts")).mailerFor(c, s.entityId, "feed_alert") : null;
+  if (mailer) {
     try {
-      await env.mailer.send({ to: f.options.alertEmail, subject: `Vendor feed failed: ${f.vendor} · ${f.name}`,
+      await mailer.send({ to: f.options.alertEmail, subject: `Vendor feed failed: ${f.vendor} · ${f.name}`,
         text: `The ${f.name} feed for ${f.vendor} failed: ${res.note}\n\nNothing from this run was kept. Open Catalog → Vendors → API setup to look.`, attachments: [] });
     } catch { /* the run log already has it */ }
   }

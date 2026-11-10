@@ -686,6 +686,9 @@ export async function sendPO(c: Client, s: Scope, poId: string, method: SendMeth
       return { ...(await log("sent", file.orderEmail, `emailed${r.id ? ` (message ${r.id})` : ""}`)), file };
     } catch (e) {
       await c.query("rollback to savepoint send");
+      // the rollback took the message log row and the connection's Failing status with it; write them again
+      const relog = (e as { relog?: (c: Client) => Promise<void> }).relog;
+      if (relog) await relog(c);
       return log("failed", file.orderEmail, `the mail service refused it: ${((e as Error).message || "").slice(0, 160)}`);
     }
   }

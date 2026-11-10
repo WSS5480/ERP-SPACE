@@ -5,6 +5,7 @@
 // packages/core/ar.ts; this file decides who may do what, reads requests,
 // and turns the engine's refusals into sentences.
 
+import * as msg from "../../packages/core/messaging.ts";
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
 import { ModuleError, need, requireRole, str, uuid, int, minor } from "./kit.ts";
 import { scopeOf } from "../actions.ts";
@@ -340,7 +341,7 @@ export const H = {
   send: wrap(async (c: Client, co: Company, a: Actor, id: string, b: Record<string, unknown>) => {
     await requireRole(c, co, a, ROLES.collect, "sending a collections message");
     const cid = await customerOr(c, co, id);
-    return ar.sendTemplate(c, scopeOf(co, a), new ar.RecordOnlyProvider(), cid, str(b.template, 40));
+    return ar.sendTemplate(c, scopeOf(co, a), collectionsProvider(c, co.id, cid), cid, str(b.template, 40));
   }),
 
   requestWriteoff: wrap(async (c: Client, co: Company, a: Actor, b: Record<string, unknown>) => {
@@ -460,6 +461,22 @@ export const H = {
 };
 
 const ID = "([0-9a-fA-F-]{36})";
+
+/**
+ * Collections texts and emails go through Admin, Connections when that channel
+ * is connected; letters, and anything with no connection, are recorded only.
+ */
+function collectionsProvider(c: Client, entityId: string, customerId: string): ar.MessageProvider {
+  const p = { name: new ar.RecordOnlyProvider().name, async send(m: { channel: "letter" | "sms" | "email"; to: string | null; subject: string | null; body: string }) {
+    if (m.channel === "letter" || !m.to || !(await msg.isConnected(c, entityId, m.channel))) return { ref: null };
+    const o = { purpose: "collections", sourceTable: "customer", sourceId: customerId };
+    const r = m.channel === "sms" ? await msg.sendSms(c, entityId, m.to, m.body, o) : await msg.sendEmail(c, entityId, { to: [m.to], subject: m.subject ?? "About your account", text: m.body }, o);
+    if (r.status !== "sent") throw new ModuleError(`The ${m.channel === "sms" ? "text" : "email"} was not sent: ${r.error ?? "the provider refused it"}`);
+    p.name = r.provider;
+    return { ref: r.providerRef ?? r.id };
+  } };
+  return p;
+}
 
 export const module: ErpModule = {
   id: "ar",

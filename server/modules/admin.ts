@@ -60,6 +60,14 @@ export const module: ErpModule = {
       return { ...(await svc.setService(c, ids, id, b.enabled === true, a.personName)), state: await svc.effectiveServices(c, co.id) };
     }));
 
+    // What a preset would switch off that still has open records; the screen shows it before asking.
+    coGet("/admin/services/preset-check", async (c, co, u, _m, p) => refuse(async () => {
+      const r = await viewerRoles(c, co, p, "Services");
+      need(r.has("owner") || r.has("controller"), "Services is for the owner or a controller");
+      const targets = u.searchParams.get("all") === "1" ? await companiesOf(c, co) : [{ id: co.id, name: co.name }];
+      return { open: await svc.presetCheck(c, targets, String(u.searchParams.get("preset") ?? "").slice(0, 30)) };
+    }));
+
     coPost("/admin/services/preset", async (c, co, a, b) => refuse(async () => {
       const id = str(b.preset, 30);
       need(svc.PRESETS.some((p) => p.id === id), "pick one of the presets");
@@ -67,6 +75,9 @@ export const module: ErpModule = {
       const held = all ? (await requireRoleEverywhere(c, co, a, MANAGE, "applying a preset to every company"), await rolesOf(c, co, a.personId))
         : await requireRole(c, co, a, MANAGE, "applying a preset");
       const targets = all ? await companiesOf(c, co) : [{ id: co.id, name: co.name }];
+      const open = await svc.presetCheck(c, targets, id);
+      need(!open.length || b.confirm === true,
+        `This preset switches off services that still have open records: ${open.map((o) => `${o.name} (${o.count} ${o.what}${targets.length > 1 ? `, ${o.company}` : ""})`).join("; ")}. Nothing is lost, but those screens hide. Confirm to go ahead.`);
       const pack = svc.presetPack(id);
       const notes: string[] = [];
       for (const t of targets) {
@@ -75,7 +86,7 @@ export const module: ErpModule = {
         await svc.applyPresetSwitches(c, t.id, id, a.personName);
       }
       if (pack && !held.has("owner")) notes.push(`The switches are set. The ${pack.name.toLowerCase()} accounts and defaults were not added: applying a setup pack is the owner's.`);
-      return { preset: id, companies: targets.length, notes, state: await svc.effectiveServices(c, co.id) };
+      return { preset: id, companies: targets.length, notes, openHidden: open, state: await svc.effectiveServices(c, co.id) };
     }));
 
     coPost("/admin/services/layout", async (c, co, a, b) => refuse(async () => {
@@ -94,33 +105,35 @@ export const module: ErpModule = {
       const scope = str(b.scope, 10) === "client" ? "client" : "company";
       const { place } = await mayConnect(c, co, a, str(b.kind, 30), scope);
       const obj = (v: unknown) => (v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {});
-      return msg.saveConnection(c, place, str(b.kind, 30), str(b.provider, 30), obj(b.settings), obj(b.secrets), { personId: a.personId, personName: a.personName });
+      return msg.saveConnection(c, place, str(b.kind, 30), str(b.provider, 30), obj(b.settings), obj(b.secrets), { personId: a.personId, personName: a.personName, fromEntityId: co.id });
     }));
 
     coPost("/admin/connections/test", async (c, co, a, b) => refuse(async () => {
       const scope = str(b.scope, 10) === "client" ? "client" : "company";
-      const { place } = await mayConnect(c, co, a, str(b.kind, 30), scope === "client" ? "company" : scope);
-      return msg.testConnection(c, { ...place, entityId: scope === "client" ? null : co.id }, co.id, str(b.kind, 30), str(b.to, 200), { personId: a.personId, personName: a.personName });
+      const { place } = await mayConnect(c, co, a, str(b.kind, 30), scope);
+      return msg.testConnection(c, place, co.id, str(b.kind, 30), str(b.to, 200), { personId: a.personId, personName: a.personName, fromEntityId: co.id });
     }));
 
     coPost("/admin/connections/off", async (c, co, a, b) => refuse(async () => {
       const scope = str(b.scope, 10) === "client" ? "client" : "company";
       const { place } = await mayConnect(c, co, a, str(b.kind, 30), scope);
-      return msg.turnOff(c, place, str(b.kind, 30), { personId: a.personId, personName: a.personName });
+      return msg.turnOff(c, place, str(b.kind, 30), { personId: a.personId, personName: a.personName, fromEntityId: co.id });
     }));
 
     // ---------------------------------------------------------- message log
     coGet("/admin/messages", async (c, co, _u, _m, p) => {
       const r = await viewerRoles(c, co, p, "the message log");
       need(r.has("owner") || r.has("controller") || r.has("web_admin"), "the message log is for the owner, a controller or the web admin");
-      return { messages: await msg.messageLog(c, co.id, 200), email: await msg.isConnected(c, co.id, "email"), sms: await msg.isConnected(c, co.id, "sms") };
+      // The web admin sees only what the web store and marketing sent.
+      const webOnly = !r.has("owner") && !r.has("controller");
+      return { webOnly, messages: await msg.messageLog(c, co.id, 200, webOnly ? msg.WEB_PURPOSES : null), email: await msg.isConnected(c, co.id, "email"), sms: await msg.isConnected(c, co.id, "sms") };
     });
 
     coPost("/admin/messages/([0-9a-fA-F-]{36})/resend", async (c, co, a, _b, m) => refuse(async () => {
       await requireRole(c, co, a, MANAGE, "sending a message again");
       const id = uuid(m[2]);
       need(id, "there is no such message");
-      return msg.resend(c, co.id, id!, { personId: a.personId, personName: a.personName });
+      return msg.resend(c, co.id, id!, { personId: a.personId, personName: a.personName, fromEntityId: co.id });
     }));
   },
 };

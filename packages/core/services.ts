@@ -242,6 +242,48 @@ export async function applyPresetSwitches(c: Client, entityId: string, presetId:
   return p!;
 }
 
+/** What still has open work, per service: switching it off would hide records someone has to finish. */
+const OPEN: Partial<Record<ModuleId, [what: string, sql: string]>> = {
+  fleet: ["open deliveries", `select count(*) n from delivery_stop where entity_id = $1 and status in ('scheduled','arrived')`],
+  storeorders: ["store orders not yet decided", `select count(*) n from store_order where entity_id = $1 and status in ('draft','submitted')`],
+  purchasing: ["open purchase orders", `select count(*) n from purchase_order where entity_id = $1 and status = 'open'`],
+  edi: ["live trading partners", `select count(*) n from edi_partner where entity_id = $1 and edi_enabled`],
+  ar: ["unpaid invoices", `select count(*) n from customer_invoice where entity_id = $1 and status = 'open'`],
+  settlements: ["financed sales waiting on funding", `select count(*) n from financed_sale where entity_id = $1 and status = 'awaiting_funding'`],
+  pos: ["open store orders", `select count(*) n from sales_order where entity_id = $1 and channel <> 'web' and status in ('open','fulfilling')`],
+  shop: ["open web orders", `select count(*) n from sales_order where entity_id = $1 and channel = 'web' and status in ('open','fulfilling')`],
+  service: ["open service tickets", `select count(*) n from service_ticket where entity_id = $1 and status not in ('resolved','closed','cancelled')`],
+  trade: ["active trade accounts", `select count(*) n from trade_account where entity_id = $1 and status = 'active'`],
+  timeoff: ["time-off requests waiting", `select count(*) n from leave_request where entity_id = $1 and status = 'requested'`],
+};
+
+export type OpenWork = { service: ModuleId; name: string; what: string; count: number };
+
+/** Of these services, the ones with open records in this company. */
+export async function openRecords(c: Client, entityId: string, ids: readonly string[]): Promise<OpenWork[]> {
+  const out: OpenWork[] = [];
+  for (const id of ids) {
+    const o = OPEN[id as ModuleId];
+    if (!o) continue;
+    const n = Number((await one<{ n: string }>(c, o[1], [entityId])).n);
+    if (n > 0) out.push({ service: id as ModuleId, name: serviceById(id)?.name ?? id, what: o[0], count: n });
+  }
+  return out;
+}
+
+/** What a preset would switch off that still has open records, in each of these companies. */
+export async function presetCheck(c: Client, entityIds: { id: string; name: string }[], presetId: string) {
+  const p = PRESETS.find((x) => x.id === presetId);
+  need(p, "pick one of the presets");
+  const out: (OpenWork & { company: string })[] = [];
+  for (const e of entityIds) {
+    const st = await effectiveServices(c, e.id);
+    const goingOff = MODULE_IDS.filter((m) => st.switches[m] && !p!.services.includes(m));
+    for (const w of await openRecords(c, e.id, goingOff)) out.push({ ...w, company: e.name });
+  }
+  return out;
+}
+
 export function presetPack(presetId: string) {
   const p = PRESETS.find((x) => x.id === presetId);
   return p?.pack ? PACKS.find((x) => x.id === p.pack) ?? null : null;

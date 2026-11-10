@@ -52,6 +52,7 @@ export type Client = pg.PoolClient;
  */
 export async function tx<T>(actor: Actor, fn: (c: Client) => Promise<T>): Promise<T> {
   const c = await pool.connect();
+  let committed = false;
   try {
     await c.query("begin");
     await c.query("select set_config('erp.actor_kind', $1, true)", [actor.kind]);
@@ -59,13 +60,27 @@ export async function tx<T>(actor: Actor, fn: (c: Client) => Promise<T>): Promis
     await c.query("select set_config('erp.actor_id', $1, true)", [actor.id ?? ""]);
     const out = await fn(c);
     await c.query("commit");
+    committed = true;
     return out;
   } catch (e) {
     await c.query("rollback");
     throw e;
   } finally {
+    const jobs = AFTER.get(c) ?? [];
+    AFTER.delete(c);
     c.release();
+    // Work that must wait for the commit (sending a queued email): started, never awaited, so the
+    // caller's answer does not wait on the network. A rollback drops it with the rows it would send.
+    if (committed) for (const j of jobs) setImmediate(() => { j().catch(() => { /* the job keeps its own log */ }); });
   }
+}
+
+const AFTER = new WeakMap<Client, (() => Promise<void>)[]>();
+/** Run fn once the transaction on this client commits (in the background). Outside tx() it never runs; callers keep a sweeper (run-due). */
+export function afterCommit(c: Client, fn: () => Promise<void>): void {
+  const list = AFTER.get(c) ?? [];
+  list.push(fn);
+  AFTER.set(c, list);
 }
 
 const UNSCOPED = /\/\*\s*unscoped:[^*]*\*\//i;
