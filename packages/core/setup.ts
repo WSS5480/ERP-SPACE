@@ -10,7 +10,7 @@ import { installStarters } from "./reports.ts";
 
 export class SetupError extends Error {}
 
-export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group"] as const;
+export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group", "edi"] as const;
 export type ModuleId = (typeof MODULE_IDS)[number];
 
 type Account = [code: string, name: string, type: "asset" | "liability" | "equity" | "revenue" | "expense", normal: "D" | "C"];
@@ -107,7 +107,7 @@ export const PACKS: Pack[] = [
     blurb: "Showrooms and a distribution center, special orders and customizable upholstery, deposits and financing, white-glove delivery with routing, commissioned sales staff.",
     vertical: "furniture",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group", "edi"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -133,7 +133,7 @@ export const PACKS: Pack[] = [
     blurb: "Serialized stock, manufacturer warranties and protection plans, install and haul-away on delivery, financing.",
     vertical: "retail",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group", "edi"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {
@@ -156,7 +156,7 @@ export const PACKS: Pack[] = [
     blurb: "Cash-and-carry stores with a web store; no delivery fleet or installment contracts unless you turn them on.",
     vertical: "retail",
     labels: { location: "Store", profitObject: "Store", aging: "Receivables" },
-    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "shop", "crm", "reports", "group"],
+    modules: ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "shop", "crm", "reports", "group", "edi"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS.filter(([k]) => k !== "delivery_exception"),
     settings: {
@@ -174,7 +174,7 @@ export const PACKS: Pack[] = [
     blurb: "Stores carrying back balances, delivery and pickup routes, a catalog and purchasing for rental merchandise. Agreements stay in your rental system; this pack reads it.",
     vertical: "rto",
     labels: { location: "Store", profitObject: "Store", aging: "Back balances" },
-    modules: ["catalog", "purchasing", "inventory", "ar", "workforce", "fleet", "service", "reports", "group"],
+    modules: ["catalog", "purchasing", "inventory", "ar", "workforce", "fleet", "service", "reports", "group", "edi"],
     accounts: RETAIL_ACCOUNTS,
     reasons: RETAIL_REASONS,
     settings: {

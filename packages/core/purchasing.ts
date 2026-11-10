@@ -12,7 +12,7 @@ import { addOnOrder } from "./inventory.ts";
 import { priceConfigured, PricingError, type Choice } from "./pricing.ts";
 import { profitObjectFor } from "./posting.ts";
 import { parseCsv, csvCell } from "./catalog.ts";
-import { orderFeedRequest, call, FeedError, type FeedEnv } from "./vendor_feeds.ts";
+import { orderFeedRequest, call, render, FeedError, type FeedEnv } from "./vendor_feeds.ts";
 
 export class PurchasingError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new PurchasingError(msg); };
@@ -640,21 +640,174 @@ export async function sendPO(c: Client, s: Scope, poId: string, method: SendMeth
     lines: lines.map((l) => ({ lineNumber: l.seq, sku: l.vendor_sku, quantity: Number(l.qty), unitCost: Number(l.unit) / 100,
       options: Object.values(l.config ?? {}).flat().map((o) => o?.vendorCode).filter(Boolean), customerOrder: l.agreement_ref })),
   };
+  // The vendor's own body shape, when the order feed has a template: {{purchaseOrderNumber}}, {{#lines}}{"sku":"{{item.sku}}"},{{/lines}}.
+  let text = JSON.stringify(body);
+  if (req.feed.body_template) {
+    text = render(req.feed.body_template, { ...body, opt: opts }, "json").replace(/,(\s*[\]}])/g, "$1");
+    try { JSON.parse(text); }
+    catch { return log("failed", null, "the order feed's body template does not make valid JSON; fix it under Catalog, Vendors, API setup"); }
+  }
   const shown = req.mask(url);
+  const mapping = req.feed.mapping ?? {};
+  const at = (j: unknown, path: string | undefined) => path ? path.split(".").reduce<unknown>((o, k) => (o && typeof o === "object" ? (o as Record<string, unknown>)[k] : undefined), j) : undefined;
   try {
-    const r = await call(env, url, { method: "POST", headers: { ...req.headers, "content-type": "application/json" }, body: JSON.stringify(body) },
+    const r = await call(env, url, { method: "POST", headers: { ...req.headers, "content-type": "application/json" }, body: text },
       req.feed.timeout_ms, "the vendor's order service", 1);
-    if (r.status !== 200 && r.status !== 201 && r.status !== 202) return log("failed", shown, `the vendor's order service answered ${r.status}${r.text ? `: ${req.mask(r.text.slice(0, 160))}` : ""}`);
-    let ref: string | null = null;
+    if (r.status !== 200 && r.status !== 201 && r.status !== 202) return { ...(await log("failed", shown, `the vendor's order service answered ${r.status}${r.text ? `: ${req.mask(r.text.slice(0, 160))}` : ""}`)), request: req.mask(text), response: req.mask(r.text.slice(0, 4000)) };
+    let ref: string | null = null, ackWord: string | null = null, ackDate: string | null = null;
     try {
       const j = JSON.parse(r.text) as Record<string, unknown>;
-      const path = req.feed.mapping?.vendor_ref;
-      const at = path ? path.split(".").reduce<unknown>((o, k) => (o && typeof o === "object" ? (o as Record<string, unknown>)[k] : undefined), j) : undefined;
-      ref = String(at ?? j.orderNumber ?? j.confirmationNumber ?? j.id ?? "") || null;
+      ref = String(at(j, mapping.vendor_ref) ?? j.orderNumber ?? j.confirmationNumber ?? j.id ?? "") || null;
+      ackWord = mapping.ack_status ? String(at(j, mapping.ack_status) ?? "") || null : null;
+      ackDate = mapping.expected_on ? String(at(j, mapping.expected_on) ?? "").slice(0, 10) || null : null;
     } catch { /* no body */ }
-    return log("sent", shown, `accepted by the vendor${ref ? ` as ${ref}` : ""}`, ref);
+    const sent = await log("sent", shown, `accepted by the vendor${ref ? ` as ${ref}` : ""}`, ref);
+    // An order service that answers with its acknowledgment (status and ship date) acknowledges the whole PO now.
+    let acknowledged: string | null = null;
+    if (ackWord && ACK_WORDS[ackWord.toLowerCase().trim()]) {
+      await c.query("savepoint api_ack");
+      try {
+        const all = await linesOf(c, s.entityId, poId);
+        await acknowledgePO(c, s, poId, { vendorRef: ref, expectedOn: ackDate && DAY.test(ackDate) ? ackDate : null,
+          lines: all.filter((l) => openQty(l) > 0).map((l) => ({ lineId: l.id, status: ackWord!, expectedOn: ackDate && DAY.test(ackDate) ? ackDate : null })) });
+        await c.query("release savepoint api_ack");
+        acknowledged = ACK_WORDS[ackWord.toLowerCase().trim()];
+      } catch (e) {
+        await c.query("rollback to savepoint api_ack");
+        if (!(e instanceof PurchasingError)) throw e;
+        acknowledged = `not applied: ${e.message}`;
+      }
+    }
+    return { ...sent, acknowledged, request: req.mask(text), response: req.mask(r.text.slice(0, 4000)) };
   } catch (e) {
     if (!(e instanceof FeedError)) throw e;
-    return log("failed", shown, req.mask(e.message));
+    return { ...(await log("failed", shown, req.mask(e.message))), request: req.mask(text) };
   }
+}
+
+// ------------------------------------------------------------ ship notices --
+
+export type ShipLine = { lineId?: string; seq?: number; vendorSku?: string; qty: number };
+export type ShipNotice = { asn: string; shippedOn?: string | null; expectedOn?: string | null; carrier?: string | null; tracking?: string | null;
+  lines: ShipLine[]; source?: "edi" | "api" | "manual"; documentId?: string | null };
+
+/**
+ * The vendor's ship notice (EDI 856, or a "shipped" status from its API):
+ * the lines and quantities on the truck, when it left, who carries it and
+ * the tracking number. The goods are in transit until receiving counts
+ * them in; the line's expected date (what receiving plans by) and the
+ * customer's ETA become the delivery date the notice gives.
+ */
+export async function recordShipment(c: Client, s: Scope, poId: string, n: ShipNotice) {
+  const po = await poFor(c, s.entityId, poId);
+  need(po.status === "open", `${po.number} is ${po.status}; a ship notice is for an open order`);
+  need(n.asn && String(n.asn).trim(), "a ship notice needs its shipment number");
+  for (const d of [n.shippedOn, n.expectedOn]) if (d) need(DAY.test(d), "the ship and delivery dates are dates, like 2026-12-01");
+  need(n.lines?.length, "a ship notice lists the lines on the truck");
+  const dup = await q(c, `select 1 from po_shipment where entity_id = $1 and purchase_order_id = $2 and asn_number = $3`, [s.entityId, poId, n.asn.trim()]);
+  need(!dup.length, `ship notice ${n.asn.trim()} is already recorded on ${po.number}`);
+  const lines = await linesOf(c, s.entityId, poId);
+  const shippedBefore = new Map((await q<{ id: string; shipped: string }>(c, `select purchase_order_line_id id, shipped_qty shipped from po_line_shipping where entity_id = $1 and purchase_order_id = $2`,
+    [s.entityId, poId])).map((x) => [x.id, Number(x.shipped)]));
+  const picked: { l: LineRow; qty: number }[] = [];
+  for (const sl of n.lines) {
+    const l = lines.find((x) => (sl.lineId && x.id === sl.lineId) || (sl.seq != null && x.seq === Number(sl.seq))
+      || (!sl.lineId && sl.seq == null && sl.vendorSku && x.vendor_sku?.toUpperCase() === sl.vendorSku.toUpperCase()));
+    need(l, `${po.number} has no line ${sl.seq ?? sl.vendorSku ?? ""}`.trim());
+    need(Number.isFinite(sl.qty) && sl.qty > 0, `line ${l!.seq} ships no quantity`);
+    const already = (shippedBefore.get(l!.id) ?? 0) + picked.filter((p) => p.l.id === l!.id).reduce((a, p) => a + p.qty, 0);
+    const left = Number(l!.quantity) - Number(l!.cancelled_qty) - already;
+    need(sl.qty <= left, `line ${l!.seq} ships ${sl.qty}, but only ${Math.max(left, 0)} are left on order to ship`);
+    picked.push({ l: l!, qty: sl.qty });
+  }
+  const arrive = n.expectedOn || null;
+  const sh = await one<{ id: string }>(c, `
+    insert into po_shipment (entity_id, purchase_order_id, asn_number, shipped_on, expected_on, carrier, tracking, source, document_id, created_by)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id`,
+    [s.entityId, poId, n.asn.trim().slice(0, 60), n.shippedOn || null, arrive, n.carrier?.trim().slice(0, 80) || null, n.tracking?.trim().slice(0, 80) || null,
+     n.source ?? "edi", n.documentId ?? null, s.actor.id || null]);
+  for (const p of picked) {
+    await c.query(`insert into po_shipment_line (entity_id, shipment_id, purchase_order_line_id, quantity) values ($1,$2,$3,$4)`, [s.entityId, sh.id, p.l.id, p.qty]);
+    // A shipped line is a confirmed one; its date is now when the truck should arrive.
+    await c.query(`update purchase_order_line set ack_status = case when ack_status = 'pending' then 'accepted' else ack_status end,
+                          expected_on = coalesce($3::date, expected_on) where id = $1 and entity_id = $2`, [p.l.id, s.entityId, arrive]);
+    await c.query(`update po_line_sales_line k set expected_on = pol.expected_on from purchase_order_line pol
+                    where k.entity_id = $1 and k.purchase_order_line_id = $2 and k.active and pol.id = k.purchase_order_line_id`, [s.entityId, p.l.id]);
+  }
+  await c.query(`update purchase_order set acknowledged_on = coalesce(acknowledged_on, current_date),
+                        expected_on = coalesce((select max(expected_on) from purchase_order_line where entity_id = $2 and purchase_order_id = $1 and ack_status <> 'rejected'), expected_on)
+                  where id = $1 and entity_id = $2`, [poId, s.entityId]);
+  await audit(c, s, { table: "po_shipment", rowId: sh.id, action: "insert", after: { po: po.number, asn: n.asn, lines: picked.length, carrier: n.carrier ?? null, tracking: n.tracking ?? null, arrive } });
+  return { shipmentId: sh.id, number: po.number, lines: picked.length, units: picked.reduce((a, p) => a + p.qty, 0), expectedOn: arrive };
+}
+
+/** "Shipped" rows from an order-status API, one ship notice per PO and notice number. Bad groups are listed, good ones applied. */
+export async function recordShipmentsFromRows(c: Client, s: Scope, vendorId: string, rows: Record<string, string>[], source: "api" | "edi" = "api") {
+  const groups = new Map<string, Record<string, string>[]>();
+  for (const r of rows) {
+    const key = `${(r.po_number ?? "").trim().toUpperCase()}|${(r.vendor_ref ?? r.tracking ?? "").trim()}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(r);
+  }
+  const usDay = (v: string | undefined) => {
+    const t = String(v ?? "").trim();
+    const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(t);
+    return us ? `${us[3]}-${us[1].padStart(2, "0")}-${us[2].padStart(2, "0")}` : /^\d{4}-\d{2}-\d{2}/.test(t) ? t.slice(0, 10) : null;
+  };
+  let shipments = 0, lineCount = 0;
+  const problems: string[] = [];
+  for (const [key, rs] of groups) {
+    const [num] = key.split("|");
+    const po = (await q<{ id: string }>(c, `select id from purchase_order where entity_id = $1 and vendor_id = $2 and number = $3`, [s.entityId, vendorId, num]))[0];
+    if (!po) { problems.push(`no purchase order ${num || "(blank)"} from this vendor`); continue; }
+    const first = rs[0];
+    const asn = (first.vendor_ref || first.tracking || `${num}-${usDay(first.ship_date) ?? today()}`).trim();
+    if ((await q(c, `select 1 from po_shipment where entity_id = $1 and purchase_order_id = $2 and asn_number = $3`, [s.entityId, po.id, asn])).length) continue;   // already have it
+    await c.query("savepoint ship_rows");
+    try {
+      await recordShipment(c, s, po.id, { asn, shippedOn: usDay(first.ship_date), expectedOn: usDay(first.delivery_date), carrier: first.carrier || null,
+        tracking: first.tracking || null, source, lines: rs.map((r) => ({ seq: r.line ? Number(r.line) : undefined, vendorSku: r.vendor_sku || undefined, qty: Number(r.qty) })) });
+      await c.query("release savepoint ship_rows");
+      shipments++; lineCount += rs.length;
+    } catch (e) {
+      await c.query("rollback to savepoint ship_rows");
+      if (!(e instanceof PurchasingError)) throw e;
+      problems.push(`${num}: ${e.message}`);
+    }
+  }
+  return { shipments, lines: lineCount, problems };
+}
+
+export async function shipmentsOf(c: Client, entityId: string, poId: string) {
+  return q<{ id: string; asn_number: string; shipped_on: string | null; expected_on: string | null; carrier: string | null; tracking: string | null; status: string; source: string;
+    lines: { seq: number; qty: string }[] }>(c, `
+    select sh.id, sh.asn_number, sh.shipped_on::text, sh.expected_on::text, sh.carrier, sh.tracking, sh.status, sh.source,
+           (select json_agg(json_build_object('seq', pol.seq, 'qty', sl.quantity) order by pol.seq) from po_shipment_line sl
+              join purchase_order_line pol on pol.id = sl.purchase_order_line_id where sl.shipment_id = sh.id and sl.entity_id = sh.entity_id) lines
+      from po_shipment sh where sh.entity_id = $1 and sh.purchase_order_id = $2 order by sh.created_at`, [entityId, poId]);
+}
+
+/** Everything an outbound order document needs (an X12 850 or a vendor's API): header, ship-to and live lines with every item id. */
+export async function orderDocument(c: Client, s: Scope, poId: string) {
+  const po = await poFor(c, s.entityId, poId, false);
+  need(po.status === "open", `${po.number} is ${po.status}; only an open order is sent`);
+  const v = await vendorFor(c, s, po.vendor_id);
+  const h = (await q<{ ordered_on: string; expected_on: string | null; exported_at: string | null; code: string; name: string; address: Record<string, string> }>(c, `
+    select po.ordered_on::text, po.expected_on::text, po.exported_at::text, l.code, l.name, l.address
+      from purchase_order po join location l on l.id = po.ship_to_location_id where po.id = $1 and po.entity_id = $2`, [poId, s.entityId]))[0];
+  const lines = await q<{ id: string; seq: number; vendor_sku: string | null; sku: string | null; barcode: string | null; description: string; qty: string; unit: string;
+    config: Record<string, { vendorCode?: string }[]>; agreement_ref: string | null; expected_on: string | null; product_id: string | null }>(c, `
+    select pol.id, pol.seq, pol.vendor_sku, p.sku, p.barcode, pol.description, (pol.quantity - pol.cancelled_qty)::text qty, pol.unit_price_minor::text unit,
+           pol.config, pol.agreement_ref, pol.expected_on::text, pol.product_id
+      from purchase_order_line pol left join product p on p.id = pol.product_id
+     where pol.entity_id = $1 and pol.purchase_order_id = $2 and pol.quantity > pol.cancelled_qty order by pol.seq`, [s.entityId, poId]);
+  need(lines.length, `${po.number} has no open lines to send`);
+  return { po: { ...po, ...h }, vendor: v, lines };
+}
+
+/** Mark an order as sent by a channel purchasing does not run itself (EDI): logged like every other send. */
+export async function markSent(c: Client, s: Scope, poId: string, destination: string, detail: string) {
+  await c.query(`insert into po_transmission (entity_id, purchase_order_id, method, status, destination, detail, sent_by) values ($1,$2,'edi','sent',$3,$4,$5)`,
+    [s.entityId, poId, destination.slice(0, 200), detail.slice(0, 500), s.actor.id || null]);
+  await c.query(`update purchase_order set exported_at = now() where id = $1 and entity_id = $2`, [poId, s.entityId]);
 }

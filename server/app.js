@@ -326,13 +326,13 @@ function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + 
  */
 const ROLE_SCREENS = {
   controller: ['home', 'approvals', 'payables', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'reports', 'group', 'setup', 'business'],
-  approver: ['home', 'approvals', 'payables', 'reports'],
-  ap_clerk: ['home', 'payables', 'reports'],
+  approver: ['home', 'approvals', 'storeorders', 'payables', 'reports'],
+  ap_clerk: ['home', 'payables', 'edi', 'reports'],
   viewer: ['home', 'books', 'chart', 'reports'],
   hr: ['home', 'payroll', 'workforce'],
   ar_clerk: ['home', 'ar', 'crm', 'service', 'reports', 'workforce'],
-  buyer: ['home', 'purchasing', 'catalog', 'inventory', 'payables', 'reports', 'workforce'],
-  store_manager: ['home', 'pos', 'approvals', 'aisle', 'crm', 'leads', 'myday', 'catalog', 'purchasing', 'inventory', 'fleet', 'service', 'ar', 'workforce', 'reports'],
+  buyer: ['home', 'purchasing', 'storeorders', 'edi', 'catalog', 'inventory', 'payables', 'reports', 'workforce'],
+  store_manager: ['home', 'pos', 'approvals', 'aisle', 'crm', 'leads', 'myday', 'catalog', 'purchasing', 'storeorders', 'inventory', 'fleet', 'service', 'ar', 'workforce', 'reports'],
   sales: ['home', 'pos', 'myday', 'aisle', 'crm', 'leads', 'service', 'ar', 'workforce'],
   cashier: ['home', 'pos', 'ar', 'service', 'workforce'],
   warehouse: ['home', 'inventory', 'fleet', 'pos', 'workforce'],

@@ -143,19 +143,21 @@ export async function call(env: FeedEnv, url: string, init: FetchInit, timeoutMs
 export const SECRET_NAMES = ["apiKey", "token", "password", "clientSecret", "atpKeyCode", "atpPassword", "sftpPassword"] as const;
 const SECRET_SET = new Set<string>(SECRET_NAMES);
 
-function seal(key: Buffer, feedId: string, name: string, value: string) {
+/** AES-256-GCM under ERP_SECRET_KEY, bound to its owner and name (the AAD), so a sealed value cannot be moved to another row. */
+export function sealSecret(key: Buffer, ownerId: string, name: string, value: string) {
   const iv = randomBytes(12);
   const c = createCipheriv("aes-256-gcm", key, iv);
-  c.setAAD(Buffer.from(`${feedId}:${name}`));
+  c.setAAD(Buffer.from(`${ownerId}:${name}`));
   const ct = Buffer.concat([c.update(value, "utf8"), c.final()]);
   return { iv, ct, tag: c.getAuthTag() };
 }
-function unseal(key: Buffer, feedId: string, name: string, iv: Buffer, ct: Buffer, tag: Buffer): string {
+export function unsealSecret(key: Buffer, ownerId: string, name: string, iv: Buffer, ct: Buffer, tag: Buffer): string {
   const d = createDecipheriv("aes-256-gcm", key, iv);
-  d.setAAD(Buffer.from(`${feedId}:${name}`));
+  d.setAAD(Buffer.from(`${ownerId}:${name}`));
   d.setAuthTag(tag);
   return Buffer.concat([d.update(ct), d.final()]).toString("utf8");
 }
+const seal = sealSecret, unseal = unsealSecret;
 
 /** Typed secrets: write-only. A value sets or replaces; null clears. Audited by name, never by value. */
 export async function setFeedSecrets(c: Client, s: Scope, env: FeedEnv, feedId: string, values: Record<string, string | null>) {
@@ -569,6 +571,9 @@ export const PURPOSE_FIELDS: Record<string, Field[]> = {
     F("qty", false, "Quantity they will ship", ["qty", "quantity", "ack_qty", "shipped_qty"]),
     F("ship_date", false, "When it ships or shipped", ["ship_date", "eta", "expected_date", "shipDate", "estimatedShipDate"]),
     F("vendor_ref", false, "Their order or notice number", ["vendor_ref", "ack_number", "orderNumber", "asn_number", "bol"]),
+    F("carrier", false, "Who is carrying it, when shipped", ["carrier", "scac", "carrier_name", "carrierName", "shipVia"]),
+    F("tracking", false, "Tracking or PRO number, when shipped", ["tracking", "tracking_number", "trackingNumber", "pro", "pro_number"]),
+    F("delivery_date", false, "When a shipment should arrive", ["delivery_date", "deliveryDate", "estimatedDeliveryDate", "arrival_date"]),
   ],
 };
 
@@ -1017,6 +1022,72 @@ export async function applyPriceHistory(c: Client, s: Scope, vendorId: string, r
 }
 
 type Mapped = Record<string, string>;
+const SHIPPED = /^(shipped|ship|in[ _-]?transit|asn|dispatched|sh)$/i;
+
+/**
+ * The pricing path every source shares (a pricing feed, an EDI 832): each
+ * row goes into the vendor's price history unless it repeats the last one,
+ * then the history in effect today prices the products.
+ */
+export async function recordVendorPrices(c: Client, s: Scope, vendorId: string, feedId: string | null, m: Mapped[], rule: Record<string, unknown> = {}) {
+  let recorded = 0, unknown = 0, bad = 0;
+  const known = new Set((await q<{ s: string }>(c, `select upper(vendor_sku) s from product where entity_id = $1 and vendor_id = $2 and vendor_sku is not null`,
+    [s.entityId, vendorId])).map((x) => x.s));
+  for (const r of m) {
+    try {
+      const sku = r.vendor_sku?.toUpperCase();
+      need(sku, "no model");
+      const cost = money(r.cost, "cost");
+      need(cost != null, "no cost");
+      const from = day(r.effective_from), to = day(r.effective_to);
+      const vals = [cost!.toString(), money(r.map ?? "", "MAP")?.toString() ?? null, money(r.msrp ?? "", "MSRP")?.toString() ?? null,
+        money(r.promo_cost ?? "", "promo cost")?.toString() ?? null, from, to];
+      if (!known.has(sku!)) unknown++;
+      const same = await q(c, `select 1 from (select cost_minor, map_minor, msrp_minor, promo_cost_minor, effective_from, effective_to from vendor_price_history
+          where entity_id = $1 and vendor_id = $2 and vendor_sku = $3 order by recorded_at desc limit 1) h
+         where h.cost_minor = $4 and h.map_minor is not distinct from $5::bigint and h.msrp_minor is not distinct from $6::bigint
+           and h.promo_cost_minor is not distinct from $7::bigint and h.effective_from is not distinct from $8::date and h.effective_to is not distinct from $9::date`,
+        [s.entityId, vendorId, sku, ...vals]);
+      if (same.length) continue;
+      await c.query(`insert into vendor_price_history (entity_id, vendor_id, vendor_sku, cost_minor, map_minor, msrp_minor, promo_cost_minor, effective_from, effective_to, feed_id)
+                     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [s.entityId, vendorId, sku, ...vals, feedId]);
+      recorded++;
+    } catch (e) { if (e instanceof FeedError || e instanceof CatalogError) bad++; else throw e; }
+  }
+  const changed = await applyPriceHistory(c, s, vendorId, rule);
+  return { recorded, changed, unknown, bad };
+}
+
+/** The quantities path every source shares (a quantities feed, an EDI 846): what the vendor can ship now, and when if short. */
+export async function recordAvailability(c: Client, s: Scope, vendorId: string, m: Mapped[]): Promise<number> {
+  let n = 0;
+  const today = new Date();
+  for (const r of m) {
+    if (!r.vendor_sku) continue;
+    const qty = r.qty === "" || r.qty == null ? null : Number(r.qty);
+    let lead = r.lead_days ? Math.max(0, Math.round(Number(r.lead_days))) : null;
+    if (lead == null && r.eta) { const d = day(r.eta); if (d) lead = Math.max(0, Math.ceil((Date.parse(d) - today.getTime()) / 86400000)); }
+    await c.query(`
+      insert into vendor_availability (entity_id, vendor_id, vendor_sku, product_id, qty_available, lead_days, exception, as_of)
+      values ($1,$2,$3,(select id from product where entity_id = $1 and vendor_id = $2 and upper(vendor_sku) = upper($3) limit 1),$4,$5,$6,now())
+      on conflict (entity_id, vendor_id, vendor_sku) do update set product_id = excluded.product_id, qty_available = excluded.qty_available,
+        lead_days = excluded.lead_days, exception = excluded.exception, as_of = now()`,
+      [s.entityId, vendorId, r.vendor_sku.toUpperCase(), qty != null && Number.isFinite(qty) ? qty : null, lead != null && Number.isFinite(lead) ? lead : null, r.exception?.slice(0, 200) || null]);
+    n++;
+  }
+  return n;
+}
+
+/**
+ * The products path every source shares, for descriptions, cartons, cube and
+ * weight (an EDI 832). Cost, MAP and MSRP are kept out of it: they go through
+ * the price history, so a future-dated price waits for its day.
+ */
+export async function applyCatalogRows(c: Client, s: Scope, vendorId: string, label: string, rows: Record<string, string>[], mapping: Record<string, string>) {
+  const pv = await previewImport(c, s, { vendorId, csv: recordsToCsv(rows), filename: label.slice(0, 200), mapping, keep: ["cost_minor", "map_minor", "msrp_minor"], costOptional: true });
+  const ap = await applyImport(c, s, pv.runId);
+  return { runId: pv.runId, added: ap.add, changed: ap.change, same: ap.same, skipped: ap.skip };
+}
 const mapRows = (rows: Record<string, string>[], mapping: Record<string, string>): Mapped[] =>
   rows.map((r) => {
     const o: Mapped = Object.fromEntries(Object.entries(mapping).map(([ours, theirs]) => [ours, String(r[theirs] ?? "").trim()]));
@@ -1044,50 +1115,12 @@ async function applyPurpose(c: Client, s: Scope, f: FeedRow & { vendor: string }
       note: `${rows.length} products: ${ap.add} added, ${ap.change} changed, ${ap.same} unchanged${ap.skip ? `, ${ap.skip} skipped` : ""}${pricing ? ` · cost, MAP and MSRP left to the pricing feed${priced ? ` (${priced} priced from it)` : ""}` : ""}` };
   }
   if (f.purpose === "pricing") {
-    let recorded = 0, unknown = 0, bad = 0;
-    const known = new Set((await q<{ s: string }>(c, `select upper(vendor_sku) s from product where entity_id = $1 and vendor_id = $2 and vendor_sku is not null`,
-      [s.entityId, f.vendor_id])).map((x) => x.s));
-    for (const r of m) {
-      try {
-        const sku = r.vendor_sku?.toUpperCase();
-        need(sku, "no model");
-        const cost = money(r.cost, "cost");
-        need(cost != null, "no cost");
-        const from = day(r.effective_from), to = day(r.effective_to);
-        const vals = [cost!.toString(), money(r.map ?? "", "MAP")?.toString() ?? null, money(r.msrp ?? "", "MSRP")?.toString() ?? null,
-          money(r.promo_cost ?? "", "promo cost")?.toString() ?? null, from, to];
-        if (!known.has(sku)) unknown++;
-        const same = await q(c, `select 1 from (select cost_minor, map_minor, msrp_minor, promo_cost_minor, effective_from, effective_to from vendor_price_history
-            where entity_id = $1 and vendor_id = $2 and vendor_sku = $3 order by recorded_at desc limit 1) h
-           where h.cost_minor = $4 and h.map_minor is not distinct from $5::bigint and h.msrp_minor is not distinct from $6::bigint
-             and h.promo_cost_minor is not distinct from $7::bigint and h.effective_from is not distinct from $8::date and h.effective_to is not distinct from $9::date`,
-          [s.entityId, f.vendor_id, sku, ...vals]);
-        if (same.length) continue;
-        await c.query(`insert into vendor_price_history (entity_id, vendor_id, vendor_sku, cost_minor, map_minor, msrp_minor, promo_cost_minor, effective_from, effective_to, feed_id)
-                       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [s.entityId, f.vendor_id, sku, ...vals, f.id]);
-        recorded++;
-      } catch (e) { if (e instanceof FeedError || e instanceof CatalogError) bad++; else throw e; }
-    }
-    const changed = await applyPriceHistory(c, s, f.vendor_id, (f.options.priceRule ?? {}) as Record<string, unknown>);
-    return { added: recorded, changed, importRun: null,
-      note: `${m.length} prices: ${recorded} new in the history, ${changed} products repriced${unknown ? `, ${unknown} for models not in the catalog yet (kept for when they arrive)` : ""}${bad ? `, ${bad} unreadable rows skipped` : ""}` };
+    const r = await recordVendorPrices(c, s, f.vendor_id, f.id, m, (f.options.priceRule ?? {}) as Record<string, unknown>);
+    return { added: r.recorded, changed: r.changed, importRun: null,
+      note: `${m.length} prices: ${r.recorded} new in the history, ${r.changed} products repriced${r.unknown ? `, ${r.unknown} for models not in the catalog yet (kept for when they arrive)` : ""}${r.bad ? `, ${r.bad} unreadable rows skipped` : ""}` };
   }
   if (f.purpose === "quantities") {
-    let n = 0;
-    const today = new Date();
-    for (const r of m) {
-      if (!r.vendor_sku) continue;
-      const qty = r.qty === "" || r.qty == null ? null : Number(r.qty);
-      let lead = r.lead_days ? Math.max(0, Math.round(Number(r.lead_days))) : null;
-      if (lead == null && r.eta) { const d = day(r.eta); if (d) lead = Math.max(0, Math.ceil((Date.parse(d) - today.getTime()) / 86400000)); }
-      await c.query(`
-        insert into vendor_availability (entity_id, vendor_id, vendor_sku, product_id, qty_available, lead_days, exception, as_of)
-        values ($1,$2,$3,(select id from product where entity_id = $1 and vendor_id = $2 and upper(vendor_sku) = upper($3) limit 1),$4,$5,$6,now())
-        on conflict (entity_id, vendor_id, vendor_sku) do update set product_id = excluded.product_id, qty_available = excluded.qty_available,
-          lead_days = excluded.lead_days, exception = excluded.exception, as_of = now()`,
-        [s.entityId, f.vendor_id, r.vendor_sku.toUpperCase(), qty != null && Number.isFinite(qty) ? qty : null, lead != null && Number.isFinite(lead) ? lead : null, r.exception?.slice(0, 200) || null]);
-      n++;
-    }
+    const n = await recordAvailability(c, s, f.vendor_id, m);
     return { added: n, changed: 0, importRun: null, note: `availability for ${n} models` };
   }
   if (f.purpose === "freight") {
@@ -1122,12 +1155,27 @@ async function applyPurpose(c: Client, s: Scope, f: FeedRow & { vendor: string }
     return { added: 0, changed, importRun: null, note: `photos: ${changed} products updated${missingProducts ? `, ${missingProducts} models not in the catalog` : ""}` };
   }
   if (f.purpose === "acknowledgments") {
-    const { importAcks } = await import("./purchasing.ts");
-    const csv = recordsToCsv(m.map((r) => ({ po_number: r.po_number ?? "", line: r.line ?? "", vendor_sku: r.vendor_sku ?? "", status: r.status ?? "",
-      qty: r.qty ?? "", ship_date: r.ship_date ?? "", vendor_ref: r.vendor_ref ?? "" })));
-    const r = await importAcks(c, s, { csv, filename: `${f.name} (API)` });
-    return { added: r.applied, changed: 0, importRun: null,
-      note: `${r.rows} acknowledgment rows: ${r.applied} applied${r.problems.length ? `, ${r.problems.length} not (${r.problems.slice(0, 3).map((p) => p.message).join("; ")})` : ""}` };
+    // Order status: "shipped" (or in transit) rows are ship notices, the same as an EDI 856; the rest are acknowledgments (855).
+    const { importAcks, recordShipmentsFromRows } = await import("./purchasing.ts");
+    const shipped = m.filter((r) => SHIPPED.test(r.status ?? ""));
+    const acks = m.filter((r) => !SHIPPED.test(r.status ?? ""));
+    let applied = 0, rowsN = 0;
+    const problems: string[] = [];
+    if (acks.length) {
+      const csv = recordsToCsv(acks.map((r) => ({ po_number: r.po_number ?? "", line: r.line ?? "", vendor_sku: r.vendor_sku ?? "", status: r.status ?? "",
+        qty: r.qty ?? "", ship_date: r.ship_date ?? "", vendor_ref: r.vendor_ref ?? "" })));
+      const r = await importAcks(c, s, { csv, filename: `${f.name} (API)` });
+      applied += r.applied; rowsN += r.rows;
+      problems.push(...r.problems.map((p) => p.message));
+    }
+    let shipNote = "";
+    if (shipped.length) {
+      const r = await recordShipmentsFromRows(c, s, f.vendor_id, shipped, "api");
+      shipNote = `, ${r.shipments} ship ${r.shipments === 1 ? "notice" : "notices"} for ${r.lines} lines`;
+      problems.push(...r.problems);
+    }
+    return { added: applied, changed: 0, importRun: null,
+      note: `${rowsN} acknowledgment rows: ${applied} applied${problems.length ? `, ${problems.length} not (${problems.slice(0, 3).join("; ")})` : ""}${shipNote}` };
   }
   throw new FeedError("an order feed sends POs when you send them; there is nothing to run");
 }

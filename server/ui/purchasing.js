@@ -260,6 +260,7 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
       const x = await coApi(`/purchasing/pos/${id}`);
       const p = x.po;
       d.dlg.querySelector('h2').textContent = `${p.number} · ${p.vendor}`;
+      const trail = S.modules && !S.modules.includes('edi') ? null : await coApi(`/edi/pos/${id}/trail`).catch(() => null);
       const open = p.status === 'open';
       const total = x.lines.reduce((a, l) => a + (Number(l.quantity) - Number(l.cancelled_qty)) * Number(l.unit_price_minor), 0);
       const landed = x.lines.reduce((a, l) => a + Number(l.landed_minor), 0);
@@ -291,17 +292,35 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
         x.sent.length ? section('Sent to vendor', `${x.sent.length}`, null, el('div', { class: 'panel' }, x.sent.map((t) => item({
           title: `${cap(t.method)} · ${t.destination || ''}`, badge: chip(t.status === 'sent' ? 'good' : t.status === 'prepared' ? 'neutral' : 'critical', t.status === 'failed' ? 'fail' : 'ok', cap(t.status)),
           detail: [t.detail, t.vendor_ref ? `their ref ${t.vendor_ref}` : null, t.by_name, shortDay(String(t.sent_at).slice(0, 10))].filter(Boolean).join(' · ') })))) : null,
+        trail ? trailSection(trail) : null,
         x.landed.length ? section('Landed cost', null, null, el('div', { class: 'panel' }, x.landed.map((c) => item({
           title: cap(c.kind), amount: money(c.amount_minor), detail: [`spread by ${c.basis === 'qty' ? 'quantity' : c.basis}`, c.note, c.by_name].filter(Boolean).join(' · ') })))) : null);
     });
   }
 
+  /** The PO's EDI and API trail: the 850 out, the vendor's 997, 855, 856 and 810, and the ship notices. */
+  const TRAIL_NAMES = { '850': 'Purchase order', '855': 'Acknowledgment', '856': 'Ship notice', '810': 'Invoice', '997': 'Functional ack' };
+  const TRAIL_TONE = { sent: 'good', applied: 'good', acknowledged: 'good', queued: 'neutral', received: 'neutral', quarantined: 'serious', failed: 'critical', rejected: 'critical', ignored: 'neutral' };
+  function trailSection(t) {
+    const docs = t.documents || [], ships = t.shipments || [];
+    if (!docs.length && !ships.length) return null;
+    return section('EDI and API trail', `${docs.length + ships.length}`, null, el('div', { class: 'panel' },
+      docs.map((x) => item({ title: `${x.direction === 'out' ? 'Sent' : 'Received'} ${x.doc_type} · ${TRAIL_NAMES[x.doc_type] || x.doc_type}${x.channel === 'api' ? ' (API)' : ''}`,
+        badge: chip(TRAIL_TONE[x.status] || 'neutral', ['quarantined', 'failed', 'rejected'].includes(x.status) ? 'warn' : 'ok', cap(x.status)),
+        detail: [x.isa_control ? `ISA ${x.isa_control}` : null, x.bill_reference ? `bill ${x.bill_reference} (${x.bill_status})` : null, shortDay(String(x.created_at).slice(0, 10))].filter(Boolean).join(' · '),
+        why: x.reason || (x.summary && x.summary.applied) || null, onClick: () => go('edi', x.direction === 'in' ? 'inbox' : 'outbox') })),
+      ships.map((sh) => item({ title: `Ship notice ${sh.asn_number}`, badge: chip(sh.status === 'in_transit' ? 'warning' : 'good', sh.status === 'in_transit' ? 'clock' : 'ok', sh.status === 'in_transit' ? 'In transit' : cap(sh.status)),
+        detail: [sh.carrier, sh.tracking ? `tracking ${sh.tracking}` : null, sh.shipped_on ? `shipped ${shortDay(sh.shipped_on)}` : null, sh.expected_on ? `due ${shortDay(sh.expected_on)}` : null,
+          (sh.lines || []).map((l) => `line ${l.seq}: ${Number(l.qty)}`).join(', ')].filter(Boolean).join(' · ') }))));
+  }
+
   function openSend(p, done) {
     const d = openDialog(`Send ${p.number}`, p.vendor);
-    const how = select([['email', `Email to ${p.order_email || 'the vendor (no address on file)'}`], ['file', 'Download the order file (850-style CSV)'], ['api', 'The vendor’s order API']], p.order_email ? 'email' : 'file');
+    const how = select([['partner', 'The vendor’s own channel (EDI 850 or its order API, from Vendor EDI)'], ['email', `Email to ${p.order_email || 'the vendor (no address on file)'}`],
+      ['file', 'Download the order file (850-style CSV)'], ['api', 'The vendor’s order API']], S.modules && !S.modules.includes('edi') ? (p.order_email ? 'email' : 'file') : 'partner');
     const err = el('div');
     const go_ = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go_, async () => {
-      const r = await post(`/purchasing/pos/${p.id}/send`, { method: how.value });
+      const r = how.value === 'partner' ? await post(`/edi/pos/${p.id}/send`, {}) : await post(`/purchasing/pos/${p.id}/send`, { method: how.value });
       if (r.file && (how.value === 'file' || r.status === 'prepared')) download(r.file.filename, r.file.csv);
       if (r.status === 'failed') throw new Error(r.detail);
       return r;

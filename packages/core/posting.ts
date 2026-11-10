@@ -18,7 +18,7 @@ export type PostLine = {
 
 export class PostingError extends Error {}
 
-export type SourceType = "sale" | "receipt" | "refund" | "inventory" | "commission" | "ar" | "fleet" | "finance" | "manual" | "opening" | "intercompany";
+export type SourceType = "invoice" | "sale" | "receipt" | "refund" | "inventory" | "commission" | "ar" | "fleet" | "finance" | "manual" | "opening" | "intercompany";
 
 /** The store's profit object, so revenue and cost land on the right P&L column. */
 export async function profitObjectFor(c: Client, entityId: string, locationId: string | null): Promise<string | null> {
