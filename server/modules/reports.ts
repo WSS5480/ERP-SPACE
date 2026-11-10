@@ -10,6 +10,7 @@ import { scopeOf } from "../actions.ts";
 import { pool, tx } from "../../packages/core/db.ts";
 import * as rep from "../../packages/core/reports.ts";
 import { enabledModules } from "../../packages/core/setup.ts";
+import * as tax from "../../packages/core/tax.ts";
 
 const ID = "([0-9a-fA-F-]{36})";
 
@@ -94,6 +95,21 @@ export const module: ErpModule = {
     // These change nothing; they are POSTs because a definition is a body. Each
     // runs read-only, with the statement timeout set inside.
     const readOnly = (c: Client) => c.query("set transaction read only");
+    // ---- the sales tax filing: per jurisdiction for a period, tied to GL 2100, and its CSV
+    const filingFor = async (c: Client, co: Company, personId: string | null, from: string, to: string) => {
+      const held = await roles(c, co, who(personId));
+      need(["owner", "controller", "viewer"].some((r) => held.has(r)), "the sales tax filing needs one of: owner, controller, viewer");
+      try { return await tax.filing(c, co.id, from, to); } catch (e) { if (e instanceof tax.TaxError) throw new ModuleError(e.message); throw e; }
+    };
+    coGet("/reports/tax-filing", async (c, co, url, _m, p) => {
+      const f = await filingFor(c, co, p, str(url.searchParams.get("from"), 10), str(url.searchParams.get("to"), 10));
+      return { ...f, reasons: tax.EXEMPT_LABEL };
+    });
+    coPost("/reports/tax-filing/export", async (c, co, a, b) => {
+      const f = await filingFor(c, co, a.personId, str(b.from, 10), str(b.to, 10));
+      return { filename: `sales-tax-${f.from}-to-${f.to}.csv`, csv: tax.filingCsv(f), rows: f.rows.length, note: f.tie.ties ? null : f.tie.note };
+    });
+
     coPost("/reports/run", async (c, co, a, b) => refuse(async () => {
       await readOnly(c);
       const r = await roles(c, co, a.personId);

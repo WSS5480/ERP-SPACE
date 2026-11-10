@@ -3,7 +3,8 @@
 // images, price lists, promotions, margins, price tags with barcodes, vendor
 // ordering facts and freight, and the vendor feed import.
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
-import { ModuleError, need, requireRole, str, uuid, int, minor } from "./kit.ts";
+import { ModuleError, PublicPage, need, requireRole, str, uuid, int, minor } from "./kit.ts";
+import { productSheet } from "./tearsheet.ts";
 import { q } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
 import * as cat from "../../packages/core/catalog.ts";
@@ -17,6 +18,7 @@ export const currentFeedEnv = () => feedEnv();
 /** How photos are fetched for the image proxy: the real network, unless checks hand in a fake. */
 let imageFetch: cat.ImageFetch | undefined;
 export const useImageFetch = (f: cat.ImageFetch | undefined) => { imageFetch = f; };
+export const currentImageFetch = () => imageFetch;
 
 const ID = "([0-9a-fA-F-]{36})";
 const EDIT = ["buyer"];
@@ -294,6 +296,11 @@ export const module: ErpModule = {
     coGet(`/catalog/image/${ID}/([0-9]{1,2})`, async (c, co, _u, m) => {
       try { return await cat.productImage(c, co.id, m[2], Number(m[3]), imageFetch); }
       catch (e) { if (e instanceof cat.CatalogError) return { dataUrl: null, problem: e.message }; throw e; }
+    });
+    // A printable sheet for one product: photos, options, dimensions, price, the store to ask at.
+    coGet(`/catalog/products/${ID}/tear-sheet`, async (c, co, url, m) => {
+      const html = await productSheet(c, co.id, m[2], { imageFetch }, uuid(url.searchParams.get("locationId")));
+      return html ? new PublicPage(html) : null;
     });
     coGet("/catalog/margins", (c, co, url) => margins(c, co, url));
     coGet("/catalog/labels", (c, co, url) => refuse(() => labels(c, co, url)));

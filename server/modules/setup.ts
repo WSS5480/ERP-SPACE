@@ -6,6 +6,8 @@ import type { ErpModule } from "./kit.ts";
 import { need, requireRole, str, uuid, int } from "./kit.ts";
 import { q } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
+import { ModuleError } from "./kit.ts";
+import * as tax from "../../packages/core/tax.ts";
 import {
   PACKS, MODULE_IDS, applyPack, enabledModules, setModule, putSetting, importCustomers, importOpenAr, saveLocation,
 } from "../../packages/core/setup.ts";
@@ -74,6 +76,33 @@ export const module: ErpModule = {
         lng, lat,
       });
       return { id };
+    });
+
+    // ---- sales tax: jurisdictions, their rates over time, where they apply, and origin or destination sourcing
+    const taxed = async <T>(fn: () => Promise<T>) => { try { return await fn(); } catch (e) { if (e instanceof tax.TaxError) throw new ModuleError(e.message); throw e; } };
+    const TAX = ["owner", "controller"];
+    coGet("/setup/tax", async (c, co) => tax.taxSetup(c, co.id));
+    coPost("/setup/tax/sourcing", async (c, co, a, body) => {
+      await requireRole(c, co, a, TAX, "choosing how sales tax is sourced");
+      return taxed(() => tax.setSourcing(c, scopeOf(co, a), str(body.sourcing, 20)));
+    });
+    coPost("/setup/tax/jurisdictions", async (c, co, a, body) => {
+      await requireRole(c, co, a, TAX, "setting up a tax jurisdiction");
+      const rate = body.ratePct === undefined || body.ratePct === "" ? undefined : Math.round(Number(body.ratePct) * 100);
+      return taxed(() => tax.saveJurisdiction(c, scopeOf(co, a), { id: uuid(body.id), code: str(body.code, 40), name: str(body.name, 120), level: str(body.level, 20),
+        state: str(body.state, 2), taxesDelivery: body.taxesDelivery === true, taxesLabor: body.taxesLabor === true, taxesWarranty: body.taxesWarranty === true,
+        filingRef: str(body.filingRef, 60) || null, note: str(body.note, 300) || null, active: body.active !== false, rateBps: rate,
+        effectiveFrom: str(body.effectiveFrom, 10) || undefined }));
+    });
+    coPost("/setup/tax/jurisdictions/([0-9a-fA-F-]{36})/rates", async (c, co, a, body, m) => {
+      await requireRole(c, co, a, TAX, "changing a tax rate");
+      need(body.ratePct !== undefined && body.ratePct !== "", "give the new rate");
+      return taxed(() => tax.addRate(c, scopeOf(co, a), m[2], { rateBps: Math.round(Number(body.ratePct) * 100), effectiveFrom: str(body.effectiveFrom, 10), note: str(body.note, 300) || null }));
+    });
+    coPost("/setup/tax/areas", async (c, co, a, body) => {
+      await requireRole(c, co, a, TAX, "changing where a tax applies");
+      return taxed(() => tax.saveArea(c, scopeOf(co, a), { id: uuid(body.id), remove: body.remove === true, jurisdictionId: uuid(body.jurisdictionId) ?? "",
+        locationId: uuid(body.locationId), state: str(body.state, 2) || null, postal: str(body.postal, 10) || null }));
     });
 
     coPost("/setup/reason", async (c, co, a, body) => {

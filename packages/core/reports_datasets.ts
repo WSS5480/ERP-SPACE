@@ -557,6 +557,32 @@ export const DATASETS: Dataset[] = [
            where r.entity_id = $1`,
   },
   {
+    id: "tax_by_jurisdiction", label: "Sales tax by jurisdiction", folder: "Finance", modules: [], roles: FINANCE,
+    description: "Every line's sales tax per jurisdiction, on the day it reached GL 2100: taxable and exempt sales (with the reason), tax collected, and returns.",
+    dateField: "posted_on", detail: ["posted_on", "order_number", "jurisdiction", "kind", "taxable", "exempt", "exempt_reason", "tax"], entryField: "entry_id",
+    fields: [
+      F("posted_on", "Posted on", "date"), F("period", "Period", "text", { hint: "YYYY-MM" }), F("state", "State", "text"),
+      F("jurisdiction_code", "Jurisdiction code", "text"), F("jurisdiction", "Jurisdiction", "text"), F("level", "Level", "text"),
+      F("kind", "Sale or return", "text"), F("sourced", "Sourced by", "text", { hint: "origin (the store) or destination (the ship-to address)" }),
+      F("item_class", "Item class", "text", { hint: "goods, delivery, labor, warranty" }), F("store", "Store", "text"),
+      F("order_number", "Order", "text"), F("sku", "SKU", "text"), F("product", "Product", "text"), F("customer", "Customer", "text"),
+      F("rate_pct", "Rate %", "number", { agg: false }), F("gross", "Gross sales", "money"), F("taxable", "Taxable sales", "money"),
+      F("exempt", "Exempt sales", "money"), F("exempt_reason", "Exempt because", "text"), F("tax", "Tax", "money"),
+      F("entry_id", "Entry", "text", { agg: false }),
+    ],
+    sql: `select t.posted_on, to_char(t.posted_on, 'YYYY-MM') as period, j.state, j.code as jurisdiction_code, j.name as jurisdiction, j.level,
+                 t.kind, t.sourced, t.item_class, lo.name as store, so.number as order_number, l.sku, l.description as product, cu.name as customer,
+                 t.rate_bps / 100.0 as rate_pct, t.taxable_minor + t.exempt_minor as gross, t.taxable_minor as taxable, t.exempt_minor as exempt,
+                 t.exempt_reason, t.tax_minor as tax, t.journal_entry_id::text as entry_id
+            from sales_order_line_tax t
+            join tax_jurisdiction j on j.id = t.jurisdiction_id and j.entity_id = $1
+            join sales_order_line l on l.id = t.sales_order_line_id and l.entity_id = $1
+            join sales_order so on so.id = t.sales_order_id and so.entity_id = $1
+            left join location lo on lo.id = so.location_id and lo.entity_id = $1
+            left join customer cu on cu.id = so.customer_id and cu.entity_id = $1
+           where t.entity_id = $1 and t.posted_on is not null`,
+  },
+  {
     id: "web_carts", label: "Web store carts", folder: "Sales", modules: ["shop"], roles: ["controller", "viewer", "web_admin", "store_manager"],
     description: "Every cart started on the web store: what was in it, whether it became an order, and when it was last touched.",
     dateField: "started_on", detail: ["started_on", "site", "items", "subtotal", "converted", "order_number"],

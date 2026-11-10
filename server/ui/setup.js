@@ -159,4 +159,112 @@
   }
 
   E.register('business', 'Business setup', 'building', screen, 'Setup');
+
+  // ============================================== sales tax and selling rules
+  const LEVEL_LABEL = { state: 'State', county: 'County', city: 'City', special: 'Special district', combined: 'Single store rate' };
+  const canTax = () => !!(E.S.person && E.S.person.roles.some((r) => r === 'owner' || r === 'controller'));
+  const canRules = () => !!(E.S.person && E.S.person.roles.some((r) => r === 'owner' || r === 'store_manager' || r === 'controller'));
+  const yes = (b) => (b ? 'taxed' : 'exempt');
+  const padded = (n) => { n.style.padding = '12px 16px 14px'; return n; };
+  const areaWords = (a) => a.location_id ? `the ${a.location} store` : a.postal ? `ZIP ${a.postal}` : `all of ${a.state}`;
+
+  async function taxScreen() {
+    const [d, pos] = await Promise.all([coApi('/setup/tax'), coApi('/pos/setup').catch(() => null)]);
+    const ctl = canTax();
+    const src = el('div');
+    const drawSrc = () => src.replaceChildren(E.seg([['destination', 'Where the goods go'], ['origin', 'At the store']], d.sourcing, (v) => {
+      if (!ctl) { toast('Only the owner or a controller changes this', 'critical'); return; }
+      act(src, () => post('/setup/tax/sourcing', { sourcing: v }), v === 'origin' ? 'Deliveries are now taxed at the store' : 'Deliveries are now taxed where they go');
+    }));
+    drawSrc();
+    const stores = el('div', { class: 'panel' }, d.stores.length ? d.stores.map((x) => item({ title: x.name, amount: pct(x.rateBps),
+      detail: x.stack.map((j) => `${j.name} ${pct(j.rateBps)}`).join(' + ') || 'No sales tax' })) : empty('No stores yet.', null, true));
+    const byState = new Map();
+    for (const j of d.jurisdictions) { if (!byState.has(j.state)) byState.set(j.state, []); byState.get(j.state).push(j); }
+    const jurs = [...byState.entries()].map(([st, list]) => section(st, plural(list.length, 'jurisdiction'), null, el('div', { class: 'panel' }, list.map((j) => item({
+      title: `${j.name} (${j.code})`, amount: j.rate_bps == null ? 'no rate today' : pct(j.rate_bps),
+      detail: [LEVEL_LABEL[j.level] || j.level, `delivery ${yes(j.taxes_delivery)}`, `labor ${yes(j.taxes_labor)}`, `protection plans ${yes(j.taxes_warranty)}`,
+        j.areas.length ? `applies to ${j.areas.map(areaWords).join(', ')}` : 'applies nowhere yet', j.filing_ref ? `filed under ${j.filing_ref}` : null].filter(Boolean).join(' · '),
+      why: j.note || null,
+      badge: !j.active ? chip('neutral', 'pause', 'Not in use') : j.for_location_id ? chip('neutral', 'info', 'Single store rate') : null,
+      acts: ctl ? [j.for_location_id ? null : el('button', { class: 'btn small', type: 'button', onclick: () => jurisdictionDialog(j) }, 'Edit'),
+        el('button', { class: 'btn small', type: 'button', onclick: () => rateDialog(j) }, 'New rate'),
+        el('button', { class: 'btn small', type: 'button', onclick: () => areaDialog(j, d) }, 'Where it applies')].filter(Boolean) : null })))));
+    let rules = null;
+    if (pos && pos.settings) {
+      const st = pos.settings;
+      const f = { special: input({ inputmode: 'decimal', value: String(st.specialOrderDepositBps / 100) }), stocked: input({ inputmode: 'decimal', value: String(st.stockedDepositBps / 100) }),
+        holds: el('input', { type: 'checkbox', checked: st.quoteHoldsAllowed || null }), days: input({ inputmode: 'numeric', value: String(st.quoteHoldMaxDays) }) };
+      const edit = canRules();
+      for (const x of Object.values(f)) if (!edit) x.disabled = true;
+      rules = section('Selling rules', null, null, el('div', { class: 'panel' }, padded(el('div', {}, el('div', { class: 'form-grid' },
+        field('Deposit on special orders %', f.special, 'At least this much of goods ordered for the customer is paid when the sale is placed'),
+        field('Deposit on stocked goods %', f.stocked, 'Usually 0'),
+        el('label', { class: 'check' }, f.holds, el('span', { text: ' Quotes may hold stock for the customer' })),
+        field('Longest hold, days', f.days, 'A store manager can extend one, never past the quote')),
+        edit ? el('div', { class: 'dlg-acts' }, el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post('/pos/settings', {
+          specialOrderDepositPct: f.special.value, stockedDepositPct: f.stocked.value, quoteHoldsAllowed: f.holds.checked, quoteHoldMaxDays: f.days.value }), 'Selling rules saved') }, 'Save')) : null))));
+    }
+    return frag(
+      head('Sales tax', ctl ? [el('button', { class: 'btn primary', type: 'button', onclick: () => jurisdictionDialog(null) }, 'Add a jurisdiction')] : null, 'Setup'),
+      el('p', { class: 'lead', text: 'Each sale is taxed by every jurisdiction where the goods are handed over: the store for take-with and pickup, and for a delivery either the delivery address or the store, as chosen here. Rates come with the dates they apply from. The rates set up for you are placeholders; check them with your accountant.' }),
+      section('Deliveries are taxed', null, null, el('div', { class: 'panel' }, padded(el('div', {}, src)))),
+      el('div', { class: 'two' },
+        el('div', {}, section('What each store charges', 'on taxable goods today', null, stores), rules),
+        el('div', {}, jurs.length ? jurs : section('Jurisdictions', null, null, el('div', { class: 'panel' }, empty('None yet.', 'Each store uses its own single rate until jurisdictions are added.', true))))));
+  }
+
+  function jurisdictionDialog(j) {
+    const d = openDialog(j ? `Edit ${j.name}` : 'Add a jurisdiction', E.S.co.name);
+    const levels = Object.entries(LEVEL_LABEL).filter(([k]) => k !== 'combined');
+    const f = { code: input({ value: j ? j.code : '', maxlength: '40', autocapitalize: 'characters', placeholder: 'TX-PALESTINE' }),
+      name: input({ value: j ? j.name : '', maxlength: '120', placeholder: 'City of Palestine' }), level: select(levels, j ? j.level : 'city'),
+      state: input({ value: j ? j.state : '', maxlength: '2', autocapitalize: 'characters' }),
+      rate: input({ inputmode: 'decimal', placeholder: '1.5' }), from: input({ type: 'date', value: E.todayIso() }),
+      delivery: el('input', { type: 'checkbox', checked: j ? j.taxes_delivery : true }), labor: el('input', { type: 'checkbox', checked: j ? j.taxes_labor : false }),
+      plans: el('input', { type: 'checkbox', checked: j ? j.taxes_warranty : true }), active: el('input', { type: 'checkbox', checked: j ? j.active : true }),
+      filing: input({ value: j && j.filing_ref ? j.filing_ref : '', maxlength: '60' }), note: input({ value: j && j.note ? j.note : '', maxlength: '300' }) };
+    const err = el('div', { class: 'result critical', role: 'alert', hidden: true });
+    d.body.append(el('div', { class: 'form-grid' }, field('Code', f.code), field('Name on the return', f.name), field('Level', f.level), field('State', f.state),
+      j ? null : field('Rate %', f.rate), j ? null : field('From', f.from),
+      el('label', { class: 'check' }, f.delivery, el('span', { text: ' Taxes delivery charges' })), el('label', { class: 'check' }, f.labor, el('span', { text: ' Taxes labor (assembly, installation)' })),
+      el('label', { class: 'check' }, f.plans, el('span', { text: ' Taxes protection plans' })), j ? el('label', { class: 'check' }, f.active, el('span', { text: ' In use' })) : null,
+      field('Filed under (account or permit)', f.filing), field('Note', f.note, null, true)), err,
+      el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel'),
+        el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post('/setup/tax/jurisdictions', { id: j ? j.id : null,
+          code: f.code.value, name: f.name.value, level: f.level.value, state: f.state.value, ratePct: f.rate.value, effectiveFrom: f.from.value,
+          taxesDelivery: f.delivery.checked, taxesLabor: f.labor.checked, taxesWarranty: f.plans.checked, active: f.active.checked, filingRef: f.filing.value, note: f.note.value }),
+          'Saved', { close: d.close, errorInto: (x) => { err.hidden = false; err.textContent = E.friendly(x); } }) }, 'Save')));
+  }
+
+  function rateDialog(j) {
+    const d = openDialog(`New rate for ${j.name}`, j.rate_bps == null ? 'No rate today' : `Today ${pct(j.rate_bps)}`);
+    const rate = input({ inputmode: 'decimal', placeholder: '1.5' }), from = input({ type: 'date', value: E.todayIso() }), note = input({ maxlength: '300' });
+    const err = el('div', { class: 'result critical', role: 'alert', hidden: true });
+    d.body.append(el('p', { class: 'lead', text: 'The rate in force ends the day before the new one starts. Past sales keep the rate they were charged.' }),
+      el('div', { class: 'panel' }, j.rates.map((r) => item({ title: `${dayLabelSafe(r.effective_from)} to ${r.effective_to ? dayLabelSafe(r.effective_to) : 'now'}`, amount: pct(r.rate_bps), detail: r.note || null }))),
+      el('div', { class: 'form-grid' }, field('New rate %', rate), field('From', from), field('Note', note, null, true)), err,
+      el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel'),
+        el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post(`/setup/tax/jurisdictions/${j.id}/rates`, { ratePct: rate.value,
+          effectiveFrom: from.value, note: note.value }), 'Rate added', { close: d.close, errorInto: (x) => { err.hidden = false; err.textContent = E.friendly(x); } }) }, 'Add the rate')));
+  }
+  const dayLabelSafe = (s) => { try { return E.dayLabel(s); } catch (_) { return s; } };
+
+  function areaDialog(j, d0) {
+    const d = openDialog(`Where ${j.name} applies`, j.state);
+    const kind = select([['state', `All of ${j.state}`], ['postal', 'One ZIP code'], ['store', 'One store']], 'postal');
+    const postal = input({ inputmode: 'numeric', maxlength: '5', placeholder: '75801' });
+    const store = select(d0.stores.map((x) => [x.id, x.name]), d0.stores[0] ? d0.stores[0].id : '');
+    const err = el('div', { class: 'result critical', role: 'alert', hidden: true });
+    d.body.append(el('div', { class: 'panel' }, j.areas.length ? j.areas.map((a) => item({ title: areaWords(a),
+      acts: [el('button', { class: 'btn small', type: 'button', onclick: (e) => act(e.currentTarget, () => post('/setup/tax/areas', { id: a.id, remove: true, jurisdictionId: j.id }),
+        'Taken off', { close: d.close }) }, 'Take off')] })) : empty('It applies nowhere yet.', null, true)),
+      el('div', { class: 'form-grid' }, field('Add', kind), field('ZIP code', postal), field('Store', store)), err,
+      el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Close'),
+        el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post('/setup/tax/areas', { jurisdictionId: j.id,
+          state: kind.value === 'store' ? null : j.state, postal: kind.value === 'postal' ? postal.value : null, locationId: kind.value === 'store' ? store.value : null }),
+          'Added', { close: d.close, errorInto: (x) => { err.hidden = false; err.textContent = E.friendly(x); } }) }, 'Add')));
+  }
+
+  E.register('salestax', 'Sales tax', 'percent', taxScreen, 'Setup', { icon: 'M5 19L19 5|C7.5 7.5 2.5|C16.5 16.5 2.5' });
 })();

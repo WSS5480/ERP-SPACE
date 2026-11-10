@@ -17,6 +17,7 @@ import { runFeed, feedDue, liveEnv, type FeedEnv } from "../packages/core/vendor
 import { processQueue, captureAbandonedCarts } from "../packages/core/crm.ts";
 import { runDueReports } from "../packages/core/reports.ts";
 import { pollPartner, liveEdiEnv, type EdiEnv } from "../packages/core/edi.ts";
+import { expireHolds } from "../packages/core/pos.ts";
 
 /** Does a five-field cron expression match this minute (UTC)? */
 export function cronMatches(expr: string, d: Date): boolean {
@@ -138,6 +139,30 @@ export async function runDueEdi(_now: Date, env: EdiEnv = liveEdiEnv(), only?: {
   return out;
 }
 
+/**
+ * Quote stock holds, every run: a hold past its day gives its stock back to
+ * the floor. Each company in its own transaction; a failure is reported and
+ * does not stop the others.
+ */
+export async function runDueHolds(now: Date, only?: { entityId: string }) {
+  const on = now.toISOString().slice(0, 10);
+  const rows = await pool.query<{ entity_id: string; tenant_id: string }>(
+    `select distinct h.entity_id, e.tenant_id from pos_quote_hold h join entity e on e.id = h.entity_id
+      where h.status = 'active' and h.held_until < $1::date and ($2::uuid is null or h.entity_id = $2)
+      /* unscoped: the scheduler walks every company's holds */`, [on, only?.entityId ?? null]);
+  const out: { entityId: string; holds: number; released: number; note?: string }[] = [];
+  for (const r of rows.rows) {
+    try {
+      const res = await tx({ kind: "system", label: "scheduler" }, (cl) =>
+        expireHolds(cl, { tenantId: r.tenant_id, entityId: r.entity_id, actor: { kind: "system", label: "scheduler" } }, on));
+      out.push({ entityId: r.entity_id, ...res });
+    } catch (e) {
+      out.push({ entityId: r.entity_id, holds: 0, released: 0, note: (e as Error).message });
+    }
+  }
+  return out;
+}
+
 /** The name the earlier scheduler used. */
 export const runDueVendorConnections = runDueVendorFeeds;
 
@@ -174,6 +199,7 @@ async function main() {
     if (r.note || r.sent || r.stopped || r.carts) console.log(`marketing ${r.entityId}: ${r.sent} sent, ${r.stopped} held back, ${r.carts} carts to leads${r.note ? ` — ${r.note}` : ""}`);
   }
   for (const r of await runDueEdi(now)) console.log(`EDI ${r.vendor}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
+  for (const r of await runDueHolds(now)) console.log(`quote holds ${r.entityId}: ${r.holds} ran out, ${r.released} lines back on the floor${r.note ? ` — ${r.note}` : ""}`);
   // Scheduled reports: each keeps a snapshot and prepares its email.
   const reports = await runDueReports(pool, tx);
   for (const r of reports.runs) console.log(`report ${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);

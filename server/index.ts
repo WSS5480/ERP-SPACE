@@ -71,6 +71,7 @@ import { PostingError } from "../packages/core/posting.ts";
 import { PricingError } from "../packages/core/pricing.ts";
 import { SetupError } from "../packages/core/setup.ts";
 import { PosError } from "../packages/core/pos.ts";
+import { TaxError } from "../packages/core/tax.ts";
 import { WorkforceError } from "../packages/core/workforce.ts";
 
 const PORT = Number(process.env.PORT ?? 10000);
@@ -410,6 +411,8 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
       if (personId && !(await views.person(c, co, personId))) personId = null;
       const out = await fn(c, co, url, m, personId);
       if (out === null) throw new HttpError(404, "not found");
+      // A printable page (a tear sheet) goes out with every header and the CSP, like any page.
+      if (out instanceof PublicPage) return [200, new Html(out.text)];
       return [200, out];
     } finally {
       c.release();
@@ -873,7 +876,7 @@ route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
 // ------------------------------------------------------------------- server
 
 // The engine's refusals are written for people; pass them on as they are.
-const REFUSALS = [ModuleError, InventoryError, ArError, PostingError, PricingError, SetupError, PosError, WorkforceError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
+const REFUSALS = [ModuleError, TaxError, InventoryError, ArError, PostingError, PricingError, SetupError, PosError, WorkforceError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
 
 function refusal(e: unknown): string | null {
   if (REFUSALS.some((K) => e instanceof K)) return (e as Error).message;

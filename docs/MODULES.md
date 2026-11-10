@@ -96,6 +96,36 @@ Data is placed with textContent only, never innerHTML.
 | reports (report creator and editor) | 0031 | none | Back office |
 | group (multi-company: consolidation, inter-company documents, net-to-zero and settle) | 0035 | 0021 | Back office |
 | edi (vendor EDI X12, API ordering, store orders; extends purchasing) | 0036 | none | Setup (Vendor EDI), Retail (Store orders) |
+| tax and selling rules (extends setup, pos, ar, reports) | 0037 | 0023 | Setup (Sales tax), Back office (Reports → Sales tax filing) |
+
+## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
+
+`packages/core/tax.ts` owns sales tax. A sale is taxed by a stack of
+jurisdictions (`tax_jurisdiction`: state, county, city, special district),
+each with dated rates (`tax_rate`) and its own say on delivery fees, labor and
+protection plans, applying to a whole state, one ZIP or one store
+(`tax_area`). The place is where the goods are handed over: the store for
+take-with and pickup, the ship-to address for delivery and direct ship when
+`tax_setting.sourcing` is destination (the default). A store with no
+jurisdictions keeps its single `location.tax_rate_bps` as one 'combined'
+jurisdiction, so one jurisdiction always gives the old rate. Each line's tax
+is kept per jurisdiction in `sales_order_line_tax`; `ar.invoiceFulfilment`
+marks the rows posted when 2100 is credited (allocating lines written by other
+doors), and POS returns write reversing rows. `tax.filing` ties the period to
+GL 2100. Certificates (`tax_exemption_certificate`) belong to a customer, name
+a state and may expire; an expired one is refused. The web store and service
+still read `location.tax_rate_bps`, which tax.ts keeps equal to the store's
+stack.
+
+POS: `pos_setting.special_order_deposit_bps` (50%) and `stocked_deposit_bps`
+(0%) are the least a sale must have paid at checkout; a store manager may go
+below with a reason (`pos_override` kind 'deposit'). A quote may hold stock
+(`pos_quote_hold`, `inventory.reserveLines`) when `quote_holds_allowed`, for
+up to `quote_hold_max_days`; a manager extends it; it ends on expiry
+(`scripts/run-due.ts`), conversion or cancel. Tear sheets
+(`server/modules/tearsheet.ts`) are server-rendered print pages with no script;
+a customer's copy is `/sheet/<token>` (only the hash is kept), sent through the
+customer message log.
 
 ## Group accounting
 

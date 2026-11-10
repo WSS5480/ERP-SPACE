@@ -207,7 +207,7 @@ export async function run(t: T) {
     t.ok("quote: carries an expiry", !!qv.quote_expires_on && qv.kind === "quote");
     await t.throws("quote: cannot be checked out as is", () => R.post(t, MARIA, `/pos/orders/${qt.id}/checkout`, { sessionId: ses.id, tenders: [] }), /is a quote; convert it/);
     await R.post(t, MARIA, `/pos/orders/${qt.id}/convert`);
-    const qo = await R.post(t, MARIA, `/pos/orders/${qt.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "financing", amount: "500", reference: "SYN-88812" }] }) as { onOrder: number };
+    const qo = await R.post(t, MARIA, `/pos/orders/${qt.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "financing", amount: "1000", reference: "SYN-88812" }] }) as { onOrder: number };
     t.ok("quote: converted and placed, the made-to-order sofa goes on order for purchasing", qo.onOrder === 1
       && ((await view(qt.id)).lines as { line_status: string }[])[0].line_status === "on_order");
     const old = await R.post(t, MARIA, "/pos/orders", { kind: "quote", locationId: LOC.ENOLA, customerId: CUST.ALICIA, lines: [{ productId: P.LAMP, qty: 1, fulfillment: "pickup" }] }) as { id: string; number: string };
@@ -303,7 +303,8 @@ export async function run(t: T) {
     // ----------------------- special order: POS → purchasing PO → receive → transfer → pickup
     const so = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.ALICIA, promisedOn: plus(30),
       lines: [{ productId: P.HUDSON, qty: 1, fulfillment: "pickup", choices: { size: "84", fabric: "linen-oat", legs: "walnut" } }] }) as { id: string; number: string };
-    await R.post(t, MARIA, `/pos/orders/${so.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "400.00", reference: "5151" }] });
+    // (a made-to-order sale needs the special-order deposit minimum, 50% by default)
+    await R.post(t, MARIA, `/pos/orders/${so.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: "700.00", reference: "5151" }] });
     const soLine = ((await view(so.id)).lines as { id: string; line_status: string }[])[0];
     t.ok("special order: the made-to-order sofa goes on order", soLine.line_status === "on_order");
     const placed = await RP.post(t, MGR, "/purchasing/special-orders", { lineIds: [soLine.id] }) as { placed?: { poId: string }[] } | { poId: string }[];
@@ -356,7 +357,7 @@ export async function run(t: T) {
     // ------------- pickup sold at Enola but sourced from the DC: the review's repro (flow2t)
     const dp = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.BRIAN, promisedOn: plus(40),
       lines: [{ productId: P.HUDSON, qty: 1, fulfillment: "pickup", fulfilFromId: DC, choices: { size: "96", fabric: "velvet-navy", legs: "brass" } }] }) as { id: string; number: string };
-    await R.post(t, MARIA, `/pos/orders/${dp.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "cash", amount: "500.00" }] });
+    await R.post(t, MARIA, `/pos/orders/${dp.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "cash", amount: "500.00" }, { method: "card", amount: "420.00", reference: "1111" }] });
     const dpLine = ((await view(dp.id)).lines as { id: string }[])[0].id;
     const dpPlaced = await RP.post(t, MGR, "/purchasing/special-orders", { lineIds: [dpLine] }) as { placed: { poId: string }[] };
     const dpPol = (await read<{ id: string; ship_to: string }>(`select pol.id, po.ship_to_location_id ship_to from purchase_order_line pol join purchase_order po on po.id = pol.purchase_order_id
