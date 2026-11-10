@@ -325,22 +325,22 @@ function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + 
  * the owner sees everything. The server still checks every action on its own.
  */
 const ROLE_SCREENS = {
-  controller: ['home', 'approvals', 'payables', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'reports', 'group', 'setup', 'business'],
-  approver: ['home', 'approvals', 'storeorders', 'payables', 'reports'],
-  ap_clerk: ['home', 'payables', 'edi', 'reports'],
+  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business'],
+  approver: ['home', 'approvals', 'storeorders', 'payables', 'memos', 'reports'],
+  ap_clerk: ['home', 'payables', 'memos', 'edi', 'reports'],
   viewer: ['home', 'books', 'chart', 'reports'],
-  hr: ['home', 'payroll', 'workforce'],
-  ar_clerk: ['home', 'ar', 'crm', 'service', 'reports', 'workforce'],
-  buyer: ['home', 'purchasing', 'storeorders', 'edi', 'catalog', 'inventory', 'wms', 'payables', 'reports', 'workforce'],
-  store_manager: ['home', 'pos', 'approvals', 'aisle', 'crm', 'leads', 'myday', 'catalog', 'purchasing', 'storeorders', 'inventory', 'wms', 'fleet', 'service', 'ar', 'workforce', 'reports'],
-  sales: ['home', 'pos', 'myday', 'aisle', 'crm', 'leads', 'service', 'ar', 'workforce'],
-  cashier: ['home', 'pos', 'ar', 'service', 'workforce'],
-  warehouse: ['home', 'inventory', 'wms', 'fleet', 'pos', 'workforce'],
-  dispatcher: ['home', 'fleet', 'service', 'inventory', 'workforce'],
-  driver: ['home', 'myroute', 'workforce'],
-  technician: ['home', 'myroute', 'service', 'workforce'],
-  web_admin: ['home', 'shop', 'marketing', 'catalog', 'workforce'],
-  marketing: ['home', 'marketing', 'crm', 'leads', 'reports', 'workforce'],
+  hr: ['home', 'payroll', 'workforce', 'timeoff'],
+  ar_clerk: ['home', 'ar', 'crm', 'service', 'reports', 'workforce', 'timeoff'],
+  buyer: ['home', 'purchasing', 'storeorders', 'edi', 'catalog', 'inventory', 'wms', 'payables', 'memos', 'reports', 'workforce', 'timeoff'],
+  store_manager: ['home', 'pos', 'approvals', 'aisle', 'crm', 'leads', 'myday', 'catalog', 'purchasing', 'storeorders', 'inventory', 'wms', 'fleet', 'loading', 'haulaway', 'service', 'ar', 'workforce', 'timeoff', 'reports'],
+  sales: ['home', 'pos', 'myday', 'aisle', 'crm', 'leads', 'service', 'ar', 'workforce', 'timeoff'],
+  cashier: ['home', 'pos', 'ar', 'service', 'workforce', 'timeoff'],
+  warehouse: ['home', 'inventory', 'wms', 'fleet', 'loading', 'haulaway', 'pos', 'workforce', 'timeoff'],
+  dispatcher: ['home', 'fleet', 'loading', 'haulaway', 'service', 'inventory', 'workforce', 'timeoff'],
+  driver: ['home', 'myroute', 'workforce', 'timeoff'],
+  technician: ['home', 'myroute', 'service', 'workforce', 'timeoff'],
+  web_admin: ['home', 'shop', 'marketing', 'catalog', 'workforce', 'timeoff'],
+  marketing: ['home', 'marketing', 'crm', 'leads', 'reports', 'workforce', 'timeoff'],
 };
 const BACK_OFFICE = ['owner', 'controller', 'approver', 'ap_clerk', 'viewer'];
 function screensForPerson() {
@@ -577,7 +577,8 @@ const GROUP_HINT = { pos: 'Sell, take deposits and payments', aisle: 'Price and 
   leads: 'Follow-ups and the pipeline', myday: 'Today’s calls, tasks and appointments', catalog: 'Products, options and prices',
   purchasing: 'Purchase orders and receiving', inventory: 'Stock, bins, transfers and counts', fleet: 'Delivery calendar and routes',
   myroute: 'Today’s stops', service: 'Service tickets and visits', ar: 'Customer accounts and collections', workforce: 'Time clock, shifts and commissions',
-  reports: 'Saved and starter reports', group: 'The companies together, inter-company', shop: 'The web store', marketing: 'Campaigns, coupons and lists', payables: 'Vendor bills', approvals: 'Waiting on a decision' };
+  reports: 'Saved and starter reports', group: 'The companies together, inter-company', shop: 'The web store', marketing: 'Campaigns, coupons and lists', payables: 'Vendor bills', approvals: 'Waiting on a decision',
+  loading: 'Load trucks, last stop first', haulaway: 'What the crews take away, and where it went', memos: 'Credits on vendor accounts', timeoff: 'Ask for time off, balances, holidays' };
 
 /** What a pay group's open period needs from a person now, or null if it is waiting on time or on someone else. */
 function payrollNext(p) {

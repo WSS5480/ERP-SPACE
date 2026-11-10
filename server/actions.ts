@@ -459,8 +459,11 @@ export async function createPaymentRun(c: Client, co: Company, a: Actor, input: 
 
   const s = scopeOf(co, a);
   const bank = await resolveDisbursementAccount(c, s, { method });
+  // What a bill still needs: its total less any vendor debit memos applied to it.
   const invs = await q<{ id: string; total_minor: string }>(c, `
-    select i.id, i.total_minor from invoice i
+    select i.id, (i.total_minor - coalesce((select sum(a.amount_minor) from vendor_memo_application a
+                                             where a.invoice_id = i.id and a.entity_id = $1), 0))::text total_minor
+      from invoice i
      where i.entity_id = $1 and i.id = any($2::uuid[]) and i.status = 'approved' and i.ic_document_id is null
        and not exists (select 1 from payment p join payment_run pr on pr.id = p.payment_run_id
                         where p.invoice_id = i.id and pr.status in ('building','pending_release','released','settled'))`,

@@ -341,6 +341,7 @@
       draft ? btn('Lock (loaded)', (e) => act(e.currentTarget, () => post(`/fleet/routes/${r.id}/lock`), 'Route locked; the order is fixed', { errorInto: showErr(err) }), { small: true, primary: true, ic: 'hold' }) : null,
       r.status === 'locked' ? btn('Unlock', (e) => act(e.currentTarget, () => post(`/fleet/routes/${r.id}/unlock`), 'Unlocked', { errorInto: showErr(err) }), { small: true }) : null,
       btn('Manifest', () => go('fleet', 'manifest:' + r.id), { small: true, ic: 'file' }),
+      draft ? btn('Load the truck', () => go('loading', 'route:' + r.id), { small: true }) : null,
       btn('Load list', () => loadDialog(r), { small: true }),
     ].filter(Boolean);
     const stopCards = r.stops.map((s, i) => item({
@@ -348,6 +349,7 @@
       detail: [KIND[s.kind], s.window_label, `${s.city} ${s.postal}`, plural(s.pieces, 'piece'), s.stairs ? `${s.stairs} flight(s) of stairs` : null, s.number].filter(Boolean).join(' · '),
       why: s.eta_min != null && s.window_end != null && s.eta_min > s.window_end ? `Late: the crew reaches it after ${s.window_label} closes.` : (s.exception_reason || null),
       acts: draft ? [
+        s.status === 'scheduled' && ['delivery', 'pickup'].includes(s.kind) && E.ops ? btn('Haul-away', () => E.ops.addHaul(s), { small: true }) : null,
         btn('Up', (e) => act(e.currentTarget, () => post(`/fleet/stops/${s.id}/move`, { dir: 'up' }), null, { errorInto: showErr(err) }), { small: true, disabled: i === 0 }),
         btn('Down', (e) => act(e.currentTarget, () => post(`/fleet/stops/${s.id}/move`, { dir: 'down' }), null, { errorInto: showErr(err) }), { small: true, disabled: i === r.stops.length - 1 }),
         (() => {
@@ -505,7 +507,7 @@
     const cards = z.zones.map((x) => item({
       title: `${x.code} · ${x.name}`, amount: money(x.fee_minor), badge: x.active ? chip('good', 'ok', x.dc_name) : chip('neutral', 'pause', 'Inactive'),
       detail: `${x.days.map((d) => DAYS[d]).join(' ')} · ${x.postal_codes.join(', ')}`,
-      why: x.windows.map((w) => `${w.label}: ${[w.stops_cap != null ? w.stops_cap + ' stops' : null, w.pieces_cap != null ? w.pieces_cap + ' pcs' : null, w.cube_cap != null ? w.cube_cap + ' cu ft' : null, w.labor_min_cap != null ? w.labor_min_cap + ' crew min' : null].filter(Boolean).join(', ') || 'no limit'}`).join(' · ') || 'No windows yet',
+      why: x.windows.map((w) => `${w.label}: ${[w.stops_cap != null ? w.stops_cap + ' stops' : null, w.pieces_cap != null ? w.pieces_cap + ' pcs' : null, w.cube_cap != null ? w.cube_cap + ' cu ft' : null, w.weight_cap_lb != null ? w.weight_cap_lb + ' lb' : null, w.labor_min_cap != null ? w.labor_min_cap + ' crew min' : null].filter(Boolean).join(', ') || 'no limit'}`).join(' · ') || 'No windows yet',
       acts: [btn('Edit', () => zoneDialog(o, x), { small: true }), btn('Add window', () => windowDialog(x), { small: true })] }));
     const bo = z.blackouts.map((b) => item({ title: dayLabel(b.day), detail: `${b.reason} · ${b.zone_id ? (z.zones.find((x) => x.id === b.zone_id) || {}).name : 'every zone'}` }));
     return frag(
@@ -530,9 +532,9 @@
     const err = errSlot();
     const f = { label: input({ placeholder: '8–12' }), starts: input({ type: 'time', value: '08:00' }), ends: input({ type: 'time', value: '12:00' }),
       stopsCap: input({ type: 'number', placeholder: 'No limit' }), piecesCap: input({ type: 'number', placeholder: 'No limit' }),
-      cubeCap: input({ type: 'number', placeholder: 'No limit' }), laborMinCap: input({ type: 'number', placeholder: 'No limit' }) };
+      cubeCap: input({ type: 'number', placeholder: 'No limit' }), weightCapLb: input({ type: 'number', placeholder: 'No limit' }), laborMinCap: input({ type: 'number', placeholder: 'No limit' }) };
     d.body.append(el('div', { class: 'form-grid' }, field('Label', f.label), field('Starts', f.starts), field('Ends', f.ends), field('Stops a day', f.stopsCap),
-      field('Pieces a day', f.piecesCap), field('Cubic feet a day', f.cubeCap), field('Crew minutes a day', f.laborMinCap)),
+      field('Pieces a day', f.piecesCap), field('Cubic feet a day', f.cubeCap), field('Pounds a day', f.weightCapLb), field('Crew minutes a day', f.laborMinCap)),
       el('div', { class: 'dlg-acts' }, btn('Add', (e) => act(e.currentTarget, () => post(`/fleet/zones/${z.id}/windows`, Object.fromEntries(Object.entries(f).map(([k, i]) => [k, i.value]))),
         'Window added', { close: d.close, errorInto: showErr(err) }), { primary: true }), btn('Cancel', d.close)), err);
   }
@@ -595,11 +597,13 @@
           title: `${s.seq}. ${s.customer || ''}`, amount: s.eta || '', badge: stopChip(s.status),
           detail: [`${s.line1}${s.line2 ? ', ' + s.line2 : ''}, ${s.city}`, s.window_label, KIND[s.kind], plural(s.pieces, 'piece'), s.stairs ? `${s.stairs} flight(s) of stairs` : null,
             BigInt(s.cod_minor || 0) > 0n && s.kind === 'delivery' ? `collect ${money(s.cod_minor)}` : null].filter(Boolean).join(' · '),
-          why: [s.address_notes, s.notes, s.problem ? `Problem: ${s.problem}` : null, s.lines.length ? s.lines.map((l) => `${l.qty}× ${l.description}`).join('; ') : null].filter(Boolean).join(' · ') || null,
+          why: [s.address_notes, s.notes, s.problem ? `Problem: ${s.problem}` : null, s.lines.length ? s.lines.map((l) => `${l.qty}× ${l.description}`).join('; ') : null,
+            (s.haulAway || []).length ? `Haul away: ${s.haulAway.map((h) => `${h.qty}× ${h.description}${h.status !== 'planned' ? ` (${words(h.status)})` : ''}`).join('; ')}` : null].filter(Boolean).join(' · ') || null,
           acts: open ? [
             el('a', { class: 'btn small', href: s.mapsUrl, target: '_blank', rel: 'noopener' }, 'Navigate'),
             s.phone ? el('a', { class: 'btn small', href: `tel:${s.phone}` }, 'Call') : null,
             live && s.status === 'scheduled' ? btn('Arrived', (e) => act(e.currentTarget, () => post(`/fleet/stops/${s.id}/arrive`), 'Arrived', { errorInto: showErr(err) }), { small: true }) : null,
+            live && E.ops && (s.haulAway || []).some((h) => h.status === 'planned') ? btn('Haul-away', () => E.ops.recordHaul(s), { small: true }) : null,
             live ? btn('Complete', () => completeDialog(s, false), { small: true, primary: s.id === nextId }) : null,
           ] : null });
         return card;

@@ -12,6 +12,7 @@ import { invoiceFulfilment } from "../../packages/core/ar.ts";
 import * as pos from "../../packages/core/pos.ts";
 import { module as serviceModule } from "../../server/modules/service.ts";
 import { module as fleetModule } from "../../server/modules/fleet.ts";
+import { module as opsModule } from "../../server/modules/ops.ts";
 import type { Actor } from "../../server/modules/kit.ts";
 import { PublicPage } from "../../server/modules/kit.ts";
 
@@ -31,7 +32,7 @@ type Handler = { method: string; re: RegExp; fn: (...a: unknown[]) => Promise<un
 export async function run(t: T) {
   // ---------------------------------------------------- the routes, as the server runs them
   const H: Handler[] = [];
-  for (const m of [serviceModule, fleetModule]) m.register({
+  for (const m of [serviceModule, fleetModule, opsModule]) m.register({
     coGet: (tail, fn) => H.push({ method: "GET", re: new RegExp(`^${tail}$`), fn: fn as Handler["fn"], pub: false }),
     coPost: (tail, fn) => H.push({ method: "POST", re: new RegExp(`^${tail}$`), fn: fn as Handler["fn"], pub: false }),
     publicRoute: (method, path, fn) => H.push({ method, re: path, fn: fn as Handler["fn"], pub: true }),
@@ -208,6 +209,8 @@ export async function run(t: T) {
   const built = await post(P.RAY, "/fleet/routes/build", { day: D, dcId: DC });
   const routeId = built.routes.find((r: any) => r.stops >= 1).routeId;
   await post(P.RAY, `/fleet/routes/${routeId}/crew`, { driverId: P.PAT, helperId: null });
+  { const ld = await post(P.DEE, `/fleet/routes/${routeId}/loading/prepare`);   // load whatever rides with the visit
+    for (const it of ld.items.filter((x: any) => x.status === "pending")) await post(P.DEE, `/fleet/routes/${routeId}/loading/scan`, { itemId: it.id }); }
   await post(P.DEE, `/fleet/routes/${routeId}/lock`);
   const veh = (await get(`/fleet/routes/${routeId}`, P.RAY)).vehicle_id;
   await post(P.PAT, "/fleet/dvir", { vehicleId: veh, items: F.DVIR_ITEMS.map((i) => ({ code: i.code, ok: true })) });
