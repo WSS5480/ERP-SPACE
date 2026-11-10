@@ -968,7 +968,14 @@ export async function start(): Promise<http.Server> {
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(PORT, "0.0.0.0", resolve));
   console.log(`erp-api ${VERSION} listening on ${PORT}`);
-  const stop = () => server.close(() => pool.end().then(() => process.exit(0)));
+  // The outbox: email and texts a restart left queued go out within a minute. A message only just
+  // queued is left to the request that queued it (a sign-in code lives only in that request's memory).
+  const outbox = setInterval(() => {
+    import("../packages/core/messaging.ts").then((m) => m.drainQueued({ olderThanSec: 60, limit: 50 }))
+      .catch((e) => console.error(`outbox: ${describeError(e)}`));
+  }, 60_000);
+  outbox.unref();
+  const stop = () => { clearInterval(outbox); server.close(() => pool.end().then(() => process.exit(0))); };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
   return server;

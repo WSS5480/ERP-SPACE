@@ -369,7 +369,7 @@
           if (why) run(e.currentTarget, out, () => post(`/pos/orders/${id}/override`, { lineId: l.id, reason: why }), 'Allowed.', reload);
         } }, 'Allow')] : [
           // A designer split or an outside trade referral on the line (trade module), until it is handed over.
-          ...(E.trade && l.role === 'item' && Number(l.qty) > 0 && !['fulfilled', 'returned', 'cancelled'].includes(l.line_status)
+          ...(E.trade && E.canSee('trade') && l.role === 'item' && !['fee', 'service', 'warranty', 'gift_card'].includes(l.kind) && Number(l.qty) > 0 && !['fulfilled', 'returned', 'cancelled'].includes(l.line_status)
             ? [el('button', { class: 'btn small', type: 'button', onclick: () => E.trade.lineCommissionDialog(l, () => reload()) }, 'Designer / referral')] : [])] }));
       const acts = [];
       const btn = (label, fn, primary) => el('button', { class: 'btn' + (primary ? ' primary' : ''), type: 'button', onclick: fn }, label);

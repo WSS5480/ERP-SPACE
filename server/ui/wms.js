@@ -232,7 +232,7 @@
     await load();
     const labor = await coApi('/wms/prep/labor');
     return frag(
-      section('Prep queue', 'unbox, inspect, touch-up, steam, assemble', [btn('Print labels', () => go('labels', 'prep' + (prepLoc ? ':' + prepLoc : '')), { small: true })],
+      section('Prep queue', 'unbox, inspect, touch-up, steam, assemble', E.canSee('labels') ? [btn('Print labels', () => go('labels', 'prep' + (prepLoc ? ':' + prepLoc : '')), { small: true })] : null,
         el('div', { class: 'toolbar' }, field('Where', loc), segBox), list),
       section('Queue a piece by hand', null, null, el('div', { class: 'form-grid' }, field('Label', label), field('Prep', kind)),
         el('div', { class: 'dlg-acts' }, btn('Queue it', (e) => run(e.currentTarget, qout, () => post('/wms/prep/queue', { label: label.value, prepType: kind.value }),

@@ -297,7 +297,7 @@
           + (forOrders.length ? ` Reserved for customer order${forOrders.length > 1 ? 's' : ''} ${forOrders.join(', ')}.` : '')
           + (res.backordersReserved ? ` ${plural(res.backordersReserved, 'back order')} now covered.` : ''); },
       (res) => { const labels = res.lines.flatMap((x) => x.labels); if (labels.length) out.append(el('div', { class: 'panel' }, item({ title: 'Labels', detail: labels.join(' '),
-        acts: [el('button', { class: 'btn small primary', type: 'button', onclick: () => { d.close(); go('labels', 'receipt:' + res.receiptId); } }, 'Print these labels')] }))); E.render(); }) }, 'Receive');
+        acts: !E.canSee('labels') ? [] : [el('button', { class: 'btn small primary', type: 'button', onclick: () => { d.close(); go('labels', 'receipt:' + res.receiptId); } }, 'Print these labels')] }))); E.render(); }) }, 'Receive');
     d.body.append(el('div', { class: 'form-grid' }, field('Receiving at', loc), field('Put in', bin), field('Note', note, { wide: true })),
       el('div', { class: 'panel' }, rows.map((x) => x.node)), el('div', { class: 'dlg-acts' }, b, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Close')), out);
   }

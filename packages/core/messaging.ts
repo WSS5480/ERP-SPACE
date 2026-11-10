@@ -760,7 +760,7 @@ type Claimed = { id: string; entity_id: string; channel: "email" | "sms" | "webh
   connection_id: string | null; source_table: string | null; source_id: string | null };
 
 /** Send what is queued: the given ids, or everything due (a restart's leftovers, from run-due). Network calls happen outside any transaction. */
-export async function drainQueued(opts: { ids?: string[]; entityId?: string; limit?: number } = {}, env: MsgEnv = msgEnv()) {
+export async function drainQueued(opts: { ids?: string[]; entityId?: string; limit?: number; olderThanSec?: number } = {}, env: MsgEnv = msgEnv()) {
   inflight++;
   let sent = 0, failed = 0;
   try {
@@ -769,9 +769,10 @@ export async function drainQueued(opts: { ids?: string[]; entityId?: string; lim
        where id in (select id from outbound_message
                      where (status = 'queued' or (status = 'sending' and claimed_at < now() - interval '10 minutes'))
                        and ($1::uuid[] is null or id = any($1)) and ($2::uuid is null or entity_id = $2)
+                       and ($4::int is null or created_at < now() - make_interval(secs => $4))
                      order by created_at limit $3 for update skip locked)
       returning id, entity_id, channel, to_addr, subject, body, redacted, connection_id, source_table, source_id /* unscoped: the outbox, by id or all due */`,
-      [opts.ids ?? null, opts.entityId ?? null, opts.limit ?? 200]));
+      [opts.ids ?? null, opts.entityId ?? null, opts.limit ?? 200, opts.olderThanSec ?? null]));
     for (const m of claimed) (await sendClaimed(m, env)) ? sent++ : failed++;
   } finally {
     inflight--;

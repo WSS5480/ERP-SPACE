@@ -216,7 +216,10 @@ async function pageProduct(id) {
   });
   setMain(wrap(el('a', { href: '#/catalog', text: '‹ Catalog' }), el('h1', { text: p.name }), el('p', { class: 'tr-muted', text: [p.brand, p.collection, p.color].filter(Boolean).join(' · ') }),
     card(priceRow, desc, p.description ? el('p', { text: p.description }) : null, opts.length ? el('div', { class: 'tr-form two' }, opts) : null,
-      el('div', { class: 'tr-form two' }, field('Quantity', qty), field('Project', projSel)), el('div', { class: 'tr-acts' }, add, sheet), err)));
+      p.sectional
+        ? el('p', { class: 'tr-muted', text: 'Sectionals are built with your rep for now: tell us the pieces, layout and cover you want and we will quote it to your project. The tear sheet shows the family.' })
+        : el('div', { class: 'tr-form two' }, field('Quantity', qty), field('Project', projSel)),
+      el('div', { class: 'tr-acts' }, p.sectional ? null : add, sheet), err)));
   if (opts.length) reprice();
 }
 

@@ -35,6 +35,7 @@
     if (name === 'account' && id) return accountPage(id);
     const o = await opts();
     const tabs = seg([['applications', 'Applications'], ['accounts', 'Accounts'], ['referrals', 'Referrals'], ['pricing', 'Trade pricing']], st.tab, (v) => { st.tab = v; E.render(); });
+    tabs.style.flexWrap = 'wrap';
     let body;
     if (st.tab === 'applications') body = await applicationsTab(o);
     else if (st.tab === 'accounts') body = await accountsTab();

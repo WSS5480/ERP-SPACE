@@ -119,7 +119,7 @@
     if (st.scanFocus) { st.scanFocus = false; setTimeout(() => scanIn.focus(), 0); }
     return frag(
       el('div', { class: 'toolbar' }, btn('All routes', () => go('loading'), { small: true }), el('span', { class: 'grow' }),
-        btn('Print manifest', () => go('loading', 'print:' + id), { small: true }), btn('Carton labels', () => go('labels', 'manifest:' + id), { small: true }),
+        btn('Print manifest', () => go('loading', 'print:' + id), { small: true }), E.canSee('labels') ? btn('Carton labels', () => go('labels', 'manifest:' + id), { small: true }) : null,
         btn('Route', () => go('fleet', 'route:' + id), { small: true })),
       head(`Load ${r.number}`, null, `${dayLabel(r.route_on)} · ${r.unit_no || 'no truck'} · ${r.dc_name}`),
       tilesRow(tile({ label: 'Loaded', value: `${t.loaded}/${t.pieces}`, tone: t.pending ? 'neutral' : 'good' }),

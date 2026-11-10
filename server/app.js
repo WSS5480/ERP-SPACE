@@ -2106,7 +2106,7 @@ const RENDER = { home: screenHome, approvals: screenApprovals, payables: screenP
 // Retail modules (server/ui/*.js) add screens here before boot. They get the
 // same helpers this file uses, so every screen looks and behaves alike.
 window.ERP = {
-  S, $, el, frag, icon, ICONS, chip, money, dayLabel, shortDay, plural, cap, sentence, human, ago, size, todayIso, isoDay,
+  canSee, S, $, el, frag, icon, ICONS, chip, money, dayLabel, shortDay, plural, cap, sentence, human, ago, size, todayIso, isoDay,
   api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
   head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input,
   openEntry, NARROW,
