@@ -6,7 +6,7 @@
   const E = window.ERP;
   if (!E) return;
   const { el, section, coApi, post, register, item, chip, money, ago, dayLabel, empty, seg, head, openDialog, fillDialog,
-    resultBox, toast, busy, friendly, tile, tilesRow, go, render, S } = E;
+    resultBox, toast, busy, friendly, tile, tilesRow, go, render, S, shortDay } = E;
   void seg;
 
   const qs = (o) => { const p = new URLSearchParams(); for (const [k, v] of Object.entries(o)) if (v) p.set(k, v); const s = p.toString(); return s ? '?' + s : ''; };
@@ -238,7 +238,8 @@
       box.replaceChildren(el('div', { class: 'panel' }, data.products.map((p) => {
         const where = p.kind === 'warranty' || p.kind === 'service' ? 'Service, nothing to stock'
           : p.kind === 'configurable' || p.kind === 'special_order' ? 'Made to order'
-          : Number(p.here) > 0 ? `${Number(p.here)} on this floor` : Number(p.dc) > 0 ? `${Number(p.dc)} at the DC` : 'On order';
+          : Number(p.here) > 0 ? `${Number(p.here)} on this floor` : Number(p.dc) > 0 ? `${Number(p.dc)} at the DC`
+          : Number(p.arriving) > 0 ? `${Number(p.arriving)} arriving${p.arriving_on ? ' on ' + shortDay(p.arriving_on) : ''}` : 'On order';
         const add = el('button', { class: 'btn primary', type: 'button', onclick: () => addAisle(p, paintCart) }, p.option_groups ? 'Choose options' : 'Add');
         return item({ title: p.name, detail: [p.brand, p.sku, where].filter(Boolean).join(' · '), amount: (p.option_groups ? 'from ' : '') + money(p.price_minor),
           badge: chip(Number(p.here) > 0 ? 'good' : 'neutral', Number(p.here) > 0 ? 'ok' : 'info', Number(p.here) > 0 ? 'Here' : p.option_groups ? 'Custom' : p.kind === 'warranty' || p.kind === 'service' ? 'Service' : Number(p.dc) > 0 ? 'At DC' : 'Order'), acts: [add] });

@@ -135,7 +135,7 @@ async function formOptions(c: Client, co: Company) {
            where ve.entity_id = $1 and ve.status = 'active' and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) order by 2`, [co.id]),
     () => q(c, `select category, array_agg(distinct subcategory) filter (where subcategory is not null) subs, count(*) n
             from product where entity_id = $1 and category is not null group by category order by category`, [co.id]),
-    () => q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' order by kind <> 'warehouse', name`, [co.id]),
+    () => q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' and kind not in ('in_transit','dropship') order by kind <> 'warehouse', name`, [co.id]),
     () => q(c, `select t.id, t.name, t.vendor_id, t.category from option_template t where t.entity_id = $1 and t.active order by t.name`, [co.id]),
     () => q(c, `select id, code, name from price_list where entity_id = $1 and active order by code`, [co.id]),
   ]);
@@ -191,7 +191,7 @@ async function margins(c: Client, co: Company, url: URL) {
   const vendor = uuid(url.searchParams.get("vendor"));
   const category = str(url.searchParams.get("category"), 80) || null;
   let loc = uuid(url.searchParams.get("location"));
-  if (!loc) loc = (await q<{ id: string }>(c, `select id from location where entity_id = $1 and status = 'active' order by kind <> 'warehouse', name limit 1`, [co.id]))[0]?.id ?? null;
+  if (!loc) loc = (await q<{ id: string }>(c, `select id from location where entity_id = $1 and status = 'active' and kind not in ('in_transit','dropship') order by kind <> 'warehouse', name limit 1`, [co.id]))[0]?.id ?? null;
   const rows = await q<{ id: string; sku: string; name: string; status: string; vendor: string | null; category: string | null; price_minor: string; cost_minor: string;
     map_minor: string | null; freight_bps: number | null; per_unit_minor: string | null }>(c, `
     select p.id, p.sku, p.name, p.status, coalesce(v.dba, v.legal_name) vendor, p.category, p.price_minor, p.cost_minor, p.map_minor,
@@ -451,7 +451,7 @@ export const module: ErpModule = {
                                  from vendor_feed f where f.entity_id = $1 and f.vendor_id = $2 order by array_position(array['products','pricing','quantities','freight','images','orders','acknowledgments'], f.purpose), f.name`, [co.id, m[2]]);
       const out = [];
       for (const r of rows) out.push(await feedOut(c, co, r));
-      const locations = await q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' order by kind <> 'warehouse', name`, [co.id]);
+      const locations = await q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' and kind not in ('in_transit','dropship') order by kind <> 'warehouse', name`, [co.id]);
       return { vendor: v, feeds: out, locations, photos: await feeds.photoTally(c, co.id, m[2]), secretKeySet: !!feedEnv().secretKey,
         purposes: feeds.PURPOSES, fields: feeds.PURPOSE_FIELDS, templates: [["ashley", "Ashley (products, prices, ATP quantities, freight, orders)"],
           ["generic_json", "Generic REST / JSON"], ["csv_https", "CSV over HTTPS"], ["blank", "Blank"]] };

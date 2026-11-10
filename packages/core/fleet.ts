@@ -10,6 +10,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import * as inventory from "./inventory.ts";
+import * as wms from "./wms.ts";
 import { postReceipt, invoiceFulfilment } from "./ar.ts";
 import { accrueCommissions } from "./workforce.ts";
 import * as R from "./routing.ts";
@@ -737,6 +738,15 @@ export async function bookStop(c: Client, scope: Scope, b: BookInput) {
     dc = r[0].id;
   }
 
+  // Goods whose deluxing, touch-up or assembly is not done: queued now if they never were, and warned about or refused, per the company.
+  let prepWarning: string | null = null;
+  if (lines.length) {
+    await wms.queueForLines(c, scope, lines.map((l) => l.id));
+    const gate = await wms.prepGate(c, scope.entityId, lines.map((l) => l.id), kind === "will_call" ? "booking the will-call" : "booking the delivery");
+    need(!gate.refuse, gate.message ?? "");
+    prepWarning = gate.message;
+  }
+
   if (kind === "service") need((b.problem ?? "").trim(), "describe what needs fixing");
   let pick: { description: string; qty: number; orderLineId: string | null }[] = [];
   if (kind === "pickup") {
@@ -773,7 +783,7 @@ export async function bookStop(c: Client, scope: Scope, b: BookInput) {
       [scope.entityId, st.id, p.orderLineId, p.description, p.qty, p.qty]);
   }
   if (kind !== "will_call" || b.day) await notify(c, scope, st.id, "confirmation");
-  return { id: st.id, number, pieces, cubeFt: cube, serviceMin: svc };
+  return { id: st.id, number, pieces, cubeFt: cube, serviceMin: svc, prepWarning };
 }
 
 async function stopRow(c: Client, entityId: string, stopId: string) {

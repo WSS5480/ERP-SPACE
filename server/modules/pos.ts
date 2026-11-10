@@ -120,6 +120,9 @@ async function products(c: Client, co: Company, url: URL) {
     select p.id, p.sku, p.name, p.kind, p.category, p.collection, p.color, p.price_minor::text, p.taxable, p.ship_class, p.status,
            coalesce((select sum(s.on_hand - s.reserved - s.held) from stock_level s where s.entity_id = p.entity_id and s.product_id = p.id and s.location_id = $3), 0)::text here,
            coalesce((select sum(s.on_hand - s.reserved - s.held) from stock_level s where s.entity_id = p.entity_id and s.product_id = p.id), 0)::text everywhere,
+           coalesce((select sum(t.qty) from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id and t.to_location_id = $3), 0)::text arriving_here,
+           coalesce((select sum(t.qty) from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id), 0)::text arriving,
+           (select min(t.arriving_on)::text from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id) arriving_on,
            exists (select 1 from product_option_group g where g.entity_id = p.entity_id and g.product_id = p.id) configurable
       from product p
      where p.entity_id = $1 and p.status not in ('draft','discontinued')

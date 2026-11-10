@@ -156,7 +156,8 @@
       try {
         const rows = await coApi(`/pos/products?locationId=${sess.location_id}&q=${encodeURIComponent(pq.value.trim())}`);
         pres.replaceChildren(...(rows.length ? rows.slice(0, 12).map((p) => item({ title: p.name, amount: money(p.price_minor),
-          detail: [p.sku, p.category, ['fee', 'warranty', 'service'].includes(p.kind) ? null : `${Number(p.here)} here · ${Number(p.everywhere)} everywhere`].filter(Boolean).join(' · '),
+          detail: [p.sku, p.category, ['fee', 'warranty', 'service'].includes(p.kind) ? null : `${Number(p.here)} here · ${Number(p.everywhere)} everywhere`,
+            Number(p.arriving) > 0 ? `${Number(p.arriving)} arriving${p.arriving_on ? ' on ' + shortDay(p.arriving_on) : ''}` : null].filter(Boolean).join(' · '),
           badge: p.configurable ? chip('neutral', 'info', 'choose options') : p.kind === 'kit' ? chip('neutral', 'info', 'package') : null,
           onClick: () => addDialog(p, store, drawCart) })) : [empty('Nothing matches.', null, true)]));
       } catch (e) { pres.replaceChildren(E.errorBox(e)); }

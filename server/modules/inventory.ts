@@ -7,6 +7,7 @@ import { need, requireRole, str, uuid, int, minor, ModuleError } from "./kit.ts"
 import { q } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
 import * as inv from "../../packages/core/inventory.ts";
+import * as wms from "../../packages/core/wms.ts";
 import { PostingError } from "../../packages/core/posting.ts";
 
 const ID = "([0-9a-fA-F-]{36})";
@@ -14,7 +15,7 @@ const LABEL = "([A-Za-z0-9-]{1,40})";
 
 /** The engine's refusals are sentences; send them back as such. */
 export function refusal(e: unknown): unknown {
-  if (e instanceof inv.InventoryError || e instanceof PostingError) return new ModuleError(e.message);
+  if (e instanceof inv.InventoryError || e instanceof PostingError || e instanceof wms.WmsError) return new ModuleError(e.message);
   return e;
 }
 const safe = <A extends unknown[], R>(fn: (...a: A) => Promise<R>) => async (...a: A): Promise<R> => {
@@ -31,7 +32,7 @@ const day = (v: unknown) => { const s = str(v, 10); return /^\d{4}-\d{2}-\d{2}$/
 
 async function locations(c: Client, co: Company) {
   return q<{ id: string; code: string; name: string; kind: string }>(c,
-    `select id, code, name, kind from location where entity_id = $1 and status = 'active' and kind <> 'web'
+    `select id, code, name, kind from location where entity_id = $1 and status = 'active' and kind not in ('web','in_transit','dropship')
       order by case kind when 'warehouse' then 0 else 1 end, name`, [co.id]);
 }
 
@@ -262,9 +263,9 @@ export const module: ErpModule = {
         salesOrderLineId: uuid(l.salesOrderLineId) }));
       return inv.createTransfer(c, sc(co, a), { fromId: uuid(b.fromId) ?? "", toId: uuid(b.toId) ?? "", lines, note: str(b.note) || undefined });
     }));
-    coPost(`/inventory/transfers/${ID}/ship`, safe(async (c, co, a, _b, m) => {
+    coPost(`/inventory/transfers/${ID}/ship`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, WAREHOUSE, "shipping a transfer");
-      return inv.shipTransfer(c, sc(co, a), m[2]);
+      return inv.shipTransfer(c, sc(co, a), m[2], { expectedOn: day(b.expectedOn) || null });
     }));
     coPost(`/inventory/transfers/${ID}/receive`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, WAREHOUSE, "receiving a transfer");
@@ -290,7 +291,13 @@ export const module: ErpModule = {
       await requireRole(c, co, a, [...WAREHOUSE, "dispatcher"], "building a pick list");
       const ids = (Array.isArray(b.orderIds) ? b.orderIds : []).map(uuid).filter(Boolean) as string[];
       need(ids.length, "pick at least one order");
-      return inv.pickListFor(c, co.id, ids);
+      const list = await inv.pickListFor(c, co.id, ids);
+      // Staging goods whose prep is not done: warned about, or refused, as the company chose.
+      const lineIds = list.lines.map((l) => l.lineId);
+      const gate = await wms.prepGate(c, co.id, lineIds, "staging this pick list");
+      need(!gate.refuse, gate.message ?? "");
+      if (gate.open.some((x) => x.status === "not_queued")) await wms.queueForLines(c, sc(co, a), lineIds);
+      return { ...list, prepWarning: gate.message };
     }));
 
     // ---- damage and claims

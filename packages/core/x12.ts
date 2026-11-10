@@ -378,6 +378,7 @@ export type AsnLine = { line?: number; vendorSku?: string; upc?: string; qty: nu
 export type Asn856 = {
   shipmentId: string; date: string | null; shippedOn?: string | null; deliveryOn?: string | null;
   carrier?: string | null; carrierName?: string | null; tracking?: string | null; bol?: string | null;
+  equipment?: string | null;      // TD3: the container or trailer (initial + number, e.g. MSCU1234567)
   orders: { poNumber: string; lines: AsnLine[] }[];
 };
 
@@ -386,6 +387,11 @@ export function build856(a: Asn856): Segment[] {
   let hl = 1;
   segs.push(["HL", String(hl), "", "S"]);
   if (a.carrier || a.carrierName) segs.push(["TD5", "", "2", a.carrier ?? "", "M", a.carrierName ?? ""]);
+  if (a.equipment) {
+    const eq = a.equipment.toUpperCase().replace(/\s+/g, "");
+    const m = /^([A-Z]{4})(\d.*)$/.exec(eq);
+    segs.push(["TD3", "CN", m ? m[1] : "", m ? m[2] : eq]);
+  }
   if (a.bol) segs.push(["REF", "BM", a.bol]);
   if (a.tracking) segs.push(["REF", "CN", a.tracking]);
   if (a.shippedOn) segs.push(["DTM", "011", dateOut(a.shippedOn)]);
@@ -418,9 +424,11 @@ export function parse856(segs: Segment[]): Asn856 & { errors: string[] } {
       continue;
     }
     if (id === "TD5") { out.carrier = el(s, 3) || out.carrier || null; out.carrierName = el(s, 5) || out.carrierName || null; }
+    else if (id === "TD3") { const eq = `${el(s, 2)}${el(s, 3)}`.toUpperCase().replace(/\s+/g, ""); if (eq) out.equipment = out.equipment || eq; }
     else if (id === "REF" && (level === "S" || !level)) {
       const q = el(s, 1);
       if (q === "BM") out.bol = el(s, 2);
+      if (q === "EQ" && el(s, 2)) out.equipment = out.equipment || el(s, 2).toUpperCase().replace(/\s+/g, "");
       if (q === "CN" || q === "2I" || q === "PK") out.tracking = out.tracking || el(s, 2);
     } else if (id === "DTM") {
       const d = x12Date(el(s, 2));

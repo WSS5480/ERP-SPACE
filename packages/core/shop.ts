@@ -1068,6 +1068,8 @@ export async function aisleCatalog(c: Client, entityId: string, locationId: stri
     select p.id, p.sku, p.name, p.kind, p.brand, p.category, p.subcategory, p.color, p.price_minor, p.ship_class,
       (select coalesce(sum(greatest(a.available,0)),0) from product_availability a where a.entity_id = p.entity_id and a.product_id = p.id and a.location_id = $2)::text here,
       (select coalesce(sum(greatest(a.available,0)),0) from product_availability a where a.entity_id = p.entity_id and a.product_id = p.id and a.location_kind = 'warehouse')::text dc,
+      (select coalesce(sum(t.qty),0) from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id)::text arriving,
+      (select min(t.arriving_on)::text from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id) arriving_on,
       (select count(*) from product_option_group g where g.entity_id = p.entity_id and g.product_id = p.id)::int option_groups
       from product p where p.entity_id = $1 and p.web_visible and p.status = 'active' and p.kind not in ('fee','gift_card')
        and ($3 = '%%' or p.name ilike $3 or p.sku ilike $3 or p.brand ilike $3)
