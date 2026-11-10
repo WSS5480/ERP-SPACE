@@ -67,7 +67,7 @@
    * screen: layout or pieces, the cover (filtered by grade and color), each
    * piece's options, and the server's price and plan.
    */
-  function sectionalBuilder({ productId, family, onPriced }) {
+  function sectionalBuilder({ productId, family, onPriced, customerId }) {
     const st = { layout: '', pieces: [], cover: family.stockCover || '', opts: [], priced: null, grade: '', color: '' };
     const first = family.layouts.find((l) => l.popular) || family.layouts[0];
     if (first) { st.layout = first.code; st.pieces = first.pieces.slice(); st.opts = st.pieces.map(() => ({})); }
@@ -87,7 +87,7 @@
       err.replaceChildren();
       if (!st.pieces.length) { planBox.replaceChildren(drawLayout(null)); sumBox.replaceChildren(); st.priced = null; if (onPriced) onPriced(null); return; }
       try {
-        const r = await post('/cfg/price', { productId, sectional: build() });
+        const r = await post('/cfg/price', { productId, sectional: build(), customerId: customerId || undefined });
         st.priced = r;
         planBox.replaceChildren(drawLayout(r.geometry));
         sumBox.replaceChildren(el('div', { class: 'facts' }, fact('Overall', `${inches(r.widthIn)} W × ${inches(r.depthIn)} D`), fact('Seats', String(r.seats)),
@@ -121,7 +121,7 @@
         });
         return el('div', { class: 'li' }, el('div', { class: 't', text: `${i + 1}. ${p.name}` }),
           el('div', { class: 'd', text: [words(p.type), p.motion && p.motion !== 'none' ? `${p.motion} recline` : null, p.widthIn ? `${inches(p.widthIn)} × ${inches(p.depthIn)}` : null, p.seats != null ? plural(p.seats, 'seat') : null].filter(Boolean).join(' · ') }),
-          pickers.length ? el('div', { class: 'form-grid' }, pickers) : null,
+          pickers.length ? el('div', { class: 'form-grid cfg-wide' }, pickers) : null,
           el('div', { class: 'acts' }, btn('Move left', () => move(i, -1), { small: true }), btn('Move right', () => move(i, 1), { small: true }),
             btn('Remove', () => { st.pieces.splice(i, 1); st.opts.splice(i, 1); st.layout = ''; layoutSel.value = ''; paintPieces(); reprice(); }, { small: true })));
       });
@@ -155,12 +155,12 @@
   }
 
   /** A dialog with the builder: fetch the family, build, then hand the build and its price to the caller. */
-  function sectionalDialog({ productId, title, sub, actLabel, extra, onAdd }) {
+  function sectionalDialog({ productId, title, sub, actLabel, extra, onAdd, customerId }) {
     const d = openDialog(title, sub || 'Build the sectional; the price is the register’s and the web’s', { wide: true });
     fillDialog(d, async () => {
       const family = await coApi(`/cfg/families/${productId}`);
       const add = el('button', { class: 'btn primary', type: 'button', disabled: true }, actLabel || 'Add');
-      const b = sectionalBuilder({ productId, family, onPriced: (r) => { add.disabled = !r; } });
+      const b = sectionalBuilder({ productId, family, customerId, onPriced: (r) => { add.disabled = !r; } });
       const ex = extra ? extra() : null;
       add.addEventListener('click', () => { const r = b.priced(); if (!r) return; onAdd(b.build(), r, ex); d.close(); });
       return frag(b.node, ex ? ex.node : null, el('div', { class: 'dlg-acts' }, add, btn('Cancel', d.close)));
@@ -185,11 +185,11 @@
 
   function familiesTab(o) {
     const add = btn('New sectional', () => newFamilyDialog(o), { primary: true });
-    return section('Sectional families', plural(o.families.length, 'family'), [add],
+    return section('Sectional families', `${o.families.length} ${o.families.length === 1 ? 'family' : 'families'}`, [add],
       o.families.length ? el('div', { class: 'panel' }, o.families.map((f) => item({ title: f.name, onClick: () => go('sectionals', `families/${f.product_id}`),
         detail: [f.sku, plural(f.pieces, 'piece'), plural(f.layouts, 'layout'), f.grade_table || 'no grade table', `${f.min_pieces}–${f.max_pieces} pieces`,
           f.bundle_discount_bps ? `${f.bundle_discount_bps / 100}% bundle discount` : null, f.sold ? `${f.sold} sold` : null].filter(Boolean).join(' · '),
-        badge: chip(f.active ? 'good' : 'neutral', f.active ? 'ok' : 'info', f.active ? 'Selling' : 'Off') })))
+        badge: f.active && f.status === 'active' ? chip('good', 'ok', 'Selling') : chip('neutral', 'info', !f.active ? 'Off' : `${f.status.replace('_', ' ')}: not for sale`) })))
         : empty('No sectionals yet', 'Make one, then add its pieces and popular layouts.', true));
   }
   function newFamilyDialog(o) {

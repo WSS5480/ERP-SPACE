@@ -18,6 +18,7 @@
 // Every portal read and write names the account; another account's order,
 // project or invoice reads exactly like one that does not exist.
 
+import { ConfigError } from "./configurator.ts";
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { priceConfigured, PricingError, type Choice } from "./pricing.ts";
@@ -37,7 +38,7 @@ const today = () => new Date().toISOString().slice(0, 10);
 export const KINDS = ["designer", "contractor", "stager", "hospitality", "other"] as const;
 
 /** Refusals a person reads as they are. */
-export const TRADE_REFUSALS: (new (...a: never[]) => Error)[] = [TradeError, projects.ProjectError, shop.ShopError, PricingError, ar.ArError, tax.TaxError];
+export const TRADE_REFUSALS: (new (...a: never[]) => Error)[] = [TradeError, projects.ProjectError, shop.ShopError, PricingError, ar.ArError, tax.TaxError, ConfigError];
 
 export const CODE_TTL_MIN = 10;
 export const CODE_MAX_TRIES = 5;
@@ -438,7 +439,7 @@ export async function createProject(c: Client, site: shop.Site, s: Session, b: p
   return projects.createProject(c, scopeFor(site, s), { ...b, salespersonId: s.repId, customerId: s.customerId, tradeAccountId: s.accountId });
 }
 export const updateProject = (c: Client, site: shop.Site, s: Session, id: string, b: projects.ProjectIn) => projects.updateProject(c, scopeFor(site, s), id, b, viewer(s));
-export const addProjectItem = (c: Client, site: shop.Site, s: Session, id: string, b: { productId: string; choices?: Choice[]; qty?: number; note?: unknown }) =>
+export const addProjectItem = (c: Client, site: shop.Site, s: Session, id: string, b: { productId: string; choices?: Choice[]; qty?: number; note?: unknown; sectional?: shop.LineIn["sectional"] }) =>
   projects.addItem(c, scopeFor(site, s), id, { ...b, stage: "considered" }, viewer(s));
 export const setProjectItem = (c: Client, site: shop.Site, s: Session, id: string, itemId: string, b: { qty?: number; remove?: boolean }) =>
   projects.setItem(c, scopeFor(site, s), id, itemId, { qty: b.qty, remove: b.remove }, viewer(s));
@@ -463,7 +464,7 @@ async function checkoutFor(c: Client, site: shop.Site, s: Session, b: OrderIn, q
   if (b.projectId) {
     project = await projects.project(c, site.entity_id, String(b.projectId), viewer(s), s.priceList);
     need(project, "No such project.");
-    lines = project!.items.filter((i) => i.stage !== "bought").map((i) => ({ productId: i.productId, qty: i.qty, choices: i.choices }));
+    lines = project!.items.filter((i) => i.stage !== "bought").map((i) => ({ productId: i.productId, qty: i.qty, choices: i.choices, ...(i.sectional ? { sectional: i.sectional } : {}) }));
     need((lines as unknown[]).length, "The project has nothing left to order.");
     if (b.shipTo === "client") {
       const ca = (project as unknown as { client_address: Record<string, string>; client_name: string | null });

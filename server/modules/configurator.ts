@@ -4,7 +4,8 @@
 // packages/core/configurator.ts (and the rule engine in pricing.ts); this file
 // decides who may do what and reads requests.
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
-import { ModuleError, need, requireRole, str, uuid, int, minor } from "./kit.ts";
+import { ModuleError, need, requireRole, str, uuid, int, minor, seesCost, scrubCost } from "./kit.ts";
+import { priceListOf } from "../../packages/core/pos.ts";
 import { q } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
 import * as cfg from "../../packages/core/configurator.ts";
@@ -59,10 +60,12 @@ export const module: ErpModule = {
   id: "configurator",
   register({ coGet, coPost }) {
     // ------------------------------------------------------------ reading
-    coGet("/cfg/options", (c, co) => options(c, co));
+    // Costs (piece cost, grade cost adders and uplifts) only for those who may see them.
+    const guard = async <R>(c: Client, co: Company, p: string | null, v: R) => (await seesCost(c, co, p) ? v : scrubCost(v));
+    coGet("/cfg/options", async (c, co, _u, _m, p) => guard(c, co, p, await options(c, co)));
     coGet("/cfg/families", (c, co) => cfg.families(c, co.id));
-    coGet(`/cfg/families/${ID}`, (c, co, _u, m) => cfg.familyView(c, co.id, m[2]));
-    coGet("/cfg/grade-tables", (c, co) => cfg.gradeTables(c, co.id));
+    coGet(`/cfg/families/${ID}`, async (c, co, _u, m, p) => guard(c, co, p, await cfg.familyView(c, co.id, m[2])));
+    coGet("/cfg/grade-tables", async (c, co, _u, _m, p) => guard(c, co, p, await cfg.gradeTables(c, co.id)));
     coGet("/cfg/swatches", async (c, co, url) => {
       const p = url.searchParams;
       return (await cfg.swatches(c, co.id, { tableId: uuid(p.get("table")), grade: str(p.get("grade"), 12).toUpperCase() || null, colorFamily: str(p.get("color"), 20) || null,
@@ -70,7 +73,7 @@ export const module: ErpModule = {
     });
     coGet(`/cfg/swatches/${ID}/image`, (c, co, _u, m) => refuse(() => cfg.swatchImage(c, co.id, m[2], currentImageFetch())));
     coGet("/cfg/rules", (c, co, url) => cfg.rulesFor(c, co.id, uuid(url.searchParams.get("product"))));
-    coGet(`/cfg/orders/${ID}/sets`, (c, co, _u, m) => cfg.setsForOrder(c, co.id, m[2]));
+    coGet(`/cfg/orders/${ID}/sets`, async (c, co, _u, m, p) => guard(c, co, p, await cfg.setsForOrder(c, co.id, m[2])));
     coGet("/cfg/condition/rules", (c, co) => cfg.gradeRules(c, co.id));
     coGet(`/cfg/condition/${LABEL}`, (c, co, _u, m) => refuse(() => cfg.conditionOf(c, co.id, m[2])));
     coGet("/cfg/asis/report", (c, co, url) => cfg.asIsReport(c, co.id, { locationId: uuid(url.searchParams.get("location")) }));
@@ -78,11 +81,14 @@ export const module: ErpModule = {
 
     // ------------------------------------------------- pricing a build
     coPost("/cfg/price", async (c, co, a, b) => {
-      await requireRole(c, co, a, SELL, "pricing a sectional");
+      const held = await requireRole(c, co, a, SELL, "pricing a sectional");
       const build = sectionalBuild(b.sectional ?? b);
       need(build, "Choose a layout or the pieces.");
-      const priced = await refuse(() => cfg.priceBuild(c, co.id, uuid(b.productId) ?? "", build!));
-      return { ...cfg.pricedView(priced), svg: cfg.layoutSvg(priced.geometry) };
+      // A customer with a trade account is priced by its list, as the register will ring it.
+      const priceList = await priceListOf(c, co.id, uuid(b.customerId));
+      const priced = await refuse(() => cfg.priceBuild(c, co.id, uuid(b.productId) ?? "", build!, { priceList }));
+      const out = { ...cfg.pricedView(priced), priceList: priced.parts.find((x) => x.priceList)?.priceList ?? null, svg: cfg.layoutSvg(priced.geometry) };
+      return held.has("owner") || ["buyer", "controller", "store_manager"].some((r) => held.has(r)) ? out : scrubCost(out);
     });
 
     // ------------------------------------------------------- set-up

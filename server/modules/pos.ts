@@ -51,7 +51,7 @@ function lines(v: unknown): pos.LineIn[] {
     fulfillment: (str(l.fulfillment, 10) || undefined) as pos.Fulfil | undefined,
     discountMinor: l.discount != null && l.discount !== "" ? minor(l.discount) : undefined,
     discountBps: l.discountPct != null && l.discountPct !== "" ? Math.round(Number(l.discountPct) * 100) : undefined,
-    fulfilFromId: uuid(l.fulfilFromId), promisedOn: day(l.promisedOn), shipAddressId: uuid(l.shipAddressId), sectional: sectionalBuild(l.sectional) }));
+    fulfilFromId: uuid(l.fulfilFromId), promisedOn: day(l.promisedOn), shipAddressId: uuid(l.shipAddressId), sectional: sectionalBuild(l.sectional), asIsLabel: str(l.asIsLabel, 40) || null }));
 }
 /** A sectional build from a request: layout or piece codes, the cover, and each piece's options. */
 export function sectionalBuild(v: unknown): sectionals.Build | null {
@@ -200,7 +200,7 @@ export const module: ErpModule = {
 
     coPost("/pos/price", safe(async (c, co, a, b) => {
       await requireRole(c, co, a, SELL, "pricing an item");
-      const p = await priceConfigured(c, co.id, uuid(b.productId) ?? "", choices(b.choices));
+      const p = await priceConfigured(c, co.id, uuid(b.productId) ?? "", choices(b.choices), { priceList: await pos.priceListOf(c, co.id, uuid(b.customerId)) });
       return { unitPriceMinor: p.unitPriceMinor, description: p.description, leadDays: p.leadDays };
     }));
 

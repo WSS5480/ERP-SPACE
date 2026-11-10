@@ -11,6 +11,7 @@
 //   protection_checkin  N days (365) after delivery -> a protection plan check-in
 // The days and whether each rule runs are in entity_setting 'clienteling.followups'.
 
+import * as sectionals from "./configurator.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { priceConfigured, type Choice } from "./pricing.ts";
 
@@ -137,7 +138,8 @@ export async function removePhoto(c: Client, scope: Scope, id: string, photoId: 
   need(r.length, "No such photo on this project.");
 }
 
-export async function addItem(c: Client, scope: Scope, id: string, e: { productId: string; choices?: Choice[]; qty?: number; stage?: string; note?: unknown }, v: Viewer = {}) {
+export async function addItem(c: Client, scope: Scope, id: string, e: { productId: string; choices?: Choice[]; qty?: number; stage?: string; note?: unknown;
+  sectional?: sectionals.Build | null }, v: Viewer = {}) {
   await projectRow(c, scope.entityId, id, v);
   need(U.test(e.productId), "Pick a product.");
   const p = (await q<{ name: string; status: string }>(c, `select name, status from product where id = $1 and entity_id = $2`, [e.productId, scope.entityId]))[0];
@@ -148,10 +150,18 @@ export async function addItem(c: Client, scope: Scope, id: string, e: { productI
   need(qty >= 1 && qty <= 50, "Quantities run from 1 to 50.");
   const stage = e.stage ?? "considered";
   need((STAGES as readonly string[]).includes(stage), "An item is considered, quoted or bought.");
+  // A sectional keeps its build (layout or pieces, cover, options), checked like any sale; it is one set.
+  const family = await sectionals.isFamily(c, scope.entityId, e.productId);
+  if (family) {
+    need(e.sectional, `Choose the pieces and cover of the ${p.name}.`);
+    need(qty === 1, "A sectional goes on a project one at a time.");
+    try { await sectionals.priceBuild(c, scope.entityId, e.productId, e.sectional!); }
+    catch (er) { if (er instanceof sectionals.ConfigError) throw new ProjectError(er.message); throw er; }
+  }
   // The choices must be ones the product has (the configurator's rules).
-  if (e.choices?.length || stage !== "considered") await priceConfigured(c, scope.entityId, e.productId, e.choices ?? []);
-  return (await one<{ id: string }>(c, `insert into room_project_item (entity_id, project_id, product_id, choices, qty, stage, note) values ($1,$2,$3,$4,$5,$6,$7) returning id`,
-    [scope.entityId, id, e.productId, JSON.stringify(e.choices ?? []), qty, stage, clean(e.note, 300) || null])).id;
+  else if (e.choices?.length || stage !== "considered") await priceConfigured(c, scope.entityId, e.productId, e.choices ?? []);
+  return (await one<{ id: string }>(c, `insert into room_project_item (entity_id, project_id, product_id, choices, qty, stage, note, sectional) values ($1,$2,$3,$4,$5,$6,$7,$8) returning id`,
+    [scope.entityId, id, e.productId, JSON.stringify(e.choices ?? []), qty, stage, clean(e.note, 300) || null, family ? JSON.stringify(e.sectional) : null])).id;
 }
 
 export async function setItem(c: Client, scope: Scope, id: string, itemId: string, e: { stage?: string; qty?: number; remove?: boolean; salesOrderId?: string | null }, v: Viewer = {}) {
@@ -211,8 +221,9 @@ export async function project(c: Client, entityId: string, id: string, v: Viewer
       left join app_user u on u.id = p.salesperson_id left join crm_household h on h.id = p.household_id
      where p.id = $1 and p.entity_id = $2`, [id, entityId]))[0];
   if (!p || (v.tradeAccountId && p.trade_account_id !== v.tradeAccountId)) return null;
-  const items = await q<{ id: string; product_id: string; name: string; sku: string; choices: Choice[]; qty: number; stage: string; note: string | null; order_number: string | null }>(c, `
-    select i.id, i.product_id, pr.name, pr.sku, i.choices, i.qty, i.stage, i.note, so.number order_number
+  const items = await q<{ id: string; product_id: string; name: string; sku: string; choices: Choice[]; qty: number; stage: string; note: string | null; order_number: string | null;
+    sectional: sectionals.Build | null }>(c, `
+    select i.id, i.product_id, pr.name, pr.sku, i.choices, i.qty, i.stage, i.note, so.number order_number, i.sectional
       from room_project_item i join product pr on pr.id = i.product_id left join sales_order so on so.id = i.sales_order_id
      where i.entity_id = $1 and i.project_id = $2 and i.removed_at is null order by i.created_at`, [entityId, id]);
   const priced = [];
@@ -221,12 +232,17 @@ export async function project(c: Client, entityId: string, id: string, v: Viewer
     let unit: bigint | null = null, description = it.name, problem: string | null = null;
     try {
       await c.query("savepoint proj_price");
-      const pr = await priceConfigured(c, entityId, it.product_id, it.choices, { priceList });
+      if (it.sectional) {
+        const pb = await sectionals.priceBuild(c, entityId, it.product_id, it.sectional, { priceList });
+        unit = pb.totalMinor; description = pb.description;
+      } else {
+        const pr = await priceConfigured(c, entityId, it.product_id, it.choices, { priceList });
+        unit = pr.unitPriceMinor; description = pr.description;
+      }
       await c.query("release savepoint proj_price");
-      unit = pr.unitPriceMinor; description = pr.description;
     } catch (e) { await c.query("rollback to savepoint proj_price"); problem = (e as Error).message; }
     if (unit != null) total += unit * BigInt(it.qty);
-    priced.push({ id: it.id, productId: it.product_id, name: it.name, sku: v.tradeAccountId ? undefined : it.sku, description, choices: it.choices, qty: it.qty,
+    priced.push({ id: it.id, productId: it.product_id, name: it.name, sku: v.tradeAccountId ? undefined : it.sku, description, choices: it.choices, sectional: it.sectional, qty: it.qty,
       stage: it.stage, note: it.note, orderNumber: it.order_number, unitPriceMinor: unit?.toString() ?? null, lineMinor: unit == null ? null : (unit * BigInt(it.qty)).toString(), problem });
   }
   const photos = await q(c, `select id, data_url, caption, created_at from room_project_photo where entity_id = $1 and project_id = $2 and removed_at is null order by created_at`, [entityId, id]);

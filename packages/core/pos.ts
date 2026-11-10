@@ -15,7 +15,7 @@
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor } from "./posting.ts";
 import { priceConfigured, type Choice } from "./pricing.ts";
-import { reserveOrder, reserveLines, fulfilLines, releaseLines, restock, returnToDamage, unitCost } from "./inventory.ts";
+import { reserveOrder, reserveLines, fulfilLines, releaseLines, restock, returnToDamage, unitCost, allocate } from "./inventory.ts";
 import * as tax from "./tax.ts";
 import * as fleet from "./fleet.ts";
 import * as wms from "./wms.ts";
@@ -205,7 +205,9 @@ export async function closeSession(c: Client, scope: Scope, sessionId: string, e
 export type LineIn = { productId: string; qty: number; choices?: Choice[]; fulfillment?: Fulfil; discountMinor?: bigint; discountBps?: number;
   fulfilFromId?: string | null; promisedOn?: string | null; shipAddressId?: string | null;
   /** a sectional family: the layout or pieces and the cover; it sells as one configured line made of a line per piece */
-  sectional?: sectionals.Build | null };
+  sectional?: sectionals.Build | null;
+  /** an as-is (graded) piece, by its label: it rings at its graded tag price and that very piece goes out */
+  asIsLabel?: string | null };
 
 export type OrderIn = { kind: "sale" | "quote" | "layaway"; locationId: string; customerId?: string | null; sessionId?: string | null;
   lines: LineIn[]; salespeople?: { id: string; splitBps: number }[]; taxExemptRef?: string | null; notes?: string;
@@ -266,7 +268,16 @@ async function sourceFor(c: Client, entityId: string, productId: string, storeId
 }
 
 type Ctx = { entityId: string; orderId: string; customerId: string | null; storeId: string; cert: tax.Cert | null; sourcing: tax.Sourced; settings: Settings;
-  defaultAddress: string | null; defaultPromised: string | null; actorId: string; managerReason: string | null; kind: string };
+  defaultAddress: string | null; defaultPromised: string | null; actorId: string; managerReason: string | null; kind: string;
+  /** the customer's price list (an active trade account's), which prices every line */
+  priceList: string | null };
+
+/** The price list a customer buys on: their trade account's, while the account is active. */
+export async function priceListOf(c: Client, entityId: string, customerId: string | null): Promise<string | null> {
+  if (!customerId || !(await hasRelation(c, "trade_account"))) return null;
+  return (await q<{ code: string }>(c, `select pl.code from trade_account t join price_list pl on pl.id = t.price_list_id and pl.entity_id = t.entity_id and pl.active
+    where t.entity_id = $1 and t.customer_id = $2 and t.status = 'active' order by t.created_at limit 1`, [entityId, customerId]))[0]?.code ?? null;
+}
 
 /**
  * How a line goes when the salesperson did not say: a fee rides on the
@@ -307,10 +318,10 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
     if (family) {
       need(ln.sectional && (ln.sectional.layout || ln.sectional.pieces?.length), `${base[0].name} is built from pieces: choose a layout or the pieces, and the cover`);
       need(qty === 1, "a sectional is sold one at a time; add it again for a second one");
-      try { sectional = await sectionals.priceBuild(c, ctx.entityId, ln.productId, ln.sectional!); }
+      try { sectional = await sectionals.priceBuild(c, ctx.entityId, ln.productId, ln.sectional!, { priceList: ctx.priceList }); }
       catch (e) { if (e instanceof sectionals.ConfigError) throw new PosError(e.message); throw e; }
     }
-    const cfgd = family ? null : await priceConfigured(c, ctx.entityId, ln.productId, ln.choices ?? []);
+    const cfgd = family ? null : await priceConfigured(c, ctx.entityId, ln.productId, ln.choices ?? [], { priceList: ctx.priceList });
     // A package sells as its components, the package price spread over them by their own prices.
     type Part = { productId: string; sku: string; description: string; kind: string; taxable: boolean; qty: number; gross: bigint; unitCost: bigint;
       listPrice: bigint; config: unknown; packageSku: string | null; shipClass: string; special?: boolean };
@@ -339,6 +350,23 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
       parts = [{ productId: cfg.productId, sku: cfg.sku, description: cfg.description, kind: base[0].kind, taxable: base[0].taxable, qty,
         gross: BigInt(Math.round(qty * Number(cfg.unitPriceMinor))), unitCost: cfg.unitCostMinor, listPrice: cfg.unitPriceMinor, config: cfg.config, packageSku: null, shipClass: base[0].ship_class }];
     }
+    // An as-is piece rings at its graded tag price, from where it stands; checkout puts that piece on the line.
+    let asIs: { label: string; location_id: string } | null = null;
+    if (ln.asIsLabel) {
+      need(!family && base[0].kind === "stock" && parts.length === 1, "only a single stocked product is sold as an as-is piece");
+      need(qty === 1, "an as-is piece is sold one at a time");
+      const u = (await q<{ label: string; status: string; line: string | null; location_id: string; price: string | null; grade: string | null }>(c, `
+        select x.label, x.status, x.sales_order_line_id line, x.location_id, coalesce(ic.price_minor, x.as_is_price_minor)::text price, ic.grade
+          from inv_piece x left join inv_condition ic on ic.entity_id = x.entity_id and ic.unit_id = x.unit_id and ic.superseded_at is null
+         where x.entity_id = $1 and x.product_id = $2 and upper(x.label) = upper($3) order by x.carton_seq limit 1`, [ctx.entityId, ln.productId, String(ln.asIsLabel).trim()]))[0];
+      need(u, `${ln.asIsLabel} is not a piece of ${base[0].name}`);
+      need(["as_is", "in_stock"].includes(u.status) && !u.line, `${u.label} is ${u.status.replace(/_/g, " ")}${u.line ? " and on another order" : ""}; it cannot be sold as is`);
+      need(u.price != null, `${u.label} has no as-is price yet; grade it first`);
+      const words = u.grade ? sectionals.CONDITION_WORDS[u.grade] : "as is";
+      parts[0] = { ...parts[0], gross: BigInt(u.price!), listPrice: BigInt(u.price!), description: `${parts[0].description} — as is, ${words.toLowerCase()} (${u.label})`,
+        config: { ...(parts[0].config as Record<string, unknown>), asIs: { label: u.label, grade: u.grade } } };
+      asIs = { label: u.label, location_id: u.location_id };
+    }
     const firstId = ids.length;
     const lineGross = parts.reduce((a, p) => a + p.gross, 0n);
     let discount = ln.discountMinor ?? 0n;
@@ -349,7 +377,8 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
     const discBps = lineGross > 0n ? Number((discount * 10000n) / lineGross) : 0;
     if (discBps > ctx.settings.discountLimitBps) why.push(`${pct(discBps)} off is past the ${pct(ctx.settings.discountLimitBps)} limit`);
     const costTotal = parts.reduce((a, p) => a + (STOCKED.includes(p.kind) ? BigInt(Math.round(p.qty * Number(p.unitCost))) : 0n), 0n);
-    if (costTotal > 0n && lineGross - discount < costTotal) why.push(`${usd(lineGross - discount)} is below cost (${usd(costTotal)})`);
+    // An as-is piece's price was set by its grade (or by a manager, with a reason): it is not a below-cost sale.
+    if (costTotal > 0n && lineGross - discount < costTotal && !(asIs && discount === 0n)) why.push(`${usd(lineGross - discount)} is below cost (${usd(costTotal)})`);
     let left = discount;
     const isPackage = parts.length > 1 || parts[0].packageSku;
     for (const [i, p] of parts.entries()) {
@@ -373,7 +402,7 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
         const a = await q(c, `select id from customer_address where id = $1 and entity_id = $2 and customer_id = $3`, [shipAddr, ctx.entityId, ctx.customerId]);
         need(a.length, "that address is not one of this customer's");
       }
-      const from = stocked ? (ln.fulfilFromId ?? await sourceFor(c, ctx.entityId, p.productId, ctx.storeId, p.qty, f)) : null;
+      const from = stocked ? (asIs ? asIs.location_id : ln.fulfilFromId ?? await sourceFor(c, ctx.entityId, p.productId, ctx.storeId, p.qty, f)) : null;
       if (from) {
         const okLoc = await q(c, `select id from location where id = $1 and entity_id = $2 and status = 'active'`, [from, ctx.entityId]);
         need(okLoc.length, "no such location to fulfil from");
@@ -466,6 +495,14 @@ async function ensureDeliveryFee(c: Client, ctx: Ctx) {
   return { lineId: row.id, feeMinor: fee.feeMinor, zone: fee.zone };
 }
 
+/** An as-is piece sold by its label: once its line is reserved, that very piece is put on it (not the oldest free one). */
+async function allocateAsIs(c: Client, scope: Scope, orderId: string) {
+  const ls = await q<{ id: string; label: string; sku: string }>(c, `select l.id, l.config->'asIs'->>'label' label, l.sku from sales_order_line l
+    where l.entity_id = $1 and l.sales_order_id = $2 and l.line_status = 'reserved' and l.config ? 'asIs'
+      and not exists (select 1 from inv_piece x where x.entity_id = l.entity_id and x.sales_order_line_id = l.id)`, [scope.entityId, orderId]);
+  for (const l of ls) await allocate(c, scope, l.label, l.id);
+}
+
 /** The order header follows its lines: delivery if any line is delivered, the earliest promise, the totals. */
 async function refreshHeader(c: Client, entityId: string, orderId: string) {
   await c.query(`
@@ -537,7 +574,7 @@ export async function createOrder(c: Client, scope: Scope, roles: Set<string>, e
   await c.query(`update sales_order set salesperson_id = $3 where id = $1 and entity_id = $2`, [so.id, scope.entityId, primary]);
   const isManager = MANAGERS.some((r) => roles.has(r));
   const ctx: Ctx = { entityId: scope.entityId, orderId: so.id, customerId: customer?.id ?? null, storeId: loc.id, cert, sourcing: await tax.sourcing(c, scope.entityId), settings: set,
-    defaultAddress: addr, defaultPromised: e.promisedOn ?? null, actorId: scope.actor.id!, kind: e.kind,
+    defaultAddress: addr, defaultPromised: e.promisedOn ?? null, actorId: scope.actor.id!, kind: e.kind, priceList: await priceListOf(c, scope.entityId, customer?.id ?? null),
     managerReason: isManager && String(e.overrideReason ?? "").trim() ? String(e.overrideReason).trim() : null };
   const r = await insertLines(c, scope, ctx, e.lines);
   const fee = await ensureDeliveryFee(c, ctx);
@@ -555,6 +592,7 @@ async function ctxFor(c: Client, scope: Scope, roles: Set<string>, o: OrderRow, 
   const cert = o.tax_exempt_ref && o.customer_id ? await tax.certificateFor(c, scope.entityId, o.customer_id, o.tax_exempt_ref, today(), loc.state) : null;
   return { entityId: scope.entityId, orderId: o.id, customerId: o.customer_id, storeId: o.location_id, cert, sourcing: await tax.sourcing(c, scope.entityId),
     settings: await settings(c, scope.entityId), defaultAddress: o.ship_address_id, defaultPromised: o.promised_on, actorId: scope.actor.id!, kind: o.kind,
+    priceList: await priceListOf(c, scope.entityId, o.customer_id),
     managerReason: isManager && String(reason ?? "").trim() ? String(reason).trim() : null };
 }
 
@@ -901,6 +939,7 @@ export async function checkout(c: Client, scope: Scope, orderId: string, e: { se
   await c.query(`update sales_order set status = 'open', ordered_at = now() where id = $1 and entity_id = $2`, [orderId, scope.entityId]);
   await c.query(`update pos_order set register_session_id = coalesce($3, register_session_id) where sales_order_id = $1 and entity_id = $2`, [orderId, scope.entityId, e.sessionId]);
   const res = await reserveOrder(c, scope.entityId, orderId);
+  await allocateAsIs(c, scope, orderId);
   const carry = await q<{ id: string; seq: number; sku: string; line_status: string; kind: string | null }>(c, `
     select l.id, l.seq, l.sku, l.line_status, p.kind from sales_order_line l join pos_line pl on pl.sales_order_line_id = l.id
       left join product p on p.id = l.product_id

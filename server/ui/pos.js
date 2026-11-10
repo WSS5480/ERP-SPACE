@@ -101,7 +101,8 @@
         acts: cart.addressId ? [pick, cart.delivery ? el('button', { class: 'btn small', type: 'button', onclick: () => { cart.delivery = null; drawDelivery(); } }, 'Clear') : null].filter(Boolean) : null })));
     }
     function deliveryDialog() {
-      const items = cart.lines.filter((l) => l.fulfillment === 'delivery').map((l) => `${l.productId}:${l.qty}`).join(',');
+      // a sectional goes on the truck as its pieces, each with its own cube and weight
+      const items = cart.lines.filter((l) => l.fulfillment === 'delivery').flatMap((l) => (l.pieceIds && l.pieceIds.length ? l.pieceIds.map((id) => `${id}:1`) : [`${l.productId}:${l.qty}`])).join(',');
       pickDayDialog({ addressId: cart.addressId, items, sub: cart.customer ? cart.customer.name : '', onPick: (x, zone) => {
         cart.delivery = { day: x.day, windowId: x.windowId, label: x.label, zone }; cart.promisedOn = x.day; drawDelivery(); E.render(); } });
     }
@@ -220,7 +221,7 @@
       shipAddressId: cart.addressId || null, promisedOn: cart.promisedOn || null,
       delivery: cart.delivery ? { day: cart.delivery.day, windowId: cart.delivery.windowId } : null, taxExemptRef: cart.taxExemptRef || null, notes: cart.notes, overrideReason: cart.overrideReason || undefined,
       salespeople: cart.second && cart.second !== cart.primary ? [{ id: cart.primary, splitPct: 100 - cart.secondPct }, { id: cart.second, splitPct: cart.secondPct }] : cart.primary ? [{ id: cart.primary, splitPct: 100 }] : [],
-      lines: cart.lines.map((l) => ({ productId: l.productId, qty: l.qty, choices: l.choices, sectional: l.sectional || undefined, fulfillment: l.fulfillment, discountPct: l.discountPct || undefined })) }),
+      lines: cart.lines.map((l) => ({ productId: l.productId, qty: l.qty, choices: l.choices, sectional: l.sectional || undefined, asIsLabel: l.asIsLabel || undefined, fulfillment: l.fulfillment, discountPct: l.discountPct || undefined })) }),
       null, async (r) => {
         const k = cart.kind, hold = cart.hold;
         if (k === 'quote' && hold) {
@@ -245,7 +246,7 @@
 
   /** A sectional: the builder, then one configured cart line (the register writes a line per piece). */
   function addSectional(p, after) {
-    E.sectionalDialog({ productId: p.id, title: p.name, actLabel: 'Add to cart',
+    E.sectionalDialog({ productId: p.id, title: p.name, actLabel: 'Add to cart', customerId: cart.customer ? cart.customer.id : null,
       extra: () => {
         const ful = select([['delivery', FUL.delivery], ['pickup', FUL.pickup]], 'delivery');
         const disc = input({ inputmode: 'decimal', placeholder: '0' });
@@ -254,7 +255,7 @@
       onAdd: (build, priced, ex) => {
         const pct = Number(ex.disc.value) || 0;
         cart.lines.push({ productId: p.id, name: p.name, sku: p.sku, desc: `${priced.layoutName}${priced.cover ? ', ' + priced.cover.name : ''} · ${priced.widthIn}" × ${priced.depthIn}"`,
-          qty: 1, choices: {}, sectional: build, fulfillment: ex.ful.value, discountPct: pct, estimate: Math.round(Number(priced.totalMinor) * (1 - pct / 100)) });
+          qty: 1, choices: {}, sectional: build, pieceIds: priced.pieces.map((x) => x.productId), fulfillment: ex.ful.value, discountPct: pct, estimate: Math.round(Number(priced.totalMinor) * (1 - pct / 100)) });
         after();
       } });
   }
@@ -275,7 +276,7 @@
       const reprice = async () => {
         const choices = {};
         for (const x of pickers) if (x.sel.value) choices[x.g.code] = x.sel.value;
-        try { const r = await post('/pos/price', { productId: p.id, choices }); unit = Number(r.unitPriceMinor); desc = r.description; price.textContent = money(unit) + (r.leadDays ? ` · ${r.leadDays} days lead` : ''); }
+        try { const r = await post('/pos/price', { productId: p.id, choices, customerId: cart.customer ? cart.customer.id : undefined }); unit = Number(r.unitPriceMinor); desc = r.description; price.textContent = money(unit) + (r.leadDays ? ` · ${r.leadDays} days lead` : ''); }
         catch (e) { price.textContent = friendly(e); }
         return choices;
       };
@@ -287,7 +288,12 @@
         d.close(); after();
       } }, 'Add to cart');
       const asIs = (full.asIs || []).length ? section('As-is pieces', 'Condition grade and tag price', null, el('div', { class: 'panel' }, full.asIs.map((x) =>
-        item({ title: `${x.label} · ${x.gradeWords}`, amount: x.price_minor ? money(x.price_minor) : null, detail: `${x.location} · ${words(x.status)}` })))) : null;
+        item({ title: `${x.label} · ${x.gradeWords}`, amount: x.price_minor ? money(x.price_minor) : null, detail: `${x.location} · ${words(x.status)}`,
+          acts: x.price_minor && x.status === 'as_is' ? [el('button', { class: 'btn small', type: 'button', onclick: () => {
+            cart.lines.push({ productId: p.id, name: p.name, sku: p.sku, desc: `As is, ${x.gradeWords.toLowerCase()} (${x.label})`, qty: 1, choices: {}, asIsLabel: x.label,
+              fulfillment: x.location === store.name ? 'carry' : 'pickup', discountPct: 0, estimate: Number(x.price_minor) });
+            d.close(); after();
+          } }, 'Sell this piece')] : null })))) : null;
       return frag(el('p', { class: 'lead', text: stocked ? `${Number(p.here)} free here at ${store.name || 'this store'}, ${Number(p.everywhere)} across every location.` : '' }), asIs,
         el('div', { class: 'form-grid' }, pickers.map((x) => field(x.g.label, x.sel)), field('Quantity', qty), field('How it goes', ful), field('Discount %', disc, { hint: 'Past the limit needs a manager.' })),
         el('p', {}, 'Price ', price), el('div', { class: 'dlg-acts' }, add, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')));

@@ -12,7 +12,7 @@
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { priceConfigured, listPrice, PricingError, checkOptionRules, optionRules, type Choice, type OptionRule } from "./pricing.ts";
 import { imageByUrl, code128, createProduct, updateProduct, CatalogError, type ImageFetch } from "./catalog.ts";
-import { pieceAction, setAsIsPrice, InventoryError } from "./inventory.ts";
+import { pieceAction, setAsIsPrice, setLotClass, InventoryError } from "./inventory.ts";
 
 export class ConfigError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new ConfigError(msg); };
@@ -200,6 +200,8 @@ export type Part = {
   config: Record<string, unknown>;
   /** the price list that priced the piece (a trade account's), and its retail before the list */
   priceList?: string | null; retailMinor?: bigint;
+  /** the least this piece may sell for at retail (MAP plus its grade and options), when it has a MAP */
+  mapFloorMinor?: bigint | null;
 };
 export type Priced = {
   familyId: string; familySku: string; familyName: string; layoutCode: string | null; layoutName: string;
@@ -281,7 +283,12 @@ export async function priceBuild(c: Client, entityId: string, familyId: string, 
   for (const [i, p] of chosen.entries()) {
     const base = await relay(() => priceConfigured(c, entityId, p.product_id, []));
     const add = adders.find((a) => a.piece_type === p.piece_type);
+    // A trade account's list price for the bare piece: a percent grade goes on that, not on retail.
+    const cat = popts.priceList ? (await q<{ category: string | null }>(c, `select category from product where id = $1 and entity_id = $2`, [p.product_id, entityId]))[0]?.category ?? null : null;
+    const lpBase = popts.priceList ? await listPrice(c, entityId, popts.priceList, { productId: p.product_id, category: cat, ticketMinor: base.unitPriceMinor, costMinor: base.unitCostMinor }) : null;
+    const listBase = lpBase && lpBase.priceMinor < base.unitPriceMinor ? lpBase.priceMinor : null;
     const gAdd = !grade ? 0n : add ? BigInt(add.price_adder_minor) : bps(base.unitPriceMinor, grade.uplift_bps);
+    const gAddList = !grade ? 0n : add ? BigInt(add.price_adder_minor) : bps(listBase ?? base.unitPriceMinor, grade.uplift_bps);
     const gCost = !grade ? 0n : add ? BigInt(add.cost_adder_minor) : bps(base.unitCostMinor, grade.cost_uplift_bps);
     const choices = (build.pieceOptions?.[i] ?? []).filter((ch) => ch && ch.group && ch.option && (!Array.isArray(ch.option) || ch.option.length));
     const picked = new Map<string, string[]>();
@@ -312,10 +319,12 @@ export async function priceBuild(c: Client, entityId: string, familyId: string, 
     const retail = gross;
     let listed: string | null = null;
     if (popts.priceList) {
-      const cat = (await q<{ category: string | null }>(c, `select category from product where id = $1 and entity_id = $2`, [p.product_id, entityId]))[0]?.category ?? null;
-      const lp = await listPrice(c, entityId, popts.priceList, { productId: p.product_id, category: cat, ticketMinor: gross, costMinor: cost, optionsDeltaMinor: gAdd + oPrice });
+      // A list price for the piece takes the grade (on the list price) and the options on top; a list rule prices the configured piece.
+      const lp = await listPrice(c, entityId, popts.priceList, { productId: p.product_id, category: cat, ticketMinor: gross, costMinor: cost, optionsDeltaMinor: gAddList + oPrice });
       if (lp && lp.priceMinor < gross) { gross = lp.priceMinor; listed = lp.code; }
     }
+    // Retail stays at or above MAP (plus the grade and options) when the piece has one; a trade list is not advertised.
+    const mapFloor = !listed && base.mapMinor != null ? base.mapMinor + gAdd + oPrice : null;
     const special = !cover || !cover.stock || chosenOpts.length > 0;
     const desc = [cover ? `${cover.name} (grade ${cover.grade})` : null, ...chosenOpts.map((o) => o.label)].filter(Boolean).join(", ");
     parts.push({
@@ -323,16 +332,19 @@ export async function priceBuild(c: Client, entityId: string, familyId: string, 
       pieceCode: p.code, pieceType: p.piece_type, position: i + 1, kind: p.kind, taxable: p.taxable, shipClass: p.ship_class,
       cubicFt: Number(p.cubic_ft ?? 0), weightLb: Number(p.weight_lb ?? 0),
       baseMinor: base.unitPriceMinor, gradeAdderMinor: gAdd, optionsMinor: oPrice, grossMinor: gross, bundleShareMinor: 0n, netMinor: gross, costMinor: cost,
-      leadDays: lead, special, options: chosenOpts, config: {}, priceList: listed, retailMinor: retail,
+      leadDays: lead, special, options: chosenOpts, config: {}, priceList: listed, retailMinor: retail, mapFloorMinor: mapFloor,
     });
   }
   const list = parts.reduce((a, x) => a + x.grossMinor, 0n);
   const bundleOn = fam!.bundle_discount_bps > 0 && parts.length >= fam!.bundle_min_pieces;
-  const bundle = bundleOn ? bps(list, fam!.bundle_discount_bps) : 0n;
-  let left = bundle;
+  const want = bundleOn ? bps(list, fam!.bundle_discount_bps) : 0n;
+  // The bundle discount comes after any trade list price and any promotion, and never takes a piece below its MAP.
+  let left = want, bundle = 0n;
   for (const [i, x] of parts.entries()) {
-    const share = i === parts.length - 1 ? left : list > 0n ? (bundle * x.grossMinor) / list : 0n;
+    let share = i === parts.length - 1 ? left : list > 0n ? (want * x.grossMinor) / list : 0n;
     left -= share;
+    if (x.mapFloorMinor != null && x.grossMinor - share < x.mapFloorMinor) share = x.grossMinor > x.mapFloorMinor ? x.grossMinor - x.mapFloorMinor : 0n;
+    bundle += share;
     x.bundleShareMinor = share; x.netMinor = x.grossMinor - share;
     x.config = {
       cfg: { family: fam!.sku, piece: x.pieceCode, type: x.pieceType, position: x.position, of: parts.length, layout: layoutName,
@@ -360,7 +372,7 @@ export function pricedView(p: Priced, forWeb = false) {
     ...(forWeb ? {} : { costMinor: p.costMinor.toString() }),
     widthIn: p.geometry.widthIn, depthIn: p.geometry.depthIn, seats: p.geometry.seats, geometry: p.geometry, leadDays: p.leadDays, madeToOrder: p.special,
     cubicFt: Math.round(p.parts.reduce((a, x) => a + x.cubicFt, 0) * 10) / 10, weightLb: Math.round(p.parts.reduce((a, x) => a + x.weightLb, 0)),
-    pieces: p.parts.map((x) => ({ position: x.position, code: x.pieceCode, type: x.pieceType, sku: x.sku, name: x.name, priceMinor: x.grossMinor.toString(),
+    pieces: p.parts.map((x) => ({ position: x.position, productId: x.productId, code: x.pieceCode, type: x.pieceType, sku: x.sku, name: x.name, priceMinor: x.grossMinor.toString(),
       baseMinor: x.baseMinor.toString(), gradeAdderMinor: x.gradeAdderMinor.toString(), optionsMinor: x.optionsMinor.toString(), netMinor: x.netMinor.toString(),
       madeToOrder: x.special, options: x.options.map((o) => ({ group: o.group, code: o.code, label: o.label, deltaMinor: o.deltaMinor })),
       ...(forWeb ? {} : { costMinor: x.costMinor.toString() }) })),
@@ -582,9 +594,14 @@ export async function savePiece(c: Client, s: Scope, x: PieceIn): Promise<string
   } else if (Object.values(fields).some((v) => v !== undefined)) {
     await relay(() => updateProduct(c, s, pid!, Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined))));
   }
-  const p = (await q<{ kind: string; name: string }>(c, `select kind, name from product where id = $1 and entity_id = $2`, [pid, s.entityId]))[0];
+  const p = (await q<{ kind: string; name: string; lot_class: string | null }>(c, `select kind, name, lot_class from product where id = $1 and entity_id = $2`, [pid, s.entityId]))[0];
   need(p, "No such product.");
   need(p.kind === "stock", `${p.name} is ${p.kind.replace("_", " ")}; a sectional piece is a stock SKU of its own.`);
+  // Upholstery and leather are matched by dye lot: a piece takes its family's lot class (dye lot when the family names none).
+  if (!p.lot_class) {
+    const famClass = (await q<{ lot_class: string | null }>(c, `select lot_class from product where id = $1 and entity_id = $2`, [x.familyId, s.entityId]))[0]?.lot_class ?? "dye_lot";
+    await relay(() => setLotClass(c, s, pid!, { lotClass: famClass }));
+  }
   const r = await one<{ id: string }>(c, `
     insert into sectional_piece (entity_id, family_id, product_id, code, piece_type, motion, width_in, depth_in, height_in, seats, active, seq)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, coalesce((select max(seq) + 1 from sectional_piece where entity_id = $1 and family_id = $2), 1))

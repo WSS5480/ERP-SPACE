@@ -295,6 +295,106 @@ export async function run(t: T) {
     const np = await R.post(t, MARIA, "/cfg/price", { productId: nf.id, sectional: { layout: "2pc" } }) as Priced;
     t.ok("set-up: a family made through the routes, with its pieces as new SKUs, prices its layout", np.totalMinor === "100000" && np.widthIn === 120 && np.seats === 4 && np.cover === null);
 
+    // ============================================================ review fixes
+    // ---- MAP: the bundle discount never takes a piece below its MAP (plus grade and options)
+    await read(`update product set map_minor = 54000 where id = $1 and entity_id = $2`, [PIECE.WG, ENTITY]);
+    const mp = await price(MGR, layout3);
+    await read(`update product set map_minor = null where id = $1 and entity_id = $2`, [PIECE.WG, ENTITY]);
+    const wgPiece = mp.pieces.find((x) => x.code === "wedge")!;
+    t.ok("MAP: the wedge's share of the bundle discount stops at its MAP; the other pieces keep theirs", wgPiece.netMinor === "54000"
+      && BigInt(mp.bundleDiscountMinor) === BigInt(mp.listMinor) - BigInt(mp.totalMinor) && BigInt(mp.bundleDiscountMinor) < 11735n, `${wgPiece.netMinor} ${mp.bundleDiscountMinor}`);
+    t.ok("costs: a store manager sees piece costs; sales does not", "costMinor" in mp && "costMinor" in mp.pieces[0] && !("costMinor" in nv) && !("costMinor" in nv.pieces[0]));
+    const famRead = await R.get(t, `/cfg/families/${FAM}`) as { pieces: Record<string, unknown>[] };
+    t.ok("costs: the family read hides piece costs from a reader who is not a buyer, manager or controller", famRead.pieces.length > 0 && famRead.pieces.every((x) => !("costMinor" in x)));
+
+    // ---- trade pricing: the list prices each piece, the grade % goes on the list price, the bundle after
+    const tradeList = (await read<{ id: string }>(`select id from price_list where entity_id = $1 and code = 'TRADE'`, [ENTITY]))[0].id;
+    const tcust = (await read<{ id: string }>(`insert into customer (entity_id, number, name, email, kind) values ($1, 'C-CFG-TRADE', 'Cfg Design Studio', 'cfg-trade@example.com', 'business') returning id /* unscoped: test set-up insert */`, [ENTITY]))[0].id;
+    await read(`insert into customer_address (entity_id, customer_id, label, line1, city, state, postal, is_default) values ($1,$2,'Studio','5 Market St','Camp Hill','PA','17011',true) /* unscoped: test set-up insert */`, [ENTITY, tcust]);
+    const tacct = (await read<{ id: string }>(`insert into trade_account (entity_id, number, customer_id, company_name, kind, contact_name, email, price_list_id)
+      values ($1, 'TA-CFG-1', $2, 'Cfg Design Studio', 'designer', 'Dana Cfg', 'cfg-trade@example.com', $3) returning id /* unscoped: test set-up insert */`, [ENTITY, tcust, tradeList]))[0].id;
+    await read(`insert into price_list_item (entity_id, price_list_id, product_id, price_minor) values ($1,$2,$3,70000)
+      on conflict (price_list_id, product_id) do update set price_minor = 70000 /* unscoped: test set-up insert */`, [ENTITY, tradeList, PIECE.LS]);
+    const tp = await tx(sys, (c) => cfg.priceBuild(c, ENTITY, FAM, { ...layout3, cover: "stone-boucle" }, { priceList: "TRADE" }));
+    const [tLS, tWG, tRL] = tp.parts;
+    t.ok("trade: a piece with a list price takes the percent grade on the list price (70.00 + 20%), not on retail", tLS.grossMinor === 84000n && tLS.priceList === "TRADE", String(tLS.grossMinor));
+    t.ok("trade: a piece priced by the list's rule (living room: cost + 35%) prices the graded piece", tWG.grossMinor === (30000n * 13500n + 5000n) / 10000n && tRL.grossMinor === (43200n * 13500n + 5000n) / 10000n,
+      `${tWG.grossMinor} ${tRL.grossMinor}`);
+    t.ok("trade: the bundle discount comes after the trade prices", tp.listMinor === tLS.grossMinor + tWG.grossMinor + tRL.grossMinor && tp.bundleDiscountMinor === (tp.listMinor * 500n + 5000n) / 10000n);
+    const tAddr = (await read<{ id: string }>(`select id from customer_address where entity_id = $1 and customer_id = $2`, [ENTITY, tcust]))[0].id;
+    const ts = await RP.post(t, MARIA, "/pos/orders", { kind: "quote", locationId: LOC.ENOLA, customerId: tcust, shipAddressId: tAddr, promisedOn: plus(30),
+      lines: [{ productId: FAM, qty: 1, fulfillment: "delivery", sectional: { ...layout3, cover: "stone-boucle" } }, { productId: "77777777-0000-0000-0000-000000000009", qty: 1, fulfillment: "carry" }] }) as { id: string };
+    const tsl = await orderLines(ts.id);
+    const lamp = (await tx(sys, (c) => import("../../packages/core/pricing.ts").then((m) => m.priceConfigured(c, ENTITY, "77777777-0000-0000-0000-000000000009", [], { priceList: "TRADE" })))).unitPriceMinor;
+    t.ok("trade at the register: a trade customer's sectional rings at the trade price, piece by piece", tsl.filter((l) => Object.values(PIECE).includes(l.product_id))
+      .reduce((a, l) => a + BigInt(l.unit_price_minor), 0n) === tp.totalMinor, tsl.map((l) => l.unit_price_minor).join(","));
+    t.ok("trade at the register: any other product rings at the customer's list price too", BigInt(tsl.find((l) => l.product_id === "77777777-0000-0000-0000-000000000009")!.unit_price_minor) === lamp && lamp < 5999n);
+    const tq = await price(MARIA, { ...layout3, cover: "stone-boucle" });
+    const tqc = await R.post(t, MARIA, "/cfg/price", { productId: FAM, customerId: tcust, sectional: { ...layout3, cover: "stone-boucle" } }) as Priced & { priceList: string | null };
+    t.ok("trade at the register: the builder prices by the customer's list when the customer has one", tqc.totalMinor === tp.totalMinor.toString() && tqc.priceList === "TRADE" && tq.totalMinor !== tqc.totalMinor);
+
+    // ---- a room project with a sectional can be ordered
+    const projects = await import("../../packages/core/projects.ts");
+    const trade = await import("../../packages/core/trade.ts");
+    const tscope = { tenantId: TENANT, entityId: ENTITY, actor: sys };
+    const proj = await tx(sys, (c) => projects.createProject(c, tscope, { name: "Den", customerId: tcust, tradeAccountId: tacct }));
+    const projId = typeof proj === "string" ? proj : (proj as { id: string }).id;
+    await t.throws("project: a sectional goes on a project with its build", () => tx(sys, (c) => projects.addItem(c, tscope, projId, { productId: FAM })), /Choose the pieces and cover/);
+    await tx(sys, (c) => projects.addItem(c, tscope, projId, { productId: FAM, sectional: { ...layout3, cover: "stone-boucle" } }));
+    const pv2 = await tx(sys, (c) => projects.project(c, ENTITY, projId, {}, "TRADE"));
+    t.ok("project: the sectional item keeps its build and is priced at the trade price", pv2!.items[0].sectional?.cover === "stone-boucle" && pv2!.items[0].unitPriceMinor === tp.totalMinor.toString());
+    const session = { accountId: tacct, customerId: tcust, entityId: ENTITY, priceList: "TRADE", company: "Cfg Design Studio", email: "cfg-trade@example.com", contact: "Dana Cfg", repId: null };
+    const site2 = await tx(sys, async (c) => (await shop.siteBySlug(c, "buddys"))!);
+    const pq2 = await tx(sys, (c) => trade.quoteOrder(c, site2, session, { projectId: projId, fulfillment: "delivery", shipTo: "address", payBy: "card", cartId: "cfg-proj-0001",
+      address: { line1: "5 Market St", city: "Camp Hill", state: "PA", postal: "17011" } }));
+    const pieceLines = (pq2.lines as { productId: string; unitPriceMinor: string }[]).filter((l) => Object.values(PIECE).includes(l.productId));
+    t.ok("project: checking out the project orders the sectional as its pieces, at the trade price", pieceLines.length === 3
+      && pieceLines.reduce((a, l) => a + BigInt(l.unitPriceMinor), 0n) === tp.totalMinor, js(pq2.lines).slice(0, 200));
+
+    // ---- vendor exports carry the piece's option codes
+    const pur = await import("../../packages/core/purchasing.ts");
+    t.ok("exports: a piece's option codes and cover code are read from its config", pur.vendorCodesOf({ cover: { vendorCode: "VV-NAV" }, cfg: { options: [{ vendorCode: "RCL-P" }] } }).join(",") === "VV-NAV,RCL-P");
+    const csv = await asPerson(ANA, (c, co, a) => pur.exportForVendor(c, scopeOf(co, a), "66666666-0000-0000-0000-0000000000a4", { poId: poLines[0].po }));
+    t.ok("exports: the CSV for the vendor sends the piece's option code with the cover's", /VV-NAV\|RCL-P/.test(csv.csv), csv.csv.split("\r\n")[1]?.slice(0, 200));
+
+    // ---- dye lots: a set's pieces match as one group; two sets in different covers do not
+    const keyOf = (lineId: string) => tx(sys, (c) => inv.lineLotKey(c, ENTITY, lineId));
+    const kA = await Promise.all(saLines.map((l) => keyOf(l.id)));
+    const kC = await keyOf(scl[0].id);
+    t.ok("lots: a set's three pieces share one matching group, the set and its cover", !!kA[0] && kA.every((k) => k === kA[0]) && /^SET CS-\d+ \| COVER=OAT-LINEN$/.test(kA[0]!), kA.join(" / "));
+    t.ok("lots: another set in another cover is another group", !!kC && kC !== kA[0] && /COVER=NAVY-VELVET/.test(kC), String(kC));
+    t.ok("lots: the pieces are matched by dye lot, like their family", (await read<{ n: string }>(`select count(*) n from product where entity_id = $1 and id = any($2) and lot_class = 'dye_lot'`, [ENTITY, Object.values(PIECE)]))[0].n === "6");
+    const npc = (await read<{ lot_class: string | null }>(`select lot_class from product where entity_id = $1 and sku = 'CUW-TEST-LL'`, [ENTITY]))[0];
+    t.ok("lots: a piece set up through the configurator takes its family's lot class", npc?.lot_class === "dye_lot");
+
+    // ---- the web shows a stocked sectional as stocked
+    const ws = await tx(sys, (c) => shop.pubSectionalPrice(c, site2, FAM, shop.parseBuild(layout3)));
+    t.ok("web: a sectional whose pieces are all in stock is not shown as on order", !["made_to_order", "backorder"].includes(ws.availability.state), ws.availability.state);
+    const wsc = await tx(sys, (c) => shop.pubSectionalPrice(c, site2, FAM, shop.parseBuild({ pieces: ["laf-sofa", "corner", "raf-loveseat"] })));
+    t.ok("web: one piece on order makes the set wait for it (the latest piece)", wsc.availability.state === "backorder", wsc.availability.state);
+
+    // ---- the truck is sized by the pieces
+    const fleet = await import("../../packages/core/fleet.ts");
+    const sized = await tx(sys, (c) => fleet.availabilityForCart(c, ENTITY, addr, [PIECE.LS, PIECE.WG, PIECE.RL].map((productId) => ({ productId, qty: 1 }))));
+    t.ok("delivery days: the finder sized by the pieces counts their cube and weight", sized.size.cube === 133 && sized.size.weight === 330, js(sized.size));
+
+    // ---- an as-is piece rings at its graded price, and that piece goes out
+    const asl = await RP.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: ALICIA, shipAddressId: addr, promisedOn: plus(5),
+      lines: [{ productId: p2.product_id, qty: 1, fulfillment: "delivery", asIsLabel: p2.label }] }) as { id: string; pendingOverrides: string[] };
+    const asLine = (await orderLines(asl.id)).find((l) => l.product_id === p2.product_id)!;
+    t.ok("as-is at the register: the graded piece rings at its tag price, with no below-cost override", asLine.unit_price_minor === "12300" && !asl.pendingOverrides.length);
+    await payAll(asl.id);
+    const onLine = (await read<{ mine: boolean }>(`select x.unit_id = (select unit_id from inv_piece where entity_id = $1 and label = $3) mine
+      from inv_piece x where x.entity_id = $1 and x.sales_order_line_id = $2`, [ENTITY, asLine.id, p2.label])).map((x) => x.mine);
+    t.ok("as-is at the register: checkout puts that very piece (all its cartons) on the line", onLine.length >= 1 && onLine.every(Boolean), String(onLine));
+    await t.throws("as-is at the register: a sold piece cannot be rung again", () => RP.post(t, MARIA, "/pos/orders", { kind: "quote", locationId: LOC.ENOLA, customerId: ALICIA,
+      lines: [{ productId: p2.product_id, qty: 1, fulfillment: "delivery", asIsLabel: p2.label }] }), /cannot be sold as is/);
+    const labelsMod = await import("../../packages/core/labels.ts");
+    const ptags = await tx(sys, (c) => labelsMod.forPriceTags(c, ENTITY, { productIds: [p1.product_id] }));
+    const gtag = ptags.labels.find((l) => (l as { barcode: string }).barcode === p1.label) as { sale: string | null; condition: string | null } | undefined;
+    t.ok("price tags: a graded piece gets its own tag with the graded price and the grade", !!gtag && gtag.sale === `$${(Number(g4.current!.price_minor) / 100).toLocaleString("en-US", { minimumFractionDigits: 2 })}`
+      && gtag.condition === "As is: Fair", js(gtag));
+
     // ------------------------------------------------------------ vendor catalog extras (832 and feeds)
     const sorted = cfg.extrasFromRows([{ vendor_sku: "Z-LCH", name: "Z chaise", sectional_family: "ZED", piece_type: "LAF Chaise", width: "36" },
       { swatch_code: "zed-red", grade: "c", cover_name: "Zed red" }, { vendor_sku: "Z-LAMP", name: "Lamp" }]);

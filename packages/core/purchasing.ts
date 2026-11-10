@@ -15,6 +15,19 @@ import { parseCsv, csvCell } from "./catalog.ts";
 import { orderFeedRequest, call, render, FeedError, type FeedEnv } from "./vendor_feeds.ts";
 
 export class PurchasingError extends Error {}
+
+/**
+ * Every factory code on a PO line's config: the chosen options' codes, a
+ * sectional piece's cover code, and its own options (config.cfg.options).
+ * The PO description, the CSV export, the API order feed and the EDI 850 all use it.
+ */
+export function vendorCodesOf(config: unknown): string[] {
+  const cfg = (config && typeof config === "object" ? config : {}) as Record<string, unknown>;
+  const out = Object.values(cfg).flat().map((o) => (o as { vendorCode?: string | null } | null)?.vendorCode).filter((x): x is string => !!x);
+  const piece = cfg.cfg as { options?: { vendorCode?: string | null }[] } | undefined;
+  if (piece && Array.isArray(piece.options)) for (const o of piece.options) if (o?.vendorCode) out.push(o.vendorCode);
+  return out;
+}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new PurchasingError(msg); };
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const money = (m: bigint) => {
@@ -131,8 +144,7 @@ export async function createPO(c: Client, s: Scope, po: PoIn, mayOverride: boole
     // A sectional piece (configurator): its cost in the chosen grade and options, and their factory codes.
     const piece = config.cfg as { unitCostMinor?: string; options?: { vendorCode?: string | null }[]; piece?: string; position?: number; of?: number } | undefined;
     if (piece && typeof piece === "object" && /^\d+$/.test(String(piece.unitCostMinor ?? ""))) unit = BigInt(piece.unitCostMinor!);
-    const codes = Object.values(config).flat().map((o) => (o as { vendorCode?: string | null }).vendorCode).filter(Boolean);
-    if (piece && Array.isArray(piece.options)) for (const o of piece.options) if (o?.vendorCode) codes.push(o.vendorCode);
+    const codes = vendorCodesOf(config);
     if (piece?.position && piece.of) desc += ` (sectional piece ${piece.position} of ${piece.of})`;
     if (codes.length) desc += ` [${codes.join(" / ")}]`;
     if (l.note) desc += ` — ${String(l.note).slice(0, 120)}`;
@@ -621,8 +633,7 @@ export async function exportForVendor(c: Client, s: Scope, vendorId: string, opt
   const dollars = (m: string) => { const b = BigInt(m); return `${b / 100n}.${String(b % 100n).padStart(2, "0")}`; };
   const lines = [EXPORT_COLUMNS.join(",")];
   for (const r of rows) {
-    const cfg = JSON.parse(r.config || "{}") as Record<string, { vendorCode?: string | null }[]>;
-    const codes = Object.values(cfg).flat().map((o) => o?.vendorCode).filter(Boolean).join("|");
+    const codes = vendorCodesOf(JSON.parse(r.config || "{}")).join("|");
     const ext = BigInt(Math.round(Number(r.qty) * Number(r.unit)));
     lines.push([r.number, r.po_date, r.exported_at ? "05" : "00", r.kind === "special" ? "SP" : "SA", v.name, v.account_no, r.code, r.loc_name,
       r.a1, r.city, r.st, r.zip, r.req, r.seq, r.vendor_sku, r.sku, r.barcode, r.description, codes, String(Number(r.qty)), "EA",
@@ -693,7 +704,7 @@ export async function sendPO(c: Client, s: Scope, poId: string, method: SendMeth
     purchaseOrderNumber: po.number, orderDate: hdr.ordered_on, requestedDate: hdr.expected_on, customer: opts.customer ?? null,
     shipTo: hdr.ship_to ?? hdr.code, orderType: po.kind === "special" ? "SpecialOrder" : "Stock",
     lines: lines.map((l) => ({ lineNumber: l.seq, sku: l.vendor_sku, quantity: Number(l.qty), unitCost: Number(l.unit) / 100,
-      options: Object.values(l.config ?? {}).flat().map((o) => o?.vendorCode).filter(Boolean), customerOrder: l.agreement_ref })),
+      options: vendorCodesOf(l.config), customerOrder: l.agreement_ref })),
   };
   // The vendor's own body shape, when the order feed has a template: {{purchaseOrderNumber}}, {{#lines}}{"sku":"{{item.sku}}"},{{/lines}}.
   let text = JSON.stringify(body);

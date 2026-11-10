@@ -164,6 +164,28 @@ export async function availabilityFor(c: Client, site: Site, p: ProdLite, leadDa
   return { state: pickup.length ? "in_stock" : "ships", lines, pickupStoreIds: pickup, deliverBy: deliverBy ? iso(deliverBy) : null, leadWeeks: null };
 }
 
+/**
+ * A sectional's availability: each piece's own (stocked pieces from their
+ * stock, made-to-order ones by lead time), and the set's is the latest of them,
+ * since it is delivered together. Pickup is where every piece is.
+ */
+export async function setAvailability(c: Client, site: Site, built: sectionals.Priced, locs?: Map<string, Loc>): Promise<Availability> {
+  locs = locs ?? await locationsOf(c, site.entity_id);
+  const RANK: Record<string, number> = { in_stock: 0, ships: 1, backorder: 2, made_to_order: 3, service: -1 };
+  let worst: Availability | null = null;
+  let pickup: string[] | null = null;
+  for (const x of built.parts) {
+    const a = await availabilityFor(c, site, { id: x.productId, kind: x.special ? "configurable" : "stock", ship_class: x.shipClass }, x.leadDays, locs);
+    pickup = pickup == null ? a.pickupStoreIds : pickup.filter((id) => a.pickupStoreIds.includes(id));
+    const later = !worst || (a.deliverBy ?? "") > (worst.deliverBy ?? "") || ((a.deliverBy ?? "") === (worst.deliverBy ?? "") && RANK[a.state] > RANK[worst.state]);
+    if (later) worst = a;
+  }
+  if (!worst) return { state: "backorder", lines: [], pickupStoreIds: [], deliverBy: null, leadWeeks: null };
+  const ids = pickup ?? [];
+  if (worst.state === "in_stock" && !ids.length) return { ...worst, state: "ships", pickupStoreIds: [], lines: worst.lines.filter((l) => l.kind !== "pickup") };
+  return { ...worst, pickupStoreIds: worst.state === "in_stock" ? ids : [] };
+}
+
 // ---------------------------------------------------------- the catalog --
 
 type ProdRow = {
@@ -285,7 +307,7 @@ export async function pubSectionalPrice(c: Client, site: Site, productId: string
   need(p, "That product is not available online.");
   need(build, "Choose a layout or the pieces.");
   const priced = await sectionals.priceBuild(c, site.entity_id, p!.id, build!, { priceList });
-  const avail = await availabilityFor(c, site, { ...p!, kind: priced.special ? "configurable" : "stock" } as ProdRow, priced.leadDays);
+  const avail = await setAvailability(c, site, priced);
   return { ...sectionals.pricedView(priced, true), availability: avail };
 }
 
@@ -450,7 +472,7 @@ async function priceLines(c: Client, site: Site, lines: LineIn[], locs: Map<stri
     if (await sectionals.isFamily(c, site.entity_id, p!.id)) {
       need(l.sectional, `Choose the pieces of the ${p!.name}.`);
       const built = await sectionals.priceBuild(c, site.entity_id, p!.id, l.sectional!, { priceList });
-      const availability = await availabilityFor(c, site, { ...p!, kind: built.special ? "configurable" : "stock" } as ProdRow, built.leadDays, locs);
+      const availability = await setAvailability(c, site, built, locs);
       const setIndex = out.length;
       out.push({
         productId: p!.id, sku: p!.sku, name: p!.name, description: built.description, kind: p!.kind, shipClass: p!.ship_class, taxable: true, qty: 1,

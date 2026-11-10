@@ -174,7 +174,7 @@ export const module: ErpModule = {
     signedIn("POST", "\\/projects", (c, site, s, _u, _m, b) => trade.createProject(c, site, s, projectIn(b)));
     signedIn("POST", `\\/projects\\/${ID}`, (c, site, s, _u, m, b) => trade.updateProject(c, site, s, m[2], projectIn(b)));
     signedIn("POST", `\\/projects\\/${ID}\\/items`, (c, site, s, _u, m, b) =>
-      trade.addProjectItem(c, site, s, m[2], { productId: String(b.productId ?? ""), choices: shop.parseChoices(b.choices), qty: int(b.qty, 1), note: b.note }).then((id) => ({ id })));
+      trade.addProjectItem(c, site, s, m[2], { productId: String(b.productId ?? ""), choices: shop.parseChoices(b.choices), qty: int(b.qty, 1), note: b.note, sectional: shop.parseBuild(b.sectional) }).then((id) => ({ id })));
     signedIn("POST", `\\/projects\\/${ID}\\/items\\/${ID}`, (c, site, s, _u, m, b) =>
       trade.setProjectItem(c, site, s, m[2], m[3], { qty: b.qty == null ? undefined : int(b.qty, 1), remove: b.remove === true }).then(() => ({ ok: true })));
     signedIn("POST", `\\/projects\\/${ID}\\/photos`, (c, site, s, _u, m, b) => trade.addProjectPhoto(c, site, s, m[2], b.dataUrl, b.caption).then((id) => ({ id })), { maxBody: PHOTO_BODY });
@@ -277,7 +277,7 @@ export const module: ErpModule = {
     kit.coPost("/trade/projects/([0-9a-fA-F-]{36})/items", async (c, co, a, b, m) => {
       await requireRole(c, co, a, ROLES.projects, "adding to a room project");
       return { id: await bo(() => projects.addItem(c, scopeOf(co, a), m[2], { productId: String(b.productId ?? ""), choices: shop.parseChoices(b.choices), qty: int(b.qty, 1),
-        stage: str(b.stage, 12) || undefined, note: b.note })) };
+        stage: str(b.stage, 12) || undefined, note: b.note, sectional: shop.parseBuild(b.sectional) })) };
     });
     kit.coPost("/trade/projects/([0-9a-fA-F-]{36})/items/([0-9a-fA-F-]{36})", async (c, co, a, b, m) => {
       await requireRole(c, co, a, ROLES.projects, "changing a room project");

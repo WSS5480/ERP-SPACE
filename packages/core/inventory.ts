@@ -1889,10 +1889,17 @@ export const LOT_KEY_SQL = `case when p.lot_class is null then null else upper(c
  */
 export const LINE_OPTS_SQL = `coalesce((select string_agg(upper(e.k) || '=' || upper(coalesce(o.v->>'code', o.v->>'label', '')), ';' order by e.k, o.v->>'code')
     from jsonb_each(case when jsonb_typeof(l.config) = 'object' then l.config else '{}'::jsonb end) e(k, v)
-    cross join lateral jsonb_array_elements(case when jsonb_typeof(e.v) = 'array' then e.v else '[]'::jsonb end) o(v)
+    cross join lateral jsonb_array_elements(case when jsonb_typeof(e.v) = 'array' then e.v when jsonb_typeof(e.v) = 'object' then jsonb_build_array(e.v) else '[]'::jsonb end) o(v)
    where e.k ~* '(fabric|cover|leather|uphol|colou?r|finish|stain|wood)'), '')`;
-/** The matching group of an order line's product (aliases p and l): the product's group plus the line's cover or finish. */
-export const LINE_LOT_KEY_SQL = `(${LOT_KEY_SQL} || case when ${LINE_OPTS_SQL} = '' then '' else ' | ' || ${LINE_OPTS_SQL} end)`;
+/**
+ * The matching group of an order line's product (aliases p and l): the product's group plus the line's cover or finish.
+ * A sectional's pieces (configurator cfg_set) match as one group: the set and its cover, whatever the piece's own collection.
+ */
+export const LINE_LOT_KEY_SQL = `(case when p.lot_class is null then null
+    when exists (select 1 from cfg_set_line sl where sl.entity_id = l.entity_id and sl.sales_order_line_id = l.id)
+    then (select 'SET ' || upper(cs.number) from cfg_set_line sl join cfg_set cs on cs.id = sl.set_id where sl.entity_id = l.entity_id and sl.sales_order_line_id = l.id)
+         || ' | COVER=' || upper(coalesce(l.config->'cover'->>'code', ''))
+    else ${LOT_KEY_SQL} || case when ${LINE_OPTS_SQL} = '' then '' else ' | ' || ${LINE_OPTS_SQL} end end)`;
 export const LOT_WORD: Record<string, string> = { dye_lot: "dye lot", finish_batch: "finish batch", batch: "batch" };
 
 const SERIAL_RE = /^[\x21-\x7e]{1,60}$/, LOT_RE = /^[\x20-\x7e]{1,40}$/;

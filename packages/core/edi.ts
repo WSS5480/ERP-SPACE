@@ -571,7 +571,7 @@ export async function build850(c: Client, s: Scope, p: Partner, poId: string, op
   const od = await pur.orderDocument(c, s, poId);
   const lines: x12.PoLine850[] = [];
   for (const l of od.lines) {
-    const options = Object.values(l.config ?? {}).flat().map((o) => (o as { vendorCode?: string })?.vendorCode).filter(Boolean) as string[];
+    const options = pur.vendorCodesOf(l.config);
     lines.push({ line: l.seq, qty: Number(l.qty), uom: "EA", unitMinor: BigInt(l.unit), vendorSku: (await vendorItemFor(c, p, l.product_id, l.vendor_sku)) ?? undefined,
       ourSku: l.sku ?? undefined, upc: l.barcode ?? undefined, description: l.description, options, customerOrder: l.agreement_ref });
   }

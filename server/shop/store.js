@@ -346,7 +346,7 @@ function sectionalBuilder(p, f, onPriced) {
         const s = el('select', { 'aria-label': `${g.label}, piece ${i + 1}` }, el('option', { value: '', text: `No ${g.label.toLowerCase()}` }),
           g.options.map((o) => el('option', { value: o.code, text: `${o.label}${Number(o.priceDeltaMinor) ? ` (+${money(o.priceDeltaMinor)})` : ''}`, selected: st.opts[i][g.code] === o.code || null })));
         s.addEventListener('change', () => { st.opts[i][g.code] = s.value; reprice(); });
-        return s;
+        return el('label', { class: 'small' }, el('span', { class: 'muted', text: `${g.label} ` }), s);
       });
       return el('div', { class: 'opt' }, el('div', { class: 'opt-h' }, el('span', { text: `${i + 1}. ${x.name}` }),
         el('button', { class: 'link', type: 'button', onclick: () => { st.pieces.splice(i, 1); st.opts.splice(i, 1); changed(); } }, 'Remove')), sels);

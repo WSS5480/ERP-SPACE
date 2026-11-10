@@ -388,3 +388,8 @@ dialog.sheet{margin:auto auto 0;width:100%;max-width:520px;border-radius:16px 16
 
 .panel.notyours{padding:22px 22px 18px;max-width:640px}
 .panel.notyours h2{margin:0 0 6px;font-size:19px}
+
+/* Configurator: a sectional piece card keeps its pickers on their own full-width row, so the name never squeezes */
+.li > .cfg-wide{grid-column:1/-1;min-width:0}
+.cfg-planbox svg{display:block;max-width:100%}
+.cfg-builder .toolbar .btn{white-space:normal;text-align:left}

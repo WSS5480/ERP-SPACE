@@ -113,3 +113,22 @@ export function bps(m: bigint, rate: number): bigint {
   const r = (a * BigInt(rate) + 5000n) / 10000n;
   return neg ? -r : r;
 }
+
+/** Who may read costs and margins: the buyer, a store manager, the controller and the owner. */
+export const COST_ROLES = ["owner", "buyer", "controller", "store_manager"];
+export async function seesCost(c: Client, co: Company, personId: string | null): Promise<boolean> {
+  if (!personId) return false;
+  const held = await rolesOf(c, co, personId);
+  return COST_ROLES.some((r) => held.has(r));
+}
+const COSTLY = /^(cost|costs|costMinor|cost_minor|unitCostMinor|unit_cost_minor|cost_delta_minor|costDeltaMinor|cost_adder_minor|cost_uplift_bps|costUpliftBps|landed_minor|landedMinor|margin_bps|marginBps|blendedBps|freight_minor)$/;
+/** A copy of a read with every cost and margin field taken out, for a reader who may not see them. */
+export function scrubCost<T>(v: T): T {
+  if (Array.isArray(v)) return v.map((x) => scrubCost(x)) as unknown as T;
+  if (v && typeof v === "object" && !(v instanceof Date)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) if (!COSTLY.test(k)) out[k] = scrubCost(x);
+    return out as T;
+  }
+  return v;
+}

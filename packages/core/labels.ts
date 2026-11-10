@@ -15,6 +15,7 @@
 // cannot move it), only ports 9100-9109, and a request names a printer by id,
 // never an address.
 
+import { gradesForProducts, CONDITION_WORDS } from "./configurator.ts";
 import net from "node:net";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { code128 } from "./catalog.ts";
@@ -201,6 +202,7 @@ export async function forPriceTags(c: Client, entityId: string, e: { productIds:
   const kits = await q<{ component_id: string; kit_id: string; name: string }>(c, `select k.component_id, k.kit_id, p.name from product_kit_component k
      join product p on p.id = k.kit_id where p.entity_id = $1 and k.component_id = any($2) and p.status = 'active'`, [entityId, rows.map((r) => r.id)]);
   const out: PriceTag[] = [];
+  const graded = await gradesForProducts(c, entityId, rows.map((r) => r.id));
   for (const r of rows) {
     let pc;
     try { pc = await priceConfigured(c, entityId, r.id, [], { priceList: e.priceList ?? null }); }
@@ -217,6 +219,11 @@ export async function forPriceTags(c: Client, entityId: string, e: { productIds:
     }
     out.push({ barcode: r.barcode && /^[\x20-\x7e]{1,40}$/.test(r.barcode) ? r.barcode : r.sku, name: r.name, brand: r.brand, sku: r.sku,
       retail: $(ticket), sale: pc.unitPriceMinor < ticket ? $(pc.unitPriceMinor) : null, package: pkg, condition: r.grade });
+    // Each graded as-is or floor piece gets its own tag: its label, its graded price, its grade.
+    for (const g of graded.filter((x) => x.product_id === r.id && x.price_minor != null)) {
+      out.push({ barcode: g.label, name: r.name, brand: r.brand, sku: r.sku, retail: $(ticket), sale: $(BigInt(g.price_minor!)), package: null,
+        condition: `As is: ${g.grade ? CONDITION_WORDS[g.grade] : "not graded"}` });
+    }
   }
   return { kind: "price_tag", labels: out, source: "price tags" };
 }

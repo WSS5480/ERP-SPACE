@@ -3,7 +3,7 @@
 // images, price lists, promotions, margins, price tags with barcodes, vendor
 // ordering facts and freight, and the vendor feed import.
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
-import { ModuleError, PublicPage, need, requireRole, str, uuid, int, minor } from "./kit.ts";
+import { ModuleError, PublicPage, need, requireRole, str, uuid, int, minor, seesCost, scrubCost } from "./kit.ts";
 import { productSheet } from "./tearsheet.ts";
 import { q } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
@@ -288,9 +288,12 @@ export const module: ErpModule = {
     const { coGet, coPost } = kit;
     const sc = (co: Company, a: Actor) => scopeOf(co, a);
 
-    coGet("/catalog/products", (c, co, url) => listProducts(c, co, url));
+    // Costs and margins only for the buyer, store managers, the controller and the owner.
+    // (A read with no acting person named is the signed-in session's own, as before.)
+    const guard = async <R>(c: Client, co: Company, p: string | null, v: R) => (!p || await seesCost(c, co, p) ? v : scrubCost(v));
+    coGet("/catalog/products", async (c, co, url, _m, p) => guard(c, co, p, await listProducts(c, co, url)));
     coGet("/catalog/form", (c, co) => formOptions(c, co));
-    coGet(`/catalog/products/${ID}`, (c, co, _u, m) => productDetail(c, co, m[2]));
+    coGet(`/catalog/products/${ID}`, async (c, co, _u, m, p) => guard(c, co, p, await productDetail(c, co, m[2])));
     coGet(`/catalog/price/${ID}`, (c, co, url, m) => refuse(async () => {
       const r = await priceConfigured(c, co.id, m[2], choicesParam(url), { priceList: url.searchParams.get("list"), on: url.searchParams.get("on") });
       return r;
@@ -306,7 +309,7 @@ export const module: ErpModule = {
       const html = await productSheet(c, co.id, m[2], { imageFetch }, uuid(url.searchParams.get("locationId")));
       return html ? new PublicPage(html) : null;
     });
-    coGet("/catalog/margins", (c, co, url) => margins(c, co, url));
+    coGet("/catalog/margins", async (c, co, url, _m, p) => guard(c, co, p, await margins(c, co, url)));
     coGet("/catalog/labels", (c, co, url) => refuse(() => labels(c, co, url)));
     coGet("/catalog/vendors", (c, co) => vendors(c, co));
     coGet("/catalog/templates", async (c, co) => {
