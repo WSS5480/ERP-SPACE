@@ -216,10 +216,17 @@ async function costIn(c: Client, entityId: string, productId: string, qty: numbe
     [entityId, productId, p.qty + qty, (p.value + valueMinor).toString()]);
 }
 
-/** Take qty out of the pool at its average; returns the value taken (the last unit takes whatever is left). */
-async function costOut(c: Client, entityId: string, productId: string, qty: number): Promise<bigint> {
+/**
+ * Take qty out of the pool at its average; returns the value taken (the last unit takes whatever is left).
+ * Goods bought from a sibling carry inter-company markup (ic_markup_move): the same share of it leaves
+ * with them -- realized when they leave the group ('out'), carried on when they go to another sibling
+ * ('carry_out'), and kept when they only move between this company's own locations ('none').
+ */
+async function costOut(c: Client, entityId: string, productId: string, qty: number,
+  markup: "out" | "carry_out" | "none" = "out", transferId: string | null = null): Promise<bigint> {
   if (qty <= 0) return 0n;
   const p = await poolOf(c, entityId, productId);
+  if (markup !== "none") await takeMarkup(c, entityId, productId, qty, p.qty, markup, transferId);
   let v: bigint;
   if (p.qty <= 0) v = BigInt(Math.round(qty * Number(await unitCost(c, entityId, productId))));
   else if (qty >= p.qty) v = p.value + (qty > p.qty ? BigInt(Math.round((qty - p.qty) * Number(p.value) / p.qty)) : 0n);
@@ -228,6 +235,22 @@ async function costOut(c: Client, entityId: string, productId: string, qty: numb
   await c.query(`update inv_cost set qty = $3, value_minor = $4, updated_at = now() where entity_id = $1 and product_id = $2`,
     [entityId, productId, p.qty - qty, (p.value - v).toString()]);
   return v;
+}
+
+/** The share of a product's inter-company markup that leaves with qty units out of a pool of poolQty. */
+async function takeMarkup(c: Client, entityId: string, productId: string, qty: number, poolQty: number, kind: "out" | "carry_out", transferId: string | null) {
+  const rows = await q<{ from_entity_id: string; qty: string; m: string }>(c, `
+    select from_entity_id, sum(qty)::text qty, sum(markup_minor)::text m from ic_markup_move
+     where entity_id = $1 and product_id = $2 group by from_entity_id having sum(qty) > 0 or sum(markup_minor) <> 0`, [entityId, productId]);
+  if (!rows.length) return;
+  const all = poolQty <= 0 || qty >= poolQty;
+  for (const r of rows) {
+    const dq = all ? Number(r.qty) : Number(r.qty) * qty / poolQty;
+    const dm = all ? BigInt(r.m) : BigInt(Math.round(Number(r.m) * qty / poolQty));
+    if (dq === 0 && dm === 0n) continue;
+    await c.query(`insert into ic_markup_move (entity_id, from_entity_id, product_id, qty, markup_minor, kind, transfer_id) values ($1,$2,$3,$4,$5,$6,$7)`,
+      [entityId, r.from_entity_id, productId, -dq, (-dm).toString(), kind, transferId]);
+  }
 }
 
 // ================================================================ helpers
@@ -745,6 +768,7 @@ export async function createTransfer(c: Client, scope: Scope, e: { fromId: strin
   // To a store of another of the client's companies: the group module pairs a sale here with a bill there when it ships.
   const toEntity = locs.length === 1 && locs[0].id === e.fromId ? await siblingOf(c, scope.entityId, e.toId) : null;
   need(locs.length === 2 || toEntity, "pick two of this company's locations");
+  if (toEntity) await groupRole(c, scope, toEntity, "a transfer to another of the client's companies");
   need(e.lines?.length, "a transfer needs at least one line");
   const number = await nextNo(c, scope.entityId, "transfer", "TR-");
   const t = await one<{ id: string }>(c, `insert into inv_transfer (entity_id, number, from_location_id, to_location_id, note, created_by, to_entity_id)
@@ -814,6 +838,7 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
   need(t.status === "draft", `transfer ${t.number} is ${t.status.replace("_", " ")}, so it cannot ship`);
   // To another of the client's companies: the goods leave this company's books (sold to the sibling at transfer price).
   const across = !!t.to_entity_id;
+  if (across) await groupRole(c, scope, t.to_entity_id!, "shipping to another of the client's companies");
   const outStatus = across ? "delivered" : "in_transit";
   const lines = await q<{ id: string; product_id: string; qty: string; unit_ids: string[]; sales_order_line_id: string | null }>(c,
     `select id, product_id, qty, unit_ids, sales_order_line_id from inv_transfer_line where entity_id = $1 and transfer_id = $2`, [scope.entityId, id]);
@@ -826,7 +851,7 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
       // A customer's goods: they stay theirs. The reservation leaves with them; the line waits on the transfer.
       const sl = await lineOf(c, scope.entityId, l.sales_order_line_id);
       need(["reserved", "ready"].includes(sl.line_status) && sl.fulfil_from_id === t.from_location_id, `${sl.number}'s goods are no longer reserved at the origin`);
-      const lineValue = await costOut(c, scope.entityId, p.id, qty);
+      const lineValue = await costOut(c, scope.entityId, p.id, qty, "none");
       if (p.serialized) {
         for (const u of l.unit_ids) {
           const pcs = await piecesOfUnit(c, scope.entityId, u);
@@ -848,7 +873,7 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
     }
     const lv = await level(c, scope.entityId, p.id, t.from_location_id);
     need(lv.available >= qty, `${p.name}: ${lv.available} available at the origin, ${qty} on the transfer`);
-    const lineValue = await costOut(c, scope.entityId, p.id, qty);
+    const lineValue = await costOut(c, scope.entityId, p.id, qty, across ? "carry_out" : "none", id);
     if (p.serialized) {
       let units = l.unit_ids;
       if (units.length) {
@@ -946,6 +971,16 @@ async function transferOf(c: Client, entityId: string, id: string) {
     `select id, number, status, from_location_id, to_location_id, to_entity_id from inv_transfer where id = $1 and entity_id = $2 for update`, [id, entityId]);
   need(r.length, "no such transfer");
   return r[0];
+}
+
+/**
+ * Stock to a sibling makes a sales invoice here and a bill there, so it is for the owner, or a
+ * controller in both companies -- not every warehouse hand (group.requireGroupRole).
+ */
+async function groupRole(c: Client, scope: Scope, toEntity: string, doing: string) {
+  const g = await import("./group.ts");
+  try { await g.requireGroupRole(c, scope.tenantId, scope.actor.id || null, [scope.entityId, toEntity], doing); }
+  catch (e) { if (e instanceof g.GroupError) throw new InventoryError(e.message); throw e; }
 }
 
 /** The company of a location that belongs to another open company of the same client, else null. */

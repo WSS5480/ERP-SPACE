@@ -1023,7 +1023,7 @@ export async function home(c: Client, co: Company, personId: string | null) {
            coalesce(sum(total_minor) filter (where status in ('approved','scheduled') and due_date < current_date), 0) as overdue,
            count(*) filter (where status in ('exception','held'))::int as attention,
            count(*) filter (where status = 'pending')::int as pending
-      from invoice where entity_id = $1`, [co.id]);
+      from invoice where entity_id = $1 and ic_document_id is null`, [co.id]);
 
   const appr = await approvals(c, co, personId);
 

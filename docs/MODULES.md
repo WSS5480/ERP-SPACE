@@ -112,7 +112,26 @@ in a payment run, Group settles them. A transfer to a sibling's location
 (`inventory.createTransfer` / `shipTransfer`) leaves at average cost and lands
 there at transfer price in one step (`inventory.landAcross`); same-company
 transfers are unchanged. Who: the owner, or a controller in every company
-covered (`group.requireGroupRole`).
+covered (`group.requireGroupRole`) -- that includes creating or shipping a
+transfer to a sibling, which a warehouse role alone cannot do.
+
+Markup on goods between siblings is tracked in `ic_markup_move`: in when the
+goods land, out at the share of the buyer's stock that leaves (inventory's
+`costOut` releases it on a sale, write-off or count loss; a move between the
+buyer's own locations keeps it; a transfer on to another sibling carries it).
+The group view takes the part still in stock out of inventory and earnings,
+and the part that left the group out of cost of goods.
+
+Settle: when both books agree, pay what is owed or less (less leaves the rest
+open, documents part-paid oldest first); more is refused. When they disagree,
+the payment is the payer's own figure and the difference goes to 6800, which
+needs a reason and the owner, or a difference within the group's write-off
+limit (set by the owner). A one-sided entry to 6800 follows the same limit.
+
+Decision (Nov 10 2026): an inter-company code (1195, 2190, 4090, 5090, 6800)
+already in a client's chart with a different type is never reused. Migration
+0035 leaves it, raises a NOTICE naming the client and code, and the group
+module refuses to post for that client, saying which account to renumber.
 
 ## Reports
 
