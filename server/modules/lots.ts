@@ -100,9 +100,9 @@ async function labelOptions(c: Client, co: Company) {
 // ------------------------------------------------------------ settlements --
 
 async function settlementView(c: Client, co: Company) {
-  const [lenders, imports, exceptions, variances, aging] = await Promise.all([
-    S.lenders(c, co.id), S.imports(c, co.id), S.exceptions(c, co.id), S.feeVariances(c, co.id), S.lenderAging(c, co.id)]);
-  return { ...lenders, imports, exceptions, variances, aging };
+  const [lenders, imports, exceptions, variances, aging, setAside] = await Promise.all([
+    S.lenders(c, co.id), S.imports(c, co.id), S.exceptions(c, co.id), S.feeVariances(c, co.id), S.lenderAging(c, co.id), S.setAside(c, co.id)]);
+  return { ...lenders, imports, exceptions, variances, aging, setAside };
 }
 
 export const module: ErpModule = {
@@ -150,11 +150,18 @@ export const module: ErpModule = {
     // ============================================================ labels
     coGet("/labels/options", safe((c, co) => labelOptions(c, co)));
     // The browser print page: HTML with SVG barcodes at the label's size, no script.
-    coGet("/labels/print", safe(async (c, co, url) => {
+    // A link opened in a new tab carries no headers, so the acting person may ride in ?as=; either way they must hold the printing roles.
+    coGet("/labels/print", safe(async (c, co, url, _m, personId) => {
+      const who = personId ?? uuid(url.searchParams.get("as"));
+      need(who, "pick who you are acting as before printing");
       const s = srcOf(url.searchParams);
+      const a: Actor = { personId: who!, personName: "", label: "" };
+      await rolesFor(c, co, a, s);
       const set = await setFor(c, co, s);
       const t = await L.templateFor(c, co.id, set.kind, s.templateId);
-      return new PublicPage(L.printPage(t, set, `${set.kind === "price_tag" ? "Price tags" : "Labels"} · ${co.name}`));
+      const html = L.printPage(t, set, `${set.kind === "price_tag" ? "Price tags" : "Labels"} · ${co.name}`);
+      await L.logMade(c, sc(co, a), "browser", set.source, set.labels.length, html.length);
+      return new PublicPage(html);
     }));
     coPost("/labels/zpl", safe(async (c, co, a, b) => {
       const s = srcOf(b);

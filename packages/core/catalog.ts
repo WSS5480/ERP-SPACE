@@ -866,7 +866,8 @@ export function code128(text: string): number[] {
   const vals: number[] = [104];
   for (const ch of text) {
     const v = ch.charCodeAt(0) - 32;
-    need(v >= 0 && v <= 95, `${ch} cannot be printed in a barcode`);
+    // printable ASCII only: control characters and DEL (0x7F) are refused before anything is encoded
+    need(v >= 0 && v <= 94, `${/[\x20-\x7e]/.test(ch) ? ch : "a control character"} cannot be printed in a barcode`);
     vals.push(v);
   }
   let sum = 104;

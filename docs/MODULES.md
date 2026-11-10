@@ -308,6 +308,22 @@ reason). When nothing is open and the posted cash equals one unmatched bank
 line of the lender's account near the deposit day, the settlement's cash
 lines are matched to it through `reconcile.matchManually`.
 
+Review fixes (migration 0046): a row with an approval code never falls back
+to a sale carrying a different one, and several candidates are an
+exception. A sale may be funded in parts (`funded_gross_minor`); what the
+lender owes is amount - `refunded_minor` - funded gross. A refund to the
+lender's card (a negative 'financing' receipt) credits its financed sale
+through `ar.postReceipt` (`financed_sale_refund`), and the lender's later
+reversal clears it (status 'refunded') rather than reopening it; in expense
+mode only what is still owed goes to 6915. A row the lender paid that is set
+aside posts Dr cash Cr 2195 Unapplied finance deposits ('suspense'), and
+applying it later moves it from 2195 to the sale. `lenderAging` reports its
+difference from 1110. Card or account numbers (13-19 digits) are kept as the
+last four only and never echoed. The lot group also carries the cover or
+finish chosen on the order line (`LINE_LOT_KEY_SQL`). The print page needs
+the printing roles (the acting person rides in `?as=`) and is logged; a
+printer's port is 9100 unless the owner allows others in `labels.printer_ports`.
+
 ## Reports
 
 A person never writes SQL. `packages/core/reports_datasets.ts` is the
