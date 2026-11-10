@@ -30,6 +30,8 @@
   const stopChip = (s) => chip(STOP_TONE[s] || 'neutral', s === 'delivered' ? 'ok' : s === 'failed' ? 'fail' : s === 'scheduled' ? 'pending' : 'clock', words(s));
   const routeChip = (s) => chip(ROUTE_TONE[s] || 'neutral', s === 'completed' ? 'ok' : s === 'locked' ? 'hold' : s === 'in_progress' ? 'clock' : 'pending', s === 'locked' ? 'Loaded' : words(s));
   const KIND = { delivery: 'Delivery', pickup: 'Pickup', service: 'Service call', will_call: 'Will-call' };
+  /** The delivery record: each piece's serial and lot, when it has them. */
+  const lotText = (l) => { const u = (l.units || []).filter((x) => x.serial || x.lot); return u.length ? ` (${u.map((x) => [x.serial ? 'SN ' + x.serial : null, x.lot ? 'lot ' + x.lot : null].filter(Boolean).join(' ')).join(', ')})` : ''; };
 
   async function options() {
     if (!st.opts || st.opts.co !== S.co.id) { st.opts = { co: S.co.id, ...(await coApi('/fleet/options')) }; }
@@ -597,7 +599,7 @@
           title: `${s.seq}. ${s.customer || ''}`, amount: s.eta || '', badge: stopChip(s.status),
           detail: [`${s.line1}${s.line2 ? ', ' + s.line2 : ''}, ${s.city}`, s.window_label, KIND[s.kind], plural(s.pieces, 'piece'), s.stairs ? `${s.stairs} flight(s) of stairs` : null,
             BigInt(s.cod_minor || 0) > 0n && s.kind === 'delivery' ? `collect ${money(s.cod_minor)}` : null].filter(Boolean).join(' · '),
-          why: [s.address_notes, s.notes, s.problem ? `Problem: ${s.problem}` : null, s.lines.length ? s.lines.map((l) => `${l.qty}× ${l.description}`).join('; ') : null,
+          why: [s.address_notes, s.notes, s.problem ? `Problem: ${s.problem}` : null, s.lines.length ? s.lines.map((l) => `${l.qty}× ${l.description}${lotText(l)}`).join('; ') : null,
             (s.haulAway || []).length ? `Haul away: ${s.haulAway.map((h) => `${h.qty}× ${h.description}${h.status !== 'planned' ? ` (${words(h.status)})` : ''}`).join('; ')}` : null].filter(Boolean).join(' · ') || null,
           acts: open ? [
             el('a', { class: 'btn small', href: s.mapsUrl, target: '_blank', rel: 'noopener' }, 'Navigate'),
@@ -706,7 +708,7 @@
     const lineSel = (s.lines || []).map((l) => {
       const o = select([[pickup ? 'picked_up' : 'delivered', pickup ? 'Picked up' : 'Delivered'], ['refused', 'Refused'], ['damaged', 'Damaged'], ['not_delivered', pickup ? 'Not picked up' : 'Not delivered']], pickup ? 'picked_up' : 'delivered');
       const note = input({ placeholder: 'Note (optional)' });
-      return { l, o, note, node: el('div', { class: 'field' }, el('span', { text: `${l.qty}× ${l.description}` }), o, note) };
+      return { l, o, note, node: el('div', { class: 'field' }, el('span', { text: `${l.qty}× ${l.description}${lotText(l)}` }), o, note) };
     });
     exc.addEventListener('change', () => {
       if (exc.value === 'not_home' || exc.value === 'refused') for (const x of lineSel) x.o.value = exc.value === 'refused' ? 'refused' : 'not_delivered';

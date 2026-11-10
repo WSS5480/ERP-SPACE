@@ -27,6 +27,7 @@ import { q, one, audit, type Client, type Scope } from "./db.ts";
 import * as x12 from "./x12.ts";
 import * as pur from "./purchasing.ts";
 import * as wms from "./wms.ts";
+import * as inventory from "./inventory.ts";
 import { enterVendorBill, BillError, TransitionError } from "./invoice.ts";
 import { sha256 } from "./connections.ts";
 import {
@@ -914,13 +915,28 @@ async function applySet(c: Client, s: Scope, _env: EdiEnv, p: Partner, type: str
     let firstPo: string | undefined;
     const done: string[] = [];
     const shipped: { shipmentId: string; poLineId: string; qty: number }[] = [];
+    const serialNotes: string[] = [];
     for (const o of a.orders) {
       const po = await poByNumber(c, p, o.poNumber);
       firstPo = firstPo ?? po.id;
       const lines: pur.ShipLine[] = [];
+      const ids: { lineId: string; serials: string[]; lot?: string }[] = [];
       for (const l of o.lines) {
         const pl = await poLineFor(c, p, po.id, l);
         lines.push({ lineId: pl.id, qty: l.qty });
+        if (l.serials?.length || l.lot) ids.push({ lineId: pl.id, serials: l.serials ?? [], lot: l.lot });
+      }
+      // Serials and lots the vendor sent: receiving uses them when the dock does not scan its own.
+      for (const x of ids) {
+        await c.query("savepoint asn_serials");
+        try {
+          await inventory.expectSerials(c, s, { poLineId: x.lineId, serials: x.serials, lot: x.lot ?? null, reference: a.shipmentId, source: "asn" });
+          await c.query("release savepoint asn_serials");
+        } catch (e) {
+          await c.query("rollback to savepoint asn_serials");
+          if (!(e instanceof inventory.InventoryError)) throw e;
+          serialNotes.push(`serials not kept for ${o.poNumber}: ${e.message}`);
+        }
       }
       const r = await pur.recordShipment(c, s, po.id, { asn: a.shipmentId, shippedOn: a.shippedOn ?? a.date ?? null, expectedOn: a.deliveryOn ?? null,
         carrier: a.carrierName || a.carrier || null, tracking: a.tracking || a.bol || null, lines, source: "edi", documentId: selfId, equipment: a.equipment ?? null });
@@ -930,7 +946,7 @@ async function applySet(c: Client, s: Scope, _env: EdiEnv, p: Partner, type: str
     // A notice that names its container or trailer attaches to it (and opens one if we had not booked it yet).
     let container: string | null = null;
     // The shipment stands whatever happens to the link: a link that cannot be made is a note, not a quarantine.
-    const notes: string[] = [];
+    const notes: string[] = [...serialNotes];
     if (a.equipment) {
       await c.query("savepoint asn_container");
       try {

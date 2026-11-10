@@ -420,7 +420,7 @@ export const H = {
     await requireRole(c, co, a, ROLES.finance, "recording a financed sale");
     const rid = uuid(b.receiptId); need(rid, "pick the financing receipt");
     const pid = uuid(b.planId); need(pid, "pick the plan");
-    return ar.recordFinancedSale(c, scopeOf(co, a), rid, pid);
+    return ar.recordFinancedSale(c, scopeOf(co, a), rid, pid, { authCode: str(b.authCode, 40) || null, accountLast4: str(b.accountLast4, 30) || null });
   }),
 
   settle: wrap(async (c: Client, co: Company, a: Actor, b: Record<string, unknown>) => {

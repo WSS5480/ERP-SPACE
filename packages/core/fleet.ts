@@ -1245,6 +1245,9 @@ export async function route(c: Client, entityId: string, routeId: string) {
     select sl.id, sl.stop_id, sl.sales_order_line_id, sl.description, sl.qty::float qty, sl.pieces, sl.outcome, sl.flagged_for_warehouse, sl.note, ol.sku
       from delivery_stop_line sl join delivery_stop s on s.id = sl.stop_id left join sales_order_line ol on ol.id = sl.sales_order_line_id
      where sl.entity_id = $1 and s.route_id = $2 and sl.outcome <> 'cancelled' order by ol.seq nulls last, sl.description`, [entityId, routeId]);
+  // the delivery record: the serial and lot of each piece on a line
+  const lotsBy = await inventory.lotsForLines(c, entityId, lines.map((l) => l.sales_order_line_id).filter(isId) as string[]);
+  for (const l of lines) (l as Record<string, unknown>).units = lotsBy.get(String(l.sales_order_line_id)) ?? [];
   // a service visit shows the parts in hand for its ticket, so the technician can mark what was used
   const tickets = st.map((x) => x.service_ticket_id).filter(Boolean);
   const parts = tickets.length ? await q(c, `
@@ -1628,7 +1631,8 @@ export async function manifest(c: Client, entityId: string, routeId: string) {
     address: [s.line1, s.line2, `${s.city ?? ""}, ${s.state ?? ""} ${s.postal ?? ""}`].filter(Boolean).join(", "),
     window: s.window_label, eta: s.eta, stairs: s.stairs, notes: [s.address_notes, s.notes, s.problem ? `Problem: ${s.problem}` : null].filter(Boolean).join(" · "),
     order: s.order_number, pieces: s.pieces, codMinor: s.kind === "delivery" ? String(s.cod_minor) : "0",
-    items: (s.lines as Record<string, unknown>[]).map((l) => ({ sku: l.sku, description: l.description, qty: l.qty, pieces: l.pieces })),
+    items: (s.lines as Record<string, unknown>[]).map((l) => ({ sku: l.sku, description: l.description, qty: l.qty, pieces: l.pieces,
+      serials: ((l as { units?: { label: string; serial: string | null; lot: string | null }[] }).units ?? []).map((x) => ({ label: x.label, serial: x.serial, lot: x.lot })) })),
     haulAway: ((s.haulAway as Record<string, unknown>[]) ?? []).map((h) => ({ description: h.description, qty: h.qty, category: h.category })),
   }));
   const cod = stopsOut.reduce((a, s) => a + BigInt(s.codMinor), 0n);

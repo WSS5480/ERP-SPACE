@@ -29,6 +29,7 @@ const RETAIL_ACCOUNTS: Account[] = [
   ["1050", "Undeposited funds", "asset", "D"],
   ["1100", "Accounts receivable, customers", "asset", "D"],
   ["1110", "Receivable from finance companies", "asset", "D"],
+  ["1115", "Finance company holdbacks receivable", "asset", "D"],
   ["1190", "Allowance for doubtful accounts", "asset", "C"],
   ["1300", "Merchandise inventory", "asset", "D"],
   ["1150", "Vendor chargebacks receivable", "asset", "D"],
@@ -59,6 +60,7 @@ const RETAIL_ACCOUNTS: Account[] = [
   ["6800", "Other operating", "expense", "D"],
   ["6900", "Bad debt expense", "expense", "D"],
   ["6910", "Card and finance fees", "expense", "D"],
+  ["6915", "Finance company chargebacks", "expense", "D"],
   ...GROUP_ACCOUNTS,
 ];
 

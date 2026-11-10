@@ -237,7 +237,10 @@ export const module: ErpModule = {
     coPost("/inventory/receiving", safe(async (c, co, a, b) => {
       await requireRole(c, co, a, WAREHOUSE, "receiving goods");
       const lines = (Array.isArray(b.lines) ? b.lines : []).map((l: Record<string, unknown>) => ({ poLineId: uuid(l.poLineId) ?? "", qty: num(l.qty),
-        damagedQty: num(l.damagedQty ?? 0) || 0, damageNote: str(l.damageNote) || undefined })).filter((l) => l.qty > 0);
+        damagedQty: num(l.damagedQty ?? 0) || 0, damageNote: str(l.damageNote) || undefined,
+        // serials and lots, scanned or typed at the dock (one entry per unit; a lot for the whole line)
+        units: Array.isArray(l.units) ? (l.units as Record<string, unknown>[]).slice(0, 500).map((u) => ({ serial: str(u?.serial, 60) || null, lot: str(u?.lot, 40) || null })) : undefined,
+        lot: str(l.lot, 40) || null })).filter((l) => l.qty > 0);
       return inv.receivePurchaseOrder(c, sc(co, a), { purchaseOrderId: uuid(b.purchaseOrderId) ?? "", locationId: uuid(b.locationId) ?? "",
         binId: uuid(b.binId), lines, note: str(b.note) || undefined, appointmentId: uuid(b.appointmentId) });
     }));

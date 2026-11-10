@@ -99,6 +99,7 @@ Data is placed with textContent only, never innerHTML.
 | wms (containers and freight, goods in transit, prep queue; extends inventory and purchasing) | 0038 | 0024 | Operations (Containers and prep) |
 | tax and selling rules (extends setup, pos, ar, reports) | 0037 | 0023 | Setup (Sales tax), Back office (Reports → Sales tax filing) |
 | ops (truck loading manifest and lanes, haul-away and recycling, vendor debit memos, time off and holidays; extends fleet, payables, workforce) | 0039, 0041 | 0025 | Operations (Loading dock, Haul-away), Back office (Debit memos, Time off) |
+| lots (serial numbers and dye lots, label printing, finance company settlements; extends inventory, edi, catalog tags, ar) | 0045 | 0028 | Operations (Serials and lots, Labels), Back office (Finance settlements) |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -206,6 +207,53 @@ loading (`loading.loadPiece`, per piece), `startRoute` and `completeStop`;
 labelled units are checked one by one, unlabelled stock by quantity free of
 prep at the location. Prep that was never queued is queued in its own
 transaction, so a refusal does not lose it.
+
+## Serials, dye lots, labels and finance settlements (lots, migration 0045)
+
+Serials and lots live on `inv_piece` (`serial_no`, `lot_code`; every carton of
+a unit carries the unit's values) and are written only by `inventory.ts`.
+A product says how it is matched on an order with `product.lot_class`
+(`dye_lot` for upholstery and leather, `finish_batch` for wood case goods,
+`batch`) and `lot_group` (the cover or finish; empty means collection and
+color, see `LOT_KEY_SQL`). Receiving takes `units: [{serial, lot}]` and a line
+`lot`; with nothing scanned it uses what the vendor's 856 said
+(`inv_expected_serial`, filled from MAN SN / LIN SN / REF SE serials and
+LIN LT / REF LT / MAN LT lots). Non-serialized stock keeps its lot on
+`goods_receipt_line.lot_code`. The pick list and `inventory.reservePieces`
+take one lot per cover or finish on an order (`unitsByLot`), warn when lots
+mix (`lotMix`, `lotWarnings` on the pick list), and in strict mode
+(`inventory.lot_strict`) refuse a reservation or a hand allocation that would
+mix, while the pick list leaves the line short. Serial and lot show on pick
+lists, the loading manifest and the delivery record (`route().stops[].lines[].units`).
+`inventory.searchSerials` is the recall and service search.
+
+Labels (`packages/core/labels.ts`): carton, bin and price-tag labels as ZPL,
+as a .zpl download, sent to a network printer, or as a no-script print page
+(HTML with SVG Code 128, sized by `@page` for a Dymo or desktop printer).
+Code 128 comes from `catalog.code128` (one implementation). Templates
+(`label_template`) set size, dpi and fields per company and kind. Batch
+sources: a goods receipt, the prep queue, a route's manifest, scanned pieces,
+bins, SKUs. Network printing is SSRF-narrow: only printers the owner set up
+(`label_printer`), only private IPv4/IPv6 literals (checked in code and by a
+check constraint), ports 9100-9109, named by id; a request carrying an
+address is refused. Price tags print a `condition_grade` only when that column
+exists on product.
+
+Finance settlements (`packages/core/ar_settlement.ts`, part of A/R's
+third-party finance): each lender has a remittance CSV mapping, a bank
+account, a fee tolerance and a chargeback mode. Rows match a `financed_sale`
+by approval (auth) code, else the account's last four (never the full number)
+with the amount and date. Funding posts Dr cash (the lender's bank account,
+else 1050), Dr 6910 the fee, Dr 1115 the holdback, Cr 1110 the sale; a
+holdback release Dr cash Cr 1115; a chargeback either reopens the sale
+(Dr 1110, the fee given back through 6910) or goes to 6915; a reopened
+chargeback can be written off to 6915 by a controller, with a reason. Fees
+are checked against the plan's rate (`finance_plan.fee_bps`, by the file's
+plan code when given) and flagged past the tolerance. Rows that match nothing
+are exceptions, settled by a person (matched to a sale, or set aside with a
+reason). When nothing is open and the posted cash equals one unmatched bank
+line of the lender's account near the deposit day, the settlement's cash
+lines are matched to it through `reconcile.matchManually`.
 
 ## Reports
 

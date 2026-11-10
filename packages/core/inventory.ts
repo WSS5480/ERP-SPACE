@@ -30,7 +30,7 @@
 // Receiving posts nothing: inventory reaches the ledger when the vendor's
 // merchandise invoice posts in payables (Dr 1300 Cr 2010), as it already does.
 
-import { q, one, type Client, type Scope } from "./db.ts";
+import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor } from "./posting.ts";
 
 export class InventoryError extends Error {}
@@ -282,11 +282,13 @@ async function takeMarkup(c: Client, entityId: string, productId: string, qty: n
 // ================================================================ helpers
 
 type Product = { id: string; sku: string; name: string; kind: string; serialized: boolean; cost_minor: string;
-  cubic_ft: string | null; weight_lb: string | null; category: string | null; vendor_id: string | null };
+  cubic_ft: string | null; weight_lb: string | null; category: string | null; vendor_id: string | null;
+  lot_class: string | null; lot_key: string | null };
 
 async function productOf(c: Client, entityId: string, productId: string): Promise<Product> {
-  const r = await q<Product>(c, `select id, sku, name, kind, serialized, cost_minor, cubic_ft, weight_lb, category, vendor_id
-    from product where id = $1 and entity_id = $2`, [productId, entityId]);
+  const r = await q<Product>(c, `select id, sku, name, kind, serialized, cost_minor, cubic_ft, weight_lb, category, vendor_id, lot_class,
+      ${LOT_KEY_SQL} lot_key
+    from product p where id = $1 and entity_id = $2`, [productId, entityId]);
   need(r.length, "no such product");
   return r[0];
 }
@@ -379,20 +381,21 @@ async function binAt(c: Client, entityId: string, binId: string | null | undefin
  */
 async function createUnits(c: Client, entityId: string, p: Product, e: { locationId: string; binId: string | null; qty: number; status: string;
   costMinor: bigint; kind: string; refType?: string; refId?: string | null; reason?: string | null; by?: string | null;
-  grLineId?: string | null; salesOrderLineId?: string | null }): Promise<{ unitIds: string[]; labels: string[] }> {
+  grLineId?: string | null; salesOrderLineId?: string | null; ids?: UnitIds[] }): Promise<{ unitIds: string[]; labels: string[] }> {
   need(Number.isInteger(e.qty) && e.qty > 0, `${p.name} is tracked piece by piece, so the quantity must be a whole number`);
   const cartons = await cartonsFor(c, entityId, p);
   const unitIds: string[] = [], labels: string[] = [];
   for (let i = 0; i < e.qty; i++) {
     const unit = (await q<{ u: string }>(c, `select gen_random_uuid()::text u /* unscoped: no table */`))[0].u;
     unitIds.push(unit);
+    const ids = e.ids?.[i] ?? {};
     for (const ct of cartons) {
       const label = await nextNo(c, entityId, "piece", "P");
       const pc = await one<{ id: string }>(c, `insert into inv_piece (entity_id, label, product_id, unit_id, carton_seq, carton_count, carton_label,
-          cubic_ft, weight_lb, location_id, bin_id, status, cost_minor, goods_receipt_line_id, sales_order_line_id)
-        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning id`,
+          cubic_ft, weight_lb, location_id, bin_id, status, cost_minor, goods_receipt_line_id, sales_order_line_id, serial_no, lot_code)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) returning id`,
         [entityId, label, p.id, unit, ct.seq, cartons.length, ct.label, ct.cubic_ft, ct.weight_lb, e.locationId, e.binId, e.status,
-         e.costMinor.toString(), e.grLineId ?? null, e.salesOrderLineId ?? null]);
+         e.costMinor.toString(), e.grLineId ?? null, e.salesOrderLineId ?? null, ids.serial ?? null, ids.lot ?? null]);
       labels.push(label);
       await logMove(c, entityId, { kind: e.kind, pieceId: pc.id, productId: p.id, qty: 1 / cartons.length, toLoc: e.locationId, toBin: e.binId,
         toStatus: e.status, refType: e.refType, refId: e.refId, reason: e.reason, by: e.by });
@@ -625,7 +628,11 @@ export async function openPurchaseOrders(c: Client, entityId: string) {
 }
 
 /** extraMinor: cost carried by these units on top of the PO line's (a container's freight and duty share for what came off it). */
-export type ReceiveLine = { poLineId: string; qty: number; damagedQty?: number; damageNote?: string; extraMinor?: bigint };
+export type ReceiveLine = { poLineId: string; qty: number; damagedQty?: number; damageNote?: string; extraMinor?: bigint;
+  /** the vendor's serial and lot for each unit, as scanned or typed (good units first, then damaged); */
+  units?: UnitIds[];
+  /** one lot (dye lot, finish batch) for every unit on the line, unless a unit names its own */
+  lot?: string | null };
 
 /**
  * Receive goods against a purchase order, partially or in full. Writes the
@@ -657,7 +664,7 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
   need(cols.has("product_id"), "purchase order lines do not name products yet, so nothing can be received into stock");
   const gr = await one<{ id: string }>(c, `insert into goods_receipt (purchase_order_id, received_on, received_by, note) values ($1,$2,$3,$4) returning id`,
     [po[0].id, today(), by, e.note ?? null]);
-  const out: { poLineId: string; sku: string; qty: number; labels: string[]; unitCostMinor: bigint; reservedFor: string[] }[] = [];
+  const out: { poLineId: string; sku: string; qty: number; labels: string[]; unitCostMinor: bigint; reservedFor: string[]; serials: string[]; lots: string[] }[] = [];
   const seen = new Set<string>();
   const received = new Set<string>(), linked = new Set<string>();
   let total = 0n;
@@ -680,24 +687,26 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
     const unitCost = BigInt(l!.unit_price_minor) + (ordered > 0 ? BigInt(Math.round(Number(l!.landed_minor ?? 0) / ordered)) : 0n)
       + (qty > 0 ? BigInt(Math.round(Number(extra) / qty)) : 0n);
     const value = BigInt(Math.round(qty * Number(unitCost - (qty > 0 ? BigInt(Math.round(Number(extra) / qty)) : 0n)))) + extra;
-    const grl = await one<{ id: string }>(c, `insert into goods_receipt_line (goods_receipt_id, purchase_order_line_id, quantity) values ($1,$2,$3) returning id`,
-      [gr.id, l!.line_id, qty]);
+    const ids = await receivingIds(c, entityId, p, l!.line_id, qty, ln);
+    const grl = await one<{ id: string }>(c, `insert into goods_receipt_line (goods_receipt_id, purchase_order_line_id, quantity, lot_code) values ($1,$2,$3,$4) returning id`,
+      [gr.id, l!.line_id, qty, p.serialized ? null : ids.lineLot]);
     const labels: string[] = [];
     let good: string[] = [];
     if (p.serialized) {
       if (qty - dmg > 0) {
         const made = await createUnits(c, entityId, p, { locationId: e.locationId, binId, qty: qty - dmg, status: "in_stock", costMinor: unitCost,
-          kind: "receive", refType: "receipt", refId: gr.id, by, grLineId: grl.id });
+          kind: "receive", refType: "receipt", refId: gr.id, by, grLineId: grl.id, ids: ids.units.slice(0, qty - dmg) });
         labels.push(...made.labels); good = made.unitIds;
       }
       if (dmg > 0) {
         const made = await createUnits(c, entityId, p, { locationId: e.locationId, binId: null, qty: dmg, status: "damaged", costMinor: unitCost,
-          kind: "receive", refType: "receipt", refId: gr.id, by, grLineId: grl.id, reason: "arrived damaged" });
+          kind: "receive", refType: "receipt", refId: gr.id, by, grLineId: grl.id, reason: "arrived damaged", ids: ids.units.slice(qty - dmg) });
         labels.push(...made.labels);
         for (const u of made.unitIds) await insertDamage(c, entityId, { productId: p.id, locationId: e.locationId, unitId: u, qty: 1, source: "receiving",
           description: ln.damageNote || `Arrived damaged on PO ${po[0].number}`, photoUrls: [], cost: unitCost, by });
       }
       await c.query(`update goods_receipt_line set unit_ids = $2 where id = $1 /* unscoped: row just written under this entity's PO */`, [grl.id, labels]);
+      await markExpectedUsed(c, entityId, ids.expectedUsed, grl.id);
     } else {
       if (binId && qty - dmg > 0) await binStockAdd(c, entityId, binId, p.id, qty - dmg);
       await logMove(c, entityId, { kind: "receive", productId: p.id, qty, toLoc: e.locationId, toBin: binId, toStatus: "in_stock", refType: "receipt", refId: gr.id, by });
@@ -722,7 +731,8 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
       reservedFor.push(sl.number);
     }
     received.add(p.id);
-    out.push({ poLineId: l!.line_id, sku: p.sku, qty, labels, unitCostMinor: unitCost, reservedFor });
+    out.push({ poLineId: l!.line_id, sku: p.sku, qty, labels, unitCostMinor: unitCost, reservedFor,
+      serials: ids.units.map((u) => u.serial ?? null).filter(Boolean) as string[], lots: [...new Set(ids.units.map((u) => u.lot).filter(Boolean))] as string[] });
   }
   // Received, not yet invoiced: the vendor's bill clears 2050.
   if (total > 0n) {
@@ -1160,8 +1170,11 @@ export async function allocate(c: Client, scope: Scope, label: string, lineId: s
   const pcs = await piecesOfUnit(c, scope.entityId, pc.unit_id);
   need(pcs.every((x) => (x.status === "in_stock" || x.status === "as_is") && !x.sales_order_line_id), `${label} is ${pc.status.replace("_", " ")}, not free stock`);
   need(await allocatedUnits(c, scope.entityId, lineId) < Number(l.qty), "that line already has all its pieces");
+  // A piece from a different dye lot or finish batch than the rest of the order's matching pieces: warned, or refused in strict mode.
+  const lotIssue = await lotConflict(c, scope.entityId, l.sales_order_id, lineId, pc.unit_id);
+  need(!lotIssue || !(await lotStrict(c, scope.entityId)), lotIssue ? `${lotIssue}; the company keeps lots strict, so pick a piece from that lot` : "");
   await transitionUnit(c, scope.entityId, scope.actor.id || null, pc.unit_id, "reserved", { kind: "allocate", refType: "order_line", refId: lineId, salesOrderLineId: lineId });
-  return { order: l.number };
+  return { order: l.number, warning: lotIssue };
 }
 
 export async function unallocate(c: Client, scope: Scope, label: string) {
@@ -1172,7 +1185,7 @@ export async function unallocate(c: Client, scope: Scope, label: string) {
 
 export type PickLine = { orderId: string; orderNumber: string; customer: string | null; lineId: string; sku: string; description: string;
   qty: number; locationId: string | null; location: string | null; serialized: boolean;
-  pieces: { id: string; label: string; carton: string; bin: string | null; status: string; cubicFt: number; weightLb: number }[];
+  pieces: { id: string; label: string; carton: string; bin: string | null; status: string; cubicFt: number; weightLb: number; serial: string | null; lot: string | null }[];
   bins: { bin: string; qty: number }[]; short: number; cubicFt: number; weightLb: number;
   prep: { number: string; type: string; status: string; label: string | null }[] };
 
@@ -1183,8 +1196,10 @@ export type PickLine = { orderId: string; orderNumber: string; customer: string 
  * cannot be covered shows its shortfall rather than failing the list.
  */
 export async function pickListFor(c: Client, entityId: string, orderIds: string[]):
-  Promise<{ lines: PickLine[]; pieces: number; cubicFt: number; weightLb: number; short: number; prepPending: number }> {
-  if (!orderIds.length) return { lines: [], pieces: 0, cubicFt: 0, weightLb: 0, short: 0, prepPending: 0 };
+  Promise<{ lines: PickLine[]; pieces: number; cubicFt: number; weightLb: number; short: number; prepPending: number; lotWarnings: string[] }> {
+  if (!orderIds.length) return { lines: [], pieces: 0, cubicFt: 0, weightLb: 0, short: 0, prepPending: 0, lotWarnings: [] };
+  const strict = await lotStrict(c, entityId);
+  const lotHeld: string[] = [];
   const rows = await q<{ order_id: string; number: string; customer: string | null; line_id: string; sku: string; description: string; qty: string;
     fulfil_from_id: string | null; location: string | null; product_id: string; serialized: boolean; cubic_ft: string | null; weight_lb: string | null }>(c, `
     select so.id order_id, so.number, cu.name customer, l.id line_id, l.sku, l.description, l.qty, l.fulfil_from_id, lo.name location,
@@ -1205,18 +1220,20 @@ export async function pickListFor(c: Client, entityId: string, orderIds: string[
     if (r.serialized && r.fulfil_from_id) {
       const have = await allocatedUnits(c, entityId, r.line_id);
       if (have < qty) {
-        const free = await freeUnits(c, entityId, r.product_id, r.fulfil_from_id, qty - have);
-        for (const u of free) await transitionUnit(c, entityId, null, u, "reserved", { kind: "allocate", refType: "order_line", refId: r.line_id, salesOrderLineId: r.line_id });
-        line.short = qty - have - free.length;
+        // Pieces of one cover or finish on one order come from one lot where the stock allows (in strict mode, only then).
+        const pick = await unitsByLot(c, entityId, r.order_id, r.line_id, r.product_id, r.fulfil_from_id, qty - have, strict);
+        for (const u of pick.units) await transitionUnit(c, entityId, null, u, "reserved", { kind: "allocate", refType: "order_line", refId: r.line_id, salesOrderLineId: r.line_id });
+        line.short = qty - have - pick.units.length;
+        if (strict && line.short > 0 && pick.free >= qty - have) lotHeld.push(`${r.number}: ${r.description} is left short rather than mixing lots (lots are kept strict)`);
       }
       const pcs = await q<{ id: string; label: string; carton_seq: number; carton_count: number; carton_label: string | null; bin: string | null; status: string;
-        cubic_ft: string | null; weight_lb: string | null }>(c, `
-        select pc.id, pc.label, pc.carton_seq, pc.carton_count, pc.carton_label, b.code bin, pc.status, pc.cubic_ft, pc.weight_lb
+        cubic_ft: string | null; weight_lb: string | null; serial_no: string | null; lot_code: string | null }>(c, `
+        select pc.id, pc.label, pc.carton_seq, pc.carton_count, pc.carton_label, b.code bin, pc.status, pc.cubic_ft, pc.weight_lb, pc.serial_no, pc.lot_code
           from inv_piece pc left join inv_bin b on b.id = pc.bin_id
          where pc.entity_id = $1 and pc.sales_order_line_id = $2 and pc.status in ('reserved','picked','loaded')
          order by b.code nulls last, pc.unit_id, pc.carton_seq`, [entityId, r.line_id]);
       line.pieces = pcs.map((x) => ({ id: x.id, label: x.label, carton: x.carton_count > 1 ? `${x.carton_seq} of ${x.carton_count}${x.carton_label ? ` · ${x.carton_label}` : ""}` : "1 of 1",
-        bin: x.bin, status: x.status, cubicFt: Number(x.cubic_ft ?? 0), weightLb: Number(x.weight_lb ?? 0) }));
+        bin: x.bin, status: x.status, cubicFt: Number(x.cubic_ft ?? 0), weightLb: Number(x.weight_lb ?? 0), serial: x.serial_no, lot: x.lot_code }));
       line.cubicFt = line.pieces.reduce((a, x) => a + x.cubicFt, 0);
       line.weightLb = line.pieces.reduce((a, x) => a + x.weightLb, 0);
       pieces += line.pieces.length;
@@ -1238,7 +1255,9 @@ export async function pickListFor(c: Client, entityId: string, orderIds: string[
   const open = await wms.prepOpenForLines(c, entityId, out.map((l) => l.lineId));
   for (const l of out) l.prep = open.get(l.lineId) ?? [];
   const prepPending = out.reduce((a, l) => a + l.prep.length, 0);
-  return { lines: out, pieces, cubicFt: Math.round(cube * 100) / 100, weightLb: Math.round(weight * 100) / 100, short, prepPending };
+  const lotWarnings: string[] = [...lotHeld];
+  for (const id of orderIds) lotWarnings.push(...(await lotMix(c, entityId, id)).map((m) => m.message));
+  return { lines: out, pieces, cubicFt: Math.round(cube * 100) / 100, weightLb: Math.round(weight * 100) / 100, short, prepPending, lotWarnings };
 }
 
 // ============================================================ scanning
@@ -1273,7 +1292,7 @@ export const NEXT: Record<string, string[]> = {
 export async function scan(c: Client, entityId: string, label: string) {
   const r = await q<PieceView>(c, `
     select pc.id, pc.label, pc.product_id, pc.unit_id, pc.carton_seq, pc.carton_count, pc.carton_label, pc.location_id, pc.bin_id, pc.status,
-           pc.sales_order_line_id, pc.cost_minor, pc.transfer_id, pc.as_is_price_minor,
+           pc.sales_order_line_id, pc.cost_minor, pc.transfer_id, pc.as_is_price_minor, pc.serial_no, pc.lot_code, p.lot_class,
            p.sku, p.name, lo.name location, b.code bin, so.number order_number, so.id order_id
       from inv_piece pc join product p on p.id = pc.product_id join location lo on lo.id = pc.location_id
       left join inv_bin b on b.id = pc.bin_id
@@ -1834,4 +1853,291 @@ export async function tieOut(c: Client, entityId: string) {
 export async function addOnOrder(c: Client, entityId: string, productId: string, locationId: string, qty: number): Promise<void> {
   if (!Number.isFinite(qty) || qty === 0) throw new InventoryError("on-order changes by a non-zero quantity");
   await bump(c, entityId, productId, locationId, { onOrder: qty });
+}
+
+// ======================================================= serials and lots
+//
+// A unit carries its vendor's serial number and, for upholstery and leather,
+// a dye lot (case goods: a finish batch). Every carton of the unit carries the
+// same values. They are captured at receiving (scanned or typed, or from the
+// vendor's 856), can be filled in later by scanning a label, and are searched
+// for recalls and service. Pieces of one cover or finish on one order should
+// come from one lot: the pick list and reservePieces choose so, warn when lots
+// would be mixed, and refuse to mix when the company keeps lots strict
+// (setting inventory.lot_strict).
+
+export type UnitIds = { serial?: string | null; lot?: string | null };
+
+/** The matching group of a product (alias p): its lot_group, else collection and color; null when it carries no lot. */
+export const LOT_KEY_SQL = `case when p.lot_class is null then null else upper(coalesce(nullif(trim(p.lot_group), ''),
+  nullif(concat_ws(' ', p.collection, p.color), ''), p.id::text)) end`;
+export const LOT_WORD: Record<string, string> = { dye_lot: "dye lot", finish_batch: "finish batch", batch: "batch" };
+
+const SERIAL_RE = /^[\x21-\x7e]{1,60}$/, LOT_RE = /^[\x20-\x7e]{1,40}$/;
+/** A serial or lot as kept: trimmed, upper case, printable ASCII. */
+export function cleanId(v: unknown, what: "serial" | "lot"): string | null {
+  const t = String(v ?? "").trim().toUpperCase();
+  if (!t) return null;
+  need((what === "serial" ? SERIAL_RE : LOT_RE).test(t), what === "serial"
+    ? `${t.slice(0, 20)} is not a serial number this system can keep (1 to 60 letters, digits or marks, no spaces)`
+    : `${t.slice(0, 20)} is not a lot code this system can keep (1 to 40 letters, digits or marks)`);
+  return t;
+}
+
+export async function lotStrict(c: Client, entityId: string): Promise<boolean> {
+  return (await settingOf<unknown>(c, entityId, "inventory.lot_strict", false)) === true;
+}
+
+export async function setLotStrict(c: Client, scope: Scope, strict: boolean) {
+  await c.query(`insert into entity_setting (entity_id, key, value) values ($1, 'inventory.lot_strict', $2::jsonb)
+    on conflict (entity_id, key) do update set value = excluded.value`, [scope.entityId, JSON.stringify(!!strict)]);
+  await audit(c, scope, { table: "entity_setting", rowId: scope.entityId, action: "update", after: { "inventory.lot_strict": !!strict } });
+  return { strict: !!strict };
+}
+
+/** Say how a product is matched on an order: by dye lot, finish batch or batch (or not at all), and its group. */
+export async function setLotClass(c: Client, scope: Scope, productId: string, e: { lotClass: string | null; lotGroup?: string | null }) {
+  await productOf(c, scope.entityId, productId);
+  need(e.lotClass === null || ["dye_lot", "finish_batch", "batch"].includes(e.lotClass), "a product is matched by dye lot, finish batch, batch, or not at all");
+  const g = e.lotGroup == null ? null : String(e.lotGroup).trim().slice(0, 80) || null;
+  await c.query(`update product set lot_class = $3, lot_group = $4, updated_at = now() where id = $1 and entity_id = $2`, [productId, scope.entityId, e.lotClass, g]);
+  return { productId, lotClass: e.lotClass, lotGroup: g };
+}
+
+/** Serials and lots a ship notice says are on their way on a PO line. */
+export async function expectSerials(c: Client, scope: Scope, e: { poLineId: string; serials?: string[]; lot?: string | null; reference?: string | null; source?: string }) {
+  const pl = await q<{ id: string }>(c, `select id from purchase_order_line where id = $1 and entity_id = $2`, [e.poLineId, scope.entityId]);
+  need(pl.length, "no such purchase order line");
+  const lot = cleanId(e.lot, "lot");
+  const serials = [...new Set((e.serials ?? []).map((x) => cleanId(x, "serial")).filter(Boolean))] as string[];
+  for (const sn of serials) await c.query(`insert into inv_expected_serial (entity_id, purchase_order_line_id, serial_no, lot_code, source, reference)
+    values ($1,$2,$3,$4,$5,$6)`, [scope.entityId, e.poLineId, sn, lot, e.source ?? "asn", e.reference ?? null]);
+  if (!serials.length && lot) await c.query(`insert into inv_expected_serial (entity_id, purchase_order_line_id, serial_no, lot_code, source, reference)
+    values ($1,$2,null,$3,$4,$5)`, [scope.entityId, e.poLineId, lot, e.source ?? "asn", e.reference ?? null]);
+  return { serials: serials.length, lot };
+}
+
+/** The serial and lot of each unit arriving on a receipt line: what the dock scanned, else what the vendor's notice said. */
+async function receivingIds(c: Client, entityId: string, p: Product, poLineId: string, qty: number, ln: ReceiveLine):
+  Promise<{ units: UnitIds[]; lineLot: string | null; expectedUsed: string[] }> {
+  const lineLot = cleanId(ln.lot, "lot");
+  let units: UnitIds[] = (ln.units ?? []).map((u) => ({ serial: cleanId(u?.serial, "serial"), lot: cleanId(u?.lot, "lot") ?? lineLot }));
+  const expectedUsed: string[] = [];
+  let fromNotice: string | null = null;
+  if (!units.some((u) => u.serial || u.lot) && !lineLot) {
+    const exp = await q<{ id: string; serial_no: string | null; lot_code: string | null }>(c, `select id, serial_no, lot_code from inv_expected_serial
+       where entity_id = $1 and purchase_order_line_id = $2 and used_at is null order by created_at, serial_no for update`, [entityId, poLineId]);
+    fromNotice = exp.find((x) => !x.serial_no && x.lot_code)?.lot_code ?? null;
+    const sn = exp.filter((x) => x.serial_no);
+    if (p.serialized) for (const x of sn.slice(0, Math.trunc(qty))) { units.push({ serial: x.serial_no, lot: x.lot_code ?? fromNotice }); expectedUsed.push(x.id); }
+    const lotRow = exp.find((x) => !x.serial_no && x.lot_code);
+    if (lotRow) expectedUsed.push(lotRow.id);
+    if (!p.serialized && !fromNotice) fromNotice = sn[0]?.lot_code ?? null;
+  }
+  if (p.serialized) {
+    need(units.length <= qty, `${units.length} serials were given for ${qty} units of ${p.sku}`);
+    while (units.length < qty) units.push({ serial: null, lot: lineLot ?? fromNotice });
+    const sns = units.map((u) => u.serial).filter(Boolean) as string[];
+    need(new Set(sns).size === sns.length, `a serial number was given twice for ${p.sku}`);
+    if (sns.length) {
+      const dup = await q<{ serial_no: string; label: string }>(c, `select serial_no, label from inv_piece where entity_id = $1 and product_id = $2 and upper(serial_no) = any($3) limit 1`,
+        [entityId, p.id, sns]);
+      need(!dup.length, `serial ${dup[0]?.serial_no} is already on piece ${dup[0]?.label} of ${p.sku}`);
+    }
+  }
+  return { units, lineLot: lineLot ?? fromNotice ?? units.find((u) => u.lot)?.lot ?? null, expectedUsed };
+}
+
+async function markExpectedUsed(c: Client, entityId: string, ids: string[], grLineId: string) {
+  if (!ids.length) return;
+  await c.query(`update inv_expected_serial x set used_at = now(),
+      piece_label = (select pc.label from inv_piece pc where pc.entity_id = x.entity_id and pc.goods_receipt_line_id = $3 and pc.serial_no = x.serial_no order by pc.carton_seq limit 1)
+    where x.entity_id = $1 and x.id = any($2)`, [entityId, ids, grLineId]);
+}
+
+/** Fill in or correct a unit's serial and lot by scanning any of its labels. */
+export async function setUnitIds(c: Client, scope: Scope, label: string, e: { serial?: string | null; lot?: string | null }) {
+  const pc = await pieceByLabel(c, scope.entityId, label);
+  const before = await one<{ serial_no: string | null; lot_code: string | null }>(c, `select serial_no, lot_code from inv_piece where id = $1 and entity_id = $2`, [pc.id, scope.entityId]);
+  const serial = e.serial === undefined ? before.serial_no : cleanId(e.serial, "serial");
+  const lot = e.lot === undefined ? before.lot_code : cleanId(e.lot, "lot");
+  if (serial) {
+    const dup = await q<{ label: string }>(c, `select label from inv_piece where entity_id = $1 and product_id = $2 and upper(serial_no) = $3 and unit_id <> $4 limit 1`,
+      [scope.entityId, pc.product_id, serial, pc.unit_id]);
+    need(!dup.length, `serial ${serial} is already on piece ${dup[0]?.label}`);
+  }
+  await c.query(`update inv_piece set serial_no = $3, lot_code = $4, updated_at = now() where entity_id = $1 and unit_id = $2`, [scope.entityId, pc.unit_id, serial, lot]);
+  await audit(c, scope, { table: "inv_piece", rowId: pc.id, action: "update", before, after: { serial_no: serial, lot_code: lot } });
+  return { label: pc.label, serial, lot };
+}
+
+type FreeUnit = { unit_id: string; lot: string; at: string };
+async function freeByLot(c: Client, entityId: string, productId: string, locationId: string): Promise<FreeUnit[]> {
+  return q<FreeUnit>(c, `select unit_id, coalesce(min(upper(lot_code)), '') lot, min(created_at)::text at from inv_piece
+     where entity_id = $1 and product_id = $2 and location_id = $3
+     group by unit_id having bool_and(status = 'in_stock' and sales_order_line_id is null)
+     order by min(created_at)`, [entityId, productId, locationId]);
+}
+
+/** The lots (non-blank) already on an order's pieces of one matching group, with how many units each. */
+async function lotsOnOrder(c: Client, entityId: string, orderId: string, key: string, exceptUnit: string | null = null) {
+  return q<{ lot: string; units: string }>(c, `
+    select upper(pc.lot_code) lot, count(distinct pc.unit_id)::text units
+      from inv_piece pc join sales_order_line l on l.id = pc.sales_order_line_id join product p on p.id = pc.product_id
+     where pc.entity_id = $1 and l.sales_order_id = $2 and pc.status in ('reserved','picked','loaded','delivered')
+       and ${LOT_KEY_SQL} = $3 and coalesce(pc.lot_code, '') <> '' and ($4::uuid is null or pc.unit_id <> $4)
+     group by upper(pc.lot_code) order by count(distinct pc.unit_id) desc, 1`, [entityId, orderId, key, exceptUnit]);
+}
+
+/**
+ * Pick n free units of a product at a location for an order line, keeping one
+ * lot per cover or finish on the order. Products that carry no lot take the
+ * oldest free units, as before. In strict mode only one lot is ever taken
+ * (the rest is left short); otherwise lots are mixed when they must be, and
+ * `mixed` says so.
+ */
+export async function unitsByLot(c: Client, entityId: string, orderId: string, lineId: string, productId: string, locationId: string, n: number, strict: boolean):
+  Promise<{ units: string[]; mixed: boolean; lot: string | null; free: number }> {
+  if (n <= 0) return { units: [], mixed: false, lot: null, free: 0 };
+  const p = await productOf(c, entityId, productId);
+  if (!p.lot_class || !p.lot_key) { const u = await freeUnits(c, entityId, productId, locationId, n); return { units: u, mixed: false, lot: null, free: u.length }; }
+  const free = await freeByLot(c, entityId, productId, locationId);
+  const byLot = new Map<string, FreeUnit[]>();
+  for (const f of free) { if (!byLot.has(f.lot)) byLot.set(f.lot, []); byLot.get(f.lot)!.push(f); }
+  const used = (await lotsOnOrder(c, entityId, orderId, p.lot_key)).map((x) => x.lot);
+  let order: string[];
+  if (used.length) {
+    order = [...used.filter((l) => byLot.has(l)), ...[...byLot.keys()].filter((l) => !used.includes(l)).sort((a, b) => byLot.get(b)!.length - byLot.get(a)!.length)];
+    if (strict && !used.some((l) => byLot.has(l))) order = [];
+    else if (strict) order = [used.find((l) => byLot.has(l))!];
+  } else {
+    // No lot yet: the one that covers this line and the most of the order's other pieces of the same cover or finish.
+    const others = await q<{ product_id: string; need: string }>(c, `
+      select l.product_id, (l.qty - (select count(distinct x.unit_id) from inv_piece x where x.entity_id = l.entity_id and x.sales_order_line_id = l.id
+                                       and x.status in ('reserved','picked','loaded')))::text need
+        from sales_order_line l join product p on p.id = l.product_id
+       where l.entity_id = $1 and l.sales_order_id = $2 and l.id <> $3 and l.line_status in ('reserved','ready') and l.fulfil_from_id = $4
+         and p.serialized and ${LOT_KEY_SQL} = $5`, [entityId, orderId, lineId, locationId, p.lot_key]);
+    const score = new Map<string, number>();
+    for (const o of others) {
+      const k = Number(o.need); if (k <= 0) continue;
+      const theirs = o.product_id === productId ? free : await freeByLot(c, entityId, o.product_id, locationId);
+      const cnt = new Map<string, number>();
+      for (const f of theirs) cnt.set(f.lot, (cnt.get(f.lot) ?? 0) + 1);
+      for (const [lot, m] of cnt) score.set(lot, (score.get(lot) ?? 0) + Math.min(m, k));
+    }
+    const lots = [...byLot.keys()];
+    lots.sort((a, b) => {
+      const ca = byLot.get(a)!.length >= n ? 1 : 0, cb = byLot.get(b)!.length >= n ? 1 : 0;
+      if (ca !== cb) return cb - ca;
+      const sa = score.get(a) ?? 0, sb = score.get(b) ?? 0;
+      if (sa !== sb) return sb - sa;
+      if (!ca && byLot.get(a)!.length !== byLot.get(b)!.length) return byLot.get(b)!.length - byLot.get(a)!.length;
+      return byLot.get(a)![0].at < byLot.get(b)![0].at ? -1 : 1;
+    });
+    order = strict ? lots.slice(0, 1) : lots;
+  }
+  const units: string[] = [];
+  const lotsTaken = new Set<string>();
+  for (const lot of order) {
+    for (const f of byLot.get(lot) ?? []) { if (units.length >= n) break; units.push(f.unit_id); lotsTaken.add(lot); }
+    if (units.length >= n) break;
+  }
+  const real = new Set([...lotsTaken, ...used].filter(Boolean));
+  return { units, mixed: real.size > 1, lot: order[0] || null, free: free.length };
+}
+
+/** Matching groups on an order whose pieces come from more than one lot. */
+export async function lotMix(c: Client, entityId: string, orderId: string): Promise<{ key: string; lotClass: string; lots: string[]; products: string[]; message: string }[]> {
+  const r = await q<{ key: string; lot_class: string; number: string; lots: string[]; products: string[] }>(c, `
+    select ${LOT_KEY_SQL} key, min(p.lot_class) lot_class, min(so.number) number,
+           array_agg(distinct upper(pc.lot_code) order by upper(pc.lot_code)) lots, array_agg(distinct p.name order by p.name) products
+      from inv_piece pc join sales_order_line l on l.id = pc.sales_order_line_id join sales_order so on so.id = l.sales_order_id
+      join product p on p.id = pc.product_id
+     where pc.entity_id = $1 and l.sales_order_id = $2 and pc.status in ('reserved','picked','loaded','delivered')
+       and p.lot_class is not null and coalesce(pc.lot_code, '') <> ''
+     group by 1 having count(distinct upper(pc.lot_code)) > 1`, [entityId, orderId]);
+  return r.map((x) => ({ key: x.key, lotClass: x.lot_class, lots: x.lots, products: x.products,
+    message: `${x.number}: ${x.products.join(" and ")} would go out in mixed ${LOT_WORD[x.lot_class] ?? "lot"}s ${x.lots.join(", ")}` }));
+}
+
+/** Why putting this unit on the line would mix lots on its order, or null. */
+export async function lotConflict(c: Client, entityId: string, orderId: string, _lineId: string, unitId: string): Promise<string | null> {
+  const u = await q<{ lot: string | null; label: string; lot_class: string | null; key: string | null; name: string }>(c, `
+    select upper(pc.lot_code) lot, pc.label, p.lot_class, ${LOT_KEY_SQL} key, p.name from inv_piece pc join product p on p.id = pc.product_id
+     where pc.entity_id = $1 and pc.unit_id = $2 order by pc.carton_seq limit 1`, [entityId, unitId]);
+  if (!u.length || !u[0].lot_class || !u[0].key || !u[0].lot) return null;
+  const used = (await lotsOnOrder(c, entityId, orderId, u[0].key, unitId)).map((x) => x.lot);
+  if (!used.length || used.includes(u[0].lot)) return null;
+  const word = LOT_WORD[u[0].lot_class] ?? "lot";
+  return `${u[0].label} is ${word} ${u[0].lot}, but this order's other pieces of that cover or finish are ${word} ${used.join(", ")}`;
+}
+
+/**
+ * Put pieces on every reserved line of an order that is tracked piece by
+ * piece, one lot per cover or finish where the stock allows. Lots that would
+ * be mixed are warned about; in strict mode the whole reservation is refused.
+ */
+export async function reservePieces(c: Client, scope: Scope, orderId: string) {
+  const entityId = scope.entityId;
+  const so = await q<{ number: string }>(c, `select number from sales_order where id = $1 and entity_id = $2`, [orderId, entityId]);
+  need(so.length, "no such order");
+  const strict = await lotStrict(c, entityId);
+  const lines = await q<{ id: string; product_id: string; qty: string; fulfil_from_id: string; name: string; lot_class: string | null }>(c, `
+    select l.id, l.product_id, l.qty, l.fulfil_from_id, p.name, p.lot_class from sales_order_line l join product p on p.id = l.product_id
+     where l.entity_id = $1 and l.sales_order_id = $2 and l.line_status in ('reserved','ready') and l.qty > 0 and p.serialized and l.fulfil_from_id is not null
+     order by p.lot_class nulls last, l.seq for update of l`, [entityId, orderId]);
+  let allocated = 0, short = 0;
+  const notes: string[] = [];
+  for (const l of lines) {
+    const want = Number(l.qty) - (await allocatedUnits(c, entityId, l.id));
+    if (want <= 0) continue;
+    const pick = await unitsByLot(c, entityId, orderId, l.id, l.product_id, l.fulfil_from_id, want, strict);
+    need(!(strict && pick.units.length < want && pick.free >= want),
+      `${so[0].number}: ${l.name} cannot come from one ${LOT_WORD[l.lot_class ?? ""] ?? "lot"} with the rest of the order's matching pieces, and the company keeps lots strict; receive more of that lot or change the order`);
+    for (const u of pick.units) await transitionUnit(c, entityId, scope.actor.id || null, u, "reserved", { kind: "allocate", refType: "order_line", refId: l.id, salesOrderLineId: l.id });
+    allocated += pick.units.length;
+    if (pick.units.length < want) { short += want - pick.units.length; notes.push(`${l.name}: ${want - pick.units.length} not in stock here`); }
+  }
+  const mix = await lotMix(c, entityId, orderId);
+  need(!(strict && mix.length), `${mix[0]?.message}; the company keeps lots strict`);
+  return { order: so[0].number, allocated, short, notes, warnings: mix.map((m) => m.message), strict };
+}
+
+/** Serial and lot of the pieces on order lines (pick lists, manifests, the delivery record). */
+export async function lotsForLines(c: Client, entityId: string, lineIds: string[]): Promise<Map<string, { label: string; serial: string | null; lot: string | null; status: string }[]>> {
+  const out = new Map<string, { label: string; serial: string | null; lot: string | null; status: string }[]>();
+  if (!lineIds.length) return out;
+  const r = await q<{ line_id: string; label: string; serial_no: string | null; lot_code: string | null; status: string }>(c, `
+    select sales_order_line_id line_id, label, serial_no, lot_code, status from inv_piece
+     where entity_id = $1 and sales_order_line_id = any($2) and status in ('reserved','picked','loaded','delivered')
+     order by unit_id, carton_seq`, [entityId, lineIds]);
+  for (const x of r) { if (!out.has(x.line_id)) out.set(x.line_id, []); out.get(x.line_id)!.push({ label: x.label, serial: x.serial_no, lot: x.lot_code, status: x.status }); }
+  return out;
+}
+
+/**
+ * Recall and service search: units by vendor serial (exact, or starting with
+ * at least four characters), or every unit of a lot, with where each is now --
+ * on the floor, on an order, or delivered, to whom and when.
+ */
+export async function searchSerials(c: Client, entityId: string, term: string) {
+  const t = String(term ?? "").trim().toUpperCase();
+  need(t.length >= 2, "type at least two characters of a serial number or lot");
+  need(t.length <= 60, "that is longer than any serial or lot");
+  return q(c, `
+    select pc.unit_id, min(pc.label) label, string_agg(pc.label, ' ' order by pc.carton_seq) labels, min(pc.serial_no) serial_no, min(pc.lot_code) lot_code,
+           min(p.lot_class) lot_class, p.sku, p.name, min(pc.status) status, lo.name location, so.number order_number, cu.name customer, cu.phone,
+           (select max(m.at)::date::text from inv_move m where m.entity_id = $1 and m.kind = 'deliver' and m.piece_id = any(array_agg(pc.id))) delivered_on,
+           (select s.number from delivery_stop_line sl join delivery_stop s on s.id = sl.stop_id
+             where sl.entity_id = $1 and sl.sales_order_line_id = min(pc.sales_order_line_id::text)::uuid order by s.scheduled_on desc nulls last limit 1) stop_number,
+           (select po.number from goods_receipt_line gl join goods_receipt gr on gr.id = gl.goods_receipt_id join purchase_order po on po.id = gr.purchase_order_id
+             where gl.id = min(pc.goods_receipt_line_id::text)::uuid and po.entity_id = $1) po_number,
+           case when upper(min(pc.serial_no)) = $2 then 'serial' when upper(min(pc.lot_code)) = $2 then 'lot' else 'serial starts with' end matched_on
+      from inv_piece pc join product p on p.id = pc.product_id join location lo on lo.id = pc.location_id
+      left join sales_order_line l on l.id = pc.sales_order_line_id left join sales_order so on so.id = l.sales_order_id
+      left join customer cu on cu.id = so.customer_id
+     where pc.entity_id = $1 and (upper(pc.serial_no) = $2 or upper(pc.lot_code) = $2 or (length($2) >= 4 and upper(pc.serial_no) like $3))
+     group by pc.unit_id, p.sku, p.name, lo.name, so.number, cu.name, cu.phone
+     order by min(pc.lot_code), min(pc.serial_no) limit 200`, [entityId, t, t.replace(/[\\%_]/g, (m) => "\\" + m) + "%"]);
 }

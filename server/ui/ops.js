@@ -106,7 +106,7 @@
       const left = list.filter((x) => x.status === 'pending').length;
       return section(`Load ${g} · stop ${f.stop_seq} · ${f.customer || ''}`, left ? `${left} to load` : 'done', null, panel(list.map((x) => item({
         title: x.description, badge: itemChip(x),
-        detail: [x.label, x.carton, x.bin ? `bin ${x.bin}` : null, f.stop_number].filter(Boolean).join(' · '),
+        detail: [x.label, x.carton, x.bin ? `bin ${x.bin}` : null, x.serial_no ? `SN ${x.serial_no}` : null, x.lot_code ? `lot ${x.lot_code}` : null, f.stop_number].filter(Boolean).join(' · '),
         why: x.status === 'short' ? `Short: ${x.short_reason}` : null,
         acts: !draft ? null : x.status === 'pending' ? [
           btn('Load', () => scan({ itemId: x.id }), { small: true, primary: g === l.nextGroup }),
@@ -119,7 +119,8 @@
     if (st.scanFocus) { st.scanFocus = false; setTimeout(() => scanIn.focus(), 0); }
     return frag(
       el('div', { class: 'toolbar' }, btn('All routes', () => go('loading'), { small: true }), el('span', { class: 'grow' }),
-        btn('Print manifest', () => go('loading', 'print:' + id), { small: true }), btn('Route', () => go('fleet', 'route:' + id), { small: true })),
+        btn('Print manifest', () => go('loading', 'print:' + id), { small: true }), btn('Carton labels', () => go('labels', 'manifest:' + id), { small: true }),
+        btn('Route', () => go('fleet', 'route:' + id), { small: true })),
       head(`Load ${r.number}`, null, `${dayLabel(r.route_on)} · ${r.unit_no || 'no truck'} · ${r.dc_name}`),
       tilesRow(tile({ label: 'Loaded', value: `${t.loaded}/${t.pieces}`, tone: t.pending ? 'neutral' : 'good' }),
         tile({ label: 'Short', value: String(t.short), tone: t.short ? 'warning' : 'neutral' }),
@@ -151,7 +152,7 @@
         return el('div', { class: 'ops-grp' },
           el('b', { text: `Load ${g} · Stop ${list[0].stop_seq} · ${list[0].stop_number} · ${list[0].customer || ''}` }),
           el('div', { text: [s.address, s.window, s.phone].filter(Boolean).join(' · ') }),
-          list.map((x) => el('div', { class: 'ops-row' }, el('span', { class: 'ops-box' }), el('span', { text: `${x.label} · ${x.description}${x.carton ? ' · ' + x.carton : ''}${x.bin ? ' · bin ' + x.bin : ''}${x.status === 'short' ? ' · SHORT: ' + x.short_reason : ''}` }))),
+          list.map((x) => el('div', { class: 'ops-row' }, el('span', { class: 'ops-box' }), el('span', { text: `${x.label} · ${x.description}${x.carton ? ' · ' + x.carton : ''}${x.bin ? ' · bin ' + x.bin : ''}${x.serial_no ? ' · SN ' + x.serial_no : ''}${x.lot_code ? ' · lot ' + x.lot_code : ''}${x.status === 'short' ? ' · SHORT: ' + x.short_reason : ''}` }))),
           (s.haulAway || []).length ? el('div', { text: `Haul away: ${s.haulAway.map((h) => `${h.qty}× ${h.description}`).join('; ')}` }) : null);
       }),
       el('div', { class: 'ops-grp', text: 'Loaded by: ____________________   Checked by: ____________________   Time: ________' }));

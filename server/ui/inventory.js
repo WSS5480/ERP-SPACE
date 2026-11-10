@@ -142,9 +142,10 @@
     out.replaceChildren(
       el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Pieces', String(r.pieces)), fact('Cube', `${r.cubicFt} cu ft`), fact('Weight', `${r.weightLb} lb`), fact('Short', String(r.short)))),
       el('div', { class: 'panel' }, r.lines.map((l) => item({ title: `${l.orderNumber} · ${l.description}`, amount: `× ${qty(l.qty)}`,
-        detail: l.serialized ? l.pieces.map((p) => `${p.label} (${p.carton}) ${p.bin ? 'in ' + p.bin : 'unbinned'}`).join(' · ') || 'No pieces free'
+        detail: l.serialized ? l.pieces.map((p) => `${p.label} (${p.carton}) ${p.bin ? 'in ' + p.bin : 'unbinned'}${p.serial ? ' · SN ' + p.serial : ''}${p.lot ? ' · lot ' + p.lot : ''}`).join(' · ') || 'No pieces free'
           : l.bins.map((b) => `${b.bin}: ${qty(b.qty)}`).join(' · ') || `from ${l.location || 'the location'}`,
-        badge: l.short ? chip('serious', 'warn', `${l.short} short`) : chip('good', 'ok', l.location || 'ready') }))));
+        badge: l.short ? chip('serious', 'warn', `${l.short} short`) : chip('good', 'ok', l.location || 'ready') }))),
+      (r.lotWarnings || []).length ? resultBox('warning', 'warn', 'Lots', r.lotWarnings.join(' · ')) : null);
   }
 
   // ----------------------------------------------------------------- scan
@@ -184,6 +185,7 @@
           el('div', { class: 'panel' }, el('div', { class: 'facts' },
             fact('Product', `${p.name} · ${p.sku}`), fact('Status', words(p.status)), fact('Where', `${p.location}${p.bin ? ' · ' + p.bin : ''}`),
             fact('Order', p.order_number || '—'), p.carton_label ? fact('Carton', p.carton_label) : null,
+            p.serial_no ? fact('Serial', p.serial_no) : null, p.lot_code ? fact(p.lot_class === 'finish_batch' ? 'Finish batch' : 'Lot', p.lot_code) : null,
             p.as_is_price_minor ? fact('As-is price', money(p.as_is_price_minor)) : null,
             s.openDamage ? fact('Damage', `${s.openDamage.number}, ${words(s.openDamage.status)}`) : null)),
           buttons.length ? el('div', { class: 'toolbar' }, buttons) : el('p', { class: 'sub', text: 'Nothing to do with it from here.' }), out),
@@ -289,7 +291,8 @@
         return `Received ${res.lines.reduce((a, x) => a + x.qty, 0)} units at ${money(res.valueMinor)}; ${res.lines.reduce((a, x) => a + x.labels.length, 0)} labels to print${res.poStatus === 'received' ? '. The PO is complete.' : '.'}`
           + (forOrders.length ? ` Reserved for customer order${forOrders.length > 1 ? 's' : ''} ${forOrders.join(', ')}.` : '')
           + (res.backordersReserved ? ` ${plural(res.backordersReserved, 'back order')} now covered.` : ''); },
-      (res) => { const labels = res.lines.flatMap((x) => x.labels); if (labels.length) out.append(el('div', { class: 'panel' }, item({ title: 'Labels', detail: labels.join(' ') }))); E.render(); }) }, 'Receive');
+      (res) => { const labels = res.lines.flatMap((x) => x.labels); if (labels.length) out.append(el('div', { class: 'panel' }, item({ title: 'Labels', detail: labels.join(' '),
+        acts: [el('button', { class: 'btn small primary', type: 'button', onclick: () => { d.close(); go('labels', 'receipt:' + res.receiptId); } }, 'Print these labels')] }))); E.render(); }) }, 'Receive');
     d.body.append(el('div', { class: 'form-grid' }, field('Receiving at', loc), field('Put in', bin), field('Note', note, { wide: true })),
       el('div', { class: 'panel' }, rows.map((x) => x.node)), el('div', { class: 'dlg-acts' }, b, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Close')), out);
   }

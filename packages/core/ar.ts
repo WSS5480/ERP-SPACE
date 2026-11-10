@@ -1296,9 +1296,10 @@ export async function recordApplication(c: Client, scope: Scope, a: {
 }
 
 /** A sale paid by a finance company: the 'financing' receipt (Dr 1110) now names who owes it and on what plan. */
-export async function recordFinancedSale(c: Client, scope: Scope, receiptId: string, planId: string) {
-  const r = await q<{ method: string; amount_minor: string; voided_at: string | null; customer_id: string | null; sales_order_id: string | null }>(c,
-    `select method, amount_minor, voided_at, customer_id, sales_order_id from customer_receipt where id = $1 and entity_id = $2`, [receiptId, scope.entityId]);
+export async function recordFinancedSale(c: Client, scope: Scope, receiptId: string, planId: string,
+  ids: { authCode?: string | null; accountLast4?: string | null } = {}) {
+  const r = await q<{ method: string; amount_minor: string; voided_at: string | null; customer_id: string | null; sales_order_id: string | null; reference: string | null }>(c,
+    `select method, amount_minor, voided_at, customer_id, sales_order_id, reference from customer_receipt where id = $1 and entity_id = $2`, [receiptId, scope.entityId]);
   need(r.length, "no such receipt");
   need(r[0].method === "financing", "only a receipt taken as financing is owed by a finance company");
   need(!r[0].voided_at, "that receipt is voided");
@@ -1310,10 +1311,16 @@ export async function recordFinancedSale(c: Client, scope: Scope, receiptId: str
   need(amt >= B(p[0].min_amount_minor) && (p[0].max_amount_minor === null || amt <= B(p[0].max_amount_minor)),
     `${$(amt)} is outside what the ${p[0].name} plan takes`);
   const fee = mulBps(amt, p[0].fee_bps);
+  // What the lender's settlement file will name it by: their approval (auth) code -- the register's reference -- and the account's last four.
+  const auth = String(ids.authCode ?? r[0].reference ?? "").trim().toUpperCase() || null;
+  need(auth === null || /^[\x21-\x7e]{1,40}$/.test(auth), "an approval code is 1 to 40 letters or digits");
+  const digits = String(ids.accountLast4 ?? "").replace(/\D/g, "");
+  need(!ids.accountLast4 || digits.length >= 4, "give at least the last four digits of the customer's account with the lender");
+  const last4 = digits ? digits.slice(-4) : null;
   const x = await one<{ id: string }>(c, `
-    insert into financed_sale (entity_id, receipt_id, company_id, plan_id, customer_id, sales_order_id, amount_minor, fee_bps, expected_fee_minor)
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning id`,
-    [scope.entityId, receiptId, p[0].company_id, planId, r[0].customer_id, r[0].sales_order_id, amt.toString(), p[0].fee_bps, fee.toString()]);
+    insert into financed_sale (entity_id, receipt_id, company_id, plan_id, customer_id, sales_order_id, amount_minor, fee_bps, expected_fee_minor, auth_code, account_last4)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning id`,
+    [scope.entityId, receiptId, p[0].company_id, planId, r[0].customer_id, r[0].sales_order_id, amt.toString(), p[0].fee_bps, fee.toString(), auth, last4]);
   return { financedSaleId: x.id, expectedFeeMinor: fee };
 }
 

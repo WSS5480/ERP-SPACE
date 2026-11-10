@@ -419,7 +419,8 @@ export function parse855(segs: Segment[]): Ack855 & { errors: string[] } {
 
 // ---------------------------------------------------------------- 856 --
 
-export type AsnLine = { line?: number; vendorSku?: string; upc?: string; qty: number };
+/** serials: the units' vendor serial numbers (LIN SN, MAN SN, REF SE); lot: dye lot or batch (LIN LT, REF LT). */
+export type AsnLine = { line?: number; vendorSku?: string; upc?: string; qty: number; serials?: string[]; lot?: string };
 export type Asn856 = {
   shipmentId: string; date: string | null; shippedOn?: string | null; deliveryOn?: string | null;
   carrier?: string | null; carrierName?: string | null; tracking?: string | null; bol?: string | null;
@@ -446,7 +447,8 @@ export function build856(a: Asn856): Segment[] {
     const ord = ++hl;
     segs.push(["HL", String(ord), String(ship), "O"], ["PRF", o.poNumber]);
     for (const l of o.lines) {
-      segs.push(["HL", String(++hl), String(ord), "I"], ["LIN", l.line != null ? String(l.line) : "", ...ids(l)], ["SN1", "", qtyOut(l.qty), "EA"]);
+      segs.push(["HL", String(++hl), String(ord), "I"], ["LIN", l.line != null ? String(l.line) : "", ...ids(l), ...(l.lot ? ["LT", l.lot] : [])], ["SN1", "", qtyOut(l.qty), "EA"]);
+      for (const sn of l.serials ?? []) segs.push(["MAN", "SN", sn]);
     }
   }
   segs.push(["CTT", String(hl)]);
@@ -487,7 +489,20 @@ export function parse856(segs: Segment[]): Asn856 & { errors: string[] } {
       if (!order) { errors.push("an item in the 856 sits under no order (no HL O with a PRF)"); continue; }
       const x = itemIds(s, 2);
       item = { line: el(s, 1) && /^\d+$/.test(el(s, 1)) ? Number(el(s, 1)) : undefined, vendorSku: x.vendorSku, upc: x.upc, qty: 0 };
+      for (let i = 2; i + 1 < s.length; i += 2) {
+        const qual = s[i].trim(), val = s[i + 1].trim();
+        if (!val) continue;
+        if (qual === "SN") (item.serials ??= []).push(val.toUpperCase());
+        if (qual === "LT" && !item.lot) item.lot = val.toUpperCase();
+      }
       order.lines.push(item);
+    } else if (id === "MAN" && item) {
+      // Marks and numbers under an item: SN serial numbers (MAN02, and MAN05 when a pair is sent); a lot as MAN*LT.
+      if (el(s, 1) === "SN") for (const v of [el(s, 2), el(s, 5)]) if (v) (item.serials ??= []).push(v.toUpperCase());
+      if (el(s, 1) === "LT" && el(s, 2) && !item.lot) item.lot = el(s, 2).toUpperCase();
+    } else if (id === "REF" && item && (level === "I" || level === "P")) {
+      if (el(s, 1) === "SE" && el(s, 2)) (item.serials ??= []).push(el(s, 2).toUpperCase());
+      if (el(s, 1) === "LT" && el(s, 2) && !item.lot) item.lot = el(s, 2).toUpperCase();
     } else if (id === "SN1") {
       if (!item) { errors.push("an SN1 quantity has no LIN item before it"); continue; }
       const q = num(el(s, 2));

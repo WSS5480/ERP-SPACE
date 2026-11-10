@@ -197,7 +197,7 @@ export async function loading(c: Client, entityId: string, routeId: string) {
   need(rt.length, "no such route");
   const items = await q<Record<string, unknown>>(c, `
     select i.id, i.stop_id, s.number stop_number, cu.name customer, a.line1, a.city, i.stop_seq, i.load_group, i.label, i.description, i.carton,
-           i.piece_id, i.status, i.out_of_order, i.short_reason, i.loaded_at::text loaded_at, u.name loaded_by, b.code bin
+           i.piece_id, i.status, i.out_of_order, i.short_reason, i.loaded_at::text loaded_at, u.name loaded_by, b.code bin, pc.serial_no, pc.lot_code
       from route_load_item i join delivery_stop s on s.id = i.stop_id
       left join customer cu on cu.id = s.customer_id left join customer_address a on a.id = s.address_id
       left join app_user u on u.id = i.loaded_by
