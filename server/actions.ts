@@ -1035,7 +1035,7 @@ const REQUIRED_ACCOUNTS: [string, string, string, "D" | "C"][] = [
 ];
 
 const ROLES = ["owner", "controller", "approver", "ap_clerk", "viewer",
-  "store_manager", "sales", "cashier", "buyer", "warehouse", "dispatcher", "driver", "ar_clerk", "hr", "web_admin", "marketing", "technician"];
+  "store_manager", "sales", "cashier", "buyer", "warehouse", "dispatcher", "driver", "ar_clerk", "hr", "web_admin", "marketing", "technician", "designer"];
 const PURPOSES = ["operating", "deposit", "payroll", "tax"];
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "x";
 

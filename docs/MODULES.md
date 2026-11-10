@@ -99,6 +99,7 @@ Data is placed with textContent only, never innerHTML.
 | wms (containers and freight, goods in transit, prep queue; extends inventory and purchasing) | 0038 | 0024 | Operations (Containers and prep) |
 | tax and selling rules (extends setup, pos, ar, reports) | 0037 | 0023 | Setup (Sales tax), Back office (Reports → Sales tax filing) |
 | ops (truck loading manifest and lanes, haul-away and recycling, vendor debit memos, time off and holidays; extends fleet, payables, workforce) | 0039, 0041 | 0025 | Operations (Loading dock, Haul-away), Back office (Debit memos, Time off) |
+| trade (trade and designer accounts, the trade portal, room projects and follow-ups, the designer as a commission role; extends crm, catalog, tax, ar, shop, workforce) | 0044 | 0027 | Retail (Trade accounts, Room projects) |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -135,6 +136,58 @@ up to `quote_hold_max_days`; a manager extends it; it ends on expiry
 (`server/modules/tearsheet.ts`) are server-rendered print pages with no script;
 a customer's copy is `/sheet/<token>` (only the hash is kept), sent through the
 customer message log.
+
+## Trade accounts, the trade portal, room projects (migration 0044, extends crm/catalog/tax/ar/shop/workforce)
+
+A trade account (`trade_account`) is one business customer: a designer,
+contractor, stager or hospitality buyer. It copies nothing: its terms and
+credit limit are its customer's house account (`ar.setAccount`, net 30 by
+default; only the controller sets a limit), its resale certificate is a
+`tax_exemption_certificate` on that customer, and its prices are a price list.
+A price list may now price whole categories by rule (`price_list_rule`, cost
+plus X% or retail less Y%, a null category being the catch-all) through
+`priceConfigured`; a product's own price on the list still wins, and nothing
+goes above the ticket. Applying is public (`trade_application`); a store
+manager or controller approves (making or reusing the customer by email) or
+declines with a reason.
+
+The portal is `/trade/<slug>/` on the web store's site: its own page and
+script (`server/shop/trade.*`, no inline script), its API at
+`/trade/<slug>/api/*` through `kit.publicRoute` (POSTs carry `x-erp-shop: 1`).
+Sign-in is an emailed six-digit code (`trade_login_code`, only its hash kept,
+10 minutes, five wrong tries, three per 15 minutes per account, plus a
+per-address limit); the session is a random token in `x-trade-session`
+(`trade_session`, hash kept, 12 hours, ended when the account is suspended).
+Every portal read names the account; another account's order, project or
+invoice reads as not found. Orders go through the web store's own checkout
+(`shop.placeWebOrder` with `CheckoutIn.trade`): channel `b2b`, priced by the
+account's list, on account (what is owed plus what is on order and unbilled
+must fit the limit; billed at hand-over by `invoiceFulfilment` on the account's
+terms) or by card. A resale order needs a current resale certificate
+(`tax.certificateFor`); a delivery to a designer's client is taxed at the
+destination like any delivery, and a certificate only exempts in its own state.
+Invoices are paid by card through `ar.receivePayment`. Tear sheets are the
+`/sheet/<token>` links (`tearsheet.createLink`).
+
+Room projects (`packages/core/projects.ts`): per customer (seen from the
+household) or trade account, with room size, doors and windows, style notes,
+photos (data URLs, removed rows kept), a budget and the products considered,
+quoted and bought; POS (customer card), CRM (`customer360.projects`) and the
+portal read the same rows. Follow-ups go on `crm_task` once each per order or
+project (`clienteling_followup`): a quote still open N days on (3), a care
+check-in N days after delivery (30), a protection plan check-in (365); set in
+`entity_setting` `clienteling.followups`, run by `scripts/run-due.ts`.
+
+Commission (`packages/core/trade_commission.ts`): a line's own split
+(`sales_order_line_split`, primary rep plus internal designer, role
+`designer`) replaces the order's salespeople for that line in
+`workforce.accrueCommissions`, on each person's plan basis (gross margin or
+sale); a return line follows the line it returns. An outside referral
+(`sales_order_line_referral`) earns the trade account its rate as
+`trade_referral_event` rows, Dr 6130 Cr 2160 through `post()`, when the line is
+delivered (or once paid: `trade.referral_on`), given back on a return or a
+cancel; `billReferrals` turns what is owed into a bill from the account's
+vendor, coded to 2160, through the payables gates.
 
 ## Group accounting
 

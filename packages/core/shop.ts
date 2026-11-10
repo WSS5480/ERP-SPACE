@@ -412,13 +412,13 @@ type Priced = {
   availability: Availability;
 };
 
-/** Price every line again on the server. A line that cannot be sold online is refused, with its reason. */
-async function priceLines(c: Client, site: Site, lines: LineIn[], locs: Map<string, Loc>): Promise<Priced[]> {
+/** Price every line again on the server. A line that cannot be sold online is refused, with its reason. A trade order prices by its account's list. */
+async function priceLines(c: Client, site: Site, lines: LineIn[], locs: Map<string, Loc>, priceList: string | null = null): Promise<Priced[]> {
   const out: Priced[] = [];
   for (const l of lines) {
     const p = await webProduct(c, site.entity_id, l.productId);
     need(p, "Something in the cart is no longer sold online. Remove it and try again.");
-    const pr = await priceConfigured(c, site.entity_id, p!.id, l.choices);
+    const pr = await priceConfigured(c, site.entity_id, p!.id, l.choices, { priceList });
     const tx = await one<{ taxable: boolean }>(c, `select taxable from product where id = $1 and entity_id = $2`, [p!.id, site.entity_id]);
     out.push({
       productId: p!.id, sku: pr.sku, name: p!.name, description: pr.description, kind: p!.kind, shipClass: p!.ship_class,
@@ -501,6 +501,12 @@ export type CheckoutIn = {
   fulfillment: "pickup" | "delivery" | "ship"; pickupLocationId: string | null; address: Address | null;
   lines: LineIn[]; paymentToken: string; notes: string | null;
   couponCode?: string | null;   // checked and redeemed through crm.checkCoupon / crm.redeemCoupon
+  /** A trade portal order (trade module): the account's customer, its price list, a resale certificate, and on account or by card. */
+  trade?: TradeCheckout | null;
+};
+export type TradeCheckout = {
+  customerId: string; priceList: string | null; resaleCert: string | null; onAccount: boolean;
+  shipLabel: string | null; reference: string | null;
 };
 
 const clean = (v: unknown, max: number) => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f<>]/g, " ").replace(/\s+/g, " ").trim().slice(0, max) : "");
@@ -590,8 +596,15 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn, write = false)
   const locs = await locationsOf(c, site.entity_id);
   if (inp.fulfillment === "pickup") need(inp.pickupLocationId && site.pickup_location_ids.includes(inp.pickupLocationId) && locs.has(inp.pickupLocationId),
     "Choose one of the store's pickup locations.");
-  const priced = await priceLines(c, site, inp.lines, locs);
+  const priced = await priceLines(c, site, inp.lines, locs, inp.trade?.priceList ?? null);
   warrantyCovered(priced);
+  // A resale order is exempt only under a current certificate of the account's own (tax.certificateFor refuses a void or expired one).
+  let cert: tax.Cert | null = null;
+  if (inp.trade?.resaleCert) {
+    try { cert = await tax.certificateFor(c, site.entity_id, inp.trade.customerId, inp.trade.resaleCert); }
+    catch (e) { if (e instanceof tax.TaxError) throw new ShopError(`${e.message.charAt(0).toUpperCase()}${e.message.slice(1)}.`); throw e; }
+    need(cert.reason === "resale", `Certificate ${cert.number} is not a resale certificate; a resale order needs one.`);
+  }
   if (inp.fulfillment === "ship") {
     const bulky = priced.find((p) => !["parcel", "carry", "none"].includes(p.shipClass));
     need(!bulky, `${bulky?.name ?? "An item"} is too large to ship by parcel. Choose delivery or pickup.`);
@@ -647,7 +660,7 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn, write = false)
   let sub = 0n, taxTotal = 0n;
   for (const l of lines) {
     const net = l.unitPriceMinor * BigInt(l.qty);
-    const lt = tax.computeLine(place.stack, { netMinor: net - l.discountMinor, itemClass: tax.classOf(l.kind), taxable: l.taxable, cert: null });
+    const lt = tax.computeLine(place.stack, { netMinor: net - l.discountMinor, itemClass: tax.classOf(l.kind), taxable: l.taxable, cert });
     l.taxMinor = lt.taxMinor; l.taxRows = lt.rows;
     sub += net; taxTotal += l.taxMinor;
   }
@@ -662,7 +675,7 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn, write = false)
   if (fee && fee.minor > 0n) {
     const fp = site.fee_product_id ? await q<{ taxable: boolean; kind: string }>(c, `select taxable, kind from product where id = $1 and entity_id = $2`, [site.fee_product_id, site.entity_id]) : [];
     fee.cls = tax.classOf(fp[0]?.kind ?? "fee");
-    const ft = tax.computeLine(place.stack, { netMinor: fee.minor, itemClass: fee.cls, taxable: !!fp[0]?.taxable, cert: null });
+    const ft = tax.computeLine(place.stack, { netMinor: fee.minor, itemClass: fee.cls, taxable: !!fp[0]?.taxable, cert });
     fee.taxMinor = ft.taxMinor; fee.taxRows = ft.rows;
   }
   taxTotal += fee?.taxMinor ?? 0n;
@@ -777,29 +790,51 @@ export type Placed = { duplicate: boolean; order: Awaited<ReturnType<typeof orde
 export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scope: Scope,
   provider: PaymentProvider = providerFor(site), messages: MessageProvider = RecordOnlyMessages, reviews: ReviewProvider = RecordOnlyReviews): Promise<Placed> {
   need(scope.entityId === site.entity_id, "That store belongs to another company.");
+  const trade = inp.trade ?? null;
+  const channel = trade ? "b2b" : "web";
   await c.query(`select pg_advisory_xact_lock(hashtext($1)) /* unscoped: a lock keyed by company and cart */`, [`shop:${site.entity_id}:${inp.cartId}`]);
   const prior = await q<{ id: string }>(c,
-    `select id from sales_order where entity_id = $1 and channel = 'web' and external_ref = $2`, [site.entity_id, inp.cartId]);
+    `select id from sales_order where entity_id = $1 and channel = $3 and external_ref = $2${trade ? " and customer_id = $4" : ""}`,
+    trade ? [site.entity_id, inp.cartId, channel, trade.customerId] : [site.entity_id, inp.cartId, channel]);
   if (prior[0]) return { duplicate: true, order: (await orderView(c, site.entity_id, prior[0].id))! };
 
   const b = await buildOrder(c, site, inp, true);
   need(b.totalMinor > 0n, "There is nothing to pay for.");
-  const customerId = await findOrCreateCustomer(c, site.entity_id, inp, inp.pickupLocationId ?? site.tax_location_id ?? site.web_location_id);
+  let customerId: string;
+  if (trade) {
+    const cu = await q<{ id: string }>(c, `select id from customer where id = $1 and entity_id = $2 and status <> 'inactive'`, [trade.customerId, site.entity_id]);
+    need(cu.length, "That trade account cannot order right now.");
+    customerId = trade.customerId;
+    // On account: what is owed, plus what is on order and not yet billed, plus this order, must fit under the limit.
+    if (trade.onAccount) {
+      const { creditCheck } = await import("./ar.ts");
+      const pending = await one<{ s: string }>(c, `
+        select coalesce(sum(greatest(so.total_minor - so.paid_minor - coalesce((select sum(i.charged_minor) from customer_invoice i
+                 where i.entity_id = so.entity_id and i.sales_order_id = so.id), 0), 0)), 0)::text s
+          from sales_order so where so.entity_id = $1 and so.customer_id = $2 and so.status in ('open','fulfilling')`, [site.entity_id, customerId]);
+      const chk = await creditCheck(c, site.entity_id, customerId, b.totalMinor + BigInt(pending.s), null);
+      need(chk.ok, chk.ok ? "" : `This order can't go on account: ${chk.reason.replace(/; an owner or controller can approve it with a reason$/, "")}. Pay by card, or ask the store to raise the limit.`);
+    }
+  } else {
+    customerId = await findOrCreateCustomer(c, site.entity_id, inp, inp.pickupLocationId ?? site.tax_location_id ?? site.web_location_id);
+  }
   let addressId: string | null = null;
   if (inp.address) {
     const hasDefault = await q<{ id: string }>(c, `select id from customer_address where entity_id = $1 and customer_id = $2 and is_default`, [site.entity_id, customerId]);
     addressId = (await one<{ id: string }>(c, `
       insert into customer_address (entity_id, customer_id, label, line1, line2, city, state, postal, is_default)
-      values ($1,$2,'Web order',$3,$4,$5,$6,$7,$8) returning id`,
-      [site.entity_id, customerId, inp.address.line1, inp.address.line2, inp.address.city, inp.address.state, inp.address.postal, !hasDefault.length])).id;
+      values ($1,$2,$9,$3,$4,$5,$6,$7,$8) returning id`,
+      [site.entity_id, customerId, inp.address.line1, inp.address.line2, inp.address.city, inp.address.state, inp.address.postal, !hasDefault.length,
+       (trade?.shipLabel || "Web order").slice(0, 60)])).id;
   }
   const number = (await one<{ n: string }>(c, `select next_doc_no($1, 'order', 'SO-') n /* unscoped: numbering function takes the entity */`, [site.entity_id])).n;
   const order = await one<{ id: string }>(c, `
     insert into sales_order (entity_id, number, channel, location_id, customer_id, status, fulfillment, ship_address_id,
                              promised_on, external_ref, notes)
-    values ($1,$2,'web',$3,$4,'open',$5,$6,$7,$8,$9) returning id`,
+    values ($1,$2,$10,$3,$4,'open',$5,$6,$7,$8,$9) returning id`,
     [site.entity_id, number, b.orderLocationId, customerId, inp.fulfillment, addressId, b.promisedOn, inp.cartId,
-     [`Web order from ${site.display_name}`, inp.notes].filter(Boolean).join(". ")]);
+     [trade ? `Trade order${trade.reference ? ` (${trade.reference})` : ""}${trade.resaleCert ? `, for resale under certificate ${trade.resaleCert}` : ""}${trade.onAccount ? ", on account" : ""}`
+       : `Web order from ${site.display_name}`, inp.notes].filter(Boolean).join(". "), channel]);
   let seq = 1;
   for (const l of b.lines) {
     const row = await one<{ id: string }>(c, `
@@ -831,6 +866,8 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
   // Stock first: if reserving fails, the card is never touched.
   await reserveOrder(c, site.entity_id, order.id);
 
+  // On account: no card; the account is billed (net terms) when the goods are handed over.
+  if (!trade?.onAccount) {
   const auth = await provider.authorize({ amountMinor: b.totalMinor, token: inp.paymentToken, reference: number });
   if (!auth.approved) throw new ShopError(auth.reason);
   try {
@@ -849,6 +886,7 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
     await provider.void(auth.authRef).catch(() => undefined);
     throw e;
   }
+  }
 
   await c.query(`
     insert into shop_cart (site_id, id, entity_id, email, lines, item_count, subtotal_minor, sales_order_id)
@@ -856,12 +894,12 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
     on conflict (site_id, id) do update set sales_order_id = excluded.sales_order_id, email = excluded.email, updated_at = now()`,
     [site.id, inp.cartId, site.entity_id, inp.email, order.id]);
 
-  const track = `/shop/${site.slug}/#/status`;
+  const track = trade ? `/trade/${site.slug}/` : `/shop/${site.slug}/#/status`;
   if (inp.phone) await messages.send(c, { entityId: site.entity_id, siteId: site.id, orderId: order.id, customerId, channel: "sms",
     toRef: maskPhone(inp.phone), template: "order_confirmed", body: `${site.display_name}: order ${number} is confirmed. Track it at ${track}` });
   await messages.send(c, { entityId: site.entity_id, siteId: site.id, orderId: order.id, customerId, channel: "email",
     toRef: maskEmail(inp.email), template: "order_confirmed", body: `Thanks for your order ${number} from ${site.display_name}.` });
-  for (const pid of new Set(b.lines.filter((l) => !["warranty", "service"].includes(l.kind)).map((l) => l.productId))) {
+  for (const pid of trade ? [] : new Set(b.lines.filter((l) => !["warranty", "service"].includes(l.kind)).map((l) => l.productId))) {
     await reviews.request(c, { entityId: site.entity_id, productId: pid, orderId: order.id, customerId });
   }
   return { duplicate: false, order: (await orderView(c, site.entity_id, order.id))! };

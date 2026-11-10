@@ -120,6 +120,7 @@
     const drawCustomer = () => {
       if (cart.customer) {
         const c = cart.customer;
+        const projBox = el('div');
         const addr = select((c.addresses || []).map((a) => [a.id, `${a.label}: ${a.line1}, ${a.city} ${a.state}`]), cart.addressId || ((c.addresses || [])[0] || {}).id || '', 'No address');
         if (cart.addressId !== addr.value) cart.delivery = null;
         cart.addressId = addr.value;
@@ -134,7 +135,10 @@
           acts: [el('button', { class: 'btn small', type: 'button', onclick: () => { cart.customer = null; cart.addressId = ''; cart.taxExemptRef = ''; drawCustomer(); } }, 'Change')] }),
           pad(el('div', { class: 'form-grid' }, field('Deliver to', addr), field('Tax exempt', exempt, { hint: certs.length ? 'Current certificates on file.' : 'Needs a current certificate on file.' }),
             el('div', { class: 'toolbar' }, el('button', { class: 'btn small', type: 'button', onclick: () => addressDialog(c, drawCustomer) }, 'Add an address'),
-              el('button', { class: 'btn small', type: 'button', onclick: () => certificateDialog(c, drawCustomer) }, 'Add a certificate')))));
+              el('button', { class: 'btn small', type: 'button', onclick: () => certificateDialog(c, drawCustomer) }, 'Add a certificate')))),
+          projBox);
+        // The customer's room projects (trade module), so the salesperson sees what they are planning.
+        if (E.trade) E.trade.projectsCard(c).then((n) => { if (n && projBox.isConnected) projBox.replaceChildren(n); });
       } else {
         const q = input({ placeholder: 'Name, phone or email', inputmode: 'search', 'aria-label': 'Find a customer' });
         const res = el('div');
@@ -338,7 +342,10 @@
         acts: l.needs_override && mgr ? [el('button', { class: 'btn small primary', type: 'button', onclick: async (e) => {
           const why = await E.askReason({ title: 'Allow this price', label: 'Why it is allowed', confirm: 'Allow it' });
           if (why) run(e.currentTarget, out, () => post(`/pos/orders/${id}/override`, { lineId: l.id, reason: why }), 'Allowed.', reload);
-        } }, 'Allow')] : [] }));
+        } }, 'Allow')] : [
+          // A designer split or an outside trade referral on the line (trade module), until it is handed over.
+          ...(E.trade && l.role === 'item' && Number(l.qty) > 0 && !['fulfilled', 'returned', 'cancelled'].includes(l.line_status)
+            ? [el('button', { class: 'btn small', type: 'button', onclick: () => E.trade.lineCommissionDialog(l, () => reload()) }, 'Designer / referral')] : [])] }));
       const acts = [];
       const btn = (label, fn, primary) => el('button', { class: 'btn' + (primary ? ' primary' : ''), type: 'button', onclick: fn }, label);
       if (o.kind === 'quote' && o.status === 'draft') acts.push(btn('Convert to a sale', (e) => run(e.currentTarget, out, () => post(`/pos/orders/${id}/convert`), 'Converted. Take payment to place it.', reload), true));

@@ -21,6 +21,7 @@ import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { createOrder, PosError } from "./pos.ts";
 import { storeCreditBalance, ArError } from "./ar.ts";
 import { PricingError } from "./pricing.ts";
+import { projectsFor } from "./projects.ts";
 
 export class CrmError extends Error {}
 export const CRM_REFUSALS = [CrmError, PosError, ArError, PricingError];
@@ -218,6 +219,9 @@ export async function customer360(c: Client, entityId: string, customerId: strin
     customer: cu, profile: pf, household, relations, addresses, consent: await consentOf(c, entityId, customerId),
     lifetimeValueMinor: money.ltv, lastPurchaseAt: money.last, orderCount: Number(money.orders), openQuotes: quotes,
     storeCreditMinor: storeCredit.toString(), leads, openTasks: tasks, timeline,
+    // Room projects (trade module): the customer's and their household's.
+    projects: await projectsFor(c, entityId, { customerId }),
+    trade: (await q(c, `select id, number, company_name, status from trade_account where entity_id = $1 and customer_id = $2`, [entityId, customerId]))[0] ?? null,
   };
 }
 
