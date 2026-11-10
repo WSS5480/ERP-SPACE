@@ -157,7 +157,7 @@ export const module: ErpModule = {
 
     kit.coGet("/shop/sites", async (c, co) => {
       const sites = await shop.sitesOf(c, co.id);
-      const locations = await c.query(`select id, code, name, kind, tax_rate_bps from location where entity_id = $1 and status = 'active' order by kind, name`, [co.id]);
+      const locations = await c.query(`select id, code, name, kind, tax_rate_bps from location where entity_id = $1 and status = 'active' and kind not in ('in_transit','dropship') order by kind, name`, [co.id]);
       const fees = await c.query(`select id, sku, name, price_minor from product where entity_id = $1 and kind = 'fee' and status = 'active' order by name`, [co.id]);
       return { sites, locations: locations.rows, feeProducts: fees.rows };
     });

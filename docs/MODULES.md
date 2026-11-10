@@ -96,6 +96,7 @@ Data is placed with textContent only, never innerHTML.
 | reports (report creator and editor) | 0031 | none | Back office |
 | group (multi-company: consolidation, inter-company documents, net-to-zero and settle) | 0035 | 0021 | Back office |
 | edi (vendor EDI X12, API ordering, store orders; extends purchasing) | 0036, 0040 | none | Setup (Vendor EDI), Retail (Store orders) |
+| wms (containers and freight, goods in transit, prep queue; extends inventory and purchasing) | 0038 | 0024 | Operations (Containers and prep) |
 
 ## Group accounting
 
@@ -132,6 +133,30 @@ Decision (Nov 10 2026): an inter-company code (1195, 2190, 4090, 5090, 6800)
 already in a client's chart with a different type is never reused. Migration
 0035 leaves it, raises a NOTICE naming the client and code, and the group
 module refuses to post for that client, saying which account to renumber.
+
+## Containers, goods in transit and prep (wms)
+
+`packages/core/wms.ts` goes through the modules it extends. A container
+(stages booked → departed → at port → customs cleared → on rail/drayage →
+delivered to DC → unloaded, each with expected and actual days) carries PO
+lines with quantities; its DC day moves the lines, the PO and the customers'
+special orders through `purchasing.setLineEta`. Freight, drayage, duty,
+tariff and port fees are spread over its lines by cube, value, weight or
+quantity into `po_landed_cost` (one row per PO line, `basis = 'line'`; a
+re-spread retires old rows with `active = false`), so `reallocate` and
+receiving value the goods with them. Unloading (in part) is
+`inventory.receivePurchaseOrder` per PO. An 856 whose TD3 names a container
+attaches to it, or opens it. `inv_in_transit` (view) is what is on the road:
+shipped-not-received PO quantities and same-company transfers in transit;
+ATP, POS search and the endless aisle read it. Settings:
+`inventory.transfers_two_step` (off: a transfer lands when it ships),
+`inventory.in_transit_gl` ('1300' default, or '1310': Dr 1310 Cr 1300 on
+ship, reversed on receipt; the account is kept on the transfer),
+`inventory.transfer_days`, `wms.prep_gate` (off, warn, refuse). Prep jobs
+are queued on receipt (and before a delivery is booked) from `wms_prep_rule`
+by product or category; a problem goes to `inventory.reportDamage` with its
+photos (https links or pictures taken on the phone, as service tickets keep
+them). Fleet's `bookStop` and the pick-list route go through `wms.prepGate`.
 
 ## Reports
 

@@ -17,5 +17,6 @@ import { module as service } from "./service.ts";
 import { module as reports } from "./reports.ts";
 import { module as group } from "./group.ts";
 import { module as edi } from "./edi.ts";
+import { module as wms } from "./wms.ts";
 
-export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports, group, edi];
+export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports, group, edi, wms];

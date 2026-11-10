@@ -14,6 +14,7 @@ import * as F from "../../packages/core/fleet.ts";
 import { InventoryError } from "../../packages/core/inventory.ts";
 import { ArError } from "../../packages/core/ar.ts";
 import { PostingError } from "../../packages/core/posting.ts";
+import { WmsError } from "../../packages/core/wms.ts";
 import { rolesOf } from "../actions.ts";
 import { ModuleError, need, requireRole, minor, str, uuid, int, type ErpModule, type Client, type Company, type Actor } from "./kit.ts";
 
@@ -33,7 +34,7 @@ const scopeOf = (co: Company, a: Actor): Scope => ({ tenantId: co.tenantId, enti
 async function plain<R>(fn: () => Promise<R>): Promise<R> {
   try { return await fn(); }
   catch (e) {
-    if (e instanceof F.FleetError || e instanceof InventoryError || e instanceof ArError || e instanceof PostingError) throw new ModuleError(e.message);
+    if (e instanceof F.FleetError || e instanceof InventoryError || e instanceof ArError || e instanceof PostingError || e instanceof WmsError) throw new ModuleError(e.message);
     throw e;
   }
 }
@@ -82,7 +83,7 @@ export const module: ErpModule = {
       await viewer(c, co, p);
       return plain(async () => {
         const [locs, vs, ds, zs, s] = await Promise.all([
-          c.query(`select id, code, name, kind, geo is not null mapped from location where entity_id = $1 and status = 'active' and kind <> 'web' order by kind <> 'warehouse', name`, [co.id]),
+          c.query(`select id, code, name, kind, geo is not null mapped from location where entity_id = $1 and status = 'active' and kind not in ('web','in_transit','dropship') order by kind <> 'warehouse', name`, [co.id]),
           c.query(`select id, unit_no, kind, status, home_location_id, crew_size from vehicle where entity_id = $1 and status <> 'retired' order by unit_no`, [co.id]),
           F.drivers(c, co.id, co.tenantId),
           c.query(`select id, code, name from delivery_zone where entity_id = $1 and active order by code`, [co.id]),

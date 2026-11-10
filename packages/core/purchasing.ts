@@ -446,34 +446,72 @@ export async function importAcks(c: Client, s: Scope, a: { csv: string; filename
 
 // --------------------------------------------------------- landed cost --
 
-/** Freight, duty or other cost on a PO, spread over its open lines by value, quantity or cube. */
+export const LANDED_KINDS = ["freight", "duty", "fuel", "other", "drayage", "tariff", "port_fees"];
+export const LANDED_BASES = ["value", "qty", "cube", "weight"];
+
+/** Freight, duty or other cost on a PO, spread over its open lines by value, quantity, cube or weight. */
 export async function addLandedCost(c: Client, s: Scope, poId: string, x: { kind: string; amountMinor: bigint; basis?: string; note?: string | null }) {
   const po = await poFor(c, s.entityId, poId);
   need(po.status !== "cancelled", `${po.number} is cancelled`);
-  need(["freight", "duty", "fuel", "other"].includes(x.kind), "landed cost is freight, duty, fuel or other");
+  need(LANDED_KINDS.includes(x.kind), "landed cost is freight, drayage, duty, tariff, port fees, fuel or other");
   need(x.amountMinor > 0n, "say the amount");
   const basis = x.basis ?? "value";
-  need(["value", "qty", "cube"].includes(basis), "spread it by value, quantity or cube");
+  need(LANDED_BASES.includes(basis), "spread it by value, quantity, cube or weight");
   await c.query(`insert into po_landed_cost (entity_id, purchase_order_id, kind, amount_minor, basis, note, created_by) values ($1,$2,$3,$4,$5,$6,$7)`,
     [s.entityId, poId, x.kind, x.amountMinor.toString(), basis, x.note?.trim() || null, s.actor.id || null]);
   await reallocate(c, s.entityId, poId);
   await audit(c, s, { table: "po_landed_cost", rowId: poId, action: "insert", after: { ...x, amountMinor: x.amountMinor.toString() } });
 }
 
-/** Spread every landed cost on a PO over its lines again; the last line takes the rounding. */
+/**
+ * One line's share of a cost spread somewhere else (a container's freight
+ * or duty, worked out over everything the container carries): it lands on
+ * that PO line alone. Returns the PO, which has been re-spread.
+ */
+export async function addLineLandedCost(c: Client, s: Scope, poLineId: string, x: { kind: string; amountMinor: bigint; containerCostId?: string | null; note?: string | null }) {
+  const l = (await q<{ purchase_order_id: string }>(c, `select purchase_order_id from purchase_order_line where id = $1 and entity_id = $2`, [poLineId, s.entityId]))[0];
+  need(l, "no such purchase order line");
+  const po = await poFor(c, s.entityId, l.purchase_order_id);
+  need(po.status !== "cancelled", `${po.number} is cancelled`);
+  need(LANDED_KINDS.includes(x.kind), "landed cost is freight, drayage, duty, tariff, port fees, fuel or other");
+  if (x.amountMinor <= 0n) return po.id;
+  await c.query(`insert into po_landed_cost (entity_id, purchase_order_id, kind, amount_minor, basis, note, created_by, purchase_order_line_id, container_cost_id)
+                 values ($1,$2,$3,$4,'line',$5,$6,$7,$8)`,
+    [s.entityId, po.id, x.kind, x.amountMinor.toString(), x.note?.trim() || null, s.actor.id || null, poLineId, x.containerCostId ?? null]);
+  await reallocate(c, s.entityId, po.id);
+  return po.id;
+}
+
+/** Retire the line shares a set of container costs put on POs (before spreading them again). Returns the POs touched, already re-spread. */
+export async function retireContainerShares(c: Client, entityId: string, containerCostIds: string[]): Promise<string[]> {
+  if (!containerCostIds.length) return [];
+  const r = await q<{ purchase_order_id: string }>(c, `update po_landed_cost set active = false
+     where entity_id = $1 and container_cost_id = any($2) and active returning purchase_order_id`, [entityId, containerCostIds]);
+  const pos = [...new Set(r.map((x) => x.purchase_order_id))];
+  for (const id of pos) await reallocate(c, entityId, id);
+  return pos;
+}
+
+/** Spread every landed cost on a PO over its lines again; the last line takes the rounding. A cost named for one line goes to that line. */
 export async function reallocate(c: Client, entityId: string, poId: string) {
-  const lines = await q<{ id: string; qty: string; unit: string; cube: string | null }>(c, `
-    select pol.id, pol.quantity - pol.cancelled_qty qty, pol.unit_price_minor unit, p.cubic_ft cube
+  const lines = await q<{ id: string; qty: string; unit: string; cube: string | null; weight: string | null }>(c, `
+    select pol.id, pol.quantity - pol.cancelled_qty qty, pol.unit_price_minor unit, p.cubic_ft cube, p.weight_lb weight
       from purchase_order_line pol left join product p on p.id = pol.product_id
      where pol.entity_id = $1 and pol.purchase_order_id = $2 order by pol.seq`, [entityId, poId]);
-  const costs = await q<{ amount_minor: string; basis: string }>(c, `select amount_minor, basis from po_landed_cost where entity_id = $1 and purchase_order_id = $2`, [entityId, poId]);
+  const costs = await q<{ amount_minor: string; basis: string; purchase_order_line_id: string | null }>(c,
+    `select amount_minor, basis, purchase_order_line_id from po_landed_cost where entity_id = $1 and purchase_order_id = $2 and active`, [entityId, poId]);
   const alloc = new Map(lines.map((l) => [l.id, 0n]));
   const live = lines.filter((l) => Number(l.qty) > 0);
   for (const k of costs) {
+    if (k.purchase_order_line_id) {
+      if (alloc.has(k.purchase_order_line_id)) alloc.set(k.purchase_order_line_id, alloc.get(k.purchase_order_line_id)! + BigInt(k.amount_minor));
+      continue;
+    }
     if (!live.length) break;
     const w = live.map((l) => {
       const q_ = Number(l.qty);
-      const v = k.basis === "qty" ? q_ : k.basis === "cube" && l.cube != null ? q_ * Number(l.cube) : q_ * Number(l.unit);
+      const v = k.basis === "qty" ? q_ : k.basis === "cube" && l.cube != null ? q_ * Number(l.cube)
+        : k.basis === "weight" && l.weight != null ? q_ * Number(l.weight) : q_ * Number(l.unit);
       return BigInt(Math.round(v * 100));
     });
     const tw = w.reduce((a, b) => a + b, 0n);
@@ -691,7 +729,7 @@ export async function sendPO(c: Client, s: Scope, poId: string, method: SendMeth
 
 export type ShipLine = { lineId?: string; seq?: number; vendorSku?: string; qty: number };
 export type ShipNotice = { asn: string; shippedOn?: string | null; expectedOn?: string | null; carrier?: string | null; tracking?: string | null;
-  lines: ShipLine[]; source?: "edi" | "api" | "manual"; documentId?: string | null };
+  lines: ShipLine[]; source?: "edi" | "api" | "manual"; documentId?: string | null; equipment?: string | null };
 
 /**
  * The vendor's ship notice (EDI 856, or a "shipped" status from its API):
@@ -724,10 +762,10 @@ export async function recordShipment(c: Client, s: Scope, poId: string, n: ShipN
   }
   const arrive = n.expectedOn || null;
   const sh = await one<{ id: string }>(c, `
-    insert into po_shipment (entity_id, purchase_order_id, asn_number, shipped_on, expected_on, carrier, tracking, source, document_id, created_by)
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id`,
+    insert into po_shipment (entity_id, purchase_order_id, asn_number, shipped_on, expected_on, carrier, tracking, source, document_id, created_by, equipment_no)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning id`,
     [s.entityId, poId, n.asn.trim().slice(0, 60), n.shippedOn || null, arrive, n.carrier?.trim().slice(0, 80) || null, n.tracking?.trim().slice(0, 80) || null,
-     n.source ?? "edi", n.documentId ?? null, s.actor.id || null]);
+     n.source ?? "edi", n.documentId ?? null, s.actor.id || null, n.equipment?.trim().toUpperCase().replace(/\s+/g, "").slice(0, 20) || null]);
   for (const p of picked) {
     await c.query(`insert into po_shipment_line (entity_id, shipment_id, purchase_order_line_id, quantity) values ($1,$2,$3,$4)`, [s.entityId, sh.id, p.l.id, p.qty]);
     // A shipped line is a confirmed one; its date is now when the truck should arrive.
@@ -740,7 +778,8 @@ export async function recordShipment(c: Client, s: Scope, poId: string, n: ShipN
                         expected_on = coalesce((select max(expected_on) from purchase_order_line where entity_id = $2 and purchase_order_id = $1 and ack_status <> 'rejected'), expected_on)
                   where id = $1 and entity_id = $2`, [poId, s.entityId]);
   await audit(c, s, { table: "po_shipment", rowId: sh.id, action: "insert", after: { po: po.number, asn: n.asn, lines: picked.length, carrier: n.carrier ?? null, tracking: n.tracking ?? null, arrive } });
-  return { shipmentId: sh.id, number: po.number, lines: picked.length, units: picked.reduce((a, p) => a + p.qty, 0), expectedOn: arrive };
+  return { shipmentId: sh.id, poId, number: po.number, lines: picked.length, units: picked.reduce((a, p) => a + p.qty, 0), expectedOn: arrive,
+    shipped: picked.map((p) => ({ poLineId: p.l.id, qty: p.qty })) };
 }
 
 /** "Shipped" rows from an order-status API, one ship notice per PO and notice number. Bad groups are listed, good ones applied. */
@@ -778,6 +817,35 @@ export async function recordShipmentsFromRows(c: Client, s: Scope, vendorId: str
     }
   }
   return { shipments, lines: lineCount, problems };
+}
+
+/**
+ * A new arrival date for PO lines (a container's ETA moved): the lines' expected
+ * dates, the customers' special orders tied to them, and the PO's own date
+ * follow, the same way an acknowledgment or a ship notice moves them.
+ */
+export async function setLineEta(c: Client, s: Scope, poLineIds: string[], expectedOn: string, why: string) {
+  need(DAY.test(expectedOn), "the arrival date is a date, like 2026-12-01");
+  const lines = await q<{ id: string; purchase_order_id: string }>(c, `
+    select pol.id, pol.purchase_order_id from purchase_order_line pol join purchase_order po on po.id = pol.purchase_order_id
+     where pol.entity_id = $1 and pol.id = any($2) and po.status = 'open' and pol.ack_status <> 'rejected' for update of pol`, [s.entityId, poLineIds]);
+  for (const l of lines) {
+    await c.query(`update purchase_order_line set ack_status = case when ack_status = 'pending' then 'accepted' else ack_status end, expected_on = $3
+                    where id = $1 and entity_id = $2`, [l.id, s.entityId, expectedOn]);
+    await c.query(`update po_line_sales_line k set expected_on = $3 where k.entity_id = $1 and k.purchase_order_line_id = $2 and k.active`, [s.entityId, l.id, expectedOn]);
+  }
+  for (const poId of new Set(lines.map((l) => l.purchase_order_id))) {
+    await c.query(`update purchase_order set expected_on = coalesce((select max(expected_on) from purchase_order_line where entity_id = $2 and purchase_order_id = $1 and ack_status <> 'rejected'), expected_on)
+                    where id = $1 and entity_id = $2`, [poId, s.entityId]);
+    await audit(c, s, { table: "purchase_order", rowId: poId, action: "update", after: { expectedOn, lines: lines.filter((l) => l.purchase_order_id === poId).length }, reason: why });
+  }
+  return lines.length;
+}
+
+/** A ship notice belongs to a container (its 856 named the container or trailer). */
+export async function linkShipmentContainer(c: Client, entityId: string, shipmentIds: string[], containerId: string) {
+  if (!shipmentIds.length) return;
+  await c.query(`update po_shipment set container_id = $3 where entity_id = $1 and id = any($2)`, [entityId, shipmentIds, containerId]);
 }
 
 export async function shipmentsOf(c: Client, entityId: string, poId: string) {

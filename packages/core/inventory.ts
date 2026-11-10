@@ -21,8 +21,9 @@
 // keeps that true.
 //
 // Accounting (accounts by code):
-//   transfer shipped          Dr 1310 inventory in transit   Cr 1300 inventory
-//   transfer received         Dr 1300                         Cr 1310
+//   transfer shipped          Dr 1310 inventory in transit   Cr 1300 inventory   (when the company keeps 1310;
+//   transfer received         Dr 1300                         Cr 1310              otherwise in-transit value stays in 1300
+//                                                                                  and the receipt only moves it between stores)
 //   count / adjustment loss   Dr 5040 shrink and damage       Cr 1300
 //   count / adjustment gain   Dr 1300                         Cr 5040
 //   damage written off        Dr 5040                         Cr 1300
@@ -274,6 +275,41 @@ async function columnsOf(c: Client, table: string): Promise<Set<string>> {
   const r = await q<{ column_name: string }>(c, `select column_name from information_schema.columns
     where table_schema = current_schema() and table_name = $1 /* unscoped: schema lookup */`, [table]);
   return new Set(r.map((x) => x.column_name));
+}
+
+/** A company setting (entity_setting), or the default. Read here so inventory needs nothing from setup. */
+export async function settingOf<T>(c: Client, entityId: string, key: string, dflt: T): Promise<T> {
+  const r = await q<{ value: T }>(c, `select value from entity_setting where entity_id = $1 and key = $2`, [entityId, key]);
+  return r.length ? r[0].value : dflt;
+}
+
+/** Whether same-company transfers ship and receive as two steps, and which account holds them on the road. */
+export async function transferSettings(c: Client, entityId: string): Promise<{ twoStep: boolean; transitGl: "1300" | "1310"; transitDays: number }> {
+  const twoStep = (await settingOf<unknown>(c, entityId, "inventory.transfers_two_step", false)) === true;
+  const gl = await settingOf<unknown>(c, entityId, "inventory.in_transit_gl", "1300");
+  const days = Number(await settingOf<unknown>(c, entityId, "inventory.transfer_days", 1));
+  return { twoStep, transitGl: gl === "1310" ? "1310" : "1300", transitDays: Number.isInteger(days) && days >= 0 && days <= 60 ? days : 1 };
+}
+
+const VIRTUAL: Record<string, [code: string, name: string, kind: string]> = {
+  vendor: ["VT-VENDOR", "In transit · vendor to DC", "in_transit"],
+  store: ["VT-STORE", "In transit · store to store", "in_transit"],
+  dropship: ["VT-DROP", "Supplier-held (drop ship)", "dropship"],
+};
+/** Kinds of location nothing is ever on hand at. */
+export const VIRTUAL_KINDS = ["in_transit", "dropship"];
+
+/**
+ * The company's virtual location for goods on the road (vendor to DC, or
+ * store to store) or for stock a supplier holds and ships for us. Made the
+ * first time it is needed.
+ */
+export async function virtualLocation(c: Client, entityId: string, which: "vendor" | "store" | "dropship"): Promise<string> {
+  const [code, name, kind] = VIRTUAL[which];
+  const r = await q<{ id: string; kind: string }>(c, `select id, kind from location where entity_id = $1 and code = $2`, [entityId, code]);
+  if (r.length) { need(r[0].kind === kind, `location ${code} is taken by a place that is not ${kind.replace("_", " ")}; rename it in Setup`); return r[0].id; }
+  return (await one<{ id: string }>(c, `insert into location (entity_id, code, name, kind, status) values ($1,$2,$3,$4,'active') returning id`,
+    [entityId, code, name, kind])).id;
 }
 
 export async function nextNo(c: Client, entityId: string, kind: string, prefix: string): Promise<string> {
@@ -582,8 +618,9 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
   const open = await openPurchaseOrders(c, entityId);
   if (!e.locationId) e.locationId = open.find((x) => x.po_id === po[0].id)?.ship_to_id ?? "";
   need(e.locationId, "pick the location receiving the goods");
-  const loc = await q<{ id: string }>(c, `select id from location where id = $1 and entity_id = $2 and status = 'active'`, [e.locationId, entityId]);
+  const loc = await q<{ id: string; kind: string }>(c, `select id, kind from location where id = $1 and entity_id = $2 and status = 'active'`, [e.locationId, entityId]);
   need(loc.length, "no such location");
+  need(loc[0].kind !== "in_transit", "goods are received where they are unloaded, not into an in-transit location");
   let binId = await binAt(c, entityId, e.binId, e.locationId);
   if (!binId) {
     const d = await q<{ receiving_bin_id: string | null }>(c, `select receiving_bin_id from inv_dock where entity_id = $1 and location_id = $2`, [entityId, e.locationId]);
@@ -671,7 +708,11 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
   if (e.appointmentId) await c.query(`update inv_receiving_appt set status = 'received' where id = $1 and entity_id = $2`, [e.appointmentId, entityId]);
   // Other back orders for what just arrived can be covered now.
   const backorders = await recheckBackorders(c, entityId, { productIds: [...received] });
-  return { receiptId: gr.id, poNumber: po[0].number, lines: out, poStatus: left.length ? "open" : "received", valueMinor: total, backordersReserved: backorders.reserved };
+  // Goods whose product or category needs deluxing, touch-up or assembly go on the warehouse's prep queue.
+  const wms = await import("./wms.ts");
+  const prep = await wms.queueForReceipt(c, scope, gr.id, e.locationId);
+  return { receiptId: gr.id, poNumber: po[0].number, lines: out, poStatus: left.length ? "open" : "received", valueMinor: total, backordersReserved: backorders.reserved,
+    prepQueued: prep.queued };
 }
 
 /** The customer order lines waiting on a PO line: purchasing's link table, else the PO line's agreement_ref naming the order. */
@@ -764,7 +805,7 @@ export type TransferLineIn = { productId?: string; qty?: number; labels?: string
  */
 export async function createTransfer(c: Client, scope: Scope, e: { fromId: string; toId: string; lines: TransferLineIn[]; note?: string }) {
   need(e.fromId !== e.toId, "a transfer goes between two different locations");
-  const locs = await q<{ id: string }>(c, `select id from location where entity_id = $1 and id = any($2) and status = 'active'`, [scope.entityId, [e.fromId, e.toId]]);
+  const locs = await q<{ id: string }>(c, `select id from location where entity_id = $1 and id = any($2) and status = 'active' and kind <> 'in_transit'`, [scope.entityId, [e.fromId, e.toId]]);
   // To a store of another of the client's companies: the group module pairs a sale here with a bill there when it ships.
   const toEntity = locs.length === 1 && locs[0].id === e.fromId ? await siblingOf(c, scope.entityId, e.toId) : null;
   need(locs.length === 2 || toEntity, "pick two of this company's locations");
@@ -832,14 +873,23 @@ export async function createTransfer(c: Client, scope: Scope, e: { fromId: strin
   return { id: t.id, number };
 }
 
-/** Ship: stock leaves the origin and is in transit, at its average cost (Dr 1310 Cr 1300). */
-export async function shipTransfer(c: Client, scope: Scope, id: string) {
+/**
+ * Ship: stock leaves the origin at its average cost and is on the road (its
+ * pieces sit at the company's store-to-store in-transit location). With
+ * 1310 kept, Dr 1310 Cr 1300; otherwise the value stays in 1300. When the
+ * company has two-step transfers off, it lands at the destination at once.
+ */
+export async function shipTransfer(c: Client, scope: Scope, id: string, opts: { expectedOn?: string | null } = {}) {
   const t = await transferOf(c, scope.entityId, id);
   need(t.status === "draft", `transfer ${t.number} is ${t.status.replace("_", " ")}, so it cannot ship`);
+  if (opts.expectedOn) need(/^\d{4}-\d{2}-\d{2}$/.test(opts.expectedOn) && opts.expectedOn >= today(), "the arrival day is a day from today on");
   // To another of the client's companies: the goods leave this company's books (sold to the sibling at transfer price).
   const across = !!t.to_entity_id;
   if (across) await groupRole(c, scope, t.to_entity_id!, "shipping to another of the client's companies");
   const outStatus = across ? "delivered" : "in_transit";
+  const ts = await transferSettings(c, scope.entityId);
+  const road = across ? undefined : await virtualLocation(c, scope.entityId, "store");
+  const gl: "1300" | "1310" = ts.twoStep ? ts.transitGl : "1300";
   const lines = await q<{ id: string; product_id: string; qty: string; unit_ids: string[]; sales_order_line_id: string | null }>(c,
     `select id, product_id, qty, unit_ids, sales_order_line_id from inv_transfer_line where entity_id = $1 and transfer_id = $2`, [scope.entityId, id]);
   let value = 0n;
@@ -857,13 +907,13 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
           const pcs = await piecesOfUnit(c, scope.entityId, u);
           need(pcs.every((x) => ["reserved", "picked"].includes(x.status) && x.sales_order_line_id === sl.id && x.location_id === t.from_location_id),
             `${pcs[0]?.label ?? "a piece"} is no longer this order's at the origin`);
-          await transitionUnit(c, scope.entityId, by, u, "in_transit", { kind: "transfer_out", refType: "transfer", refId: id, transferId: id });
+          await transitionUnit(c, scope.entityId, by, u, "in_transit", { kind: "transfer_out", refType: "transfer", refId: id, transferId: id, toLocation: road });
         }
         await bump(c, scope.entityId, p.id, t.from_location_id, { reserved: -qty });
       } else {
         await bump(c, scope.entityId, p.id, t.from_location_id, { onHand: -qty, reserved: -qty });
         await binStockTake(c, scope.entityId, p.id, t.from_location_id, qty);
-        await logMove(c, scope.entityId, { kind: "transfer_out", productId: p.id, qty, fromLoc: t.from_location_id, toStatus: "in_transit", refType: "transfer", refId: id, by });
+        await logMove(c, scope.entityId, { kind: "transfer_out", productId: p.id, qty, fromLoc: t.from_location_id, toLoc: road, toStatus: "in_transit", refType: "transfer", refId: id, by });
       }
       await c.query(`update sales_order_line set line_status = 'on_order' where id = $1 and entity_id = $2`, [sl.id, scope.entityId]);
       await c.query(`update inv_transfer_line set value_minor = $3, cost_minor = $4 where id = $1 and entity_id = $2`, [l.id, scope.entityId, lineValue.toString(),
@@ -888,11 +938,11 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
         await c.query(`update inv_transfer_line set unit_ids = $3 where id = $1 and entity_id = $2`, [l.id, scope.entityId, units]);
       }
       for (const u of units) await transitionUnit(c, scope.entityId, by, u, outStatus,
-        { kind: "transfer_out", refType: "transfer", refId: id, transferId: id });
+        { kind: "transfer_out", refType: "transfer", refId: id, transferId: id, toLocation: road });
     } else {
       await bump(c, scope.entityId, p.id, t.from_location_id, { onHand: -qty });
       await binStockTake(c, scope.entityId, p.id, t.from_location_id, qty);
-      await logMove(c, scope.entityId, { kind: "transfer_out", productId: p.id, qty, fromLoc: t.from_location_id, toStatus: outStatus,
+      await logMove(c, scope.entityId, { kind: "transfer_out", productId: p.id, qty, fromLoc: t.from_location_id, toLoc: road ?? null, toStatus: outStatus,
         refType: "transfer", refId: id, by: scope.actor.id });
     }
     await c.query(`update inv_transfer_line set value_minor = $3, cost_minor = $4 where id = $1 and entity_id = $2`, [l.id, scope.entityId, lineValue.toString(),
@@ -907,16 +957,30 @@ export async function shipTransfer(c: Client, scope: Scope, id: string) {
     const docs = await group.completeAcross(c, scope, id);
     return { number: t.number, valueMinor: value, ...docs };
   }
-  await c.query(`update inv_transfer set status = 'in_transit', shipped_by = $3, shipped_at = now() where id = $1 and entity_id = $2`, [id, scope.entityId, by]);
-  if (value > 0n) {
+  const arrive = opts.expectedOn || addDaysIso(today(), ts.transitDays);
+  await c.query(`update inv_transfer set status = 'in_transit', shipped_by = $3, shipped_at = now(), transit_gl = $4, expected_on = $5 where id = $1 and entity_id = $2`,
+    [id, scope.entityId, by, gl, arrive]);
+  if (value > 0n && gl === "1310") {
     const po = await profitObjectFor(c, scope.entityId, t.from_location_id);
     await post(c, scope, { date: today(), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} shipped`,
       lines: [{ code: "1310", debit: value, profitObjectId: po }, { code: "1300", credit: value, profitObjectId: po }] });
   }
-  return { number: t.number, valueMinor: value };
+  if (!ts.twoStep) {
+    // One step: shipped and landed together.
+    await receiveTransfer(c, scope, id);
+    return { number: t.number, valueMinor: value, transitGl: gl, expectedOn: null, received: true };
+  }
+  return { number: t.number, valueMinor: value, transitGl: gl, expectedOn: arrive, received: false };
 }
 
-/** Receive: stock lands at the destination at the value that left (Dr 1300 Cr 1310). A customer's goods arrive reserved to them. */
+const addDaysIso = (iso: string, n: number) => { const d = new Date(iso + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+
+/**
+ * Receive: stock lands at the destination at the value that left. Shipped
+ * through 1310, the receipt reverses it (Dr 1300 Cr 1310); left in 1300, it
+ * moves the value from the origin's P&L column to the destination's. A
+ * customer's goods arrive reserved to them.
+ */
 export async function receiveTransfer(c: Client, scope: Scope, id: string, e: { binId?: string | null } = {}) {
   const t = await transferOf(c, scope.entityId, id);
   need(t.status === "in_transit", `transfer ${t.number} is ${t.status.replace("_", " ")}, not in transit`);
@@ -953,8 +1017,15 @@ export async function receiveTransfer(c: Client, scope: Scope, id: string, e: { 
   await c.query(`update inv_transfer set status = 'received', received_by = $3, received_at = now() where id = $1 and entity_id = $2`, [id, scope.entityId, by]);
   if (value > 0n) {
     const po = await profitObjectFor(c, scope.entityId, t.to_location_id);
-    await post(c, scope, { date: today(), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} received`,
-      lines: [{ code: "1300", debit: value, profitObjectId: po }, { code: "1310", credit: value, profitObjectId: po }] });
+    // Shipped before the account was chosen per transfer: it went through 1310.
+    if ((t.transit_gl ?? "1310") === "1310") {
+      await post(c, scope, { date: today(), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} received`,
+        lines: [{ code: "1300", debit: value, profitObjectId: po }, { code: "1310", credit: value, profitObjectId: po }] });
+    } else {
+      const from = await profitObjectFor(c, scope.entityId, t.from_location_id);
+      if (from !== po) await post(c, scope, { date: today(), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} received`,
+        lines: [{ code: "1300", debit: value, profitObjectId: po }, { code: "1300", credit: value, profitObjectId: from }] });
+    }
   }
   if (products.size) await recheckBackorders(c, scope.entityId, { productIds: [...products] });
   return { number: t.number, valueMinor: value };
@@ -967,8 +1038,8 @@ export async function cancelTransfer(c: Client, scope: Scope, id: string) {
 }
 
 async function transferOf(c: Client, entityId: string, id: string) {
-  const r = await q<{ id: string; number: string; status: string; from_location_id: string; to_location_id: string; to_entity_id: string | null }>(c,
-    `select id, number, status, from_location_id, to_location_id, to_entity_id from inv_transfer where id = $1 and entity_id = $2 for update`, [id, entityId]);
+  const r = await q<{ id: string; number: string; status: string; from_location_id: string; to_location_id: string; to_entity_id: string | null; transit_gl: string | null }>(c,
+    `select id, number, status, from_location_id, to_location_id, to_entity_id, transit_gl from inv_transfer where id = $1 and entity_id = $2 for update`, [id, entityId]);
   need(r.length, "no such transfer");
   return r[0];
 }
@@ -1073,7 +1144,8 @@ export async function unallocate(c: Client, scope: Scope, label: string) {
 export type PickLine = { orderId: string; orderNumber: string; customer: string | null; lineId: string; sku: string; description: string;
   qty: number; locationId: string | null; location: string | null; serialized: boolean;
   pieces: { id: string; label: string; carton: string; bin: string | null; status: string; cubicFt: number; weightLb: number }[];
-  bins: { bin: string; qty: number }[]; short: number; cubicFt: number; weightLb: number };
+  bins: { bin: string; qty: number }[]; short: number; cubicFt: number; weightLb: number;
+  prep: { number: string; type: string; status: string; label: string | null }[] };
 
 /**
  * The pick list for one or more orders: every open stock line, the exact
@@ -1082,8 +1154,8 @@ export type PickLine = { orderId: string; orderNumber: string; customer: string 
  * cannot be covered shows its shortfall rather than failing the list.
  */
 export async function pickListFor(c: Client, entityId: string, orderIds: string[]):
-  Promise<{ lines: PickLine[]; pieces: number; cubicFt: number; weightLb: number; short: number }> {
-  if (!orderIds.length) return { lines: [], pieces: 0, cubicFt: 0, weightLb: 0, short: 0 };
+  Promise<{ lines: PickLine[]; pieces: number; cubicFt: number; weightLb: number; short: number; prepPending: number }> {
+  if (!orderIds.length) return { lines: [], pieces: 0, cubicFt: 0, weightLb: 0, short: 0, prepPending: 0 };
   const rows = await q<{ order_id: string; number: string; customer: string | null; line_id: string; sku: string; description: string; qty: string;
     fulfil_from_id: string | null; location: string | null; product_id: string; serialized: boolean; cubic_ft: string | null; weight_lb: string | null }>(c, `
     select so.id order_id, so.number, cu.name customer, l.id line_id, l.sku, l.description, l.qty, l.fulfil_from_id, lo.name location,
@@ -1100,7 +1172,7 @@ export async function pickListFor(c: Client, entityId: string, orderIds: string[
   for (const r of rows) {
     const qty = Number(r.qty);
     const line: PickLine = { orderId: r.order_id, orderNumber: r.number, customer: r.customer, lineId: r.line_id, sku: r.sku, description: r.description,
-      qty, locationId: r.fulfil_from_id, location: r.location, serialized: r.serialized, pieces: [], bins: [], short: 0, cubicFt: 0, weightLb: 0 };
+      qty, locationId: r.fulfil_from_id, location: r.location, serialized: r.serialized, pieces: [], bins: [], short: 0, cubicFt: 0, weightLb: 0, prep: [] };
     if (r.serialized && r.fulfil_from_id) {
       const have = await allocatedUnits(c, entityId, r.line_id);
       if (have < qty) {
@@ -1132,7 +1204,12 @@ export async function pickListFor(c: Client, entityId: string, orderIds: string[
     cube += line.cubicFt; weight += line.weightLb; short += line.short;
     out.push(line);
   }
-  return { lines: out, pieces, cubicFt: Math.round(cube * 100) / 100, weightLb: Math.round(weight * 100) / 100, short };
+  // Prep not finished on what is about to go out (deluxing, touch-up, assembly).
+  const wms = await import("./wms.ts");
+  const open = await wms.prepOpenForLines(c, entityId, out.map((l) => l.lineId));
+  for (const l of out) l.prep = open.get(l.lineId) ?? [];
+  const prepPending = out.reduce((a, l) => a + l.prep.length, 0);
+  return { lines: out, pieces, cubicFt: Math.round(cube * 100) / 100, weightLb: Math.round(weight * 100) / 100, short, prepPending };
 }
 
 // ============================================================ scanning
@@ -1254,7 +1331,9 @@ async function insertDamage(c: Client, entityId: string, e: { productId: string;
 function cleanUrls(urls: unknown): string[] {
   const list = Array.isArray(urls) ? urls : [];
   const out = list.map((u) => String(u ?? "").trim()).filter(Boolean).slice(0, 12);
-  for (const u of out) need(/^https:\/\/\S+$/i.test(u) && u.length <= 1000, "photo links must be https addresses");
+  // A link (https), or a picture taken on the phone (service tickets and delivery proof keep them the same way).
+  for (const u of out) need((/^https:\/\/\S+$/i.test(u) && u.length <= 1000) || (/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(u) && u.length <= 1_500_000),
+    "photo links must be https addresses, or pictures taken here");
   return out;
 }
 
@@ -1592,8 +1671,8 @@ export async function availableToPromise(c: Client, entityId: string, productId:
     select l.id location_id, l.name, l.kind, coalesce(s.on_hand,0)::text on_hand, coalesce(s.reserved,0)::text reserved, coalesce(s.held,0)::text held,
            coalesce(s.on_hand - s.reserved - s.held,0)::text available, coalesce(s.on_order,0)::text on_order
       from location l left join stock_level s on s.location_id = l.id and s.entity_id = l.entity_id and s.product_id = $2
-     where l.entity_id = $1 and l.status = 'active' and l.kind <> 'web'
-     order by case l.kind when 'warehouse' then 0 else 1 end, l.name`, [entityId, productId]);
+     where l.entity_id = $1 and l.status = 'active' and l.kind not in ('web','in_transit')
+     order by case l.kind when 'warehouse' then 0 when 'dropship' then 2 else 1 end, l.name`, [entityId, productId]);
   const asIs = await q<{ n: string }>(c, `select count(distinct unit_id) n from inv_piece where entity_id = $1 and product_id = $2 and status = 'as_is'`, [entityId, productId]);
   let next: { number: string; expectedOn: string | null; qty: number } | null = null;
   const cols = await columnsOf(c, "purchase_order_line");
@@ -1612,14 +1691,30 @@ export async function availableToPromise(c: Client, entityId: string, productId:
     const open = r.filter((x) => Number(x.left) > 0);
     if (open.length) next = { number: open[0].number, expectedOn: open[0].eta, qty: Number(open[0].left) };
   }
-  const availableNow = locs.reduce((a, x) => a + Math.max(0, Number(x.available)), 0);
+  // Supplier-held stock is promised as a drop ship, not as ours on hand.
+  const availableNow = locs.filter((x) => x.kind !== "dropship").reduce((a, x) => a + Math.max(0, Number(x.available)), 0);
+  const dropship = locs.filter((x) => x.kind === "dropship").reduce((a, x) => a + Math.max(0, Number(x.available)), 0);
+  const transit = await inTransitFor(c, entityId, productId);
+  const arrivingOn = transit.map((x) => x.arrivingOn).filter(Boolean).sort()[0] ?? null;
   return {
     product: { id: p.id, sku: p.sku, name: p.name, serialized: p.serialized },
     locations: locs.map((x) => ({ locationId: x.location_id, name: x.name, kind: x.kind, onHand: Number(x.on_hand), reserved: Number(x.reserved),
       held: Number(x.held), available: Number(x.available), onOrder: Number(x.on_order) })),
-    availableNow, asIs: Number(asIs[0].n), nextPurchaseOrder: next,
-    promise: availableNow > 0 ? "now" : next?.expectedOn ? next.expectedOn : next ? "on order, no date yet" : "not available",
+    availableNow, asIs: Number(asIs[0].n), nextPurchaseOrder: next, dropship,
+    inTransit: transit, inTransitQty: transit.reduce((a, x) => a + x.qty, 0), arrivingOn,
+    promise: availableNow > 0 ? "now" : arrivingOn ? `arriving on ${arrivingOn}` : dropship > 0 ? "ships from the supplier"
+      : next?.expectedOn ? next.expectedOn : next ? "on order, no date yet" : "not available",
   };
+}
+
+/** Goods on the road for a product: shipped on a PO (an 856 or a container that left) or on a transfer, and where each is going. */
+export async function inTransitFor(c: Client, entityId: string, productId: string) {
+  const r = await q<{ source: string; ref_id: string; ref_no: string; to_location_id: string; to_name: string; qty: string; arriving_on: string | null }>(c, `
+    select t.source, t.ref_id, t.ref_no, t.to_location_id, l.name to_name, t.qty::text, t.arriving_on::text
+      from inv_in_transit t join location l on l.id = t.to_location_id
+     where t.entity_id = $1 and t.product_id = $2 order by t.arriving_on nulls last, t.ref_no`, [entityId, productId]);
+  return r.map((x) => ({ source: x.source as "po" | "transfer", refId: x.ref_id, ref: x.ref_no, toLocationId: x.to_location_id, to: x.to_name,
+    qty: Number(x.qty), arrivingOn: x.arriving_on, text: x.arriving_on ? `arriving on ${x.arriving_on}` : "on the way, no date yet" }));
 }
 
 /**

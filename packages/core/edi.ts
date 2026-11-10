@@ -26,6 +26,7 @@ import { join, resolve, sep as pathSep } from "node:path";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import * as x12 from "./x12.ts";
 import * as pur from "./purchasing.ts";
+import * as wms from "./wms.ts";
 import { enterVendorBill, BillError, TransitionError } from "./invoice.ts";
 import { sha256 } from "./connections.ts";
 import {
@@ -42,7 +43,7 @@ export type EdiEnv = FeedEnv & { dropDir?: string | null };
 export const liveEdiEnv = (): EdiEnv => ({ ...liveEnv(), dropDir: process.env.ERP_EDI_DROP_DIR?.trim() || null });
 
 /** Refusals from the modules an EDI document drives, as the plain reason a quarantine records. */
-const REFUSED = [EdiError, x12.X12Error, pur.PurchasingError, BillError, TransitionError, FeedError, CatalogError, PostingError];
+const REFUSED = [EdiError, x12.X12Error, pur.PurchasingError, wms.WmsError, BillError, TransitionError, FeedError, CatalogError, PostingError];
 const refusal = (e: unknown): string | null => (REFUSED.some((K) => e instanceof K) ? (e as Error).message : null);
 
 // ------------------------------------------------------------ partners --
@@ -912,6 +913,7 @@ async function applySet(c: Client, s: Scope, _env: EdiEnv, p: Partner, type: str
     const a = v as unknown as x12.Asn856;
     let firstPo: string | undefined;
     const done: string[] = [];
+    const shipped: { shipmentId: string; poLineId: string; qty: number }[] = [];
     for (const o of a.orders) {
       const po = await poByNumber(c, p, o.poNumber);
       firstPo = firstPo ?? po.id;
@@ -921,10 +923,19 @@ async function applySet(c: Client, s: Scope, _env: EdiEnv, p: Partner, type: str
         lines.push({ lineId: pl.id, qty: l.qty });
       }
       const r = await pur.recordShipment(c, s, po.id, { asn: a.shipmentId, shippedOn: a.shippedOn ?? a.date ?? null, expectedOn: a.deliveryOn ?? null,
-        carrier: a.carrierName || a.carrier || null, tracking: a.tracking || a.bol || null, lines, source: "edi", documentId: selfId });
+        carrier: a.carrierName || a.carrier || null, tracking: a.tracking || a.bol || null, lines, source: "edi", documentId: selfId, equipment: a.equipment ?? null });
       done.push(`${r.units} units on ${r.number}`);
+      for (const x of r.shipped) shipped.push({ shipmentId: r.shipmentId, ...x });
     }
-    return { poId: firstPo, summary: { applied: done.join(", ") } };
+    // A notice that names its container or trailer attaches to it (and opens one if we had not booked it yet).
+    let container: string | null = null;
+    if (a.equipment) {
+      const ct = await wms.attachShipment(c, s, { equipment: a.equipment, vendorId: p.vendor_id, carrier: a.carrierName || a.carrier || null, bol: a.bol ?? null,
+        shippedOn: a.shippedOn ?? a.date ?? null, deliveryOn: a.deliveryOn ?? null, shipped });
+      container = ct.number;
+      done.push(`on container ${ct.containerNo} (${ct.number})`);
+    }
+    return { poId: firstPo, summary: { applied: done.join(", "), container } };
   }
   if (type === "810") {
     const inv = v as unknown as x12.Invoice810;

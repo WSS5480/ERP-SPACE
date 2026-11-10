@@ -125,6 +125,8 @@ export const PACKS: Pack[] = [
       "catalog.special_order_lead_days": 42,
       "service.sla_hours": { urgent: 24, high: 48, normal: 120, low: 240 },
       "service.labor_rate_minor": 3000,
+      "inventory.transfers_two_step": true,     // ship, on the road, receive (in-transit value stays in 1300 unless 1310 is chosen)
+      "wms.prep_gate": "warn",
     },
   },
   {
@@ -148,6 +150,7 @@ export const PACKS: Pack[] = [
       "ar.late_fee": { rate_bps: 500, min_minor: 1000, grace_days: 10 },
       "service.sla_hours": { urgent: 24, high: 48, normal: 72, low: 168 },
       "service.labor_rate_minor": 3500,
+      "inventory.transfers_two_step": true,
     },
   },
   {
