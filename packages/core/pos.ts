@@ -18,6 +18,7 @@ import { priceConfigured, type Choice } from "./pricing.ts";
 import { reserveOrder, reserveLines, fulfilLines, releaseLines, restock, returnToDamage, unitCost } from "./inventory.ts";
 import * as tax from "./tax.ts";
 import * as fleet from "./fleet.ts";
+import * as wms from "./wms.ts";
 import { postReceipt, invoiceFulfilment, chargeRoom } from "./ar.ts";
 import { providerNamed } from "./shop.ts";
 import { accrueCommissions } from "./workforce.ts";
@@ -975,6 +976,9 @@ export async function fulfilAtCounter(c: Client, scope: Scope, orderId: string, 
   const hereName = (await locationOf(c, scope.entityId, here)).name;
   need(["open", "fulfilling"].includes(o.status), `${o.number} is ${o.status}`);
   need(lineIds.length, "pick the lines being handed over");
+  // goods whose deluxing, touch-up or assembly is not done do not go out the door either
+  const gate = await wms.gateOrQueue(c, scope, lineIds, "handing it over at the counter");
+  if (gate.refuse) throw new PosError(gate.message ?? "the goods are not prepped yet");
   if (o.kind === "layaway") need(BigInt(o.paid_minor) >= BigInt(o.total_minor), `layaway ${o.number} is not paid in full; ${usd(BigInt(o.total_minor) - BigInt(o.paid_minor))} is still owed`);
   const ls = await q<{ id: string; sku: string; fulfillment: string; line_status: string; kind: string | null; fulfil_from_id: string | null; at: string | null; moving: boolean }>(c, `
     select l.id, l.sku, pl.fulfillment, l.line_status, p.kind, l.fulfil_from_id, fl.name at,
