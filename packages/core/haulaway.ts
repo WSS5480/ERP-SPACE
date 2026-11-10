@@ -2,11 +2,15 @@
 //
 // A stop carries haul-away lines (what, how many, the fee per piece from the
 // company's rates, any trade-in value). On a stop with an order, the fee is a
-// fee line on the order and a trade-in is a credit line on it, both left open
-// so they are handed over and invoiced with the delivery (fleet.completeStop
-// -> ar.invoiceFulfilment): the fee is revenue (4030), the trade-in comes off
-// the sale. The driver records what was actually taken, with a photo, before
-// the stop is completed; what was not taken comes off the order.
+// fee line on the order, priced and taxed through the tax module like any
+// other line (the fee product's kind and taxability, each jurisdiction's own
+// rules), and a trade-in is a credit line that posts to 4095 (trade-in
+// allowances, contra-revenue). A trade-in reduces taxable sales only where the
+// jurisdiction says so (tax_jurisdiction.trade_in_reduces_taxable; default no).
+// Both belong to their own stop: they are invoiced when that stop is completed
+// (delivery or pickup), for what the crew recorded -- the fee for the pieces
+// taken, the trade-in for the share taken. The driver records before the stop
+// is completed; what was not taken comes off the order.
 //
 // The disposal log says where it went (recycler, landfill, donation), when,
 // the weight and the certificate number, and feeds a report by state for the
@@ -14,6 +18,7 @@
 
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { FleetError } from "./fleet.ts";
+import * as tax from "./tax.ts";
 
 function need(cond: unknown, message: string): asserts cond {
   if (!cond) throw new FleetError(message);
@@ -84,22 +89,98 @@ async function stopOf(c: Client, entityId: string, stopId: string) {
   return r[0];
 }
 
-async function addOrderLine(c: Client, entityId: string, orderId: string, l: { productId: string | null; sku: string; description: string; qty: number; unitMinor: bigint; creditMinor?: bigint }) {
+type OrderFacts = { id: string; location_id: string; fulfillment: string; ship_address_id: string | null; customer_id: string | null; exempt_ref: string | null };
+async function orderFacts(c: Client, entityId: string, orderId: string): Promise<OrderFacts> {
+  return one<OrderFacts>(c, `select so.id, so.location_id, so.fulfillment, so.ship_address_id, so.customer_id, po.tax_exempt_ref exempt_ref
+                               from sales_order so left join pos_order po on po.sales_order_id = so.id
+                              where so.entity_id = $1 and so.id = $2`, [entityId, orderId]);
+}
+/** Where the order is taxed, and the customer's certificate if the sale carries a current one. */
+async function placeOf(c: Client, entityId: string, o: OrderFacts) {
+  const place = await tax.stackForLine(c, entityId, { storeId: o.location_id, fulfillment: o.fulfillment, shipAddressId: o.ship_address_id });
+  let cert: tax.Cert | null = null;
+  if (o.exempt_ref && o.customer_id) {
+    try { cert = await tax.certificateFor(c, entityId, o.customer_id, o.exempt_ref); } catch { cert = null; }   // only reads; an expired one taxes
+  }
+  return { ...place, cert };
+}
+/** A fee line's tax, the way POS prices one: the fee product's kind and taxability over the stack. */
+async function feeTax(c: Client, entityId: string, o: OrderFacts, productId: string | null, netMinor: bigint) {
+  const p = productId ? await q<{ kind: string; taxable: boolean }>(c, `select kind, taxable from product where entity_id = $1 and id = $2`, [entityId, productId]) : [];
+  const cls = tax.classOf(p[0]?.kind ?? "fee");
+  const pl = await placeOf(c, entityId, o);
+  const lt = tax.computeLine(pl.stack, { netMinor, itemClass: cls, taxable: p[0]?.taxable ?? false, cert: pl.cert });
+  return { ...lt, cls, sourced: pl.sourced };
+}
+/**
+ * A trade-in's tax: in a jurisdiction whose trade-ins reduce taxable sales, the
+ * credit comes off taxable sales and its tax comes off; elsewhere it changes
+ * neither (rows of zero, so the filing's gross is the sale as sold).
+ */
+async function tradeTax(c: Client, entityId: string, o: OrderFacts, creditMinor: bigint) {
+  const pl = await placeOf(c, entityId, o);
+  const ids = pl.stack.map((j) => j.id);
+  const flags = ids.length ? await q<{ id: string; r: boolean }>(c, `select id, trade_in_reduces_taxable r from tax_jurisdiction where entity_id = $1 and id = any($2)`, [entityId, ids]) : [];
+  const reduces = (id: string) => !!flags.find((f) => f.id === id)?.r && !(pl.cert && pl.cert.state === pl.stack.find((j) => j.id === id)?.state);
+  const rate = pl.stack.reduce((a, j) => a + (reduces(j.id) ? j.rateBps : 0), 0);
+  const net = -creditMinor;
+  const total = net < 0n ? -((creditMinor * BigInt(rate) + 5000n) / 10000n) : 0n;
+  const parts = tax.split(total, pl.stack.map((j) => (reduces(j.id) ? BigInt(j.rateBps) : 0n)));
+  const rows: tax.TaxRow[] = pl.stack.map((j, i) => ({ jurisdictionId: j.id, rateBps: j.rateBps, taxableMinor: reduces(j.id) ? net : 0n, exemptMinor: 0n,
+    exemptReason: null, taxMinor: reduces(j.id) ? (parts[i] ?? 0n) : 0n }));
+  return { rows, taxMinor: rows.reduce((a, r) => a + r.taxMinor, 0n), cls: "other" as tax.ItemClass, sourced: pl.sourced };
+}
+/** Write (or rewrite, while the line is still open) a line's tax rows. */
+async function writeTax(c: Client, entityId: string, orderId: string, lineId: string, t: { rows: tax.TaxRow[]; taxMinor: bigint; cls: tax.ItemClass; sourced: tax.Sourced }) {
+  const have = await q<{ jurisdiction_id: string }>(c, `select jurisdiction_id from sales_order_line_tax where entity_id = $1 and sales_order_line_id = $2 and kind = 'sale'`, [entityId, lineId]);
+  if (!have.length) { await tax.writeLineTax(c, entityId, orderId, lineId, t.rows, t.sourced, t.cls); }
+  else {
+    for (const r of t.rows) {
+      await c.query(`insert into sales_order_line_tax (entity_id, sales_order_id, sales_order_line_id, jurisdiction_id, kind, sourced, item_class, rate_bps,
+                       taxable_minor, exempt_minor, exempt_reason, tax_minor) values ($1,$2,$3,$4,'sale',$5,$6,$7,$8,$9,$10,$11)
+                     on conflict (sales_order_line_id, jurisdiction_id) do update set rate_bps = excluded.rate_bps, taxable_minor = excluded.taxable_minor,
+                       exempt_minor = excluded.exempt_minor, exempt_reason = excluded.exempt_reason, tax_minor = excluded.tax_minor`,
+        [entityId, orderId, lineId, r.jurisdictionId, t.sourced, t.cls, r.rateBps, r.taxableMinor.toString(), r.exemptMinor.toString(), r.exemptReason, r.taxMinor.toString()]);
+    }
+    const keep = t.rows.map((r) => r.jurisdictionId);
+    await c.query(`update sales_order_line_tax set taxable_minor = 0, exempt_minor = 0, exempt_reason = null, tax_minor = 0
+                    where entity_id = $1 and sales_order_line_id = $2 and kind = 'sale' and posted_on is null and not (jurisdiction_id = any($3))`, [entityId, lineId, keep]);
+  }
+  await c.query(`update sales_order_line set tax_minor = $3 where entity_id = $1 and id = $2`, [entityId, lineId, t.taxMinor.toString()]);
+}
+
+async function addOrderLine(c: Client, entityId: string, orderId: string, l: { productId: string | null; sku: string; description: string; qty: number; unitMinor: bigint;
+  creditMinor?: bigint; revenueCode?: string | null }) {
   const seq = await one<{ s: number }>(c, `select coalesce(max(seq),0)::int + 1 s from sales_order_line where entity_id = $1 and sales_order_id = $2`, [entityId, orderId]);
   const r = await one<{ id: string }>(c, `
-    insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, discount_minor, tax_minor, line_status)
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,'open') returning id`,
-    [entityId, orderId, seq.s, l.productId, l.sku, l.description.slice(0, 200), l.qty, l.unitMinor.toString(), (l.creditMinor ?? 0n).toString()]);
+    insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, discount_minor, tax_minor, line_status, revenue_code)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,'open',$10) returning id`,
+    [entityId, orderId, seq.s, l.productId, l.sku, l.description.slice(0, 200), l.qty, l.unitMinor.toString(), (l.creditMinor ?? 0n).toString(), l.revenueCode ?? null]);
   return r.id;
 }
 async function retotal(c: Client, orderId: string) {
   await c.query(`select sales_order_retotal($1) /* unscoped: an order of this entity */`, [orderId]);
 }
-/** A line still open comes off (cancelled), or down to a smaller quantity. Never one already handed over. */
-async function trimLine(c: Client, entityId: string, lineId: string | null, qty: number) {
+/** A line still open comes off (cancelled). Never one already handed over. */
+async function cancelLine(c: Client, entityId: string, lineId: string | null) {
   if (!lineId) return;
-  if (qty <= 0) await c.query(`update sales_order_line set line_status = 'cancelled' where entity_id = $1 and id = $2 and line_status = 'open'`, [entityId, lineId]);
-  else await c.query(`update sales_order_line set qty = $3 where entity_id = $1 and id = $2 and line_status = 'open'`, [entityId, lineId, qty]);
+  await c.query(`update sales_order_line set line_status = 'cancelled' where entity_id = $1 and id = $2 and line_status = 'open'`, [entityId, lineId]);
+}
+/** The fee for the pieces taken, retaxed. */
+async function setFeeQty(c: Client, entityId: string, orderId: string, lineId: string, qty: number) {
+  const l = await one<{ product_id: string | null; unit_price_minor: string; line_status: string }>(c,
+    `select product_id, unit_price_minor, line_status from sales_order_line where entity_id = $1 and id = $2 for update`, [entityId, lineId]);
+  if (l.line_status !== "open") return;
+  await c.query(`update sales_order_line set qty = $3 where entity_id = $1 and id = $2`, [entityId, lineId, qty]);
+  const net = BigInt(Math.round(qty * Number(l.unit_price_minor)));
+  await writeTax(c, entityId, orderId, lineId, await feeTax(c, entityId, await orderFacts(c, entityId, orderId), l.product_id, net));
+}
+/** The trade-in for the share taken, retaxed. */
+async function setTradeCredit(c: Client, entityId: string, orderId: string, lineId: string, creditMinor: bigint) {
+  const l = await one<{ line_status: string }>(c, `select line_status from sales_order_line where entity_id = $1 and id = $2 for update`, [entityId, lineId]);
+  if (l.line_status !== "open") return;
+  await c.query(`update sales_order_line set discount_minor = $3 where entity_id = $1 and id = $2`, [entityId, lineId, creditMinor.toString()]);
+  await writeTax(c, entityId, orderId, lineId, await tradeTax(c, entityId, await orderFacts(c, entityId, orderId), creditMinor));
 }
 
 export async function forStop(c: Client, entityId: string, stopId: string) {
@@ -132,10 +213,13 @@ export async function addHaulAway(c: Client, scope: Scope, stopId: string, b: { 
   if (st.sales_order_id && fee > 0n) {
     feeLine = await addOrderLine(c, scope.entityId, st.sales_order_id, { productId: rate[0].fee_product_id, sku: rate[0].sku ?? "HAUL-AWAY",
       description: `Haul-away: ${desc}`, qty, unitMinor: fee });
+    await setFeeQty(c, scope.entityId, st.sales_order_id, feeLine, qty);
   }
   if (st.sales_order_id && trade > 0n) {
-    // a credit line: nothing sold, the trade-in's value off (it is handed over and invoiced with the delivery)
-    tradeLine = await addOrderLine(c, scope.entityId, st.sales_order_id, { productId: null, sku: "TRADE-IN", description: `Trade-in credit: ${desc}`, qty: 1, unitMinor: 0n, creditMinor: trade });
+    // a credit line: nothing sold, the trade-in's value off; it posts to 4095 when its stop is completed
+    tradeLine = await addOrderLine(c, scope.entityId, st.sales_order_id, { productId: null, sku: "TRADE-IN", description: `Trade-in credit: ${desc}`, qty: 1,
+      unitMinor: 0n, creditMinor: trade, revenueCode: "4095" });
+    await setTradeCredit(c, scope.entityId, st.sales_order_id, tradeLine, trade);
   }
   if (st.sales_order_id) await retotal(c, st.sales_order_id);
   const r = await one<{ id: string }>(c, `
@@ -154,8 +238,8 @@ export async function cancelHaulAway(c: Client, scope: Scope, id: string, reason
   need(String(reason ?? "").trim().length >= 3, "say why it comes off");
   const st = await stopOf(c, scope.entityId, h.stop_id);
   need(["scheduled", "arrived"].includes(st.status), `stop ${st.number} is ${st.status}`);
-  await trimLine(c, scope.entityId, h.fee_line_id, 0);
-  await trimLine(c, scope.entityId, h.trade_in_line_id, 0);
+  await cancelLine(c, scope.entityId, h.fee_line_id);
+  await cancelLine(c, scope.entityId, h.trade_in_line_id);
   if (st.sales_order_id) await retotal(c, st.sales_order_id);
   await c.query(`update stop_haul_away set status = 'cancelled', cancel_reason = $3 where entity_id = $1 and id = $2`, [scope.entityId, id, String(reason).trim().slice(0, 300)]);
   return { status: "cancelled" };
@@ -164,8 +248,8 @@ export async function cancelHaulAway(c: Client, scope: Scope, id: string, reason
 async function haulRow(c: Client, entityId: string, id: string) {
   need(isId(id), "no such haul-away");
   const r = await q<{ id: string; stop_id: string; status: string; qty: string; fee_line_id: string | null; trade_in_line_id: string | null; category: string;
-    disposal_id: string | null; taken_qty: string | null }>(c,
-    `select id, stop_id, status, qty, fee_line_id, trade_in_line_id, category, disposal_id, taken_qty from stop_haul_away where entity_id = $1 and id = $2 for update`, [entityId, id]);
+    disposal_id: string | null; taken_qty: string | null; trade_in_minor: string }>(c,
+    `select id, stop_id, status, qty, fee_line_id, trade_in_line_id, category, disposal_id, taken_qty, trade_in_minor from stop_haul_away where entity_id = $1 and id = $2 for update`, [entityId, id]);
   need(r.length, "no such haul-away");
   return r[0];
 }
@@ -189,8 +273,13 @@ export async function recordHaulAway(c: Client, scope: Scope, id: string, b: { t
     need(photo.length <= 2_000_000, "the photo is too large; send a link to it");
   }
   if (taken === 0) need(String(b.note ?? "").trim().length >= 3, "say why nothing was taken");
-  await trimLine(c, scope.entityId, h.fee_line_id, taken);
-  if (taken === 0) await trimLine(c, scope.entityId, h.trade_in_line_id, 0);
+  if (taken === 0) { await cancelLine(c, scope.entityId, h.fee_line_id); await cancelLine(c, scope.entityId, h.trade_in_line_id); }
+  else if (st.sales_order_id) {
+    if (h.fee_line_id) await setFeeQty(c, scope.entityId, st.sales_order_id, h.fee_line_id, taken);
+    // the trade-in is worth the share actually taken
+    const share = BigInt(h.trade_in_minor) * BigInt(Math.round(taken * 100)) / BigInt(Math.round(n(h.qty) * 100));
+    if (h.trade_in_line_id) { if (share > 0n) await setTradeCredit(c, scope.entityId, st.sales_order_id, h.trade_in_line_id, share); else await cancelLine(c, scope.entityId, h.trade_in_line_id); }
+  }
   if (st.sales_order_id) await retotal(c, st.sales_order_id);
   const weight = b.weightLb != null && Number.isFinite(Number(b.weightLb)) ? Math.max(0, Number(b.weightLb)) : null;
   await c.query(`update stop_haul_away set status = $3, taken_qty = $4, photo = nullif($5,''), taken_note = nullif($6,''), taken_at = now(), taken_by = $7,
@@ -201,6 +290,30 @@ export async function recordHaulAway(c: Client, scope: Scope, id: string, b: { t
 }
 
 // ------------------------------------------------------------ disposal --
+
+/** The order lines a completed stop invoices for its own haul-away: what was taken, still open. Called by fleet.completeStop. */
+export async function linesToInvoice(c: Client, entityId: string, stopId: string): Promise<string[]> {
+  const r = await q<{ id: string }>(c, `
+    select l.id from stop_haul_away h join sales_order_line l on l.id in (h.fee_line_id, h.trade_in_line_id) and l.entity_id = h.entity_id
+     where h.entity_id = $1 and h.stop_id = $2 and h.status = 'taken' and l.line_status = 'open'`, [entityId, stopId]);
+  return r.map((x) => x.id);
+}
+export async function markInvoiced(c: Client, entityId: string, stopId: string) {
+  await c.query(`update stop_haul_away set invoiced_at = now() where entity_id = $1 and stop_id = $2 and status = 'taken' and invoiced_at is null`, [entityId, stopId]);
+}
+/** A cancelled stop's planned haul-away comes off with it, and off the order. Called by fleet.cancelStop. */
+export async function cancelForStop(c: Client, scope: Scope, stopId: string, reason: string) {
+  const hs = await q<{ id: string; fee_line_id: string | null; trade_in_line_id: string | null; order_id: string | null }>(c, `
+    select h.id, h.fee_line_id, h.trade_in_line_id, s.sales_order_id order_id from stop_haul_away h join delivery_stop s on s.id = h.stop_id
+     where h.entity_id = $1 and h.stop_id = $2 and h.status = 'planned'`, [scope.entityId, stopId]);
+  for (const h of hs) {
+    await cancelLine(c, scope.entityId, h.fee_line_id);
+    await cancelLine(c, scope.entityId, h.trade_in_line_id);
+    await c.query(`update stop_haul_away set status = 'cancelled', cancel_reason = $3 where entity_id = $1 and id = $2`, [scope.entityId, h.id, `stop cancelled: ${reason}`.slice(0, 300)]);
+  }
+  if (hs[0]?.order_id) await retotal(c, hs[0].order_id);
+  return hs.length;
+}
 
 /** Taken away and back at the warehouse, not yet disposed of. */
 export async function collected(c: Client, entityId: string, dcId: string | null) {

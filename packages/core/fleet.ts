@@ -15,7 +15,8 @@ import { postReceipt, invoiceFulfilment } from "./ar.ts";
 import { accrueCommissions } from "./workforce.ts";
 import * as R from "./routing.ts";
 import { geocodeAddress, setManualGeo, GeocodeError } from "./geocode.ts";
-import { loadGate, pendingPieces } from "./loading.ts";
+import { loadGate, pendingPieces, unloadLeftovers } from "./loading.ts";
+import * as haul from "./haulaway.ts";
 
 export class FleetError extends Error {}
 function need(cond: unknown, message: string): asserts cond {
@@ -394,7 +395,7 @@ export async function zones(c: Client, entityId: string) {
            cube_cap::float cube_cap, weight_cap_lb::float weight_cap_lb, labor_min_cap, active
       from delivery_window where entity_id = $1 order by starts`, [entityId]);
   const blackouts = await q(c, `select b.id, b.zone_id, b.day::text as day, b.reason from delivery_blackout b
-                                 where b.entity_id = $1 and b.day >= current_date order by b.day`, [entityId]);
+                                 where b.entity_id = $1 and b.day >= current_date and b.released_at is null order by b.day`, [entityId]);
   return { zones: z.map((x) => ({ ...x, windows: w.filter((y) => y.zone_id === x.id) })), blackouts };
 }
 
@@ -489,7 +490,7 @@ export async function availability(c: Client, entityId: string, zoneId: string, 
            w.stops_cap, w.pieces_cap, w.cube_cap::float cube_cap, w.labor_min_cap, w.weight_cap_lb::float weight_cap,
            coalesce(u.n,0)::int n, coalesce(u.pcs,0)::int pcs, coalesce(u.cube,0)::float cube, coalesce(u.lab,0)::int lab,
            coalesce(u.wt,0)::float wt,
-           exists (select 1 from delivery_blackout b where b.entity_id = $1 and b.day = d.day and (b.zone_id is null or b.zone_id = $2)) blackout,
+           exists (select 1 from delivery_blackout b where b.entity_id = $1 and b.day = d.day and (b.zone_id is null or b.zone_id = $2) and b.released_at is null) blackout,
            exists (select 1 from delivery_day_lock k where k.entity_id = $1 and k.day = d.day and k.unlocked_at is null) locked
       from d cross join delivery_window w
       left join lateral (select count(*) n, sum(s.pieces) pcs, sum(s.cube_ft) cube, sum(s.service_min) lab, sum(s.weight_lb) wt
@@ -674,7 +675,7 @@ async function checkSlot(c: Client, entityId: string, s: Settings, zone: { id: s
   need(day >= first, allowToday ? "that day has passed" : `the first day that can be booked is ${dayWords(first)}`);
   need(day !== now.day || w[0].end_min > now.min, `today's ${w[0].label} window has already ended; pick a later one`);
   need(zone.days.map(Number).includes(dow(day)), `this zone does not get deliveries on ${new Date(day + "T12:00:00Z").toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" })}s`);
-  const bo = await q<{ reason: string }>(c, `select reason from delivery_blackout where entity_id = $1 and day = $2 and (zone_id is null or zone_id = $3)`,
+  const bo = await q<{ reason: string }>(c, `select reason from delivery_blackout where entity_id = $1 and day = $2 and (zone_id is null or zone_id = $3) and released_at is null`,
     [entityId, day, zone.id]);
   need(!bo.length, `no deliveries on ${dayWords(day)}: ${bo[0]?.reason}`);
 }
@@ -838,6 +839,7 @@ export async function cancelStop(c: Client, scope: Scope, stopId: string, reason
   await c.query(`update delivery_stop set status = 'cancelled', cancel_reason = $3, route_id = null, seq = null where entity_id = $1 and id = $2`,
     [scope.entityId, stopId, reason.trim()]);
   await c.query(`update delivery_stop_line set outcome = 'cancelled' where entity_id = $1 and stop_id = $2 and outcome = 'pending'`, [scope.entityId, stopId]);
+  await haul.cancelForStop(c, scope, stopId, reason.trim());
   await notify(c, scope, stopId, "cancelled");
   return { ok: true };
 }
@@ -1250,13 +1252,13 @@ export async function route(c: Client, entityId: string, routeId: string) {
       from service_part sp join sales_order_line l on l.id = sp.sales_order_line_id join product p on p.id = sp.product_id
      where sp.entity_id = $1 and sp.ticket_id = any($2) and sp.used_at is null and sp.cancelled_at is null`, [entityId, tickets]) : [];
   // haul-away the crew takes from each door (the haul-away module's lines)
-  const haul = st.length ? await q(c, `
+  const haulRows = st.length ? await q(c, `
     select h.id, h.stop_id, h.category, h.description, h.qty::float qty, h.fee_minor::text fee_minor, h.trade_in_minor::text trade_in_minor,
            h.status, h.taken_qty::float taken_qty
       from stop_haul_away h where h.entity_id = $1 and h.stop_id = any($2) and h.status <> 'cancelled' order by h.created_at`, [entityId, st.map((x) => x.id)]) : [];
   return { ...r[0], stops: st.map((x) => ({ ...x, eta: x.eta_min != null ? R.clock(x.eta_min) : null, lines: lines.filter((l) => l.stop_id === x.id),
     mapsUrl: mapsUrl(x), serviceParts: x.service_ticket_id ? parts.filter((p) => p.ticket_id === x.service_ticket_id) : [],
-    haulAway: haul.filter((h) => h.stop_id === x.id) })) };
+    haulAway: haulRows.filter((h) => h.stop_id === x.id) })) };
 }
 
 export function mapsUrl(x: Record<string, unknown>): string {
@@ -1490,8 +1492,8 @@ export async function completeStop(c: Client, scope: Scope, stopId: string, b: C
   const st = await stopRow(c, scope.entityId, stopId);
   need(["scheduled", "arrived"].includes(st.status), `stop ${st.number} is already ${st.status}`);
   if (st.route_id) need(st.route_status === "in_progress", "start the route before completing stops");
-  const haul = await q<{ n: number }>(c, `select count(*)::int n from stop_haul_away where entity_id = $1 and stop_id = $2 and status = 'planned'`, [scope.entityId, stopId]);
-  need(!haul[0].n, `record what was hauled away from stop ${st.number} first (taken, with a photo, or not taken)`);
+  const unrecorded = await q<{ n: number }>(c, `select count(*)::int n from stop_haul_away where entity_id = $1 and stop_id = $2 and status = 'planned'`, [scope.entityId, stopId]);
+  need(!unrecorded[0].n, `record what was hauled away from stop ${st.number} first (taken, with a photo, or not taken)`);
   const lines = await q<{ id: string; sales_order_line_id: string | null; description: string; line_status: string | null }>(c, `
     select sl.id, sl.sales_order_line_id, sl.description, ol.line_status
       from delivery_stop_line sl left join sales_order_line ol on ol.id = sl.sales_order_line_id
@@ -1552,14 +1554,17 @@ export async function completeStop(c: Client, scope: Scope, stopId: string, b: C
 
   // goods handed over: stock out, sale recognised
   let costMinor = 0n, journalEntryId: string | null = null;
+  // this stop's own haul-away (what the crew recorded taking): invoiced with this stop, whatever else happens
+  const haulLines = st.sales_order_id ? await haul.linesToInvoice(c, scope.entityId, stopId) : [];
   if (!isPickup && st.sales_order_id && good.length) {
     const ids = good.map((l) => l.sales_order_line_id).filter(isId);
-    // fees, services and protection plans on the order go with its first delivery
+    // fees, services and protection plans on the order go with its first delivery (haul-away lines go with their own stop)
     const extras = await q<{ id: string }>(c, `
       select l.id from sales_order_line l left join product p on p.id = l.product_id
        where l.entity_id = $1 and l.sales_order_id = $2 and l.line_status = 'open' and l.qty > 0
-         and (p.id is null or p.kind in ('fee','service','warranty'))`, [scope.entityId, st.sales_order_id]);
-    const all = [...ids, ...extras.map((x) => x.id)];
+         and (p.id is null or p.kind in ('fee','service','warranty'))
+         and not exists (select 1 from stop_haul_away h where h.entity_id = $1 and (h.fee_line_id = l.id or h.trade_in_line_id = l.id))`, [scope.entityId, st.sales_order_id]);
+    const all = [...ids, ...extras.map((x) => x.id), ...haulLines];
     const f = await inventory.fulfilLines(c, scope.entityId, st.sales_order_id, all);
     costMinor = f.costMinor;
     const inv = await invoiceFulfilment(c, scope, st.sales_order_id, all, f.costMinor);
@@ -1569,7 +1574,13 @@ export async function completeStop(c: Client, scope: Scope, stopId: string, b: C
                                                and line_status in ('open','reserved','ready','on_order') and qty > 0`, [scope.entityId, st.sales_order_id]);
     await c.query(`update sales_order set status = $3 where entity_id = $1 and id = $2 and status in ('open','fulfilling')`,
       [scope.entityId, st.sales_order_id, left.n ? "fulfilling" : "fulfilled"]);
+  } else if (haulLines.length) {
+    // a pickup, or a delivery where nothing was handed over: the haul-away is still charged (and the trade-in credited)
+    const f = await inventory.fulfilLines(c, scope.entityId, st.sales_order_id!, haulLines);
+    const inv = await invoiceFulfilment(c, scope, st.sales_order_id!, haulLines, f.costMinor);
+    journalEntryId = inv.journalEntryId;
   }
+  if (haulLines.length) await haul.markInvoiced(c, scope.entityId, stopId);
   for (const l of lines) {
     const o = outcome.get(l.id)!;
     await c.query(`update delivery_stop_line set outcome = $3, note = nullif($4,''), flagged_for_warehouse = $5 where entity_id = $1 and id = $2`,
@@ -1603,6 +1614,8 @@ export async function finishRoute(c: Client, scope: Scope, routeId: string, odom
   }
   await c.query(`update delivery_route set status = 'completed', finished_at = now(), end_odometer = $3, actual_miles = $4 where entity_id = $1 and id = $2`,
     [scope.entityId, routeId, odometer ?? null, miles]);
+  // pieces refused or not delivered come back off the truck
+  await unloadLeftovers(c, scope, routeId);
   return { status: "completed", miles };
 }
 

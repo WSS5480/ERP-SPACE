@@ -83,8 +83,8 @@ export async function invoiceFulfilment(c: Client, scope: Scope, orderId: string
     `select number, location_id, paid_minor, fees_minor, customer_id from sales_order where id = $1 and entity_id = $2 for update`,
     [orderId, scope.entityId]);
   const lines = await q<{ id: string; kind: string | null; qty: string; unit_price_minor: string; discount_minor: string; tax_minor: string;
-                          sku: string; description: string; seq: number }>(c, `
-    select l.id, p.kind, l.qty, l.unit_price_minor, l.discount_minor, l.tax_minor, l.sku, l.description, l.seq
+                          sku: string; description: string; seq: number; revenue_code: string | null }>(c, `
+    select l.id, p.kind, l.qty, l.unit_price_minor, l.discount_minor, l.tax_minor, l.sku, l.description, l.seq, l.revenue_code
       from sales_order_line l left join product p on p.id = l.product_id
      where l.entity_id = $1 and l.sales_order_id = $2 and l.line_status = 'fulfilled'
        and ($3::uuid[] is null or l.id = any($3))
@@ -94,7 +94,8 @@ export async function invoiceFulfilment(c: Client, scope: Scope, orderId: string
   const rev = new Map<string, bigint>();
   let tax = 0n;
   const netOf = (l: typeof lines[number]) => BigInt(Math.round(Number(l.qty) * Number(l.unit_price_minor))) - BigInt(l.discount_minor);
-  const codeOf = (l: typeof lines[number]) => l.kind === "fee" || l.kind === "service" ? "4030" : l.kind === "warranty" ? "4040" : "4000";
+  // a line may name its own account (a trade-in credits 4095, trade-in allowances)
+  const codeOf = (l: typeof lines[number]) => l.revenue_code ?? (l.kind === "fee" || l.kind === "service" ? "4030" : l.kind === "warranty" ? "4040" : "4000");
   for (const l of lines) {
     const code = codeOf(l);
     rev.set(code, (rev.get(code) ?? 0n) + netOf(l));
@@ -136,7 +137,8 @@ export async function invoiceFulfilment(c: Client, scope: Scope, orderId: string
     { code: "1100", debit: toAr > 0n ? toAr : 0n, profitObjectId: po },
     { code: "1100", credit: toAr < 0n ? -toAr : 0n, profitObjectId: po },
     ...[...rev.entries()].map(([code, v]) => v >= 0n ? { code, credit: v, profitObjectId: po } : { code, debit: -v, profitObjectId: po }),
-    { code: "2100", credit: tax, profitObjectId: po },
+    { code: "2100", credit: tax > 0n ? tax : 0n, profitObjectId: po },
+    { code: "2100", debit: tax < 0n ? -tax : 0n, profitObjectId: po },
     { code: "5000", debit: costMinor, profitObjectId: po },
     { code: "1300", credit: costMinor, profitObjectId: po },
   ];

@@ -14,7 +14,18 @@
 //
 // Holiday lists are per company. A store-closed day is a delivery blackout
 // (through fleet.addBlackout), and a paid holiday is holiday pay for hourly
-// people in the pay period that holds it.
+// people in the pay period that holds it. A holiday that lands on approved
+// leave gives the leave hours back (the day is paid once, as the holiday).
+// A cancelled holiday releases its blackout and cancels holiday pay not yet
+// in a payroll run; leave days it gave back stay given back.
+//
+// Paid once: a leave day with time already worked on it is refused (the
+// person asks for the hours not worked instead, as a shorter day); a manager
+// does not punch anyone in on a full paid leave day; and before a payroll run
+// is built, each paid leave day's worked hours plus leave hours may not be
+// more than the day's hours. Leave in a pay period that is already built or
+// posted is refused, and paid leave for an hourly person with no pay group is
+// refused -- hours are never taken that are never paid.
 
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { WorkforceError, cancelShift } from "./workforce.ts";
@@ -113,6 +124,11 @@ export async function adjust(c: Client, scope: Scope, b: { employeeId: string; l
   const h = r3(n(b.hours));
   need(h !== 0 && Math.abs(h) <= 2000, "give the hours to add (or take off, as a negative)");
   need(String(b.note ?? "").trim().length >= 3, "say why the balance changes");
+  const t = await typeOf(c, scope.entityId, b.leaveTypeId);
+  if (h < 0 && !t.allow_negative) {
+    const bal = await balanceOf(c, scope.entityId, b.employeeId, t.id);
+    need(r3(bal + h) >= 0, `${t.name} cannot go below zero (the balance is ${r3(bal)} hours); turn on "may go negative" for it first`);
+  }
   return one(c, `insert into leave_ledger (entity_id, employee_id, leave_type_id, occurred_on, kind, hours, note, created_by)
                  values ($1,$2,$3,$4,'adjustment',$5,$6,$7) returning id`,
     [scope.entityId, b.employeeId, b.leaveTypeId, isDay(b.on) ? b.on : new Date().toISOString().slice(0, 10), h, String(b.note).trim().slice(0, 300), scope.actor.id || null]);
@@ -160,7 +176,7 @@ export async function accrue(c: Client, scope: Scope, payPeriodId: string) {
 // ------------------------------------------------------------ requests --
 
 async function holidayDays(c: Client, entityId: string, from: string, to: string): Promise<Set<string>> {
-  const r = await q<{ d: string }>(c, `select day::text d from company_holiday where entity_id = $1 and day between $2::date and $3::date`, [entityId, from, to]);
+  const r = await q<{ d: string }>(c, `select day::text d from company_holiday where entity_id = $1 and day between $2::date and $3::date and cancelled_at is null`, [entityId, from, to]);
   return new Set(r.map((x) => x.d));
 }
 
@@ -198,11 +214,12 @@ export async function request(c: Client, scope: Scope, b: { employeeId: string; 
   return { id: r.id, totalHours: total, days: days.length };
 }
 
-type ReqRow = { id: string; employee_id: string; leave_type_id: string; starts_on: string; ends_on: string; total_hours: string; status: string; app_user_id: string | null; name: string };
+type ReqRow = { id: string; employee_id: string; leave_type_id: string; starts_on: string; ends_on: string; total_hours: string; status: string; app_user_id: string | null; name: string;
+  requested_by: string | null };
 async function reqOf(c: Client, entityId: string, id: string): Promise<ReqRow> {
   need(isId(id), "no such request");
   const r = await q<ReqRow>(c, `
-    select r.id, r.employee_id, r.leave_type_id, r.starts_on::text starts_on, r.ends_on::text ends_on, r.total_hours, r.status, e.app_user_id,
+    select r.id, r.employee_id, r.leave_type_id, r.starts_on::text starts_on, r.ends_on::text ends_on, r.total_hours, r.status, e.app_user_id, r.requested_by,
            e.first_name || ' ' || e.last_name name
       from leave_request r join employee e on e.id = r.employee_id where r.entity_id = $1 and r.id = $2 for update of r`, [entityId, id]);
   need(r.length, "no such request");
@@ -231,6 +248,7 @@ export async function decide(c: Client, scope: Scope, id: string, d: { approve: 
   const r = await reqOf(c, scope.entityId, id);
   need(r.status === "requested", `that request is already ${r.status}`);
   need(!r.app_user_id || r.app_user_id !== scope.actor.id, "nobody approves or declines their own time off; another manager does");
+  need(!r.requested_by || r.requested_by !== scope.actor.id, "whoever entered a time-off request does not decide it; another manager does");
   if (!d.approve) {
     need(String(d.note ?? "").trim().length >= 3, "say why the time off is declined");
     await c.query(`update leave_request set status = 'declined', decided_by = $3, decided_at = now(), decision_note = $4 where entity_id = $1 and id = $2`,
@@ -243,6 +261,23 @@ export async function decide(c: Client, scope: Scope, id: string, d: { approve: 
     const avail = r3((await balanceOf(c, scope.entityId, r.employee_id, t.id)) - (await pendingOf(c, scope.entityId, r.employee_id, t.id, id)));
     need(avail >= n(r.total_hours), `${r.name} has ${avail} hours of ${t.name.toLowerCase()} available, not ${n(r.total_hours)}`);
   }
+  if (t.paid && p.pay_type === "hourly") {
+    need(p.pay_group_id, `${r.name} is not in a pay group, so paid time off could never be paid; put them in one under Payroll first`);
+    const closed = await q<{ day: string; status: string }>(c, `
+      select d.day::text as day, pp.status from leave_request_day d
+        join pay_period pp on pp.pay_group_id = $3 and d.day between pp.starts_on and pp.ends_on
+       where d.entity_id = $1 and d.request_id = $2 and pp.status in ('built','released','posted') order by d.day limit 1`, [scope.entityId, id, p.pay_group_id]);
+    need(!closed.length, `the pay period holding ${closed[0] ? dayWords(closed[0].day) : ""} is already ${closed[0]?.status}; time off there is corrected in payroll, not approved here`);
+  }
+  // paid once: no leave on a day already worked (ask for a shorter day: the hours not worked)
+  const worked = await q<{ day: string; hours: string | null }>(c, `
+    select d.day::text as day,
+           (select sum(tc.hours)::text from timecard tc where tc.employee_id = $2 and tc.worked_on = d.day and tc.status <> 'rejected') hours
+      from leave_request_day d where d.entity_id = $1 and d.request_id = $3 and d.returned_at is null
+       and (exists (select 1 from timecard tc where tc.employee_id = $2 and tc.worked_on = d.day and tc.status <> 'rejected' and tc.hours > 0)
+            or exists (select 1 from time_punch tp where tp.entity_id = $1 and tp.employee_id = $2 and tp.work_day = d.day and tp.voided_at is null))
+     order by d.day limit 1`, [scope.entityId, r.employee_id, id]);
+  need(!worked.length, `${r.name} already has time worked on ${worked[0] ? dayWords(worked[0].day) : ""}${worked[0]?.hours ? ` (${n(worked[0].hours)} h)` : ""}; a day is paid once, so ask for the hours not worked that day instead`);
   await c.query(`update leave_request set status = 'approved', decided_by = $3, decided_at = now(), decision_note = nullif($4,'') where entity_id = $1 and id = $2`,
     [scope.entityId, id, scope.actor.id || null, String(d.note ?? "").trim().slice(0, 300)]);
   if (t.kind !== "unpaid") {
@@ -308,38 +343,94 @@ export async function requests(c: Client, entityId: string, f: { employeeId?: st
 export async function onLeave(c: Client, entityId: string, employeeId: string, day: string): Promise<string | null> {
   const r = await q<{ name: string }>(c, `
     select t.name from leave_request_day d join leave_request r on r.id = d.request_id join leave_type t on t.id = r.leave_type_id
-     where d.entity_id = $1 and r.employee_id = $2 and d.day = $3::date and r.status = 'approved' limit 1`, [entityId, employeeId, day]);
+     where d.entity_id = $1 and r.employee_id = $2 and d.day = $3::date and r.status = 'approved' and d.returned_at is null limit 1`, [entityId, employeeId, day]);
   return r[0]?.name ?? null;
 }
 
 // ------------------------------------------------------------ holidays --
 
 export async function holidays(c: Client, entityId: string, from: string, to: string) {
-  return q(c, `select h.id, h.day::text as day, h.name, h.store_closed, h.paid, h.hours::float hours, h.blackout_id,
-                      (select count(*) from holiday_pay x where x.holiday_id = h.id)::int paid_people
+  return q(c, `select h.id, h.day::text as day, h.name, h.store_closed, h.paid, h.hours::float hours, h.blackout_id, h.cancelled_at::text cancelled_at, h.cancel_reason,
+                      (select count(*) from holiday_pay x join payroll_earning e on e.id = x.earning_id where x.holiday_id = h.id and e.status = 'approved')::int paid_people
                  from company_holiday h where h.entity_id = $1 and h.day between $2::date and $3::date order by h.day`, [entityId, from, to]);
 }
 
-/** A company holiday. Stores closed: no deliveries that day (a blackout in every zone). */
-export async function addHoliday(c: Client, scope: Scope, b: { day: string; name: string; storeClosed?: boolean; paid?: boolean; hours?: number }) {
+/**
+ * A company holiday. Stores closed: no deliveries that day (a blackout in every
+ * zone). Stops already booked that day are listed and nothing is added until
+ * the person confirms. Approved leave on the day is given back (paid as the holiday).
+ */
+export async function addHoliday(c: Client, scope: Scope, b: { day: string; name: string; storeClosed?: boolean; paid?: boolean; hours?: number; confirm?: boolean }) {
   need(isDay(b.day), "pick the day");
   const name = String(b.name ?? "").trim().slice(0, 80);
   need(name, "name the holiday");
-  const dup = await q<{ name: string }>(c, `select name from company_holiday where entity_id = $1 and day = $2`, [scope.entityId, b.day]);
+  const dup = await q<{ name: string }>(c, `select name from company_holiday where entity_id = $1 and day = $2 and cancelled_at is null`, [scope.entityId, b.day]);
   need(!dup.length, `${dayWords(b.day)} is already a holiday (${dup[0]?.name})`);
   const closed = b.storeClosed !== false;
   const hours = r2(n(b.hours ?? 8));
   need(hours > 0 && hours <= 24, "holiday hours are more than 0 and at most 24");
-  let blackout: string | null = null;
-  if (closed) {
-    const already = await q<{ id: string }>(c, `select id from delivery_blackout where entity_id = $1 and day = $2 and zone_id is null limit 1`, [scope.entityId, b.day]);
-    blackout = already[0]?.id ?? ((await addBlackout(c, scope, { day: b.day, reason: `${name} (stores closed)` })) as { id: string }).id;
+  if (closed && !b.confirm) {
+    const booked = await q<{ id: string; number: string; customer: string | null; kind: string }>(c, `
+      select s.id, s.number, cu.name customer, s.kind from delivery_stop s left join customer cu on cu.id = s.customer_id
+       where s.entity_id = $1 and s.scheduled_on = $2 and s.status in ('scheduled','arrived') order by s.number`, [scope.entityId, b.day]);
+    if (booked.length) {
+      return { created: false, confirmNeeded: true, stops: booked,
+        warning: `${booked.length} stop${booked.length === 1 ? " is" : "s are"} already booked on ${dayWords(b.day)} (${booked.map((x) => x.number).join(", ")}). ` +
+          `Closing the stores does not move them; move them in Delivery, or add the holiday anyway.` };
+    }
   }
+  const blackout = closed ? ((await addBlackout(c, scope, { day: b.day, reason: `${name} (stores closed)` })) as { id: string }).id : null;
   const r = await one<{ id: string }>(c, `insert into company_holiday (entity_id, day, name, store_closed, paid, hours, blackout_id, created_by)
                                           values ($1,$2,$3,$4,$5,$6,$7,$8) returning id`,
     [scope.entityId, b.day, name, closed, b.paid !== false, hours, blackout, scope.actor.id || null]);
-  await audit(c, scope, { table: "company_holiday", rowId: r.id, action: "insert", after: { day: b.day, name, closed, blackout } });
-  return { id: r.id, blackoutId: blackout };
+  const returned = b.paid !== false ? await returnLeaveFor(c, scope, r.id, b.day, name) : 0;
+  await audit(c, scope, { table: "company_holiday", rowId: r.id, action: "insert", after: { day: b.day, name, closed, blackout, leaveDaysReturned: returned } });
+  return { created: true, id: r.id, blackoutId: blackout, leaveDaysReturned: returned };
+}
+
+/** Approved leave on a paid holiday: the day is the holiday, so the leave hours go back and that day's leave pay is cancelled. */
+async function returnLeaveFor(c: Client, scope: Scope, holidayId: string, day: string, name: string) {
+  const days = await q<{ id: string; hours: string; request_id: string; employee_id: string; leave_type_id: string; kind: string; earning_id: string | null; run: string | null }>(c, `
+    select d.id, d.hours, d.request_id, r.employee_id, r.leave_type_id, t.kind, d.earning_id, e.payroll_run_id run
+      from leave_request_day d join leave_request r on r.id = d.request_id join leave_type t on t.id = r.leave_type_id
+      left join payroll_earning e on e.id = d.earning_id
+     where d.entity_id = $1 and d.day = $2::date and r.status = 'approved' and d.returned_at is null for update of d`, [scope.entityId, day]);
+  let n0 = 0;
+  for (const d of days) {
+    if (d.run) continue;   // already paid in a run: payroll corrects it there
+    await c.query(`update leave_request_day set returned_at = now(), returned_reason = $3, holiday_id = $4 where entity_id = $1 and id = $2`,
+      [scope.entityId, d.id, `${name} is a paid holiday`, holidayId]);
+    if (d.earning_id) await c.query(`update payroll_earning set status = 'cancelled' where entity_id = $1 and id = $2 and payroll_run_id is null`, [scope.entityId, d.earning_id]);
+    if (d.kind !== "unpaid") {
+      await c.query(`insert into leave_ledger (entity_id, employee_id, leave_type_id, occurred_on, kind, hours, request_id, note, created_by)
+                     values ($1,$2,$3,$4,'reversal',$5,$6,$7,$8)`,
+        [scope.entityId, d.employee_id, d.leave_type_id, day, n(d.hours), d.request_id, `${name} is a paid holiday; the hours come back`, scope.actor.id || null]);
+    }
+    n0++;
+  }
+  return n0;
+}
+
+/** Cancel a holiday: its delivery blackout is released and holiday pay not yet in a payroll run is cancelled. Nothing is deleted. */
+export async function cancelHoliday(c: Client, scope: Scope, id: string, reason: string) {
+  need(isId(id), "no such holiday");
+  need(String(reason ?? "").trim().length >= 3, "say why the holiday is cancelled");
+  const h = await q<{ id: string; day: string; name: string; blackout_id: string | null; cancelled_at: string | null }>(c, `
+    select id, day::text as day, name, blackout_id, cancelled_at from company_holiday where entity_id = $1 and id = $2 for update`, [scope.entityId, id]);
+  need(h.length, "no such holiday");
+  need(!h[0].cancelled_at, `${h[0].name} is already cancelled`);
+  const why = String(reason).trim().slice(0, 300);
+  await c.query(`update company_holiday set cancelled_at = now(), cancelled_by = $3, cancel_reason = $4 where entity_id = $1 and id = $2`, [scope.entityId, id, scope.actor.id || null, why]);
+  if (h[0].blackout_id) {
+    await c.query(`update delivery_blackout set released_at = now(), release_reason = $3 where entity_id = $1 and id = $2 and released_at is null`,
+      [scope.entityId, h[0].blackout_id, `holiday cancelled: ${why}`]);
+  }
+  const pay = await q<{ paid: number; cancelled: number }>(c, `
+    with x as (select e.id, e.payroll_run_id, e.status from holiday_pay hp join payroll_earning e on e.id = hp.earning_id where hp.entity_id = $1 and hp.holiday_id = $2),
+         u as (update payroll_earning e set status = 'cancelled' from x where e.id = x.id and e.entity_id = $1 and x.payroll_run_id is null and x.status = 'approved' returning e.id)
+    select (select count(*) from x where payroll_run_id is not null and status = 'approved')::int paid, (select count(*) from u)::int cancelled`, [scope.entityId, id]);
+  await audit(c, scope, { table: "company_holiday", rowId: id, action: "transition", after: { cancelled: true, payCancelled: pay[0].cancelled }, reason: why });
+  return { status: "cancelled", blackoutReleased: !!h[0].blackout_id, holidayPayCancelled: pay[0].cancelled, alreadyPaid: pay[0].paid };
 }
 
 /**
@@ -358,20 +449,23 @@ export async function leavePayForPeriod(c: Client, scope: Scope, payPeriodId: st
     select d.id, d.day::text as day, d.hours, d.request_id, r.employee_id, t.name type
       from leave_request_day d join leave_request r on r.id = d.request_id join leave_type t on t.id = r.leave_type_id
       join employee e on e.id = r.employee_id
-     where d.entity_id = $1 and r.status = 'approved' and t.paid and d.earning_id is null and e.pay_group_id = $2
+     where d.entity_id = $1 and r.status = 'approved' and t.paid and d.earning_id is null and e.pay_group_id = $2 and d.returned_at is null
        and d.day between $3::date and $4::date`, [scope.entityId, p0.pay_group_id, p0.starts_on, p0.ends_on]);
   for (const d of days) {
     const p = await person(c, scope.entityId, d.employee_id);
     if (await payDay(c, scope, p, d, d.type, d.request_id, by)) leaveDays++;
   }
   const hols = await q<{ id: string; day: string; name: string; hours: string }>(c, `
-    select id, day::text as day, name, hours from company_holiday where entity_id = $1 and paid and day between $2::date and $3::date`,
+    select id, day::text as day, name, hours from company_holiday where entity_id = $1 and paid and cancelled_at is null and day between $2::date and $3::date`,
     [scope.entityId, p0.starts_on, p0.ends_on]);
   for (const h of hols) {
     const people = await q<{ id: string; base_rate_minor: string }>(c, `
       select e.id, e.base_rate_minor from employee e
        where e.entity_id = $1 and e.pay_group_id = $2 and e.pay_type = 'hourly' and e.status = 'active' and e.hired_on <= $3::date
-         and not exists (select 1 from holiday_pay x where x.holiday_id = $4 and x.employee_id = e.id)`, [scope.entityId, p0.pay_group_id, h.day, h.id]);
+         and not exists (select 1 from holiday_pay x where x.holiday_id = $4 and x.employee_id = e.id)
+         and not exists (select 1 from leave_request_day d join leave_request r on r.id = d.request_id
+                          where d.entity_id = $1 and r.employee_id = e.id and d.day = $3::date and r.status = 'approved' and d.returned_at is null and d.earning_id is not null)`,
+      [scope.entityId, p0.pay_group_id, h.day, h.id]);
     for (const p of people) {
       const amt = BigInt(Math.round(n(h.hours) * 100)) * BigInt(p.base_rate_minor) / 100n;
       if (amt <= 0n) continue;
@@ -383,6 +477,17 @@ export async function leavePayForPeriod(c: Client, scope: Scope, payPeriodId: st
       holidayPay++;
     }
   }
+  // paid once: on a paid leave day, worked hours plus leave hours are no more than the day's hours
+  const over = await q<{ name: string; day: string; worked: string; leave: string; day_hours: string }>(c, `
+    select e.first_name || ' ' || e.last_name name, d.day::text as day, sum(tc.hours)::text worked, d.hours::text leave, r.hours_per_day::text day_hours
+      from leave_request_day d join leave_request r on r.id = d.request_id join leave_type t on t.id = r.leave_type_id
+      join employee e on e.id = r.employee_id
+      join timecard tc on tc.employee_id = e.id and tc.worked_on = d.day and tc.status <> 'rejected'
+     where d.entity_id = $1 and r.status = 'approved' and t.paid and d.returned_at is null and e.pay_group_id = $2 and d.day between $3::date and $4::date
+     group by e.first_name, e.last_name, d.day, d.hours, r.hours_per_day
+    having sum(tc.hours) + d.hours > r.hours_per_day`, [scope.entityId, p0.pay_group_id, p0.starts_on, p0.ends_on]);
+  need(!over.length, over.length ? `${over[0].name} has ${n(over[0].worked)} h worked and ${n(over[0].leave)} h paid leave on ${dayWords(over[0].day)}, ` +
+    `more than the day's ${n(over[0].day_hours)} h; fix the time or take back the leave before building payroll` : "");
   return { leaveDays, holidayPay };
 }
 
@@ -399,7 +504,7 @@ export async function absentToday(c: Client, entityId: string, locationId: strin
     select e.id employee_id, e.first_name || ' ' || e.last_name name, t.name type, t.kind, r.ends_on::text back_after, d.hours::float hours
       from leave_request_day d join leave_request r on r.id = d.request_id join leave_type t on t.id = r.leave_type_id join employee e on e.id = r.employee_id
       left join profit_object po on po.id = e.profit_object_id
-     where d.entity_id = $1 and d.day = $2::date and r.status = 'approved' and ($3::uuid is null or po.location_id = $3)
+     where d.entity_id = $1 and d.day = $2::date and r.status = 'approved' and d.returned_at is null and ($3::uuid is null or po.location_id = $3)
      order by e.last_name`, [entityId, day, locationId]);
   const noShow = await q(c, `
     select e.id employee_id, e.first_name || ' ' || e.last_name name, lo.name location, to_char(w.starts_at at time zone $4, 'HH24:MI') starts
@@ -408,7 +513,7 @@ export async function absentToday(c: Client, entityId: string, locationId: strin
        and ($3::uuid is null or w.location_id = $3)
        and not exists (select 1 from time_punch p where p.entity_id = $1 and p.employee_id = e.id and p.work_day = $2::date and p.kind = 'in' and p.voided_at is null)
      order by w.starts_at`, [entityId, day, locationId, tz]);
-  const hol = await q(c, `select name, store_closed from company_holiday where entity_id = $1 and day = $2::date`, [entityId, day]);
+  const hol = await q(c, `select name, store_closed from company_holiday where entity_id = $1 and day = $2::date and cancelled_at is null`, [entityId, day]);
   return { day, holiday: hol[0] ?? null, onLeave: onLeaveToday, noShow };
 }
 

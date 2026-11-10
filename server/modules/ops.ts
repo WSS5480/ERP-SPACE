@@ -241,6 +241,22 @@ export const module: ErpModule = {
         return { ...r, appliedMinor: r.appliedMinor.toString(), memoLeftMinor: r.memoLeftMinor.toString(), billLeftMinor: r.billLeftMinor.toString() };
       });
     });
+    coGet("/payables/memo-settings", async (c, co, _u, _m, p) => {
+      await canRead(c, co, p, MEMO_READ, "debit memo settings");
+      return plain(async () => ({ autoApproveBelowMinor: (await DM.settings(c, co.id)).autoApproveBelowMinor.toString() }));
+    });
+    coPost("/payables/memo-settings", async (c, co, a, b) => {
+      await requireRole(c, co, a, ["controller"], "setting when chargeback memos approve themselves");
+      return plain(async () => ({ autoApproveBelowMinor: (await DM.saveSettings(c, scopeOf(co, a), minor(b.autoApproveBelow ?? 0))).autoApproveBelowMinor.toString() }));
+    });
+    coPost(`/tax/jurisdictions/${ID}/trade-in`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, ["controller"], "saying how trade-ins are taxed");
+      return plain(async () => {
+        const r = await c.query(`update tax_jurisdiction set trade_in_reduces_taxable = $3 where entity_id = $1 and id = $2 returning code`, [co.id, m[2], b.reducesTaxable === true]);
+        need(r.rowCount, "no such tax jurisdiction");
+        return { code: r.rows[0].code, tradeInReducesTaxable: b.reducesTaxable === true };
+      });
+    });
     coGet(`/payables/vendors/${ID}/statement`, async (c, co, _u, m, p) => {
       await canRead(c, co, p, MEMO_READ, "a vendor statement");
       return plain(() => DM.statement(c, co.id, m[2]));
@@ -329,7 +345,11 @@ export const module: ErpModule = {
     coPost("/workforce/holidays", async (c, co, a, b) => {
       await requireRole(c, co, a, LEAVE_SETUP, "adding a company holiday");
       return plain(() => LV.addHoliday(c, scopeOf(co, a), { day: str(b.day, 10), name: str(b.name, 80), storeClosed: b.storeClosed !== false,
-        paid: b.paid !== false, hours: b.hours != null && b.hours !== "" ? Number(b.hours) : undefined }));
+        paid: b.paid !== false, hours: b.hours != null && b.hours !== "" ? Number(b.hours) : undefined, confirm: b.confirm === true }));
+    });
+    coPost(`/workforce/holidays/${ID}/cancel`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, LEAVE_SETUP, "cancelling a company holiday");
+      return plain(() => LV.cancelHoliday(c, scopeOf(co, a), m[2], str(b.reason, 300)));
     });
     coGet("/workforce/absent-today", async (c, co, url, _m, p) => {
       await canRead(c, co, p, LEAVE_MANAGE, "who is absent today");

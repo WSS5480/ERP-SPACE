@@ -204,7 +204,8 @@ export async function buildRun(
 
   // Paid leave and paid holidays in the period become earnings first (the leave module; once each).
   const { leavePayForPeriod } = await import("./leave.ts");
-  await leavePayForPeriod(c, scope, input.payPeriodId, input.builtBy);
+  try { await leavePayForPeriod(c, scope, input.payPeriodId, input.builtBy); }
+  catch (e) { throw (e as Error)?.constructor?.name === "WorkforceError" ? new PayrollError((e as Error).message) : e; }
 
   const otAfter = Number(period.overtime_after_hours);
   const otMult = Number(period.overtime_multiplier);

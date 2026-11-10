@@ -6,6 +6,14 @@
 
 begin;
 
+-- ---------------------------------------------- trade-in allowances --
+insert into gl_account (tenant_id, code, name, account_type, normal_balance)
+select '11111111-1111-1111-1111-111111111111', '4095', 'Trade-in allowances', 'revenue', 'D'
+ where not exists (select 1 from gl_account where tenant_id = '11111111-1111-1111-1111-111111111111' and code = '4095');
+insert into entity_gl_account (entity_id, gl_account_id)
+select e.id, g.id from entity e join gl_account g on g.tenant_id = e.tenant_id and g.code = '4095'
+ where e.tenant_id = '11111111-1111-1111-1111-111111111111' on conflict do nothing;
+
 -- --------------------------------------------------------- staging lanes --
 insert into dock_lane (entity_id, dc_location_id, code, name) values
   ('22222222-2222-2222-2222-222222222222','33333333-0000-0000-0000-0000000000dc','L1','Lane 1 (door 3)'),
@@ -15,7 +23,7 @@ insert into dock_lane (entity_id, dc_location_id, code, name) values
 
 -- ----------------------------------------------------------- haul-away --
 insert into product (id, entity_id, sku, name, kind, category, subcategory, price_minor, cost_minor, taxable, serialized, ship_class) values
-  ('77777777-0000-0000-0000-000000000061','22222222-2222-2222-2222-222222222222','SVC-HAUL-MATT','Haul-away, mattress or box spring','fee','Services','Haul-away',2500,0,false,false,'none'),
+  ('77777777-0000-0000-0000-000000000061','22222222-2222-2222-2222-222222222222','SVC-HAUL-MATT','Haul-away, mattress or box spring','fee','Services','Haul-away',2500,0,true,false,'none'),
   ('77777777-0000-0000-0000-000000000062','22222222-2222-2222-2222-222222222222','SVC-HAUL-FURN','Haul-away, furniture piece','fee','Services','Haul-away',3500,0,false,false,'none');
 
 insert into haul_away_rate (entity_id, category, label, fee_product_id, fee_minor, est_weight_lb) values

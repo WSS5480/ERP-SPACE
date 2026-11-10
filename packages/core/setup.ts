@@ -47,6 +47,7 @@ const RETAIL_ACCOUNTS: Account[] = [
   ["4050", "Service revenue", "revenue", "C"],
   ["4900", "Sales returns and allowances", "revenue", "D"],
   ["4910", "Sales discounts", "revenue", "D"],
+  ["4095", "Trade-in allowances", "revenue", "D"],
   ["5000", "Cost of goods sold", "expense", "D"],
   ["5030", "Freight in", "expense", "D"],
   ["5040", "Inventory shrink and damage", "expense", "D"],

@@ -171,7 +171,12 @@ export async function syncLoad(c: Client, scope: Scope, routeId: string) {
   }
   for (const h of have) if (!wantKeys.has(key(h))) {
     await c.query(`update route_load_item set status = 'removed' where entity_id = $1 and id = $2`, [scope.entityId, h.id]);
-    if (h.piece_id && h.status === "loaded") await pieceStep(c, scope, h.piece_id, ["unload"]);
+    // the stop moved to another truck: unload the piece only if that truck has not loaded it already
+    if (h.piece_id && h.status === "loaded") {
+      const elsewhere = await q(c, `select 1 from route_load_item where entity_id = $1 and piece_id = $2 and route_id <> $3 and status = 'loaded'`,
+        [scope.entityId, h.piece_id, routeId]);
+      if (!elsewhere.length) await pieceStep(c, scope, h.piece_id, ["unload"]);
+    }
     removed++;
   }
   return { synced: true, added, removed };
@@ -250,6 +255,10 @@ async function itemFor(c: Client, entityId: string, routeId: string, by: { itemI
   const elsewhere = await q<{ number: string }>(c, `select r.number from route_load_item i join delivery_route r on r.id = i.route_id
      where i.entity_id = $1 and i.route_id <> $2 and upper(i.label) = upper($3) and i.status <> 'removed' limit 1`, [entityId, routeId, code]);
   need(!elsewhere.length, `${code} belongs on route ${elsewhere[0]?.number}, not this truck`);
+  // a barcode the warehouse knows, held back from this load (damage hold, repair, back in stock): say why
+  const pc = await q<{ status: string }>(c, `select status from inv_piece where entity_id = $1 and upper(label) = upper($2)`, [entityId, code]);
+  need(!pc.length || ["reserved", "picked", "loaded"].includes(pc[0].status),
+    `${code} is ${pc[0]?.status.replace(/_/g, " ")} in the warehouse, so it cannot go on the truck; mark the piece it replaces short with the reason, or clear it in Warehouse first`);
   const done = await q(c, `select 1 from route_load_item where entity_id = $1 and route_id = $2 and upper(label) = upper($3) and status <> 'removed'`, [entityId, routeId, code]);
   need(!done.length, `every ${code} on this route is already loaded or marked short`);
   need(false, `${code} is not on this route's manifest`);
@@ -263,6 +272,14 @@ export async function loadPiece(c: Client, scope: Scope, routeId: string, by: { 
   await syncLoad(c, scope, routeId);
   const it = await itemFor(c, scope.entityId, routeId, by);
   need(it.status !== "loaded", `${it.label} (${it.description}) is already loaded`);
+  if (it.piece_id) {
+    // only goods held for this order go on: never a piece on damage hold, in repair, or back in stock
+    const pc = await q<{ status: string; line: string | null }>(c, `
+      select pc.status, pc.sales_order_line_id line from inv_piece pc where pc.entity_id = $1 and pc.id = $2`, [scope.entityId, it.piece_id]);
+    const status = pc[0]?.status ?? "missing";
+    need(["reserved", "picked", "loaded"].includes(status),
+      `${it.label} is ${status.replace(/_/g, " ")} in the warehouse, so it cannot go on the truck; mark it short with the reason, or clear it in Warehouse first`);
+  }
   // Prep (deluxing, touch-up, assembly) is checked again as each piece goes on: one swapped in or flagged since booking still stops here.
   const prep = await prepAtLoading(c, scope, it);
   need(!prep.refuse, prep.message ?? "");
@@ -317,6 +334,19 @@ export async function unloadPiece(c: Client, scope: Scope, routeId: string, item
   await c.query(`update route_load_item set status = 'pending', loaded_at = null, loaded_by = null, short_reason = null where entity_id = $1 and id = $2`,
     [scope.entityId, it.id]);
   return { itemId: it.id, status: "pending" };
+}
+
+/**
+ * The route is finished: a piece still on the truck (refused, damaged at the
+ * door, not delivered) comes off it, back to picked at the warehouse. Called by
+ * fleet.finishRoute.
+ */
+export async function unloadLeftovers(c: Client, scope: Scope, routeId: string) {
+  const left = await q<{ piece_id: string }>(c, `
+    select distinct i.piece_id from route_load_item i join inv_piece pc on pc.id = i.piece_id and pc.entity_id = i.entity_id
+     where i.entity_id = $1 and i.route_id = $2 and i.status = 'loaded' and pc.status = 'loaded'`, [scope.entityId, routeId]);
+  for (const x of left) await pieceStep(c, scope, x.piece_id, ["unload"]);
+  return left.length;
 }
 
 /** Before a route is locked: every piece is loaded or short. Called by fleet.lockRoute. */
