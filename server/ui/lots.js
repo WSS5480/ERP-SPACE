@@ -145,7 +145,7 @@
       pick.addEventListener('change', () => { lb.id = pick.value; });
       pick = field('Route', pick);
     } else if (lb.source === 'prep' || lb.source === 'bins') {
-      const s = select([['', lb.source === 'prep' ? 'Every location' : 'Pick a location'], ...o.locations.map((l) => [l.id, l.name])], lb.locationId);
+      const s = E.storePicker(select([['', lb.source === 'prep' ? 'Every location' : 'Pick a location'], ...o.locations.map((l) => [l.id, l.name])], lb.locationId));
       s.addEventListener('change', () => { lb.locationId = s.value; });
       pick = field(lb.source === 'prep' ? `Where (${plural(o.prepOpen, 'open job')})` : 'Location', s);
     } else {
@@ -214,7 +214,7 @@
     const name = input({ value: p ? p.name : '', maxlength: '60', placeholder: 'Dock Zebra' });
     const host = input({ value: p ? p.host : '', placeholder: '192.168.1.50', inputmode: 'decimal' });
     const port = input({ value: p ? String(p.port) : '9100', inputmode: 'numeric' });
-    const loc = select([['', 'Any location'], ...o.locations.map((l) => [l.id, l.name])], p ? p.location_id || '' : '');
+    const loc = E.storePicker(select([['', 'Any location'], ...o.locations.map((l) => [l.id, l.name])], p ? p.location_id || '' : ''));
     const on = el('input', { type: 'checkbox', checked: !p || p.active ? true : null, 'aria-label': 'In use' });
     formDialog(p ? 'Change printer' : 'Add a network printer', 'The owner only. A fixed private address (10.x, 172.16-31.x, 192.168.x), port 9100.',
       [field('Name', name), field('Address', host, 'An IP address; host names are not accepted'), field('Port', port), field('Where', loc), field('In use', on)], 'Save',
@@ -319,7 +319,7 @@
     } catch (e) { dd.body.append(resultBox('critical', 'fail', 'Not loaded', friendly(e))); }
   }
 
-  E.register('lots', 'Serials and lots', 'box', screenLots, 'Operations', { module: 'inventory' });
-  E.register('labels', 'Labels', 'tag', screenLabels, 'Operations', { module: 'inventory' });
-  E.register('settlements', 'Finance settlements', 'cash', screenSettlements, 'Back office', { module: 'ar' });
+  E.register('lots', 'Serials and lots', 'box', screenLots, 'Operations', { module: 'lots' });
+  E.register('labels', 'Labels', 'tag', screenLabels, 'Operations', { module: 'labels' });
+  E.register('settlements', 'Finance settlements', 'cash', screenSettlements, 'Back office', { module: 'settlements' });
 })();

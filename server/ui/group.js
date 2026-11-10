@@ -299,7 +299,7 @@
           detail: p.linked ? `${p.sibling} is customer ${p.customerNumber} and a vendor in ${p.company}` : `${p.sibling} becomes a customer and a vendor of ${p.company} on first use` })))));
   }
 
-  E.register('group', 'Group', 'building', screen, 'Back office');
+  E.register('group', 'Group', 'building', screen, 'Back office', { module: 'group' });
 
   // ============================================================== Home
   E.homeCard(async () => {

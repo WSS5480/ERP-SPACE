@@ -102,6 +102,7 @@ Data is placed with textContent only, never innerHTML.
 | lots (serial numbers and dye lots, label printing, finance company settlements; extends inventory, edi, catalog tags, ar) | 0045 | 0028 | Operations (Serials and lots, Labels), Back office (Finance settlements) |
 | trade (trade and designer accounts, the trade portal, room projects and follow-ups, the designer as a commission role; extends crm, catalog, tax, ar, shop, workforce) | 0044, 0047 | 0027 | Retail (Trade accounts, Room projects) |
 | configurator (sectionals, fabric/leather grades and swatches, option rules, condition grades; extends catalog, pos, inventory, shop, edi) | 0043 | 0026 | Retail (Sectionals), Operations (As-is grades) |
+| admin (service switches and presets, single-store rule, connections, outbound message log) | 0049 | none | Setup (Services, Connections) |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -417,3 +418,36 @@ export PGDATABASE=erp PGUSER=root PGHOST=/var/run/postgresql
 npm run smoke            # the finance core, 139 checks, must stay green
 npm run smoke:modules    # the retail modules
 ```
+
+## Admin: services and connections (migration 0049)
+
+`packages/core/services.ts` is the service catalog: every switchable service
+(`MODULE_IDS`, one `entity_module` row each) with its plain name, group, parent
+and screens (`SCREEN_SERVICE`); every `E.register` names its service in
+`module`. A switch hides a service's screens, Home cards (`E.homeCard(fn,
+{ module })`) and menu entries; it never stops it: data, jobs, postings and
+API routes keep working. `/setup/modules` returns what shows
+(`effectiveServices`: the switch, every parent on, and the layout rule: Group
+needs a second company, store orders a second location; owner override
+`admin.layout` = auto/single/multi). `setup.enabledModules` stays the raw
+switches; a 0049 service with no row follows the module it rode on
+(`SERVICE_SEED`). Presets map to the packs (single/multi-store retail →
+retail, furniture → furniture, delivery → trucking, back office → none).
+Store pickers marked `E.storePicker(select)` hide when they have one choice.
+
+`packages/core/messaging.ts` owns `admin_connection` (per company, or the
+whole client with `entity_id` null; the company's row wins), its sealed
+`admin_connection_secret` (AES-256-GCM, AAD connection:name, never returned)
+and `outbound_message` (status, provider id, error; codes stored redacted and
+never resent). Email: its own SMTP client (EHLO, STARTTLS, AUTH PLAIN/LOGIN,
+dot-stuffing, timeouts, public addresses only unless ERP_SMTP_ALLOW_PRIVATE=1,
+no-TLS only with ERP_SMTP_ALLOW_PLAIN=1) or SendGrid/Postmark/Mailgun/Resend
+through `vendor_feeds.call`. Wired: trade sign-in codes (`trade.ConnectedMailer`),
+`purchasing.sendPO` email, fleet customer messages and tear sheets (text when a
+text provider is connected, else email, else the old log), scheduled reports.
+With nothing connected each keeps its old behaviour (logged, not sent). SMS:
+Twilio or a generic HTTPS provider. Maps: Census, Google or Mapbox feed
+`geocode.geocodeAddress`. Webhooks: a signed test only (X-ERP-Signature
+t=,v1=HMAC-SHA256 of "t.body"); order events are not sent yet. Card
+processors other than the test one, card terminals, Plaid, accounting and
+payroll exports, marketplaces and ad platforms store keys only.

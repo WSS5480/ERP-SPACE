@@ -8,6 +8,7 @@ import { q } from "../../packages/core/db.ts";
 import { scopeOf, rolesOf } from "../actions.ts";
 import { ModuleError } from "./kit.ts";
 import * as tax from "../../packages/core/tax.ts";
+import { effectiveServices } from "../../packages/core/services.ts";
 import {
   PACKS, MODULE_IDS, applyPack, enabledModules, setModule, putSetting, importCustomers, importOpenAr, saveLocation,
 } from "../../packages/core/setup.ts";
@@ -16,7 +17,11 @@ export const module: ErpModule = {
   id: "setup",
   register({ coGet, coPost }) {
     // Every screen asks this to decide what to show; no role needed.
-    coGet("/setup/modules", async (c, co) => ({ modules: await enabledModules(c, co.id) }));
+    // modules: the services that show (switch on, parents on, needed by the layout); switches: each company switch as set.
+    coGet("/setup/modules", async (c, co) => {
+      const st = await effectiveServices(c, co.id);
+      return { modules: st.on, switches: await enabledModules(c, co.id), hidden: st.hidden, layout: st.layout };
+    });
 
     coGet("/setup/business", async (c, co) => {
       // One client runs one query at a time, so these go in sequence.

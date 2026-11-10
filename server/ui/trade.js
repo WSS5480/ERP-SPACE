@@ -318,6 +318,6 @@
 
   const ICON_TRADE = 'M4 20V9l8-5 8 5v11|M9 20v-6h6v6|M4 20h16';
   const ICON_ROOM = 'M3 10l9-6 9 6|M5 9v11h14V9|M9 20v-5h6v5';
-  E.register('trade', 'Trade accounts', 'tradeacct', screenTrade, 'Retail', { icon: ICON_TRADE, module: 'crm' });
-  E.register('projects', 'Room projects', 'roomproj', screenProjects, 'Retail', { icon: ICON_ROOM, module: 'crm' });
+  E.register('trade', 'Trade accounts', 'tradeacct', screenTrade, 'Retail', { icon: ICON_TRADE, module: 'trade' });
+  E.register('projects', 'Room projects', 'roomproj', screenProjects, 'Retail', { icon: ICON_ROOM, module: 'projects' });
 })();

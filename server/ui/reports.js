@@ -24,7 +24,7 @@
     cashier: 'Cashier', buyer: 'Buyer', warehouse: 'Warehouse', dispatcher: 'Dispatcher', driver: 'Driver', ar_clerk: 'A/R clerk', hr: 'HR', web_admin: 'Web admin' };
   const DOW = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
-  E.register('reports', 'Reports', 'chart', screen, 'Back office', { icon: 'M4 20h16|M7 16.5v-5M12 16.5V7M17 16.5v-8' });
+  E.register('reports', 'Reports', 'chart', screen, 'Back office', { icon: 'M4 20h16|M7 16.5v-5M12 16.5V7M17 16.5v-8', module: 'reports' });
 
   function style() {
     if (window.__repSheet) return;

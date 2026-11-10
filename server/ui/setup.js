@@ -34,19 +34,14 @@
     const packCards = el('div', { class: 'pack-grid' }, d.packs.map((p) => el('div', { class: 'panel pack' + (last && last.pack === p.id ? ' on' : '') },
       el('h3', { text: p.name }),
       el('p', { class: 'd', text: p.blurb }),
-      el('p', { class: 'fine', text: `Turns on: ${p.modules.map((m) => MODULE_LABEL[m][0]).join(', ')}` }),
+      el('p', { class: 'fine', text: `Turns on: ${p.modules.map((m) => (MODULE_LABEL[m] || [m])[0]).join(', ')}` }),
       el('div', { class: 'acts' }, el('button', { class: 'btn' + (last && last.pack === p.id ? '' : ' primary'), type: 'button', disabled: !owner || null,
         onclick: (e) => confirmPack(p, e.currentTarget) }, last && last.pack === p.id ? 'Apply again' : 'Use this setup')))));
 
-    const modules = el('div', { class: 'panel' }, d.allModules.map((m) => {
-      const on = d.modules.includes(m);
-      const box = el('input', { type: 'checkbox', checked: on, disabled: !owner || null, 'aria-label': MODULE_LABEL[m][0] });
-      box.addEventListener('change', () => act(box, () => post('/setup/module', { module: m, enabled: box.checked }),
-        `${MODULE_LABEL[m][0]} turned ${box.checked ? 'on' : 'off'}`).then(() => location.reload()));
-      return el('label', { class: 'li check-row' }, box,
-        el('div', { class: 't' }, MODULE_LABEL[m][0]), el('div', { class: 'd', text: MODULE_LABEL[m][1] }));
-    }));
-
+    // The switches moved to Admin, Services: every service has its own there, with presets and "apply to all my companies".
+    const showing = (E.S.modules || d.modules).length;
+    const modules = el('div', { class: 'panel' }, item({ title: 'Services', detail: `${showing} services showing. Switch each service on or off, use a preset, or apply to all your companies.`,
+      onClick: () => E.go('services') }));
     const locs = el('div', { class: 'panel' }, d.locations.length ? d.locations.map((l) => item({
       title: `${l.name} (${l.code})`,
       detail: [KIND_LABEL[l.kind] || l.kind, [l.address && l.address.city, l.state].filter(Boolean).join(', '),
@@ -80,7 +75,7 @@
         : 'Pick the kind of business this company is. That turns on the right modules and adds the accounts, pick lists and defaults they need. You can change any of it afterwards.' }),
       section('Kind of business', null, null, packCards),
       el('div', { class: 'two' },
-        el('div', {}, section('Modules', `${d.modules.length} of ${d.allModules.length} on`, null, modules),
+        el('div', {}, section('Services', null, null, modules),
           section('Pick lists', null, null, reasons)),
         el('div', {}, section('Stores and warehouses', `${d.locations.length}`, null, locs),
           section('Bring data over', null, null, imports))));
@@ -90,7 +85,7 @@
     const d = openDialog(`Set up as ${p.name.toLowerCase()}?`, E.S.co.name);
     d.body.append(
       el('p', { class: 'lead', text: p.blurb }),
-      el('p', { text: `This turns on ${p.modules.map((m) => MODULE_LABEL[m][0]).join(', ')}, and adds the accounts, reason lists and default settings those need. It removes nothing, and settings you already changed stay as you set them.` }),
+      el('p', { text: `This turns on ${p.modules.map((m) => (MODULE_LABEL[m] || [m])[0]).join(', ')}, and adds the accounts, reason lists and default settings those need. It removes nothing, and settings you already changed stay as you set them.` }),
       el('div', { class: 'dlg-acts' },
         el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel'),
         el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post('/setup/pack', { pack: p.id }),
@@ -158,7 +153,7 @@
         } }, 'Import')));
   }
 
-  E.register('business', 'Business setup', 'building', screen, 'Setup');
+  E.register('business', 'Business setup', 'building', screen, 'Setup', { module: null });
 
   // ============================================== sales tax and selling rules
   const LEVEL_LABEL = { state: 'State', county: 'County', city: 'City', special: 'Special district', combined: 'Single store rate' };
@@ -266,5 +261,5 @@
           'Added', { close: d.close, errorInto: (x) => { err.hidden = false; err.textContent = E.friendly(x); } }) }, 'Add')));
   }
 
-  E.register('salestax', 'Sales tax', 'percent', taxScreen, 'Setup', { icon: 'M5 19L19 5|C7.5 7.5 2.5|C16.5 16.5 2.5' });
+  E.register('salestax', 'Sales tax', 'percent', taxScreen, 'Setup', { icon: 'M5 19L19 5|C7.5 7.5 2.5|C16.5 16.5 2.5', module: 'salestax' });
 })();

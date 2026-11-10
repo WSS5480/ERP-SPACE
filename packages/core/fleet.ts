@@ -9,6 +9,7 @@
 
 import { partialSetWarning } from "./configurator.ts";
 import { createHash, randomBytes } from "node:crypto";
+import * as messaging from "./messaging.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import * as inventory from "./inventory.ts";
 import * as wms from "./wms.ts";
@@ -952,7 +953,30 @@ export type OutboundMessage = { channel: "sms" | "email"; to: string; body: stri
 /** The seam for a real SMS/email service. The default writes to the log table only and sends nothing. */
 export interface MessageProvider { name: string; send(m: OutboundMessage): Promise<{ ok: boolean; ref?: string; error?: string }> }
 let provider: MessageProvider = { name: "log", async send() { return { ok: true, ref: "log-" + randomBytes(5).toString("hex") }; } };
-export function setMessageProvider(p: MessageProvider) { provider = p; }
+let providerSet = false;
+export function setMessageProvider(p: MessageProvider) { provider = p; providerSet = true; }
+
+type Route = { channel: "sms" | "email"; to: string; name: string;
+  send(c: Client, entityId: string, m: OutboundMessage, messageId: string): Promise<{ ok: boolean; ref?: string; error?: string }> };
+/**
+ * How a customer message goes. A text provider or email connected in Admin,
+ * Connections sends it (and logs it there); with neither, the message is kept
+ * in this log as before (logged, not sent).
+ */
+async function messageRouteFor(c: Client, entityId: string, phone: string | null, email: string | null): Promise<Route> {
+  const via = providerSet ? null : await messaging.customerRoute(c, entityId, phone, email);
+  if (via) {
+    return { channel: via.channel, to: via.to, name: via.row.provider, async send(c2, e, m, messageId) {
+      const o = { purpose: m.kind === "tear_sheet" ? "tear_sheet" : "customer_" + m.kind, sourceTable: "customer_message", sourceId: messageId };
+      const r = via.channel === "sms"
+        ? await messaging.sendSms(c2, e, via.to, m.body, o, messaging.msgEnv(), via.row)
+        : await messaging.sendEmail(c2, e, { to: [via.to], subject: m.body.split(":")[0].slice(0, 80) || "A message from us", text: m.body }, o, messaging.msgEnv(), via.row);
+      return r.status === "sent" ? { ok: true, ref: r.providerRef ?? r.id } : { ok: false, error: r.error ?? "not sent" };
+    } };
+  }
+  const channel: "sms" | "email" = phone ? "sms" : "email";
+  return { channel, to: phone || email || "", name: provider.name, send: (_c, _e, m) => provider.send(m) };
+}
 
 async function notify(c: Client, scope: Scope, stopId: string | null, kind: string, extra: { orderId?: string; url?: string; etaMin?: number } = {}) {
   const info = await q<{ number: string; customer_id: string; name: string; phone: string | null; email: string | null; marketing: boolean;
@@ -981,15 +1005,15 @@ async function notify(c: Client, scope: Scope, stopId: string | null, kind: stri
     exception: `${co}: we could not complete your ${what} ${x.number} today. We will call to rebook.`,
     schedule_link: `${co}: your order ${x.order_no} is ready to schedule. Pick your delivery day here: ${extra.url ?? ""}`,
   }[kind] ?? `${co}: an update on ${x.number ?? x.order_no}.`;
-  const channel: "sms" | "email" = x.phone ? "sms" : "email";
-  const to = x.phone || x.email || "";
+  const route = await messageRouteFor(c, scope.entityId, x.phone, x.email);
+  const { channel, to } = route;
   const row = await one<{ id: string }>(c, `
     insert into customer_message (entity_id, stop_id, sales_order_id, customer_id, kind, channel, to_addr, body, provider, status)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id`,
-    [scope.entityId, stopId, x.order_id, x.customer_id, kind, channel, to || "-", body, provider.name, to ? "queued" : "skipped"]);
+    [scope.entityId, stopId, x.order_id, x.customer_id, kind, channel, to || "-", body, route.name, to ? "queued" : "skipped"]);
   if (!to) return;
   try {
-    const r = await provider.send({ channel, to, body, kind });
+    const r = await route.send(c, scope.entityId, { channel, to, body, kind }, row.id);
     await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end
                     where entity_id = $1 and id = $2`, [scope.entityId, row.id, r.ok ? "sent" : "failed", r.ref ?? null, r.error ?? null]);
   } catch (e) {
@@ -1003,16 +1027,16 @@ export async function messageCustomer(c: Client, scope: Scope, m: { customerId: 
   const kind = m.kind ?? "service_update";
   const cu = await q<{ phone: string | null; email: string | null }>(c, `select phone, email from customer where entity_id = $1 and id = $2`, [scope.entityId, m.customerId]);
   if (!cu.length) return null;
-  const channel: "sms" | "email" = cu[0].phone ? "sms" : "email";
-  const to = cu[0].phone || cu[0].email || "";
+  const route = await messageRouteFor(c, scope.entityId, cu[0].phone, cu[0].email);
+  const { channel, to } = route;
   const body = `${await companyName(c, scope.entityId)}: ${m.body}`.slice(0, 1000);
   const row = await one<{ id: string }>(c, `
     insert into customer_message (entity_id, sales_order_id, customer_id, kind, channel, to_addr, body, provider, status)
     values ($1,$2,$3,$9,$4,$5,$6,$7,$8) returning id`,
-    [scope.entityId, m.orderId ?? null, m.customerId, channel, to || "-", body, provider.name, to ? "queued" : "skipped", kind]);
+    [scope.entityId, m.orderId ?? null, m.customerId, channel, to || "-", body, route.name, to ? "queued" : "skipped", kind]);
   if (!to) return row.id;
   try {
-    const r = await provider.send({ channel, to, body, kind });
+    const r = await route.send(c, scope.entityId, { channel, to, body, kind }, row.id);
     await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end
                     where entity_id = $1 and id = $2`, [scope.entityId, row.id, r.ok ? "sent" : "failed", r.ref ?? null, r.error ?? null]);
   } catch (e) {

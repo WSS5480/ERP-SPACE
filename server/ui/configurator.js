@@ -407,7 +407,7 @@
       catch (e) { pieceBox.replaceChildren(E.errorBox(e)); }
     };
     label.addEventListener('keydown', (e) => { if (e.key === 'Enter') look(); });
-    const locSel = select(o.locations.map((l) => [l.id, l.name]), '', 'Every location');
+    const locSel = E.storePicker(select(o.locations.map((l) => [l.id, l.name]), '', 'Every location'));
     const repBox = el('div');
     const loadRep = async () => {
       repBox.replaceChildren(E.loadingNode());
@@ -495,6 +495,6 @@
     doc.body.append(bar, sheet);
   }
 
-  E.register('sectionals', 'Sectionals', 'sofa', screenSectionals, 'Retail', { icon: 'M3 15.5v-5a2 2 0 0 1 2-2h4v4h12v3|M3 15.5h18v3H3z|M9 8.5v-2h10a2 2 0 0 1 2 2v4', module: 'catalog' });
-  E.register('asis', 'As-is grades', 'grade', screenAsIs, 'Operations', { icon: 'M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z', module: 'inventory' });
+  E.register('sectionals', 'Sectionals', 'sofa', screenSectionals, 'Retail', { icon: 'M3 15.5v-5a2 2 0 0 1 2-2h4v4h12v3|M3 15.5h18v3H3z|M9 8.5v-2h10a2 2 0 0 1 2 2v4', module: 'sectionals' });
+  E.register('asis', 'As-is grades', 'grade', screenAsIs, 'Operations', { icon: 'M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z', module: 'asis' });
 })();

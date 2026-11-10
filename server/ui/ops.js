@@ -49,7 +49,7 @@
     return st.opts;
   }
   const dayPicker = () => { const i = input({ type: 'date', value: st.day, 'aria-label': 'Day' }); i.addEventListener('change', () => { if (i.value) { st.day = i.value; E.render(); } }); return i; };
-  const dcPicker = (o) => { const s = select(o.locations.filter((l) => l.kind !== 'web').map((l) => [l.id, l.name]), st.dc, { 'aria-label': 'Warehouse' }); s.addEventListener('change', () => { st.dc = s.value; E.render(); }); return s; };
+  const dcPicker = (o) => { const s = E.storePicker(select(o.locations.filter((l) => l.kind !== 'web').map((l) => [l.id, l.name]), st.dc, { 'aria-label': 'Warehouse' })); s.addEventListener('change', () => { st.dc = s.value; E.render(); }); return s; };
 
   // ====================================================== Loading dock
   const ITEM_TONE = { pending: 'neutral', loaded: 'good', short: 'warning' };
@@ -76,7 +76,7 @@
   }
 
   function laneDialog(o) {
-    const dc = select(o.locations.filter((l) => l.kind === 'warehouse' || l.kind === 'store').map((l) => [l.id, l.name]), st.dc);
+    const dc = E.storePicker(select(o.locations.filter((l) => l.kind === 'warehouse' || l.kind === 'store').map((l) => [l.id, l.name]), st.dc));
     const code = input({ placeholder: 'L5', maxlength: '12' }), nm = input({ placeholder: 'Lane 5 (door 7)' });
     formDialog('Add a dock lane', null, [field('Warehouse', dc), field('Code', code), field('Name', nm)], 'Add lane',
       () => post('/fleet/lanes', { dcLocationId: dc.value, code: code.value, name: nm.value }), 'Lane added');
@@ -248,7 +248,7 @@
 
   function disposalDialog(o, ids) {
     if (!ids.length) { toast('Tick what went first', 'warning'); return; }
-    const dc = select(o.locations.filter((l) => l.kind !== 'web').map((l) => [l.id, l.name]), st.dc);
+    const dc = E.storePicker(select(o.locations.filter((l) => l.kind !== 'web').map((l) => [l.id, l.name]), st.dc));
     const on = input({ type: 'date', value: todayIso() });
     const method = select([['recycler', 'Recycler'], ['landfill', 'Landfill'], ['donation', 'Donation']], 'recycler');
     const fac = input({ placeholder: 'Keystone Mattress Recycling' }), wt = input({ inputmode: 'decimal', placeholder: 'Leave empty to use the estimate' });
@@ -508,7 +508,7 @@
       ...a.noShow.map((x) => item({ title: x.name, badge: chip('critical', 'warn', 'Not clocked in'), detail: `shift at ${x.location} from ${x.starts}` })),
     ].filter(Boolean);
     return section('Absent today', plural(a.onLeave.length + a.noShow.length, 'person', 'people'), null, panel(capped(rows, 6, 'people')));
-  });
+  }, { module: 'timeoff' });
 
   // the Delivery screens call these
   E.ops = { recordHaul, addHaul };
@@ -517,8 +517,8 @@
   const ICON_RECYCLE = 'M7 19h10l2-4|M5 15l2-7 5 2|M14 5l5 4-3 5';
   const ICON_MEMO = 'M6 3h9l4 4v14H6z|M9 11h7M9 15h7M9 7h4';
   const ICON_CAL = 'M4 6h16v14H4z|M4 10h16|M8 3v5M16 3v5';
-  E.register('loading', 'Loading dock', 'box', screenLoading, 'Operations', { icon: ICON_BOX, module: 'fleet' });
-  E.register('haulaway', 'Haul-away', 'recycle', screenHaul, 'Operations', { icon: ICON_RECYCLE, module: 'fleet' });
-  E.register('memos', 'Debit memos', 'memo', screenMemos, 'Back office', { icon: ICON_MEMO, module: null });
-  E.register('timeoff', 'Time off', 'cal', screenTimeOff, 'Back office', { icon: ICON_CAL, module: 'workforce' });
+  E.register('loading', 'Loading dock', 'box', screenLoading, 'Operations', { icon: ICON_BOX, module: 'loading' });
+  E.register('haulaway', 'Haul-away', 'recycle', screenHaul, 'Operations', { icon: ICON_RECYCLE, module: 'haulaway' });
+  E.register('memos', 'Debit memos', 'memo', screenMemos, 'Back office', { icon: ICON_MEMO, module: 'memos' });
+  E.register('timeoff', 'Time off', 'cal', screenTimeOff, 'Back office', { icon: ICON_CAL, module: 'timeoff' });
 })();

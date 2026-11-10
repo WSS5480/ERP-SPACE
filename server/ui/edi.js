@@ -322,7 +322,7 @@
       if (!f.vendor) return empty('No vendor has anything to order.', null, true);
       state.vendor = f.vendor.id;
       if (!state.location) state.location = (f.locations[0] || {}).id;
-      const v = select(f.vendors.map((x) => [x.id, x.name]), state.vendor), loc = select(f.locations.map((l) => [l.id, l.name]), state.location);
+      const v = select(f.vendors.map((x) => [x.id, x.name]), state.vendor), loc = E.storePicker(select(f.locations.map((l) => [l.id, l.name]), state.location));
       if (o) { v.disabled = true; loc.disabled = true; }
       v.onchange = () => { state.vendor = v.value; state.qty = {}; draw(); };
       loc.onchange = () => { state.location = loc.value; };
@@ -403,5 +403,5 @@
   }
 
   E.register('edi', 'Vendor EDI', 'feed', screen, 'Setup', { module: 'edi' });
-  E.register('storeorders', 'Store orders', 'cart', screenStore, 'Retail', { module: 'edi' });
+  E.register('storeorders', 'Store orders', 'cart', screenStore, 'Retail', { module: 'storeorders' });
 })();

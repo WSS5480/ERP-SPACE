@@ -51,7 +51,7 @@
     : (OPT = { co: E.S.co.id, as: E.S.person && E.S.person.id, data: await coApi('/workforce/options') }).data);
   const isManager = (o) => o.me.roles.some((r) => ['owner', 'store_manager', 'hr'].includes(r));
   const canPlans = (o) => o.me.roles.some((r) => ['owner', 'hr', 'controller'].includes(r));
-  const locSelect = (o, value) => select(o.locations.map((l) => [l.id, l.name]), value || (o.locations[0] && o.locations[0].id));
+  const locSelect = (o, value) => E.storePicker(select(o.locations.map((l) => [l.id, l.name]), value || (o.locations[0] && o.locations[0].id)));
 
   const SECTIONS = [['', 'My time'], ['board', 'Who is on the clock'], ['exceptions', 'Time to fix'], ['schedule', 'Schedule'],
     ['commissions', 'Commission plans'], ['statement', 'Commission statements'], ['leaderboard', 'Leaderboard']];
@@ -147,7 +147,7 @@
   }
 
   async function board(o, locId) {
-    const loc = select([['', 'Every store'], ...o.locations.map((l) => [l.id, l.name])], locId || '');
+    const loc = E.storePicker(select([['', 'Every store'], ...o.locations.map((l) => [l.id, l.name])], locId || ''));
     loc.addEventListener('change', () => go('workforce', loc.value ? `board~${loc.value}` : 'board'));
     const rows = await coApi(`/workforce/clock${locId ? `?location=${locId}` : ''}`);
     const mgr = isManager(o);
@@ -320,6 +320,6 @@
     return frag(el('div', { class: 'wf-pick' }, field('From', from), field('To', to)), el('p', { class: 'wf-sub', text: 'Ranked by delivered sales. Written is what was sold in the dates; delivered is what was handed over.' }), box);
   }
 
-  E.register('workforce', 'Time and commissions', 'clock', screen, 'Back office');
+  E.register('workforce', 'Time and commissions', 'clock', screen, 'Back office', { module: 'workforce' });
   void toast; void cap;
 })();

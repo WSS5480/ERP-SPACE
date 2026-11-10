@@ -46,7 +46,7 @@
     return i;
   };
   const dcPicker = (o) => {
-    const s = select(o.locations.filter((l) => l.kind !== 'web').map((l) => [l.id, l.name]), st.dc, { 'aria-label': 'Warehouse' });
+    const s = E.storePicker(select(o.locations.filter((l) => l.kind !== 'web').map((l) => [l.id, l.name]), st.dc, { 'aria-label': 'Warehouse' }));
     s.addEventListener('change', () => { st.dc = s.value; E.render(); });
     s.style.width = 'auto';
     return s;
@@ -439,7 +439,7 @@
       unitNo: input({ placeholder: 'T-104' }), vinLast6: input({ class: 'upper', maxlength: '6', placeholder: 'Last 6 of the VIN' }),
       plate: input({ class: 'upper' }), plateState: input({ class: 'upper', maxlength: '2' }), kind: select(o.vehicleKinds.map((k) => [k, words(k)]), 'box_truck'),
       makeModel: input({}), modelYear: input({ type: 'number', inputmode: 'numeric' }),
-      homeLocationId: select(o.locations.map((l) => [l.id, l.name]), st.dc), cubeFt: input({ type: 'number', inputmode: 'decimal' }),
+      homeLocationId: E.storePicker(select(o.locations.map((l) => [l.id, l.name]), st.dc)), cubeFt: input({ type: 'number', inputmode: 'decimal' }),
       maxWeightLb: input({ type: 'number', inputmode: 'numeric' }), maxStops: input({ type: 'number', value: '14' }), crewSize: input({ type: 'number', value: '2' }),
       mpg: input({ type: 'number', inputmode: 'decimal', value: '9' }), odometerMi: input({ type: 'number', inputmode: 'numeric' }), geotabDeviceId: input({ placeholder: 'Optional' }),
       requiresCdl: el('input', { type: 'checkbox', class: 'pickbox' }),
@@ -520,7 +520,7 @@
     const d = openDialog(x ? `Edit ${x.code}` : 'Add zone', 'Postal codes, days, fee');
     const err = errSlot();
     const code = input({ class: 'upper', value: x ? x.code : '' }), name = input({ value: x ? x.name : '' });
-    const dc = select(o.locations.map((l) => [l.id, l.name]), x ? x.dc_location_id : st.dc);
+    const dc = E.storePicker(select(o.locations.map((l) => [l.id, l.name]), x ? x.dc_location_id : st.dc));
     const postals = el('textarea', { placeholder: '17025, 17011, …' }); postals.value = x ? x.postal_codes.join(', ') : '';
     const fee = input({ inputmode: 'decimal', value: x ? dollars(x.fee_minor) : '0.00' });
     const days = DAYS.map((label, i) => { const c = el('input', { type: 'checkbox', class: 'pickbox', checked: x ? x.days.includes(i) : i > 0 }); return [i, c, label]; });
@@ -739,6 +739,6 @@
       btn('Cancel', d.close)), err);
   }
 
-  E.register('fleet', 'Delivery', 'truck', screenFleet, 'Operations', { icon: ICON_TRUCK });
-  E.register('myroute', 'My route', 'pin', screenMyRoute, 'Operations', { icon: ICON_PIN });
+  E.register('fleet', 'Delivery', 'truck', screenFleet, 'Operations', { icon: ICON_TRUCK, module: 'fleet' });
+  E.register('myroute', 'My route', 'pin', screenMyRoute, 'Operations', { icon: ICON_PIN, module: 'fleet' });
 })();

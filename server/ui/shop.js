@@ -219,7 +219,7 @@
         badge: chip(x.status === 'published' ? 'good' : 'neutral', 'info', x.status) }))) : empty('No review requests yet', null, true)));
   }
 
-  register('shop', 'Web store', 'shopbag', screenShop, 'Retail', { icon: 'M5 8h14l-1.2 12H6.2z|M9 8V6.5a3 3 0 0 1 6 0V8' });
+  register('shop', 'Web store', 'shopbag', screenShop, 'Retail', { icon: 'M5 8h14l-1.2 12H6.2z|M9 8V6.5a3 3 0 0 1 6 0V8', module: 'shop' });
 
   // ======================================================== endless aisle
   // The tablet cart lives here between screens, per company.
@@ -250,7 +250,7 @@
       try { paint(await coApi('/shop/aisle' + qs({ location: AISLE.location, q: AISLE.q, category: AISLE.category }))); }
       catch (e) { box.replaceChildren(E.errorBox(e)); }
     }, 250);
-    const storeSel = select(first.stores.map((s) => [s.id, s.name]), AISLE.location, { onchange: (e) => { AISLE.location = e.target.value; reload(); } });
+    const storeSel = E.storePicker(select(first.stores.map((s) => [s.id, s.name]), AISLE.location, { onchange: (e) => { AISLE.location = e.target.value; reload(); } }));
     const catSel = select([['', 'Every department'], ...first.categories.map((c) => [c, c])], AISLE.category, { onchange: (e) => { AISLE.category = e.target.value; reload(); } });
     const search = input({ enterkeyhint: 'search', value: AISLE.q, placeholder: 'Search the whole catalog', oninput: (e) => { AISLE.q = e.target.value.trim(); reload(); } });
     function paintCart() {
@@ -332,5 +332,5 @@
     run('');
   }
 
-  register('aisle', 'Endless aisle', 'tablet', screenAisle, 'Retail', { icon: 'R6 3 12 18|M10.5 18h3' });
+  register('aisle', 'Endless aisle', 'tablet', screenAisle, 'Retail', { icon: 'R6 3 12 18|M10.5 18h3', module: 'aisle' });
 })();

@@ -8,7 +8,10 @@
   const { el, frag, section, head, item, chip, money, openDialog, fillDialog, post, coApi, toast, seg, empty, resultBox,
     tilesRow, tile, plural, dayLabel, shortDay, ago, busy, friendly, go, S, fact, capped, todayIso } = E;
 
-  const TABS = [['stock', 'Stock'], ['scan', 'Scan'], ['receive', 'Receive'], ['transfers', 'Transfers'], ['damage', 'Damage'], ['counts', 'Counts'], ['adjust', 'Adjust']];
+  const ALL_TABS = [['stock', 'Stock'], ['scan', 'Scan'], ['receive', 'Receive'], ['transfers', 'Transfers'], ['damage', 'Damage'], ['counts', 'Counts'], ['adjust', 'Adjust']];
+  // One company with one location has nowhere to transfer to; the tab comes back with a second store.
+  const multi = () => !E.S.layout || E.S.layout.multiStore || E.S.layout.multiCompany;
+  let TABS = ALL_TABS;
   const STATUS_TONE = { in_stock: 'good', reserved: 'neutral', picked: 'neutral', loaded: 'neutral', delivered: 'neutral', damaged: 'serious', in_repair: 'warning',
     vendor_claim: 'warning', as_is: 'warning', returned: 'warning', in_transit: 'neutral', written_off: 'critical', returned_to_vendor: 'neutral',
     open: 'warning', submitted: 'warning', approved: 'good', rejected: 'critical', draft: 'neutral', received: 'good', cancelled: 'neutral', resolved: 'good',
@@ -45,6 +48,7 @@
   async function layout() { if (!cache.layout) cache.layout = await coApi('/inventory/layout'); return cache.layout; }
   async function products() { if (!cache.stock) cache.stock = await coApi('/inventory/stock'); return cache.stock; }
   const locOptions = (L) => L.locations.map((l) => [l.id, l.name]);
+  const locSelect = (...a) => E.storePicker(select(...a));
   const binOptions = (L, locationId) => L.bins.filter((b) => b.location_id === locationId).map((b) => [b.id, b.code]);
   const productOptions = (P) => P.map((p) => [p.id, `${p.name} · ${p.sku}`]);
   let locFilter = '';
@@ -52,6 +56,7 @@
   // =================================================================== screen
   async function screen(sub) {
     cache = { layout: null, stock: null };
+    TABS = ALL_TABS.filter(([k]) => k !== 'transfers' || multi());
     const tab = TABS.some(([k]) => k === sub) ? sub : 'stock';
     const body = await ({ stock: stockTab, scan: scanTab, receive: receiveTab, transfers: transfersTab, damage: damageTab, counts: countsTab, adjust: adjustTab })[tab]();
     return frag(head('Warehouse', [], `${S.co.name} · stock and tracking`),
@@ -63,7 +68,7 @@
     const [ov, L] = await Promise.all([coApi('/inventory/overview'), layout()]);
     const list = el('div', { class: 'panel' }, E.loadingNode());
     const q = input({ placeholder: 'Search by name or SKU', 'aria-label': 'Search products', inputmode: 'search' });
-    const loc = select(locOptions(L), locFilter, 'Every location');
+    const loc = locSelect(locOptions(L), locFilter, 'Every location');
     const load = async () => {
       locFilter = loc.value;
       try {
@@ -222,7 +227,7 @@
     fillDialog(d, async () => {
       const [L, P] = await Promise.all([layout(), products()]);
       const prod = select(productOptions(P.filter((p) => !p.serialized)), '', 'Pick the product');
-      const loc = select(locOptions(L), '', 'Pick the location');
+      const loc = locSelect(locOptions(L), '', 'Pick the location');
       const n = input({ inputmode: 'numeric', value: '1' });
       const source = select([['warehouse', 'Found in the warehouse'], ['showroom', 'Showroom'], ['delivery', 'On a delivery'], ['receiving', 'At receiving']], 'warehouse');
       const desc = el('textarea', { maxlength: '500', placeholder: 'What is wrong, and where on the piece' });
@@ -271,7 +276,7 @@
   function receiveDialog(po, L, r) {
     const d = openDialog(`Receive ${po.number}`, po.vendor, { wide: true });
     const defaultLoc = po.ship_to_id || (L.locations.find((l) => l.kind === 'warehouse') || L.locations[0] || {}).id;
-    const loc = select(locOptions(L), defaultLoc);
+    const loc = locSelect(locOptions(L), defaultLoc);
     const dock = r.docks.find((x) => x.location_id === loc.value);
     const bin = select(binOptions(L, loc.value), '', dock ? 'The dock’s receiving bin' : 'No bin yet');
     loc.addEventListener('change', () => bin.replaceChildren(el('option', { value: '', text: 'No bin yet' }), binOptions(L, loc.value).map(([v, t]) => el('option', { value: v, text: t }))));
@@ -299,7 +304,7 @@
 
   function bookDialog(L, pos) {
     const d = openDialog('Book a delivery', 'The dock refuses a day past its piece limit');
-    const loc = select(locOptions(L), (L.locations.find((l) => l.kind === 'warehouse') || {}).id);
+    const loc = locSelect(locOptions(L), (L.locations.find((l) => l.kind === 'warehouse') || {}).id);
     const day = input({ type: 'date', min: todayIso(), value: todayIso() });
     const win = input({ maxlength: '40', placeholder: '8–10am' });
     const po = select(pos.map((p) => [p.po_id, `${p.number} · ${p.vendor}`]), '', 'No purchase order');
@@ -334,8 +339,8 @@
     fillDialog(d, async () => {
       const P = await products();
       // Another of the client's companies' stores too: shipping there pairs a sale here with a bill there (Group).
-      const sib = await coApi('/group/locations').then((r) => r.locations).catch(() => []);
-      const from = select(locOptions(L), (L.locations.find((l) => l.kind === 'warehouse') || {}).id);
+      const sib = E.S.layout && !E.S.layout.multiCompany ? [] : await coApi('/group/locations').then((r) => r.locations).catch(() => []);
+      const from = locSelect(locOptions(L), (L.locations.find((l) => l.kind === 'warehouse') || {}).id);
       const to = select([...locOptions(L), ...sib.map((l) => [l.id, `${l.name} · ${l.company}`])], '', 'To');
       const rowsBox = el('div', { class: 'panel' });
       const rows = [];
@@ -429,7 +434,7 @@
   }
   function newCount(L) {
     const d = openDialog('Count a bin', 'The sheet lists what the system expects');
-    const loc = select(locOptions(L), (L.locations.find((l) => l.kind === 'warehouse') || {}).id);
+    const loc = locSelect(locOptions(L), (L.locations.find((l) => l.kind === 'warehouse') || {}).id);
     const bin = select(binOptions(L, loc.value), '', 'Unbinned stock');
     loc.addEventListener('change', () => bin.replaceChildren(el('option', { value: '', text: 'Unbinned stock' }), binOptions(L, loc.value).map(([v, t]) => el('option', { value: v, text: t }))));
     const out = outBox();
@@ -473,7 +478,7 @@
   // --------------------------------------------------------------- adjust
   async function adjustTab() {
     const [a, L, P] = await Promise.all([coApi('/inventory/adjustments'), layout(), products()]);
-    const loc = select(locOptions(L), (L.locations.find((l) => l.kind === 'warehouse') || {}).id);
+    const loc = locSelect(locOptions(L), (L.locations.find((l) => l.kind === 'warehouse') || {}).id);
     const bin = select(binOptions(L, loc.value), '', 'No bin');
     loc.addEventListener('change', () => bin.replaceChildren(el('option', { value: '', text: 'No bin' }), binOptions(L, loc.value).map(([v, t]) => el('option', { value: v, text: t }))));
     const prod = select(productOptions(P), '', 'Pick the product');
@@ -493,5 +498,5 @@
         detail: [`${Number(x.qty) > 0 ? '+' : ''}${qty(x.qty)} at ${x.location}`, words(x.reason_code), x.note, x.by_name, ago(x.at)].filter(Boolean).join(' · ') })) : empty('None yet.', null, true))));
   }
 
-  E.register('inventory', 'Warehouse', 'box', screen, 'Operations', { icon: 'M3.5 7.5L12 3.5l8.5 4v9L12 20.5l-8.5-4z|M3.5 7.5L12 11.5l8.5-4|M12 11.5v9' });
+  E.register('inventory', 'Warehouse', 'box', screen, 'Operations', { icon: 'M3.5 7.5L12 3.5l8.5 4v9L12 20.5l-8.5-4z|M3.5 7.5L12 11.5l8.5-4|M12 11.5v9', module: 'inventory' });
 })();

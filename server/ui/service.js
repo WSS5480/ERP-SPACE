@@ -430,5 +430,5 @@
     });
   }
 
-  E.register('service', 'Service', 'wrench', screenService, 'Operations', { icon: ICON_WRENCH });
+  E.register('service', 'Service', 'wrench', screenService, 'Operations', { icon: ICON_WRENCH, module: 'service' });
 })();
