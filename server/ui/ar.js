@@ -30,7 +30,7 @@
   function setLabel(label) {
     if (!label || label === LABEL) return;
     LABEL = label;
-    E.register('ar', LABEL, 'cash', screen, 'Back office');
+    E.register('ar', LABEL, 'cash', screen, 'Back office', { module: 'ar' });
     const a = document.querySelector('#nav a[href$="/ar"]');
     if (a) for (const n of a.childNodes) if (n.nodeType === 3) n.textContent = LABEL;
   }
@@ -513,6 +513,6 @@
       field('On the call list after (days late)', callAfter))));
   }
 
-  E.register('ar', LABEL, 'cash', screen, 'Back office');
+  E.register('ar', LABEL, 'cash', screen, 'Back office', { module: 'ar' });
   void render; void capped;
 })();

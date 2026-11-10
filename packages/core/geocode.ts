@@ -53,6 +53,9 @@ export function censusGeocoder(fetchFn: FetchLike = globalThis.fetch as unknown 
 let current: Geocoder = censusGeocoder();
 export function setGeocoder(g: Geocoder) { current = g; }
 export function geocoder(): Geocoder { return current; }
+/** A company's own map provider (Admin, Connections) when it has one; set by messaging.ts. */
+let forEntity: ((c: Client, entityId: string) => Promise<Geocoder | null>) | null = null;
+export function setGeocoderFor(f: typeof forEntity) { forEntity = f; }
 
 export type GeoResult = { ok: true; lng: number; lat: number; source: string } | { ok: false; reason: string };
 
@@ -72,12 +75,14 @@ export async function geocodeAddress(c: Client, entityId: string, addressId: str
   if (!force && a.geo_error && a.recent) return { ok: false, reason: a.geo_error };
   const oneLine = `${a.line1}, ${a.city}, ${a.state} ${a.postal}`;
   let hit: Hit | null = null, reason = "";
-  try { hit = await current.locate(oneLine); if (!hit) reason = "the map service found no such address"; }
+  let g = current;
+  try { g = (forEntity ? await forEntity(c, entityId) : null) ?? current; } catch (e) { reason = (e as Error).message; }
+  try { hit = await g.locate(oneLine); if (!hit) reason = "the map service found no such address"; }
   catch (e) { reason = (e as Error).message; }
   if (hit) {
     await c.query(`update customer_address set geo = point($3, $4), geo_source = $5, geo_at = now(), geo_error = null where entity_id = $1 and id = $2`,
-      [entityId, addressId, hit.lng, hit.lat, current.name]);
-    return { ok: true, lng: hit.lng, lat: hit.lat, source: current.name };
+      [entityId, addressId, hit.lng, hit.lat, g.name]);
+    return { ok: true, lng: hit.lng, lat: hit.lat, source: g.name };
   }
   await c.query(`update customer_address set geo_at = now(), geo_error = $3 where entity_id = $1 and id = $2`, [entityId, addressId, reason.slice(0, 300)]);
   return { ok: false, reason };

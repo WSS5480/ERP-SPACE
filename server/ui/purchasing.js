@@ -390,7 +390,7 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
   function openBudget(d) {
     const dl = openDialog('Set a budget', 'Owner only');
     const month = input({ type: 'month', value: d.month.slice(0, 7) });
-    const cat = input({ list: 'po-cats', placeholder: 'Living room' }), loc = select(d.locations.map((l) => [l.id, l.name]));
+    const cat = input({ list: 'po-cats', placeholder: 'Living room' }), loc = E.storePicker(select(d.locations.map((l) => [l.id, l.name])));
     const amt = input({ inputmode: 'decimal', placeholder: '15000.00' });
     const err = el('div');
     const save = el('button', { class: 'btn primary', type: 'button', onclick: () => act(save, () => post('/purchasing/budgets', { month: month.value, category: cat.value, locationId: loc.value, budget: amt.value }),
@@ -432,7 +432,7 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
     const d = openDialog(r ? `${r.name} · ${r.location}` : 'New reorder point', 'At or under the minimum, buy up to the maximum');
     const prods = (await coApi('/catalog/products?kind=stock&status=active&limit=200')).items;
     const fo = await coApi('/purchasing/budgets');
-    const prod = select(prods.map((p) => [p.id, `${p.name} · ${p.sku}`]), r && r.product_id), loc = select(fo.locations.map((l) => [l.id, l.name]), r && r.location_id);
+    const prod = select(prods.map((p) => [p.id, `${p.name} · ${p.sku}`]), r && r.product_id), loc = E.storePicker(select(fo.locations.map((l) => [l.id, l.name]), r && r.location_id));
     const min = input({ type: 'number', min: '0', value: r ? Number(r.min_qty) : '' }), max = input({ type: 'number', min: '1', value: r ? Number(r.max_qty) : '' });
     const on = el('input', { type: 'checkbox', checked: !r || r.active });
     const err = el('div');
@@ -477,5 +477,5 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
         why: r.problems.length ? r.problems.slice(0, 4).map((p) => `Row ${p.row}: ${p.message}`).join(' · ') : null })), 8, 'files') : empty('None yet.', null, true))));
   }
 
-  E.register('purchasing', 'Buying', 'cart', screen, 'Retail', { icon: 'M3 4h2.5l2.2 11h10.6l2-8H7|C9.5 19 1.3|C17 19 1.3' });
+  E.register('purchasing', 'Buying', 'cart', screen, 'Retail', { icon: 'M3 4h2.5l2.2 11h10.6l2-8H7|C9.5 19 1.3|C17 19 1.3', module: 'purchasing' });
 })();

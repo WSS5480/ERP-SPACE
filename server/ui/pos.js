@@ -621,7 +621,7 @@
   }
   function registerDialog(setup) {
     const d = openDialog('Add a register', null);
-    const loc = select(setup.stores.filter((s) => s.kind !== 'warehouse').map((s) => [s.id, s.name]), '', 'Store');
+    const loc = E.storePicker(select(setup.stores.filter((s) => s.kind !== 'warehouse').map((s) => [s.id, s.name]), '', 'Store'));
     const code = input({ maxlength: '8', placeholder: 'R2' }), name = input({ maxlength: '60', placeholder: 'Front counter 2' });
     const out = outBox();
     const b = el('button', { class: 'btn primary', type: 'button', onclick: () => run(b, out, () => post('/pos/registers', { locationId: loc.value, code: code.value, name: name.value }), 'Added.', async () => { d.close(); E.render(); }) }, 'Add it');
@@ -711,5 +711,5 @@
       el('button', { class: 'btn', type: 'button', onclick: () => go('pos', 'orders') }, 'Back')], S.co.name), paper);
   }
 
-  E.register('pos', 'Point of sale', 'cash', screen, 'Retail');
+  E.register('pos', 'Point of sale', 'cash', screen, 'Retail', { module: 'pos' });
 })();

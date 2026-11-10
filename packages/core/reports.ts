@@ -11,6 +11,7 @@
 // scheduled; a scheduled run keeps a snapshot and prepares an email (there is
 // no mail service yet, so the delivery stays "prepared").
 
+import * as messaging from "./messaging.ts";
 import { deflateRawSync, crc32 } from "node:zlib";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { DATASETS, DATASET, GROUP, type Dataset, type Field, type FieldType } from "./reports_datasets.ts";
@@ -1039,6 +1040,20 @@ export async function snapshot(c: Client, scope: Scope, id: string, runAs: strin
       values ($1,$2,$3,'email',$4,$5,'prepared') returning id, status`,
       [scope.entityId, id, snap.id, addrs, `${r.name}: ${problem ? "could not run" : `${result!.count} rows`}`]);
     delivery = { id: d.id, status: d.status, to: addrs };
+    // Emailed when the company has email connected (Admin, Connections); otherwise it stays prepared.
+    if (addrs.length && await messaging.isConnected(c, scope.entityId)) {
+      const cols = result?.columns ?? [];
+      const cell = (v: unknown) => { const t = v === null || v === undefined ? "" : String(v); return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+      const csv = result ? [cols.map((x) => cell(x.label)).join(","), ...result.rows.map((row) => cols.map((x) => cell(row[x.key])).join(","))].join("\r\n") + "\r\n" : "";
+      const sent = await messaging.sendEmail(c, scope.entityId, { to: addrs, subject: `${r.name}: ${problem ? "could not run" : `${result!.count} rows`}`,
+        text: problem ? `The scheduled report ${r.name} could not run: ${problem}` : `The scheduled report ${r.name} ran with ${result!.count} rows. The rows are attached.`,
+        attachments: result ? [{ filename: `${r.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "report"}.csv`, content: csv }] : [] },
+        { purpose: "report", sourceTable: "report_delivery", sourceId: d.id });
+      const ok = sent.status === "sent";
+      await c.query(`update report_delivery set status = $3, sent_at = case when $3 = 'sent' then now() end, provider_ref = $4, problem = $5 where id = $1 and entity_id = $2`,
+        [d.id, scope.entityId, ok ? "sent" : "failed", sent.providerRef, ok ? null : sent.error]);
+      delivery = { id: d.id, status: ok ? "sent" : "failed", to: addrs };
+    }
   }
   return { snapshotId: snap.id, runAt: snap.run_at, rows: result?.count ?? 0, problem, delivery };
 }

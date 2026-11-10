@@ -18,6 +18,7 @@
 // Every portal read and write names the account; another account's order,
 // project or invoice reads exactly like one that does not exist.
 
+import * as messaging from "./messaging.ts";
 import { ConfigError } from "./configurator.ts";
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
@@ -58,6 +59,29 @@ export const RecordOnlyMailer: CodeMailer = {
     await c.query(`insert into shop_message (entity_id, site_id, customer_id, channel, to_ref, template, body, provider, status)
                    values ($1,$2,$3,'email',$4,'trade_code','A trade portal sign-in code was sent. The code is not kept.','record','recorded')`,
       [m.entityId, m.siteId, m.customerId, shop.maskEmail(m.to)]);
+  },
+};
+
+/**
+ * The default: through the company's email connection (Admin, Connections),
+ * logged there with the code redacted. With no email connected, today's
+ * record-only behaviour: filed, not sent.
+ */
+export const ConnectedMailer: CodeMailer = {
+  name: "connected",
+  async send(c, m) {
+    if (!(await messaging.isConnected(c, m.entityId, "email"))) {
+      await RecordOnlyMailer.send(c, m);
+      const code = /\b\d{6}\b/.exec(m.body)?.[0];
+      await messaging.sendEmail(c, m.entityId, { to: [m.to], subject: m.subject, text: m.body }, { purpose: "trade_code", redact: code ? [code] : [], sourceTable: "trade_account" }, messaging.msgEnv(), null);
+      return;
+    }
+    const code = /\b\d{6}\b/.exec(m.body)?.[0];
+    const r = await messaging.sendEmail(c, m.entityId, { to: [m.to], subject: m.subject, text: m.body }, { purpose: "trade_code", redact: code ? [code] : [] });
+    await c.query(`insert into shop_message (entity_id, site_id, customer_id, channel, to_ref, template, body, provider, status)
+                   values ($1,$2,$3,'email',$4,'trade_code',$5,$6,$7)`,
+      [m.entityId, m.siteId, m.customerId, shop.maskEmail(m.to), r.status === "sent" ? "A trade portal sign-in code was emailed. The code is not kept." : `A sign-in code could not be emailed: ${r.error ?? "not sent"}`,
+       r.provider, r.status === "sent" ? "sent" : "failed"]);
   },
 };
 
@@ -304,7 +328,7 @@ const codeHash = (accountId: string, code: string) => sha(`trade-code|${accountI
  * Email a sign-in code. Says the same thing whether or not the email has an
  * account, so it cannot be used to find out who trades here.
  */
-export async function requestCode(c: Client, site: shop.Site, emailIn: unknown, ipHash: string | null, mailer: CodeMailer = RecordOnlyMailer, at: Date = new Date()) {
+export async function requestCode(c: Client, site: shop.Site, emailIn: unknown, ipHash: string | null, mailer: CodeMailer = ConnectedMailer, at: Date = new Date()) {
   const email = clean(emailIn, 120).toLowerCase();
   need(EMAIL.test(email), "Enter the email your trade account uses.");
   const sent = { sent: true, message: "If that email has a trade account, a six-digit code is on its way. It works for 10 minutes." };

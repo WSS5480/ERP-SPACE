@@ -158,7 +158,7 @@
     });
     const filters = el('div', { class: 'form-grid' },
       tab === 'open' || tab === 'mine' ? field('Stage', select([['', 'Every open stage'], ...look.stages.filter((s) => !['won', 'lost'].includes(s)).map((s) => [s, STAGE[s][1]])], '', { onchange: (e) => { stage = e.target.value; load(); } })) : null,
-      field('Store', select([['', 'Every store'], ...look.stores.map((s) => [s.id, s.name])], '', { onchange: (e) => { store = e.target.value; load(); } })),
+      field('Store', E.storePicker(select([['', 'Every store'], ...look.stores.map((s) => [s.id, s.name])], '', { onchange: (e) => { store = e.target.value; load(); } }))),
       field('Search', input({ enterkeyhint: 'search', placeholder: 'Name, phone, email, interest', oninput: debounce((e) => { q = e.target.value.trim(); load(); }, 300) }), null, true));
     load();
     body.append(section(tab === 'won' ? 'Won' : tab === 'lost' ? 'Lost' : tab === 'mine' ? 'My leads' : 'Open pipeline', null, null, filters, box));
@@ -169,7 +169,7 @@
     const d = openDialog('New lead', 'Walk-in, phone call, referral…');
     const f = { source: select(look.sources.map((s) => [s, SOURCE[s]]), 'walk_in'), name: input({ maxlength: '80' }), phone: input({ type: 'tel', maxlength: '20' }),
       email: input({ type: 'email', maxlength: '120' }), interest: textarea({ maxlength: '500', placeholder: 'What are they shopping for?' }),
-      store: select([['', 'No store'], ...look.stores.map((s) => [s.id, s.name])], ''), assign: select([['', 'Next in the rotation'], ...look.people.map((p) => [p.id, p.name])], ''),
+      store: E.storePicker(select([['', 'No store'], ...look.stores.map((s) => [s.id, s.name])], '')), assign: select([['', 'Next in the rotation'], ...look.people.map((p) => [p.id, p.name])], ''),
       estimate: input({ inputmode: 'decimal', placeholder: 'e.g. 2500' }), campaign: select([['', 'None'], ...look.campaigns.map((k) => [k.id, k.name])], ''),
       cEmail: el('input', { type: 'checkbox' }), cSms: el('input', { type: 'checkbox' }) };
     const err = el('div');
@@ -233,7 +233,7 @@
     const rows = await coApi('/crm/rules');
     const add = () => {
       const d = openDialog('Round-robin rule', 'New leads that match go to the next person in turn');
-      const name = input({ maxlength: '80' }), store = select([['', 'Any store'], ...look.stores.map((s) => [s.id, s.name])], ''),
+      const name = input({ maxlength: '80' }), store = E.storePicker(select([['', 'Any store'], ...look.stores.map((s) => [s.id, s.name])], '')),
         src = select([['', 'Any source'], ...look.sources.map((s) => [s, SOURCE[s]])], '');
       const boxes = look.people.map((p) => el('label', { class: 'check' }, el('input', { type: 'checkbox', value: p.id }), el('span', { text: p.name })));
       d.body.append(el('div', { class: 'form-grid' }, field('Name', name, null, true), field('Store', store), field('Source', src),
@@ -254,7 +254,7 @@
       const look = lookIn || await lookups();
       const start = new Date(Date.now() + (pre.kind === 'appointment' ? 86400_000 : 3600_000)); start.setMinutes(0, 0, 0);
       const f = { kind: select(Object.entries(KIND), pre.kind || 'call'), title: input({ value: pre.title || '', maxlength: '140' }), due: input({ type: 'datetime-local', value: localInput(start) }),
-        mins: select([['30', '30 min'], ['60', '1 hour'], ['90', '90 min'], ['120', '2 hours']], '60'), store: select(look.stores.map((s) => [s.id, s.name]), ''),
+        mins: select([['30', '30 min'], ['60', '1 hour'], ['90', '90 min'], ['120', '2 hours']], '60'), store: E.storePicker(select(look.stores.map((s) => [s.id, s.name]), '')),
         who: select(look.people.map((p) => [p.id, p.name]), S.person && S.person.id), notes: textarea({ maxlength: '1000' }) };
       const apptOnly = [field('Length', f.mins), field('Showroom', f.store)];
       const sync = () => { for (const n of apptOnly) n.hidden = f.kind.value !== 'appointment'; };
@@ -343,7 +343,7 @@
       const d = openDialog('New segment', 'A saved filter. Consent is checked when a campaign sends, not here.', { wide: true });
       const f = { name: input({ maxlength: '80' }), cat: select([['', 'Any'], ...look.categories.map((c) => [c, c])], ''), sub: input({ placeholder: 'e.g. Sofas' }),
         min: input({ inputmode: 'numeric', placeholder: '6' }), max: input({ inputmode: 'numeric', placeholder: '18' }), plan: el('input', { type: 'checkbox' }),
-        store: select([['', 'Any store'], ...look.stores.map((s) => [s.id, s.name])], ''), spend: input({ inputmode: 'decimal', placeholder: '1000' }),
+        store: E.storePicker(select([['', 'Any store'], ...look.stores.map((s) => [s.id, s.name])], '')), spend: input({ inputmode: 'decimal', placeholder: '1000' }),
         lapsed: input({ inputmode: 'numeric', placeholder: '12' }), bday: select([['', 'Any'], ['0', 'This month'], ...['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'].map((m, i) => [String(i + 1), m])], ''),
         cart: el('input', { type: 'checkbox' }), tag: input({ placeholder: 'vip' }) };
       const filter = () => ({ boughtCategory: f.cat.value, boughtSubcategory: f.sub.value, monthsAgoMin: f.min.value, monthsAgoMax: f.max.value, hasProtectionPlan: f.plan.checked,
@@ -451,8 +451,8 @@
   }
 
   const ICON = { crm: 'C12 8 3.5|M5 20c0-3.9 3.1-6.2 7-6.2s7 2.3 7 6.2', leads: 'M3 5h18l-7 8v6l-4 2v-8z', day: 'R4 5 16 15|M4 10h16M8 3v4M16 3v4', mkt: 'M4 10v4l12 5V5z|M16 9a3 3 0 0 1 0 6' };
-  register('crm', 'Customers', 'crmcust', screenCustomers, 'Retail', { icon: ICON.crm });
-  register('leads', 'Leads', 'crmleads', screenLeads, 'Retail', { icon: ICON.leads });
-  register('myday', 'My day', 'crmday', screenMyDay, 'Retail', { icon: ICON.day });
-  register('marketing', 'Marketing', 'crmmkt', screenMarketing, 'Retail', { icon: ICON.mkt });
+  register('crm', 'Customers', 'crmcust', screenCustomers, 'Retail', { icon: ICON.crm, module: 'crm' });
+  register('leads', 'Leads', 'crmleads', screenLeads, 'Retail', { icon: ICON.leads, module: 'leads' });
+  register('myday', 'My day', 'crmday', screenMyDay, 'Retail', { icon: ICON.day, module: 'myday' });
+  register('marketing', 'Marketing', 'crmmkt', screenMarketing, 'Retail', { icon: ICON.mkt, module: 'marketing' });
 })();

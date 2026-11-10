@@ -316,7 +316,7 @@ const td = (text, cls) => el('td', { class: cls || null }, text);
 
 // ============================================================ navigation
 const SCREENS = [
-  ['home', 'Home', 'home'], ['approvals', 'Approvals', 'check'], ['payables', 'Payables', 'file'], ['payroll', 'Payroll', 'people'],
+  ['home', 'Home', 'home'], ['approvals', 'Approvals', 'check'], ['payables', 'Payables', 'file'], ['payroll', 'Payroll', 'people', 'Back office', 'payroll'],
   ['books', 'Books', 'book'], ['cash', 'Cash', 'cash'], ['recon', 'Reconcile', 'recon'], ['feeds', 'Feeds', 'feed'], ['setup', 'Setup', 'building'],
 ];
 const TABS = ['home', 'approvals', 'payables', 'books'];
@@ -327,7 +327,7 @@ function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + 
  * the owner sees everything. The server still checks every action on its own.
  */
 const ROLE_SCREENS = {
-  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business', 'salestax', 'wms', 'settlements', 'trade', 'asis'],
+  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business', 'services', 'connections', 'salestax', 'wms', 'settlements', 'trade', 'asis'],
   approver: ['home', 'approvals', 'storeorders', 'payables', 'memos', 'reports'],
   ap_clerk: ['home', 'payables', 'memos', 'edi', 'reports', 'trade'],
   viewer: ['home', 'books', 'chart', 'reports'],
@@ -342,7 +342,7 @@ const ROLE_SCREENS = {
   dispatcher: ['home', 'fleet', 'loading', 'haulaway', 'service', 'inventory', 'workforce', 'timeoff', 'labels'],
   driver: ['home', 'myroute', 'workforce', 'timeoff'],
   technician: ['home', 'myroute', 'service', 'workforce', 'timeoff'],
-  web_admin: ['home', 'shop', 'marketing', 'catalog', 'sectionals', 'workforce', 'timeoff'],
+  web_admin: ['home', 'shop', 'marketing', 'catalog', 'sectionals', 'connections', 'workforce', 'timeoff'],
   marketing: ['home', 'marketing', 'crm', 'leads', 'projects', 'reports', 'workforce', 'timeoff'],
 };
 const BACK_OFFICE = ['owner', 'controller', 'approver', 'ap_clerk', 'viewer'];
@@ -447,7 +447,8 @@ async function setCompany(c) {
   S.co = c;
   store.set('erp.company', c.id);
   S.people = await api(`/api/c/${c.id}/people`);
-  try { S.modules = (await api(`/api/c/${c.id}/setup/modules`)).modules; } catch (_) { S.modules = null; }
+  // the services this company shows (switches, parents, and the single-store rule), and its layout
+  try { const m = await api(`/api/c/${c.id}/setup/modules`); S.modules = m.modules; S.layout = m.layout || null; } catch (_) { S.modules = null; S.layout = null; }
   const saved = store.get(`erp.as.${c.id}`);
   const byName = S.people.find((p) => p.name.toLowerCase() === (S.me.viewer.name || '').toLowerCase());
   const owner = S.people.find((p) => p.roles.includes('owner'));
@@ -501,6 +502,8 @@ async function render() {
 
 // ================================================================= home
 const HOME_CARDS = [];
+/** A Home card shows only while its service is on for the company. */
+const cardsOn = () => HOME_CARDS.filter((f) => !f.module || !S.modules || S.modules.includes(f.module));
 async function screenHome() {
   if (!backOfficeHome()) return screenRoleHome();
   const d = await coApi('/home');
@@ -553,7 +556,7 @@ async function screenHome() {
     onClick: () => go('feeds') });
 
   // Cards modules add to Home (pinned reports, ...). One that fails to load is left out, never breaks Home.
-  const extras = (await Promise.all(HOME_CARDS.map((f) => Promise.resolve().then(f).catch(() => null)))).filter(Boolean);
+  const extras = (await Promise.all(cardsOn().map((f) => Promise.resolve().then(f).catch(() => null)))).filter(Boolean);
   return frag(
     head('Home', canSee('payables') ? [el('button', { class: 'btn primary', type: 'button', onclick: () => openNewBill() }, icon('plus'), 'New bill')] : []),
     trialBanner(), tiles, extras,
@@ -568,7 +571,7 @@ async function screenHome() {
 async function screenRoleHome() {
   const who = S.person ? S.person.name : 'nobody';
   const mine = visibleScreens().filter(([n]) => n !== 'home');
-  const extras = (await Promise.all(HOME_CARDS.map((f) => Promise.resolve().then(f).catch(() => null)))).filter(Boolean);
+  const extras = (await Promise.all(cardsOn().map((f) => Promise.resolve().then(f).catch(() => null)))).filter(Boolean);
   return frag(head('Home'), trialBanner(),
     el('p', { class: 'lead', text: `Acting as ${who}. These are the screens they work in; switch who you’re acting as to see someone else’s view.` }),
     section('Your screens', null, null, el('div', { class: 'panel' }, mine.length
@@ -2108,7 +2111,13 @@ window.ERP = {
   head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input,
   openEntry, NARROW,
   /** homeCard(async () => node | null): a card on Home, after the tiles */
-  homeCard(fn) { HOME_CARDS.push(fn); },
+  homeCard(fn, opts = {}) {
+    const src = document.currentScript && /\/ui\/([a-z]+)\.js/.exec(document.currentScript.src);
+    fn.module = opts.module !== undefined ? opts.module : (src && SCREENS.some((r) => r[4] === src[1]) ? src[1] : null);
+    HOME_CARDS.push(fn);
+  },
+  /** Mark a store or location picker: with a single choice it is set to that choice and hidden (one store needs no picker). */
+  storePicker(sel) { sel.dataset.picker = 'store'; return sel; },
   /** register('pos', 'Point of sale', 'cash', screenFn, 'Retail', {icon: 'M..', module: 'pos'}) -- hidden when the company has that module off */
   register(name, label, ic, fn, group, opts = {}) {
     if (opts.icon) ICONS[ic] = opts.icon;
@@ -2176,7 +2185,27 @@ async function boot() {
     $('#boot .spin').hidden = true;
   }
 }
+// A store picker with a single choice is set to it and hidden; it comes back when a second store is added.
+function tidyPicker(sel) {
+  const real = [...sel.options].filter((o) => o.value !== '');
+  const blank = [...sel.options].find((o) => o.value === '');
+  const wrap = sel.closest('.field') || sel;
+  if (real.length <= 1) {
+    if (real.length === 1 && (!blank || !/^(every|any|all|no|going anywhere)\b/i.test(blank.textContent || ''))) sel.value = real[0].value;
+    wrap.style.display = 'none';
+  } else if (wrap.style.display === 'none') wrap.style.display = '';
+}
+function watchPickers() {
+  new MutationObserver((muts) => {
+    for (const m of muts) for (const n of m.addedNodes) {
+      if (n.nodeType !== 1) continue;
+      if (n.matches('select[data-picker="store"]')) tidyPicker(n);
+      for (const x of n.querySelectorAll('select[data-picker="store"]')) tidyPicker(x);
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+}
 function wire() {
+  watchPickers();
   for (const b of document.querySelectorAll('[data-act="refresh"]')) { b.prepend(icon('refresh')); b.addEventListener('click', () => render()); }
   for (const b of document.querySelectorAll('[data-act="signout"]')) { b.prepend(icon('out')); b.addEventListener('click', signOut); }
   $('#co-switch').append(icon('chev'));

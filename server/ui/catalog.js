@@ -378,7 +378,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     const d = await coApi(`/catalog/margins?${qs}`);
     const vSel = select([['', 'All vendors'], ...fo.vendors.map((v) => [v.id, v.name])], M.vendor);
     const cSel = select([['', 'All categories'], ...fo.categories.map((c) => [c.category, c.category])], M.category);
-    const lSel = select(fo.locations.map((l) => [l.id, `Landed at ${l.name}`]), M.location || d.locationId);
+    const lSel = E.storePicker(select(fo.locations.map((l) => [l.id, `Landed at ${l.name}`]), M.location || d.locationId));
     for (const [s, k] of [[vSel, 'vendor'], [cSel, 'category'], [lSel, 'location']]) s.onchange = () => { M[k] = s.value; render(); };
     const low = d.items.filter((x) => x.margin_bps != null && x.margin_bps < 4000);
     const rows = d.items.map((x) => item({
@@ -794,7 +794,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
   async function openFreight(v) {
     const fo = await form();
     const d = openDialog(`Freight from ${v.name}`, 'Percent of cost, a flat amount per unit, or both');
-    const loc = select(fo.locations.map((l) => [l.id, l.name]));
+    const loc = E.storePicker(select(fo.locations.map((l) => [l.id, l.name])));
     const pctIn = input({ inputmode: 'decimal', placeholder: '6' }), per = moneyIn(null);
     const fill = () => { const f = v.freight.find((x) => x.location_id === loc.value); pctIn.value = f ? f.freight_bps / 100 : ''; per.value = f ? (Number(f.per_unit_minor) / 100).toFixed(2) : ''; };
     loc.onchange = fill; fill();
@@ -967,5 +967,5 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     doc.body.append(bar, sheet);
   }
 
-  E.register('catalog', 'Catalog', 'tag', screen, 'Retail', { icon: 'M3.5 12.5V4.5a1 1 0 0 1 1-1h8l8 8-9 9z|C8 8 1.4' });
+  E.register('catalog', 'Catalog', 'tag', screen, 'Retail', { icon: 'M3.5 12.5V4.5a1 1 0 0 1 1-1h8l8 8-9 9z|C8 8 1.4', module: 'catalog' });
 })();

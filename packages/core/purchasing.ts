@@ -7,6 +7,7 @@
 // on_order moves only through inventory.ts addOnOrder. Receiving (on hand,
 // on_order down) is the inventory module's.
 
+import * as messaging from "./messaging.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { addOnOrder } from "./inventory.ts";
 import { priceConfigured, PricingError, type Choice } from "./pricing.ts";
@@ -677,9 +678,11 @@ export async function sendPO(c: Client, s: Scope, poId: string, method: SendMeth
     const mail = { to: file.orderEmail, subject: `Purchase order ${po.number}`,
       text: `Please confirm purchase order ${po.number}: ${file.lines} ${file.lines === 1 ? "line" : "lines"}, attached.`,
       attachments: [{ filename: file.filename, content: file.csv }] };
-    if (!env.mailer) return { ...(await log("prepared", file.orderEmail, "no mail service is set up here, so download the file and email it to the vendor")), file };
+    // the checks' own mailer, else the company's email connection (Admin, Connections)
+    const mailer = env.mailer ?? await messaging.mailerFor(c, s.entityId, "purchase_order", { ...messaging.msgEnv(), ...env });
+    if (!mailer) return { ...(await log("prepared", file.orderEmail, "no email is connected (Admin, Connections), so download the file and email it to the vendor")), file };
     try {
-      const r = await env.mailer.send(mail);
+      const r = await mailer.send(mail);
       return { ...(await log("sent", file.orderEmail, `emailed${r.id ? ` (message ${r.id})` : ""}`)), file };
     } catch (e) {
       await c.query("rollback to savepoint send");

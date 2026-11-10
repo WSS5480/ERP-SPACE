@@ -11,8 +11,35 @@ import { installStarters } from "./reports.ts";
 
 export class SetupError extends Error {}
 
-export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group", "edi"] as const;
+/**
+ * Every switchable service (packages/core/services.ts describes each one). The
+ * first thirteen are the original modules; the rest gave their screens a
+ * switch of their own in migration 0049.
+ */
+export const MODULE_IDS = ["catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "crm", "service", "reports", "group", "edi",
+  "wms", "salestax", "loading", "haulaway", "memos", "timeoff", "lots", "labels", "settlements", "trade", "projects",
+  "sectionals", "asis", "storeorders", "leads", "marketing", "aisle", "myday", "payroll"] as const;
 export type ModuleId = (typeof MODULE_IDS)[number];
+
+/**
+ * A service added in 0049 with no switch yet takes the value of the module its
+ * screens rode on before (null: on). A company that chose its modules keeps
+ * seeing exactly what it saw.
+ */
+export const SERVICE_SEED: Partial<Record<ModuleId, ModuleId | null>> = {
+  wms: "inventory", loading: "fleet", haulaway: "fleet", timeoff: "workforce", lots: "inventory", labels: "inventory",
+  settlements: "ar", trade: "crm", projects: "crm", sectionals: "catalog", asis: "inventory", storeorders: "edi",
+  leads: "crm", marketing: "crm", aisle: "shop", myday: "crm", salestax: null, memos: null, payroll: null,
+};
+
+/** The modules a pack turns on, with the services that come with them (the ones seeded from a module the pack has). */
+export function packServices(pack: Pick<Pack, "modules">): ModuleId[] {
+  const out = new Set<ModuleId>(pack.modules);
+  for (const [svc, from] of Object.entries(SERVICE_SEED) as [ModuleId, ModuleId | null][]) {
+    if (from === null || out.has(from)) out.add(svc);
+  }
+  return MODULE_IDS.filter((m) => out.has(m));
+}
 
 type Account = [code: string, name: string, type: "asset" | "liability" | "equity" | "revenue" | "expense", normal: "D" | "C"];
 
@@ -237,7 +264,7 @@ export function packById(id: string): Pack {
  */
 export async function applyPack(c: Client, scope: Scope, packId: string, appliedBy: string) {
   const pack = packById(packId);
-  let accountsAdded = 0, modulesOn = 0, reasonsAdded = 0, settingsAdded = 0;
+  let accountsAdded = 0, modulesOn = 0, servicesOn = 0, reasonsAdded = 0, settingsAdded = 0;
 
   for (const [code, name, type, nb] of pack.accounts) {
     const r = await c.query(
@@ -252,14 +279,15 @@ export async function applyPack(c: Client, scope: Scope, packId: string, applied
   // Vendor categories take their usual accounts from the chart the pack just filled (merchandise → 2050, utilities → 6410, …).
   await c.query(`select vendor_category_defaults($1)`, [scope.tenantId]);
 
+  const services = packServices(pack);
   for (const m of MODULE_IDS) {
-    const on = pack.modules.includes(m);
+    const on = services.includes(m);
     const r = await c.query(
       `insert into entity_module (entity_id, module, enabled, changed_by) values ($1,$2,$3,$4)
        on conflict (entity_id, module) do update set enabled = entity_module.enabled or excluded.enabled,
          changed_at = case when entity_module.enabled then entity_module.changed_at else now() end
        returning enabled`, [scope.entityId, m, on, `pack ${pack.id} (${appliedBy})`]);
-    if (on && r.rows[0]?.enabled) modulesOn++;
+    if (on && r.rows[0]?.enabled) { servicesOn++; if (pack.modules.includes(m)) modulesOn++; }
   }
 
   // The starter reports the pack's modules call for (reports never removes one a person deleted).
@@ -291,26 +319,41 @@ export async function applyPack(c: Client, scope: Scope, packId: string, applied
     relabelled = true;
   }
 
-  const summary = { accountsAdded, modulesOn, reasonsAdded, settingsAdded, relabelled, startersAdded };
+  const summary = { accountsAdded, modulesOn, servicesOn, reasonsAdded, settingsAdded, relabelled, startersAdded };
   await c.query(`insert into pack_application (entity_id, pack, applied_by, summary) values ($1,$2,$3,$4)`,
     [scope.entityId, pack.id, appliedBy, JSON.stringify(summary)]);
   return { pack: pack.id, ...summary };
 }
 
-/** Modules on for a company. A company that has never had a pack applied sees every module. */
+/**
+ * The switches that are on for a company (raw: a parent's switch and the
+ * single-store rule are applied by services.effectiveServices). A company that
+ * has never had a pack applied sees every module.
+ */
 export async function enabledModules(c: Client, entityId: string): Promise<ModuleId[]> {
   const rows = await q<{ module: ModuleId; enabled: boolean }>(c,
     `select module, enabled from entity_module where entity_id = $1`, [entityId]);
   if (!rows.length) return [...MODULE_IDS];
-  return rows.filter((r) => r.enabled).map((r) => r.module);
+  return MODULE_IDS.filter((m) => switchValue(rows, m));
+}
+
+/** A row's value; a 0049 service with no row follows the module it rode on. An original module with no row is off. */
+function switchValue(rows: { module: string; enabled: boolean }[], m: ModuleId): boolean {
+  const r = rows.find((x) => x.module === m);
+  if (r) return r.enabled;
+  if (!(m in SERVICE_SEED)) return false;
+  const from = SERVICE_SEED[m];
+  return from === null || from === undefined ? true : switchValue(rows, from);
 }
 
 export async function setModule(c: Client, entityId: string, module: string, enabled: boolean, by: string) {
   if (!(MODULE_IDS as readonly string[]).includes(module)) throw new SetupError(`there is no module called ${module}`);
-  // First explicit choice on a company with no pack: record every module as on, then change this one.
+  // First explicit choice: record every switch the way it reads now, then change this one.
+  const rows = await q<{ module: ModuleId; enabled: boolean }>(c, `select module, enabled from entity_module where entity_id = $1`, [entityId]);
+  const now = rows.length ? MODULE_IDS.map((m) => switchValue(rows, m)) : MODULE_IDS.map(() => true);
   await c.query(
     `insert into entity_module (entity_id, module, enabled, changed_by)
-     select $1, m, true, $2 from unnest($3::text[]) m on conflict do nothing`, [entityId, by, [...MODULE_IDS]]);
+     select $1, m, v, $2 from unnest($3::text[], $4::boolean[]) x(m, v) on conflict do nothing`, [entityId, by, [...MODULE_IDS], now]);
   await c.query(
     `update entity_module set enabled = $3, changed_at = now(), changed_by = $4 where entity_id = $1 and module = $2`,
     [entityId, module, enabled, by]);

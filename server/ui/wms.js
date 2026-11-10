@@ -96,7 +96,7 @@
     const d = openDialog('Book a container', 'or a domestic trailer');
     const f = { no: input({ maxlength: '20', placeholder: 'MSCU1234567', autocapitalize: 'characters' }), carrier: input({ maxlength: '80' }),
       vessel: input({ maxlength: '80' }), voyage: input({ maxlength: '40' }), bol: input({ maxlength: '60' }), pol: input({ maxlength: '80', placeholder: 'Ningbo' }),
-      pod: input({ maxlength: '80', placeholder: 'Houston' }), dest: select(o.locations.map((l) => [l.id, l.name]), (o.locations[0] || {}).id),
+      pod: input({ maxlength: '80', placeholder: 'Houston' }), dest: E.storePicker(select(o.locations.map((l) => [l.id, l.name]), (o.locations[0] || {}).id)),
       vendor: select(o.vendors.map((v) => [v.id, v.name]), '', 'Vendor (optional)'), eta: dateInput('', 'Expected at the DC') };
     const out = outBox();
     d.body.append(el('div', { class: 'form-grid' }, field('Container or trailer number', f.no), field('Coming into', f.dest), field('Vendor', f.vendor),
@@ -196,7 +196,7 @@
   // -------------------------------------------------------------- in transit
   async function transitTab() {
     const [rows, o] = await Promise.all([coApi('/wms/in-transit'), options()]);
-    const loc = select(o.locations.map((l) => [l.id, l.name]), '', 'Going anywhere');
+    const loc = E.storePicker(select(o.locations.map((l) => [l.id, l.name]), '', 'Going anywhere'));
     const list = el('div', { class: 'panel' });
     const paint = (rs) => list.replaceChildren(...(rs.length ? capped(rs.map((r) => item({ title: `${r.name} · ${r.sku}`, amount: `${qty(r.qty)} on the way`,
       badge: chip('neutral', 'clock', r.arriving_on ? `arriving ${shortDay(r.arriving_on)}` : 'no date yet'),
@@ -213,7 +213,7 @@
   let prepLoc = '', prepStatus = '';
   async function prepTab() {
     const o = await options();
-    const loc = select(o.locations.map((l) => [l.id, l.name]), prepLoc, 'Every location');
+    const loc = E.storePicker(select(o.locations.map((l) => [l.id, l.name]), prepLoc, 'Every location'));
     const list = el('div', { class: 'panel' }, E.loadingNode());
     const label = input({ placeholder: 'Scan a label to queue prep', autocapitalize: 'characters', 'aria-label': 'Piece label' });
     const kind = select(o.prepTypes.map((t) => [t, PREP_LABEL[t] || cap1(t)]), 'touch_up');
@@ -320,5 +320,5 @@
         transferDays: days.value, prepGate: gate.value }), 'Saved.'), { primary: true })), out);
   }
 
-  E.register('wms', 'Containers and prep', 'box', screen, 'Operations', { module: 'inventory' });
+  E.register('wms', 'Containers and prep', 'box', screen, 'Operations', { module: 'wms' });
 })();
