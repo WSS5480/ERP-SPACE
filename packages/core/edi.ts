@@ -21,6 +21,7 @@
 // in words: this build has no SSH or AS2 library (package.json carries only
 // pg), and adding one is a decision for the owner, not a side effect.
 
+import { applyVendorExtras, pieceTypeFrom, type VendorExtra } from "./configurator.ts";
 import { readdir, readFile, writeFile, mkdir, rename, stat } from "node:fs/promises";
 import { join, resolve, sep as pathSep } from "node:path";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
@@ -965,20 +966,34 @@ async function applySet(c: Client, s: Scope, _env: EdiEnv, p: Partner, type: str
     const known = new Map((await q<{ sku: string; name: string }>(c, `select upper(vendor_sku) sku, name from product where entity_id = $1 and vendor_id = $2 and vendor_sku is not null`,
       [p.entity_id, p.vendor_id])).map((x) => [x.sku, x.name]));
     // Our names stay ours: a known model keeps its name; a new one is named by the vendor's description.
-    const rows = cat.items.filter((it) => it.description || it.cubicFt != null || it.weightLb != null || it.upc).map((it) => ({
+    const rows = cat.items.filter((it) => !it.swatch && (it.description || it.cubicFt != null || it.weightLb != null || it.upc)).map((it) => ({
       vendor_sku: it.vendorSku, name: known.get(it.vendorSku) ?? it.description ?? it.vendorSku, description: it.description ?? "", barcode: it.upc ?? "",
       cubic_ft: it.cubicFt != null ? String(it.cubicFt) : "", weight_lb: it.weightLb != null ? String(it.weightLb) : "",
     }));
     let cat_ = { added: 0, changed: 0 };
     if (rows.length) cat_ = await applyCatalogRows(c, s, p.vendor_id, `${p.vendor} 832 ${cat.catalogId}`, rows,
       { vendor_sku: "vendor_sku", name: "name", description: "description", barcode: "barcode", cubic_ft: "cubic_ft", weight_lb: "weight_lb" });
-    const prices = cat.items.filter((it) => it.costMinor != null).map((it) => ({ vendor_sku: it.vendorSku, cost: x12.fromMinor(it.costMinor!),
+    // Sectional pieces and covers, where the vendor sends them (best effort; never stops the catalog).
+    const extras: VendorExtra[] = [];
+    for (const it of cat.items) {
+      if (it.swatch) extras.push({ kind: "swatch", code: it.vendorSku, name: it.description ?? it.vendorSku, grade: it.swatch.grade, color: it.swatch.color ?? null,
+        colorFamily: it.swatch.colorFamily ?? null, content: it.swatch.content ?? null, cleaningCode: it.swatch.cleaning ?? null, discontinuedOn: it.swatch.discontinuedOn ?? null });
+      else if (it.sectional?.family && it.sectional.piece) {
+        const t = pieceTypeFrom(it.sectional.piece);
+        if (t) extras.push({ kind: "piece", vendorSku: it.vendorSku, family: it.sectional.family, familyName: it.sectional.familyName ?? null, pieceType: t,
+          motion: /power/i.test(it.sectional.motion ?? "") ? "power" : /manual|recl/i.test(it.sectional.motion ?? "") ? "manual" : "none",
+          widthIn: it.widthIn ?? null, depthIn: it.depthIn ?? null, heightIn: it.heightIn ?? null, seats: it.sectional.seats ?? null, gradeAdders: it.sectional.gradeAdders });
+      }
+    }
+    const cx = extras.length ? await applyVendorExtras(c, s, p.vendor_id, extras) : null;
+    const prices = cat.items.filter((it) => it.costMinor != null && !it.swatch).map((it) => ({ vendor_sku: it.vendorSku, cost: x12.fromMinor(it.costMinor!),
       map: it.mapMinor != null ? x12.fromMinor(it.mapMinor) : "", msrp: it.msrpMinor != null ? x12.fromMinor(it.msrpMinor) : "", promo_cost: "", effective_from: it.effectiveOn ?? "", effective_to: "" }));
     const rule = ((await q<{ options: Record<string, unknown> }>(c, `select options from vendor_feed where entity_id = $1 and vendor_id = $2 and purpose = 'pricing' and active limit 1`,
       [p.entity_id, p.vendor_id]))[0]?.options?.priceRule ?? {}) as Record<string, unknown>;
     const pr = prices.length ? await recordVendorPrices(c, s, p.vendor_id, null, prices, rule) : { recorded: 0, changed: 0, unknown: 0, bad: 0 };
     need(!pr.bad, `${pr.bad} prices in the catalog could not be read`);
-    return { summary: { applied: `${cat.items.length} items: ${cat_.added} products added, ${cat_.changed} changed; ${pr.recorded} prices recorded, ${pr.changed} products repriced` } };
+    return { summary: { applied: `${cat.items.length} items: ${cat_.added} products added, ${cat_.changed} changed; ${pr.recorded} prices recorded, ${pr.changed} products repriced`
+      + (cx ? `; ${cx.pieces} sectional pieces, ${cx.covers} covers${cx.skipped ? `, ${cx.skipped} not set up` : ""}` : ""), notes: cx?.notes.length ? cx.notes : undefined } };
   }
   if (type === "846") {
     const inv = v as unknown as x12.Inventory846;

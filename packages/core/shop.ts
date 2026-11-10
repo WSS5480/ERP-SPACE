@@ -17,11 +17,12 @@ import { reserveOrder, InventoryError } from "./inventory.ts";
 import { postReceipt, ArError } from "./ar.ts";
 import { PostingError } from "./posting.ts";
 import * as tax from "./tax.ts";
+import * as sectionals from "./configurator.ts";
 
 export class ShopError extends Error {}
 
 /** Errors a shopper or clerk can read as they are. */
-export const SHOP_REFUSALS = [ShopError, PricingError, InventoryError, ArError, PostingError];
+export const SHOP_REFUSALS = [ShopError, PricingError, InventoryError, ArError, PostingError, sectionals.ConfigError];
 
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new ShopError(msg); };
 
@@ -234,7 +235,8 @@ async function webProduct(c: Client, entityId: string, productId: string): Promi
 export async function pubProduct(c: Client, site: Site, productId: string) {
   const p = await webProduct(c, site.entity_id, productId);
   if (!p) return null;
-  const groups = await q<{ id: string; code: string; label: string; required: boolean; multi: boolean }>(c,
+  const family = await sectionals.familyView(c, site.entity_id, p.id, true);
+  const groups = family ? [] : await q<{ id: string; code: string; label: string; required: boolean; multi: boolean }>(c,
     `select id, code, label, required, multi from product_option_group where entity_id = $1 and product_id = $2 order by seq, label`,
     [site.entity_id, p.id]);
   const opts = await q<{ group_id: string; code: string; label: string; price_delta_minor: string; lead_days: number; swatch: string | null }>(c,
@@ -261,7 +263,30 @@ export async function pubProduct(c: Client, site: Site, productId: string) {
     availability: avail,
     package: await packageInfo(c, site.entity_id, p.id),
     financingUrl: site.financing_url,
+    sectional: family,
   };
+}
+
+/** A sectional build parsed from a request: codes only; priceBuild checks they exist. */
+export function parseBuild(v: unknown): sectionals.Build | null {
+  if (v == null) return null;
+  need(typeof v === "object" && !Array.isArray(v), "The sectional sent is not in a form the store understands.");
+  const b = v as Record<string, unknown>;
+  const code = (x: unknown) => { need(x == null || x === "" || (typeof x === "string" && CODE.test(x)), "A sectional piece or cover is not valid."); return typeof x === "string" && x ? x : null; };
+  need(b.pieces == null || (Array.isArray(b.pieces) && b.pieces.length <= 12), "A sectional has twelve pieces at most.");
+  need(b.pieceOptions == null || (Array.isArray(b.pieceOptions) && b.pieceOptions.length <= 12), "The sectional's options are not in a form the store understands.");
+  return { layout: code(b.layout), cover: code(b.cover), pieces: ((b.pieces as unknown[]) ?? []).map((x) => code(x)).filter((x): x is string => !!x),
+    pieceOptions: ((b.pieceOptions as unknown[]) ?? []).map((o) => parseChoices(o ?? [])) };
+}
+
+/** A sectional's price for a shopper: the pieces, the cover, the plan. No cost, no vendor codes. */
+export async function pubSectionalPrice(c: Client, site: Site, productId: string, build: sectionals.Build | null) {
+  const p = await webProduct(c, site.entity_id, productId);
+  need(p, "That product is not available online.");
+  need(build, "Choose a layout or the pieces.");
+  const priced = await sectionals.priceBuild(c, site.entity_id, p!.id, build!);
+  const avail = await availabilityFor(c, site, { ...p!, kind: priced.special ? "configurable" : "stock" } as ProdRow, priced.leadDays);
+  return { ...sectionals.pricedView(priced, true), availability: avail };
 }
 
 // --------------------------------------------------------------- choices --
@@ -391,7 +416,7 @@ export async function packageInfo(c: Client, entityId: string, productId: string
 
 // ------------------------------------------------------------ cart lines --
 
-export type LineIn = { productId: string; choices: Choice[]; qty: number };
+export type LineIn = { productId: string; choices: Choice[]; qty: number; sectional?: sectionals.Build | null };
 
 export function parseLines(v: unknown, max = 30): LineIn[] {
   need(Array.isArray(v), "The cart is not in a form the store understands.");
@@ -402,7 +427,9 @@ export function parseLines(v: unknown, max = 30): LineIn[] {
     need(typeof o.productId === "string" && /^[0-9a-f-]{36}$/i.test(o.productId), "A cart line names no product.");
     const qty = Number(o.qty ?? 1);
     need(Number.isInteger(qty) && qty >= 1 && qty <= 20, "Quantities run from 1 to 20.");
-    return { productId: o.productId as string, choices: parseChoices(o.choices), qty };
+    const sectional = parseBuild(o.sectional);
+    need(!sectional || qty === 1, "A sectional is bought one at a time.");
+    return { productId: o.productId as string, choices: parseChoices(o.choices), qty, sectional };
   });
 }
 
@@ -410,6 +437,8 @@ type Priced = {
   productId: string; sku: string; name: string; description: string; kind: string; shipClass: string; taxable: boolean;
   qty: number; unitPriceMinor: bigint; leadDays: number; config: Record<string, unknown>; choices: Choice[];
   availability: Availability;
+  /** a sectional: the build as sent, how it priced, and one priced line per piece */
+  sectional?: sectionals.Build | null; built?: sectionals.Priced; parts?: Priced[]; setIndex?: number; special?: boolean;
 };
 
 /** Price every line again on the server. A line that cannot be sold online is refused, with its reason. */
@@ -418,6 +447,21 @@ async function priceLines(c: Client, site: Site, lines: LineIn[], locs: Map<stri
   for (const l of lines) {
     const p = await webProduct(c, site.entity_id, l.productId);
     need(p, "Something in the cart is no longer sold online. Remove it and try again.");
+    if (await sectionals.isFamily(c, site.entity_id, p!.id)) {
+      need(l.sectional, `Choose the pieces of the ${p!.name}.`);
+      const built = await sectionals.priceBuild(c, site.entity_id, p!.id, l.sectional!);
+      const availability = await availabilityFor(c, site, { ...p!, kind: built.special ? "configurable" : "stock" } as ProdRow, built.leadDays, locs);
+      const setIndex = out.length;
+      out.push({
+        productId: p!.id, sku: p!.sku, name: p!.name, description: built.description, kind: p!.kind, shipClass: p!.ship_class, taxable: true, qty: 1,
+        unitPriceMinor: built.totalMinor, leadDays: built.leadDays, config: { sectional: { layout: built.layoutName, cover: built.cover?.name ?? null, pieces: built.parts.length } },
+        choices: [], availability, sectional: l.sectional, built, setIndex,
+        parts: built.parts.map((x) => ({ productId: x.productId, sku: x.sku, name: x.name, description: x.description, kind: x.special ? "special_order" : "stock",
+          shipClass: x.shipClass, taxable: x.taxable, qty: 1, unitPriceMinor: x.netMinor, leadDays: x.leadDays, config: x.config, choices: [], availability,
+          setIndex, special: x.special })),
+      });
+      continue;
+    }
     const pr = await priceConfigured(c, site.entity_id, p!.id, l.choices);
     const tx = await one<{ taxable: boolean }>(c, `select taxable from product where id = $1 and entity_id = $2`, [p!.id, site.entity_id]);
     out.push({
@@ -443,6 +487,8 @@ const pubLine = (p: Priced) => ({
   productId: p.productId, sku: p.sku, name: p.name, description: p.description, kind: p.kind, shipClass: p.shipClass,
   qty: p.qty, unitPriceMinor: p.unitPriceMinor.toString(), lineMinor: (p.unitPriceMinor * BigInt(p.qty)).toString(),
   choices: p.choices, availability: p.availability,
+  ...(p.built ? { sectional: p.sectional, plan: { layout: p.built.layoutName, cover: p.built.cover?.name ?? null, widthIn: p.built.geometry.widthIn,
+    depthIn: p.built.geometry.depthIn, seats: p.built.geometry.seats, pieces: p.built.parts.map((x) => ({ name: x.name, netMinor: x.netMinor.toString() })) } } : {}),
 });
 
 const CART_ID = /^[A-Za-z0-9_-]{8,64}$/;
@@ -488,7 +534,7 @@ export async function saveCart(c: Client, site: Site, cartId: string, rawLines: 
         subtotal_minor = excluded.subtotal_minor, updated_at = now()
       where shop_cart.sales_order_id is null`,
       [site.id, cartId, site.entity_id, em, JSON.stringify(out.map((l) => ({ productId: l.productId, sku: l.sku, name: l.name,
-        qty: l.qty, unitPriceMinor: l.unitPriceMinor, choices: l.choices }))), out.reduce((a, l) => a + l.qty, 0), sub.toString()]);
+        qty: l.qty, unitPriceMinor: l.unitPriceMinor, choices: l.choices, ...("sectional" in l ? { sectional: l.sectional } : {}) }))), out.reduce((a, l) => a + l.qty, 0), sub.toString()]);
   }
   return { cartId, lines: out, problems, subtotalMinor: sub.toString(), converted: !!existing[0]?.sales_order_id };
 }
@@ -582,6 +628,7 @@ type Built = {
   place: tax.Place;
   orderLocationId: string; promisedOn: string | null;
   subtotalMinor: bigint; taxMinor: bigint; totalMinor: bigint; rateBps: number;
+  sets: { setIndex: number; priced: sectionals.Priced }[];
 };
 
 /** The order a cart would make: lines priced, sources picked, tax and fees. Writes nothing. */
@@ -601,7 +648,7 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn, write = false)
   const lines: Built["lines"] = [];
   let promised: Date | null = null;
   const later = (d: Date) => { if (!promised || d > promised) promised = d; };
-  for (const p of priced) {
+  for (const p of priced.flatMap((x) => x.parts ?? [x])) {
     const rows = ["stock"].includes(p.kind) ? await stockRows(c, site.entity_id, p.productId) : [];
     const availAt = (id: string) => Number(rows.find((r) => r.location_id === id)?.available ?? 0);
     const warehouses = [...locs.values()].filter((l) => l.kind === "warehouse")
@@ -668,7 +715,8 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn, write = false)
   taxTotal += fee?.taxMinor ?? 0n;
   sub += fee?.minor ?? 0n;
   const disc = coupon?.discountMinor ?? 0n;
-  return { lines, coupon, fee, place, orderLocationId, promisedOn: promised ? iso(promised) : null, subtotalMinor: sub, taxMinor: taxTotal, totalMinor: sub - disc + taxTotal, rateBps };
+  const sets = priced.filter((x) => x.built).map((x) => ({ setIndex: x.setIndex!, priced: x.built! }));
+  return { lines, coupon, fee, place, orderLocationId, promisedOn: promised ? iso(promised) : null, subtotalMinor: sub, taxMinor: taxTotal, totalMinor: sub - disc + taxTotal, rateBps, sets };
 }
 
 /** Checkout preview: what the order will cost with this fulfillment, from the server's own prices. */
@@ -801,6 +849,7 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
     [site.entity_id, number, b.orderLocationId, customerId, inp.fulfillment, addressId, b.promisedOn, inp.cartId,
      [`Web order from ${site.display_name}`, inp.notes].filter(Boolean).join(". ")]);
   let seq = 1;
+  const setLines = new Map<number, string[]>();
   for (const l of b.lines) {
     const row = await one<{ id: string }>(c, `
       insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, config, fulfil_from_id, discount_minor)
@@ -808,7 +857,13 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
       [site.entity_id, order.id, seq++, l.productId, l.sku, l.description, l.qty, l.unitPriceMinor.toString(), l.taxMinor.toString(),
        JSON.stringify(l.config), l.fulfilFromId, l.discountMinor.toString()]);
     await tax.writeLineTax(c, site.entity_id, order.id, row.id, l.taxRows, b.place, tax.classOf(l.kind));
+    if (l.setIndex != null) {
+      setLines.set(l.setIndex, [...(setLines.get(l.setIndex) ?? []), row.id]);
+      // a piece in a cover that is not stocked is made for the customer
+      if (l.special) await c.query(`update sales_order_line set line_status = 'on_order' where id = $1 and entity_id = $2`, [row.id, site.entity_id]);
+    }
   }
+  for (const st of b.sets) await sectionals.recordSet(c, site.entity_id, { orderId: order.id, priced: st.priced, lineIds: setLines.get(st.setIndex) ?? [], channel: "web" });
   if (b.fee && b.fee.minor > 0n) {
     const fp = site.fee_product_id ? await q<{ sku: string }>(c, `select sku from product where id = $1 and entity_id = $2`, [site.fee_product_id, site.entity_id]) : [];
     const row = await one<{ id: string }>(c, `
@@ -1079,7 +1134,8 @@ export async function aisleCatalog(c: Client, entityId: string, locationId: stri
       (select coalesce(sum(greatest(a.available,0)),0) from product_availability a where a.entity_id = p.entity_id and a.product_id = p.id and a.location_kind = 'warehouse')::text dc,
       (select coalesce(sum(t.qty),0) from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id)::text arriving,
       (select min(t.arriving_on)::text from inv_in_transit t where t.entity_id = p.entity_id and t.product_id = p.id) arriving_on,
-      (select count(*) from product_option_group g where g.entity_id = p.entity_id and g.product_id = p.id)::int option_groups
+      (select count(*) from product_option_group g where g.entity_id = p.entity_id and g.product_id = p.id)::int option_groups,
+      exists (select 1 from sectional_family f where f.entity_id = p.entity_id and f.product_id = p.id and f.active) sectional
       from product p where p.entity_id = $1 and p.web_visible and p.status = 'active' and p.kind not in ('fee','gift_card')
        and ($3 = '%%' or p.name ilike $3 or p.sku ilike $3 or p.brand ilike $3)
        and ($4 = '' or p.category = $4)
@@ -1124,6 +1180,24 @@ export async function aisleHandoff(c: Client, entityId: string, personId: string
     const p = (await q<{ id: string; kind: string; web_visible: boolean; status: string; name: string }>(c,
       `select id, kind, web_visible, status, name from product where id = $1 and entity_id = $2`, [l.productId, entityId]))[0];
     need(p && p.status === "active", "Something on the tablet is not for sale.");
+    if (await sectionals.isFamily(c, entityId, p!.id)) {
+      // A sectional from the tablet: one line per piece, the set recorded, stocked pieces from here or the DC.
+      need(l.sectional, `Choose the pieces of the ${p!.name}.`);
+      const built = await sectionals.priceBuild(c, entityId, p!.id, l.sectional!);
+      const ids: string[] = [];
+      for (const x of built.parts) {
+        const here = Number((await q<{ a: string }>(c, `select coalesce(sum(available),0)::text a from product_availability where entity_id = $1 and product_id = $2 and location_id = $3`,
+          [entityId, x.productId, locationId]))[0]?.a ?? 0);
+        const row = await one<{ id: string }>(c, `
+          insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, config, fulfil_from_id, line_status)
+          values ($1,$2,$3,$4,$5,$6,1,$7,$8,$9,$10) returning id`,
+          [entityId, order.id, seq++, x.productId, x.sku, x.description.slice(0, 300), x.netMinor.toString(), JSON.stringify(x.config),
+           !x.special && here >= 1 ? locationId : wh, x.special ? "on_order" : "open"]);
+        ids.push(row.id);
+      }
+      await sectionals.recordSet(c, entityId, { orderId: order.id, priced: built, lineIds: ids, channel: "aisle", by: personId });
+      continue;
+    }
     const pr = await priceConfigured(c, entityId, p!.id, l.choices);
     const here = Number((await q<{ a: string }>(c, `select coalesce(sum(available),0)::text a from product_availability where entity_id = $1 and product_id = $2 and location_id = $3`,
       [entityId, p!.id, locationId]))[0]?.a ?? 0);

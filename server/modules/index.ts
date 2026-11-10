@@ -19,5 +19,6 @@ import { module as group } from "./group.ts";
 import { module as edi } from "./edi.ts";
 import { module as wms } from "./wms.ts";
 import { module as ops } from "./ops.ts";
+import { module as configurator } from "./configurator.ts";
 
-export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports, group, edi, wms, ops];
+export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports, group, edi, wms, ops, configurator];

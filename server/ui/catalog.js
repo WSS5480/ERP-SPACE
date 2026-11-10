@@ -956,7 +956,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
       const n = mk('div', 'tag');
       n.append(mk('div', 'brand', [it.brand, it.collection].filter(Boolean).join(' · ')), mk('h1', null, it.name),
         mk('div', 'sub', [it.color, it.pieces > 1 ? `${it.pieces} cartons` : null, it.sku].filter(Boolean).join(' · ')));
-      if (it.status === 'floor_sample') n.append(mk('div', 'promo', 'Floor model · as is'));
+      if (it.status === 'floor_sample') n.append(mk('div', 'promo', `Floor model · as is${it.condition ? ` · condition ${it.condition.words}` : ''}`));
       if (it.status === 'drop') n.append(mk('div', 'note', 'Final stock: will not be reordered'));
       if (it.kit) n.append(mk('div', 'note', `Includes ${it.kit.pieces.join(', ')}. Separately ${money(it.kit.component_total_minor)}.`));
       if (it.promotion) n.append(mk('div', 'promo', `${it.promotion.name} · save ${money(it.promotion.savings_minor)}`), mk('div', 'was', money(it.ticket_minor)));

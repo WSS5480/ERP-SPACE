@@ -240,7 +240,7 @@
           : p.kind === 'configurable' || p.kind === 'special_order' ? 'Made to order'
           : Number(p.here) > 0 ? `${Number(p.here)} on this floor` : Number(p.dc) > 0 ? `${Number(p.dc)} at the DC`
           : Number(p.arriving) > 0 ? `${Number(p.arriving)} arriving${p.arriving_on ? ' on ' + shortDay(p.arriving_on) : ''}` : 'On order';
-        const add = el('button', { class: 'btn primary', type: 'button', onclick: () => addAisle(p, paintCart) }, p.option_groups ? 'Choose options' : 'Add');
+        const add = el('button', { class: 'btn primary', type: 'button', onclick: () => addAisle(p, paintCart) }, p.sectional ? 'Build it' : p.option_groups ? 'Choose options' : 'Add');
         return item({ title: p.name, detail: [p.brand, p.sku, where].filter(Boolean).join(' · '), amount: (p.option_groups ? 'from ' : '') + money(p.price_minor),
           badge: chip(Number(p.here) > 0 ? 'good' : 'neutral', Number(p.here) > 0 ? 'ok' : 'info', Number(p.here) > 0 ? 'Here' : p.option_groups ? 'Custom' : p.kind === 'warranty' || p.kind === 'service' ? 'Service' : Number(p.dc) > 0 ? 'At DC' : 'Order'), acts: [add] });
       })));
@@ -260,7 +260,7 @@
         busy(send, true, 'Sending…');
         try {
           const r = await post('/shop/aisle/handoff', { locationId: AISLE.location, customerId: AISLE.customer && AISLE.customer.id,
-            lines: AISLE.lines.map((l) => ({ productId: l.productId, choices: l.choices, qty: l.qty })) });
+            lines: AISLE.lines.map((l) => ({ productId: l.productId, choices: l.choices, qty: l.qty, sectional: l.sectional || undefined })) });
           toast(`Sent to the register at ${r.store} as draft ${r.number}, ${money(r.totalMinor)}.`, 'good');
           AISLE.lines = []; AISLE.customer = null; paintCart();
         } catch (e) { toast(friendly(e), 'critical'); busy(send, false); }
@@ -280,6 +280,13 @@
       cartBox);
   }
   function addAisle(p, after) {
+    if (p.sectional && E.sectionalDialog) {
+      E.sectionalDialog({ productId: p.id, title: p.name, actLabel: 'Add to tablet cart', onAdd: (build, priced) => {
+        AISLE.lines.push({ productId: p.id, choices: [], qty: 1, unitPriceMinor: priced.totalMinor, description: `${priced.description} · ${priced.widthIn}" × ${priced.depthIn}"`, sectional: build });
+        toast('Added to the tablet cart.', 'good'); after();
+      } });
+      return;
+    }
     if (!p.option_groups) {
       const hit = AISLE.lines.find((l) => l.productId === p.id && !l.choices.length);
       if (hit) hit.qty = Math.min(20, hit.qty + 1);

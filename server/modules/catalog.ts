@@ -10,6 +10,7 @@ import { scopeOf } from "../actions.ts";
 import * as cat from "../../packages/core/catalog.ts";
 import { priceConfigured, PricingError, type Choice } from "../../packages/core/pricing.ts";
 import * as feeds from "../../packages/core/vendor_feeds.ts";
+import { gradesForProducts, CONDITION_WORDS } from "../../packages/core/configurator.ts";
 
 /** The network the vendor connections use: the real one, unless checks hand in a fake. */
 let feedEnv: () => feeds.FeedEnv = feeds.liveEnv;
@@ -242,6 +243,8 @@ async function labels(c: Client, co: Company, url: URL) {
        and (cardinality($2::uuid[]) = 0 or p.id = any($2)) and ($3::uuid is null or p.vendor_id = $3) and ($4::text is null or p.category = $4)
      order by p.category, p.name limit 200`, [co.id, ids, vendor, category]);
   const out = [];
+  // A floor sample or as-is piece carries its condition grade on the tag (configurator).
+  const graded = await gradesForProducts(c, co.id, rows.filter((r) => r.status === "floor_sample").map((r) => r.id));
   for (const r of rows) {
     let pc;
     try { pc = await priceConfigured(c, co.id, r.id, [], { priceList: list }); }
@@ -254,6 +257,7 @@ async function labels(c: Client, co: Company, url: URL) {
       price_list: pc.priceList, from_options: r.kind === "configurable" || r.kind === "special_order",
       kit: pc.kit ? { component_total_minor: pc.kit.componentTotalMinor.toString(), pieces: pc.kit.components.map((k) => `${k.qty} × ${k.name}`) } : null,
       barcode: { text: code, bars: cat.code128(code) },
+      condition: (() => { const g = graded.find((x) => x.product_id === r.id && x.grade); return g ? { grade: g.grade, words: CONDITION_WORDS[g.grade], price_minor: g.price_minor } : null; })(),
     });
   }
   return { items: out };

@@ -31,6 +31,50 @@ export type PriceOpts = {
   on?: string | null;          // YYYY-MM-DD the price is for; today when absent
 };
 
+// ----------------------------------------------------------- option rules
+// A generic rule engine over a product's option groups (migration 0043):
+// choosing an option requires one of some others, excludes some others, or is
+// only allowed on some sectional piece types. option_code null = any option of
+// the group; target_options empty = any option of the target group.
+
+export type OptionRule = { group_code: string; option_code: string | null; kind: "requires" | "excludes" | "only_on";
+  target_group: string | null; target_options: string[]; piece_types: string[]; message: string | null };
+
+export async function optionRules(c: Client, entityId: string, productId: string): Promise<OptionRule[]> {
+  return q<OptionRule>(c, `select group_code, option_code, kind, target_group, target_options, piece_types, message
+    from product_option_rule where entity_id = $1 and product_id = $2 and active order by created_at`, [entityId, productId]);
+}
+
+const pieceWords = (t: string) => t.replace(/^laf_/, "LAF ").replace(/^raf_/, "RAF ").replace(/_/g, " ");
+
+/**
+ * Check chosen options against the rules. picked: group code -> option codes.
+ * label(group, code) names an option for the sentence. pieceType is the
+ * sectional piece the options are on; only-on rules apply only to pieces.
+ */
+export function checkOptionRules(rules: OptionRule[], picked: Map<string, string[]>, label: (group: string, code: string | null) => string,
+  pieceType: string | null = null): void {
+  for (const r of rules) {
+    const mine = picked.get(r.group_code) ?? [];
+    const hit = r.option_code ? mine.filter((x) => x === r.option_code) : mine;
+    if (!hit.length) continue;
+    const what = label(r.group_code, hit[0]);
+    if (r.kind === "only_on") {
+      if (pieceType == null) continue;
+      if (!r.piece_types.includes(pieceType))
+        throw new PricingError(r.message || `${what} is offered only on ${r.piece_types.map(pieceWords).join(", ")}; not on the ${pieceWords(pieceType)}`);
+      continue;
+    }
+    const theirs = picked.get(r.target_group!) ?? [];
+    const match = r.target_options.length ? theirs.filter((x) => r.target_options.includes(x)) : theirs;
+    if (r.kind === "requires" && !match.length) {
+      const need = r.target_options.length ? r.target_options.map((x) => label(r.target_group!, x)).join(" or ") : `a ${label(r.target_group!, null).toLowerCase()}`;
+      throw new PricingError(r.message || `${what} needs ${need}`);
+    }
+    if (r.kind === "excludes" && match.length) throw new PricingError(r.message || `${what} cannot go with ${label(r.target_group!, match[0])}`);
+  }
+}
+
 type Promo = { id: string; name: string; kind: string; pct_bps: number | null; amount_minor: string | null; respect_map: boolean };
 
 /** The price a promotion gives on a configured price; never below zero, and not below MAP when it respects MAP. */
@@ -90,6 +134,15 @@ export async function priceConfigured(c: Client, entityId: string, productId: st
     byGroup.delete(g.code);
   }
   if (byGroup.size) throw new PricingError(`${p.name} has no option group ${[...byGroup.keys()].join(", ")}`);
+  const rules = groups.length ? await optionRules(c, entityId, productId) : [];
+  if (rules.length) {
+    const picked = new Map(Object.entries(config).map(([g, list]) => [g, list.map((o) => o.code)]));
+    const allOpts = await q<{ gcode: string; glabel: string; code: string; label: string }>(c, `
+      select g.code gcode, g.label glabel, o.code, o.label from product_option o join product_option_group g on g.id = o.group_id
+       where o.entity_id = $1 and g.product_id = $2`, [entityId, productId]);
+    checkOptionRules(rules, picked, (g, code) => code ? (allOpts.find((o) => o.gcode === g && o.code === code)?.label ?? code)
+      : (allOpts.find((o) => o.gcode === g)?.glabel ?? g));
+  }
   if (price < 0n) throw new PricingError("options cannot take the price below zero");
 
   // The ticket price, then a price list if one was asked for, then the best

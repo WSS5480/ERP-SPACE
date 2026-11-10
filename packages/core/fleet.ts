@@ -7,6 +7,7 @@
 // taken at the door goes through a customer_receipt and ar.postReceipt.
 // Routing maths is in routing.ts and has no database in it.
 
+import { partialSetWarning } from "./configurator.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import * as inventory from "./inventory.ts";
@@ -788,7 +789,9 @@ export async function bookStop(c: Client, scope: Scope, b: BookInput) {
       [scope.entityId, st.id, p.orderLineId, p.description, p.qty, p.qty]);
   }
   if (kind !== "will_call" || b.day) await notify(c, scope, st.id, "confirmation");
-  return { id: st.id, number, pieces, cubeFt: cube, serviceMin: svc, prepWarning };
+  // A sectional goes as a set: booking some of its pieces without the rest is allowed, and said.
+  const setWarning = lines.length ? await partialSetWarning(c, scope.entityId, lines.map((l) => l.id)) : null;
+  return { id: st.id, number, pieces, cubeFt: cube, weightLb: weight, serviceMin: svc, prepWarning, setWarning };
 }
 
 async function stopRow(c: Client, entityId: string, stopId: string) {

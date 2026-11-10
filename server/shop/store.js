@@ -75,22 +75,23 @@ const KEY = `shop.${SLUG}.cart`;
 const S = { site: null, cart: store.get(KEY) || { id: newId(), lines: [] }, priced: null, seq: 0 };
 if (!S.cart.id || !/^[A-Za-z0-9_-]{8,64}$/.test(S.cart.id) || !Array.isArray(S.cart.lines)) S.cart = { id: newId(), lines: [] };
 const saveCart = () => { store.set(KEY, S.cart); paintCount(); };
-const lineKey = (productId, choices) => productId + '|' + JSON.stringify(choices || []);
+const lineKey = (productId, choices, sectional) => productId + '|' + JSON.stringify(choices || [])
+  + (sectional ? '|' + JSON.stringify([sectional.layout || null, sectional.pieces || [], sectional.cover || null, (sectional.pieceOptions || []).map((o) => (o || []).map((c) => [c.group, c.option]))]) : '');
 function paintCount() {
   const n = S.cart.lines.reduce((a, l) => a + l.qty, 0);
   const c = $('#cart-count'); c.textContent = String(n); c.hidden = !n;
   $('#cart-link').setAttribute('aria-label', n ? `Cart, ${n} item${n === 1 ? '' : 's'}` : 'Cart, empty');
 }
 async function syncCart(email) {
-  const r = await post('/cart', { cartId: S.cart.id, lines: S.cart.lines.map((l) => ({ productId: l.productId, choices: l.choices, qty: l.qty })), email: email || undefined });
+  const r = await post('/cart', { cartId: S.cart.id, lines: S.cart.lines.map((l) => ({ productId: l.productId, choices: l.choices, qty: l.qty, sectional: l.sectional || undefined })), email: email || undefined });
   if (r.converted) { S.cart = { id: newId(), lines: [] }; saveCart(); return syncCart(); }
   S.priced = r;
   return r;
 }
-function addToCart(productId, choices, qty, name) {
-  const k = lineKey(productId, choices);
-  const hit = S.cart.lines.find((l) => lineKey(l.productId, l.choices) === k);
-  if (hit) hit.qty = Math.min(20, hit.qty + qty); else S.cart.lines.push({ productId, choices, qty, name });
+function addToCart(productId, choices, qty, name, sectional) {
+  const k = lineKey(productId, choices, sectional);
+  const hit = sectional ? null : S.cart.lines.find((l) => lineKey(l.productId, l.choices, l.sectional) === k);
+  if (hit) hit.qty = Math.min(20, hit.qty + qty); else S.cart.lines.push(sectional ? { productId, choices, qty: 1, name, sectional } : { productId, choices, qty, name });
   saveCart();
   syncCart().catch(() => undefined);
 }
@@ -298,9 +299,88 @@ function priceSteps(lo, hi) {
   return out;
 }
 
+/** The plan from above, drawn from the server's rectangles (inches). */
+function planSvg(g) {
+  if (!g || !g.pieces || !g.pieces.length) return el('p', { class: 'small muted', text: 'Pick pieces to see the plan.' });
+  const pad = 4, W = g.viewW + pad * 2, H = g.viewH + pad * 2;
+  const r = (x, fill) => sv('rect', { x: x.x + pad, y: x.y + pad, width: x.w, height: x.h, fill, stroke: '#3d3a36', 'stroke-width': 0.6, rx: 1 });
+  return sv('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': `Plan, ${g.widthIn} by ${g.depthIn} inches, seats ${g.seats}` },
+    g.pieces.map((p) => sv('g', {}, r(p, p.free ? '#efe9df' : '#e3d9c8'), p.back.map((b) => r(b, '#b9ab94')), p.arms.map((a) => r(a, '#9c8b72')),
+      sv('text', { x: p.x + pad + p.w / 2, y: p.y + pad + p.h / 2 + 2, 'font-size': 5, 'text-anchor': 'middle', fill: '#2b2925' }, document.createTextNode(p.label)))));
+}
+
+/** Build a sectional: a popular layout or your own pieces, the cover (by grade and color), each piece's options. */
+function sectionalBuilder(p, f, onPriced) {
+  const st = { pieces: [], opts: [], cover: f.stockCover || (f.covers[0] && f.covers[0].code) || '', grade: '', color: '', priced: null, seq: 0 };
+  const first = f.layouts.find((l) => l.popular) || f.layouts[0];
+  if (first) { st.pieces = first.pieces.slice(); st.opts = st.pieces.map(() => ({})); }
+  const byCode = new Map(f.pieces.map((x) => [x.code, x]));
+  const plan = el('div', { class: 'ph' }), facts = el('div', { class: 'small muted' }), err = el('div'), piecesEl = el('div'), coverEl = el('div');
+  const allowed = (g, piece) => (g !== 'recline' || piece.motion === 'none') && (!f.rules.some((r) => r.kind === 'only_on' && r.group === g)
+    || f.rules.some((r) => r.kind === 'only_on' && r.group === g && r.pieceTypes.includes(piece.type)));
+  const build = () => {
+    const lay = f.layouts.find((l) => l.pieces.join('|') === st.pieces.join('|'));
+    return { layout: lay ? lay.code : null, pieces: st.pieces.slice(), cover: st.cover || null,
+      pieceOptions: st.opts.map((m) => Object.entries(m).filter(([, v]) => v).map(([group, option]) => ({ group, option }))) };
+  };
+  async function reprice() {
+    const my = ++st.seq;
+    if (!st.pieces.length) { plan.replaceChildren(planSvg(null)); st.priced = null; onPriced(null); return; }
+    try {
+      const r = await post('/sectional-price', { productId: p.id, sectional: build() });
+      if (my !== st.seq) return;
+      st.priced = r; err.replaceChildren();
+      plan.replaceChildren(planSvg(r.geometry));
+      facts.textContent = `${r.widthIn}" W × ${r.depthIn}" D · seats ${r.seats} · ${r.pieces.length} pieces${Number(r.bundleDiscountMinor) ? ` · set saves ${money(r.bundleDiscountMinor)}` : ''}`;
+      onPriced(r);
+    } catch (e) { if (my === st.seq) { st.priced = null; onPriced(null); err.replaceChildren(el('div', { class: 'alert', text: e.message })); } }
+  }
+  const changed = () => { paintPieces(); reprice(); };
+  function paintPieces() {
+    const lay = el('div', { class: 'chips', role: 'group', 'aria-label': 'Popular layouts' }, f.layouts.map((l) =>
+      el('button', { type: 'button', class: 'chip txt', 'aria-pressed': String(l.pieces.join('|') === st.pieces.join('|')),
+        onclick: () => { st.pieces = l.pieces.slice(); st.opts = st.pieces.map(() => ({})); changed(); } }, el('span', { text: l.name }))));
+    const rows = st.pieces.map((code, i) => {
+      const x = byCode.get(code) || { name: code, type: '', motion: 'none' };
+      const sels = f.options.filter((g) => allowed(g.code, x)).map((g) => {
+        const s = el('select', { 'aria-label': `${g.label}, piece ${i + 1}` }, el('option', { value: '', text: `No ${g.label.toLowerCase()}` }),
+          g.options.map((o) => el('option', { value: o.code, text: `${o.label}${Number(o.priceDeltaMinor) ? ` (+${money(o.priceDeltaMinor)})` : ''}`, selected: st.opts[i][g.code] === o.code || null })));
+        s.addEventListener('change', () => { st.opts[i][g.code] = s.value; reprice(); });
+        return s;
+      });
+      return el('div', { class: 'opt' }, el('div', { class: 'opt-h' }, el('span', { text: `${i + 1}. ${x.name}` }),
+        el('button', { class: 'link', type: 'button', onclick: () => { st.pieces.splice(i, 1); st.opts.splice(i, 1); changed(); } }, 'Remove')), sels);
+    });
+    const add = el('select', { 'aria-label': 'Add a piece on the right end' }, el('option', { value: '', text: 'Add a piece on the right end' }),
+      f.pieces.map((x) => el('option', { value: x.code, text: `${x.name} · ${money(x.priceMinor)}` })));
+    add.addEventListener('change', () => { if (add.value) { st.pieces.push(add.value); st.opts.push({}); changed(); } });
+    piecesEl.replaceChildren(el('div', { class: 'opt' }, el('div', { class: 'opt-h' }, el('span', { text: 'Layout' })), lay), ...rows, add);
+  }
+  function paintCovers() {
+    const pick = (label, value, opts, set) => { const s = el('select', { 'aria-label': label }, el('option', { value: '', text: label }), opts.map(([v, t]) => el('option', { value: v, text: t, selected: v === value || null })));
+      s.addEventListener('change', () => { set(s.value); paintCovers(); }); return s; };
+    const list = f.covers.filter((c) => (!st.grade || c.grade === st.grade) && (!st.color || c.colorFamily === st.color));
+    const chips = el('div', { class: 'chips', role: 'group', 'aria-label': 'Covers' }, list.map((c) => {
+      const b = el('button', { type: 'button', class: 'chip', 'aria-pressed': String(st.cover === c.code), onclick: () => { st.cover = c.code; paintCovers(); reprice(); } },
+        el('span', { class: 'dot' }), el('span', { text: c.name }), el('span', { class: 'delta', text: `Grade ${c.grade}` }));
+      if (c.hex) b.querySelector('.dot').style.setProperty('--sw', c.hex);
+      return b;
+    }));
+    const cur = f.covers.find((c) => c.code === st.cover);
+    coverEl.replaceChildren(el('div', { class: 'opt' }, el('div', { class: 'opt-h' }, el('span', { text: 'Cover' }), el('span', { text: cur ? cur.name : 'Choose one' })),
+      el('div', { class: 'buyrow' }, pick('Every grade', st.grade, f.grades.map((g) => [g.code, g.label]), (v) => { st.grade = v; }),
+        pick('Every color', st.color, [...new Set(f.covers.map((c) => c.colorFamily))].map((c) => [c, c]), (v) => { st.color = v; })),
+      list.length ? chips : el('p', { class: 'small muted', text: 'No cover matches; clear a filter.' }),
+      cur ? el('p', { class: 'small muted', text: [cur.content, cur.cleaning ? `Cleaning: ${cur.cleaning}` : null].filter(Boolean).join(' · ') } ) : null));
+  }
+  paintPieces(); paintCovers(); reprice();
+  return { plan, node: el('div', {}, piecesEl, coverEl, err, facts), build, priced: () => st.priced };
+}
+
 async function pageProduct(id) {
   const p = await get('/products/' + encodeURIComponent(id));
   markNav(p.category);
+  if (p.sectional) return pageSectional(p);
   const picked = {};
   for (const d of p.defaults || []) picked[d.group] = d.option;
   let qty = 1, seq = 0;
@@ -383,12 +463,39 @@ async function pageProduct(id) {
   if (p.options.length) reprice();
 }
 
+async function pageSectional(p) {
+  const priceEl = el('div', { class: 'price' }, money(p.priceMinor)), barPrice = el('span', { class: 'bp', text: money(p.priceMinor) });
+  const availEl = el('div', {}, availBlock(p.availability));
+  const descEl = el('div', { class: 'small muted' });
+  const addBtns = [];
+  const b = sectionalBuilder(p, p.sectional, (r) => {
+    for (const x of addBtns) x.disabled = !r;
+    if (!r) return;
+    priceEl.textContent = money(r.totalMinor); barPrice.textContent = money(r.totalMinor); descEl.textContent = r.description;
+    availEl.replaceChildren(availBlock(r.availability));
+  });
+  const add = () => { const r = b.priced(); if (!r) return; addToCart(p.id, [], 1, `${p.name} — ${r.layoutName}`, b.build()); toast(`${p.name} is in your cart.`); };
+  const mk = () => { const x = el('button', { class: 'btn primary', type: 'button', onclick: add, disabled: true }, 'Add to cart'); addBtns.push(x); return x; };
+  setMain(el('div', { class: 'wrap' },
+    crumbs(el('a', { href: '#/', text: 'Home' }), p.category ? el('a', { href: `#/c/${encodeURIComponent(p.category)}`, text: p.category }) : null, el('span', { text: p.name })),
+    el('div', { class: 'pdp' },
+      el('div', { class: 'gallery' }, b.plan, el('p', { class: 'cap', text: 'Your sectional from above. It updates as you build.' })),
+      el('div', { class: 'buy' },
+        el('p', { class: 'eyebrow', text: [p.brand, p.collection].filter(Boolean).join(' · ') || p.category || '' }),
+        el('h1', { text: p.name }), priceEl, descEl, p.description ? el('p', { class: 'desc', text: p.description }) : null,
+        b.node, availEl, el('div', { class: 'buyrow' }, mk()),
+        el('details', { class: 'more' }, el('summary', { text: 'Delivery, pickup and returns' }),
+          el('p', { text: 'A sectional is delivered as a set, every piece on the same truck. ' + (S.site.policies || '') })))),
+    el('div', { class: 'buybar' }, barPrice, mk())));
+}
+
 async function pageCart() {
   setMain(loading('Checking prices and stock…'));
   const r = await syncCart();
-  const byKey = new Map(S.cart.lines.map((l) => [lineKey(l.productId, l.choices), l]));
+  const byKey = new Map(S.cart.lines.map((l) => [lineKey(l.productId, l.choices, l.sectional), l]));
   const change = (l, qty) => {
-    const mine = byKey.get(lineKey(l.productId, l.choices));
+    const mine = byKey.get(lineKey(l.productId, l.choices, l.sectional));
+    if (mine && mine.sectional && qty > 1) return;
     if (!mine) return;
     if (qty <= 0) S.cart.lines = S.cart.lines.filter((x) => x !== mine); else mine.qty = Math.min(20, qty);
     saveCart(); pageCart().catch(showErr);
@@ -398,6 +505,7 @@ async function pageCart() {
     el('div', {},
       el('a', { class: 'nm', href: `#/p/${l.productId}`, text: l.name }),
       l.description !== l.name ? el('div', { class: 'ds', text: l.description.replace(l.name + ' — ', '') }) : null,
+      l.plan ? el('div', { class: 'ds', text: `${l.plan.widthIn}" W × ${l.plan.depthIn}" D · seats ${l.plan.seats} · ${l.plan.pieces.length} pieces, delivered together` }) : null,
       el('div', { class: 'av', text: (l.availability.lines[0] || {}).text || '' }),
       el('div', { class: 'row' },
         el('div', { class: 'qty' },
@@ -489,7 +597,7 @@ async function pageCheckout() {
   const err = el('div', { 'aria-live': 'assertive' });
   const placeBtn = el('button', { class: 'btn primary block', type: 'submit' }, 'Place order');
   const body = () => ({
-    cartId: S.cart.id, lines: S.cart.lines.map((l) => ({ productId: l.productId, choices: l.choices, qty: l.qty })),
+    cartId: S.cart.id, lines: S.cart.lines.map((l) => ({ productId: l.productId, choices: l.choices, qty: l.qty, sectional: l.sectional || undefined })),
     email: f.email.value.trim(), name: f.name.value.trim(), phone: f.phone.value.trim(), marketingOk: f.marketing.checked,
     fulfillment: mode, pickupLocationId: mode === 'pickup' ? f.store.value : undefined,
     address: mode === 'pickup' ? undefined : { line1: f.line1.value, line2: f.line2.value, city: f.city.value, state: f.state.value.toUpperCase(), postal: f.postal.value },

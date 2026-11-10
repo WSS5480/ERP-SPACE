@@ -22,6 +22,7 @@ import * as wms from "./wms.ts";
 import { postReceipt, invoiceFulfilment, chargeRoom } from "./ar.ts";
 import { providerNamed } from "./shop.ts";
 import { accrueCommissions } from "./workforce.ts";
+import * as sectionals from "./configurator.ts";
 
 export class PosError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new PosError(msg); };
@@ -202,7 +203,9 @@ export async function closeSession(c: Client, scope: Scope, sessionId: string, e
 // ============================================================ building a sale
 
 export type LineIn = { productId: string; qty: number; choices?: Choice[]; fulfillment?: Fulfil; discountMinor?: bigint; discountBps?: number;
-  fulfilFromId?: string | null; promisedOn?: string | null; shipAddressId?: string | null };
+  fulfilFromId?: string | null; promisedOn?: string | null; shipAddressId?: string | null;
+  /** a sectional family: the layout or pieces and the cover; it sells as one configured line made of a line per piece */
+  sectional?: sectionals.Build | null };
 
 export type OrderIn = { kind: "sale" | "quote" | "layaway"; locationId: string; customerId?: string | null; sessionId?: string | null;
   lines: LineIn[]; salespeople?: { id: string; splitBps: number }[]; taxExemptRef?: string | null; notes?: string;
@@ -298,12 +301,25 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
     const base = await q<{ id: string; kind: string; taxable: boolean; name: string; status: string; ship_class: string }>(c,
       `select id, kind, taxable, name, status, ship_class from product where id = $1 and entity_id = $2`, [ln.productId, ctx.entityId]);
     need(base.length, "no such product");
-    const cfg = await priceConfigured(c, ctx.entityId, ln.productId, ln.choices ?? []);
+    // A sectional sells as its pieces: one configured line, a real line per piece.
+    const family = await sectionals.isFamily(c, ctx.entityId, ln.productId);
+    let sectional: sectionals.Priced | null = null;
+    if (family) {
+      need(ln.sectional && (ln.sectional.layout || ln.sectional.pieces?.length), `${base[0].name} is built from pieces: choose a layout or the pieces, and the cover`);
+      need(qty === 1, "a sectional is sold one at a time; add it again for a second one");
+      try { sectional = await sectionals.priceBuild(c, ctx.entityId, ln.productId, ln.sectional!); }
+      catch (e) { if (e instanceof sectionals.ConfigError) throw new PosError(e.message); throw e; }
+    }
+    const cfgd = family ? null : await priceConfigured(c, ctx.entityId, ln.productId, ln.choices ?? []);
     // A package sells as its components, the package price spread over them by their own prices.
     type Part = { productId: string; sku: string; description: string; kind: string; taxable: boolean; qty: number; gross: bigint; unitCost: bigint;
-      listPrice: bigint; config: unknown; packageSku: string | null; shipClass: string };
+      listPrice: bigint; config: unknown; packageSku: string | null; shipClass: string; special?: boolean };
     let parts: Part[];
-    if (base[0].kind === "kit" && kitTable) {
+    if (sectional) {
+      parts = sectional.parts.map((x) => ({ productId: x.productId, sku: x.sku, description: x.description, kind: x.kind, taxable: x.taxable, qty: 1,
+        gross: x.netMinor, unitCost: x.costMinor, listPrice: x.grossMinor, config: x.config, packageSku: sectional!.familySku, shipClass: x.shipClass, special: x.special }));
+    } else if (base[0].kind === "kit" && kitTable) {
+      const cfg = cfgd!;
       const comps = await q<{ id: string; sku: string; name: string; kind: string; taxable: boolean; price_minor: string; cost_minor: string; qty: string; ship_class: string }>(c, `
         select p.id, p.sku, p.name, p.kind, p.taxable, p.price_minor, p.cost_minor, k.qty, p.ship_class from product_kit_component k join product p on p.id = k.component_id
          where k.entity_id = $1 and k.kit_id = $2 order by k.seq, p.sku`, [ctx.entityId, ln.productId]);
@@ -319,9 +335,11 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
           gross: share, unitCost: BigInt(x.cost_minor), listPrice: BigInt(x.price_minor), config: { package: cfg.sku }, packageSku: cfg.sku, shipClass: x.ship_class };
       });
     } else {
+      const cfg = cfgd!;
       parts = [{ productId: cfg.productId, sku: cfg.sku, description: cfg.description, kind: base[0].kind, taxable: base[0].taxable, qty,
         gross: BigInt(Math.round(qty * Number(cfg.unitPriceMinor))), unitCost: cfg.unitCostMinor, listPrice: cfg.unitPriceMinor, config: cfg.config, packageSku: null, shipClass: base[0].ship_class }];
     }
+    const firstId = ids.length;
     const lineGross = parts.reduce((a, p) => a + p.gross, 0n);
     let discount = ln.discountMinor ?? 0n;
     if (ln.discountBps) discount = bps(lineGross, ln.discountBps);
@@ -388,8 +406,11 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
         [row.id, ctx.entityId, ctx.orderId, f, promised, shipAddr, p.unitCost.toString(), p.listPrice.toString(), p.packageSku,
          overrideId ? null : needs, overrideId]);
       if (needs && !overrideId) pending.push(`line ${seq} (${p.sku}): ${needs}`);
+      // A piece in a cover or with options that is not stocked is made for the customer: on order from the start.
+      if (p.special) await c.query(`update sales_order_line set line_status = 'on_order' where id = $1 and entity_id = $2`, [row.id, ctx.entityId]);
       ids.push(row.id);
     }
+    if (sectional) await sectionals.recordSet(c, ctx.entityId, { orderId: ctx.orderId, priced: sectional, lineIds: ids.slice(firstId), channel: "pos", by: ctx.actorId });
   }
   return { lineIds: ids, pendingOverrides: pending };
 }
@@ -564,14 +585,17 @@ export async function voidLine(c: Client, scope: Scope, orderId: string, lineId:
         [scope.entityId, orderId, lineId, scope.actor.id, reason.trim()]);
     }
   }
-  await releaseLines(c, scope.entityId, orderId, [lineId]);   // a line a quote was holding gives its stock back
-  const r = await q<{ sku: string }>(c, `update sales_order_line set line_status = 'cancelled' where id = $1 and entity_id = $2 and sales_order_id = $3
-      and line_status <> 'cancelled' returning sku`, [lineId, scope.entityId, orderId]);
+  // A sectional is sold as a set: one of its pieces comes off with all of them.
+  const sold = await sectionals.setOfLine(c, scope.entityId, lineId);
+  const lineIds = sold ? sold.lineIds : [lineId];
+  await releaseLines(c, scope.entityId, orderId, lineIds);   // a line a quote was holding gives its stock back
+  const r = await q<{ sku: string }>(c, `update sales_order_line set line_status = 'cancelled' where id = any($1::uuid[]) and entity_id = $2 and sales_order_id = $3
+      and line_status <> 'cancelled' returning sku`, [lineIds, scope.entityId, orderId]);
   need(r.length, "no such line on this order");
-  await c.query(`update pos_line set needs_override = null where sales_order_line_id = $1 and entity_id = $2`, [lineId, scope.entityId]);
+  await c.query(`update pos_line set needs_override = null where sales_order_line_id = any($1::uuid[]) and entity_id = $2`, [lineIds, scope.entityId]);
   await refreshHeader(c, scope.entityId, orderId);
-  await audit(c, scope, { table: "sales_order", rowId: orderId, action: "update", after: { voided: r[0].sku }, reason });
-  return { ok: true };
+  await audit(c, scope, { table: "sales_order", rowId: orderId, action: "update", after: { voided: r.map((x) => x.sku).join(", "), set: sold?.number }, reason });
+  return { ok: true, voided: r.length, set: sold?.number ?? null };
 }
 
 /** A manager allows a discount past the limit, or a price below cost. Who and why are kept. */
@@ -960,7 +984,7 @@ async function bookAtSale(c: Client, scope: Scope, orderId: string, manager: boo
     const st = await fleet.bookStop(c, scope, { kind: "delivery", orderId, lineIds: ready, day: r[0].day, windowId: r[0].window_id,
       manager, allowToday: manager, from: "sale" });
     await c.query("release savepoint book_at_sale");
-    return { booked: true, number: st.number, day: r[0].day, waiting, confirmed: manager };
+    return { booked: true, number: st.number, day: r[0].day, waiting, confirmed: manager, setWarning: st.setWarning, cubeFt: st.cubeFt, weightLb: st.weightLb };
   } catch (err) {
     await c.query("rollback to savepoint book_at_sale");
     const capacity = (err as { code?: string }).code === "P0001" && /window on .* (is full|has room|has .* left)/.test((err as Error).message);
@@ -1044,10 +1068,11 @@ export async function fulfilAtCounter(c: Client, scope: Scope, orderId: string, 
   const owedAfter = (await grossOf(c, scope.entityId, orderId, `(l.line_status = 'fulfilled' or l.id = any($3))`, [lineIds])) - BigInt(o.paid_minor);
   const room = await creditRoom(c, scope.entityId, o.customer_id, o.id);
   need(owedAfter <= room, `goods leave paid for: take ${usd(owedAfter - room)} more first`);
+  const setWarning = await sectionals.partialSetWarning(c, scope.entityId, lineIds);
   const h = await hand(c, scope, o, lineIds);
   await settleStatus(c, scope, orderId);
-  await audit(c, scope, { table: "sales_order", rowId: orderId, action: "transition", after: { handedOver: h.lines }, sourceRef: "pos pickup" });
-  return { number: o.number, handedOver: h.lines, journalEntryId: h.journalEntryId };
+  await audit(c, scope, { table: "sales_order", rowId: orderId, action: "transition", after: { handedOver: h.lines, setWarning }, sourceRef: "pos pickup" });
+  return { number: o.number, handedOver: h.lines, journalEntryId: h.journalEntryId, setWarning };
 }
 
 /** Cancel an order nothing has left on. Reservations are released and any money taken is refunded. */
@@ -1336,7 +1361,8 @@ export async function orderView(c: Client, entityId: string, id: string) {
   const deposit = head.kind === "sale" || head.kind === "quote" ? await depositRequirement(c, entityId, id) : null;
   const sheetLinks = await q(c, `select k.id, k.expires_at, k.opened_count, k.created_at from tear_sheet_link k
      where k.entity_id = $1 and k.sales_order_id = $2 and k.revoked_at is null and k.expires_at > now() order by k.created_at desc`, [entityId, id]);
-  return { ...head, lines, receipts, salespeople: people, overrides, returns, history, storeCreditMinor: credit, taxes, hold, deposit, sheetLinks };
+  const sectionalSets = await sectionals.setsForOrder(c, entityId, id);
+  return { ...head, lines, receipts, salespeople: people, overrides, returns, history, storeCreditMinor: credit, taxes, hold, deposit, sheetLinks, sectionals: sectionalSets };
 }
 
 export async function listOrders(c: Client, entityId: string, f: { kind?: string; status?: string; q?: string; locationId?: string | null }) {

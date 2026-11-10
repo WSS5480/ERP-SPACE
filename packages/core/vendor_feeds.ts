@@ -29,6 +29,7 @@
 // A failed feed changes nothing (its work is inside a savepoint) and never
 // blocks the vendor's other feeds.
 
+import { applyVendorExtras, extrasFromRows } from "./configurator.ts";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import {
@@ -1106,13 +1107,18 @@ async function applyPurpose(c: Client, s: Scope, f: FeedRow & { vendor: string }
   const m = mapRows(rows, mapping);
   if (f.purpose === "products") {
     const pricing = await hasPricingFeed(c, s.entityId, f.vendor_id, f.id);
+    // Covers (a cover code with a grade) are not products; sectional pieces are products and also pieces. Best effort, see the configurator.
+    const { productRows, extras } = extrasFromRows(rows);
+    rows = productRows;
     const pv = await previewImport(c, s, { vendorId: f.vendor_id, csv: recordsToCsv(rows.map((r) => Object.fromEntries(Object.entries(r).filter(([k]) => !k.startsWith("__"))))),
       filename: `${f.name} (API)`, mapping, keep: pricing ? ["cost_minor", "map_minor", "msrp_minor"] : [], costOptional: pricing });
     const ap = await applyImport(c, s, pv.runId);
     let priced = 0;
     if (pricing) priced = await applyPriceHistory(c, s, f.vendor_id, (await priceRule(c, s.entityId, f.vendor_id)));
+    const cx = extras.length ? await applyVendorExtras(c, s, f.vendor_id, extras) : null;
     return { added: ap.add, changed: ap.change, importRun: pv.runId,
-      note: `${rows.length} products: ${ap.add} added, ${ap.change} changed, ${ap.same} unchanged${ap.skip ? `, ${ap.skip} skipped` : ""}${pricing ? ` · cost, MAP and MSRP left to the pricing feed${priced ? ` (${priced} priced from it)` : ""}` : ""}` };
+      note: `${rows.length} products: ${ap.add} added, ${ap.change} changed, ${ap.same} unchanged${ap.skip ? `, ${ap.skip} skipped` : ""}${pricing ? ` · cost, MAP and MSRP left to the pricing feed${priced ? ` (${priced} priced from it)` : ""}` : ""}`
+        + (cx ? ` · ${cx.pieces} sectional pieces, ${cx.covers} covers${cx.skipped ? ` (${cx.skipped} not set up: ${cx.notes.slice(0, 2).join("; ")})` : ""}` : "") };
   }
   if (f.purpose === "pricing") {
     const r = await recordVendorPrices(c, s, f.vendor_id, f.id, m, (f.options.priceRule ?? {}) as Record<string, unknown>);

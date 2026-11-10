@@ -120,13 +120,20 @@ export async function createPO(c: Client, s: Scope, po: PoIn, mayOverride: boole
     if (l.choices?.length) {
       try {
         const pc = await priceConfigured(c, s.entityId, p.id, l.choices);
-        unit = pc.unitCostMinor; lead = pc.leadDays; desc = pc.description; config = pc.config;
+        unit = pc.unitCostMinor; lead = pc.leadDays; desc = pc.description;
+        // keep what is not an option (a sectional piece's cover and place in the set) alongside the priced options
+        config = { ...Object.fromEntries(Object.entries(config).filter(([, v]) => !Array.isArray(v))), ...pc.config };
       } catch (e) {
         if (e instanceof PricingError) throw new PurchasingError(e.message);
         throw e;
       }
     }
+    // A sectional piece (configurator): its cost in the chosen grade and options, and their factory codes.
+    const piece = config.cfg as { unitCostMinor?: string; options?: { vendorCode?: string | null }[]; piece?: string; position?: number; of?: number } | undefined;
+    if (piece && typeof piece === "object" && /^\d+$/.test(String(piece.unitCostMinor ?? ""))) unit = BigInt(piece.unitCostMinor!);
     const codes = Object.values(config).flat().map((o) => (o as { vendorCode?: string | null }).vendorCode).filter(Boolean);
+    if (piece && Array.isArray(piece.options)) for (const o of piece.options) if (o?.vendorCode) codes.push(o.vendorCode);
+    if (piece?.position && piece.of) desc += ` (sectional piece ${piece.position} of ${piece.of})`;
     if (codes.length) desc += ` [${codes.join(" / ")}]`;
     if (l.note) desc += ` — ${String(l.note).slice(0, 120)}`;
     // What the vendor says it can ship (ATP): enough on hand ships on the usual lead time; short, it ships on theirs.

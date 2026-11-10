@@ -571,6 +571,10 @@ export function parse810(segs: Segment[]): Invoice810 & { errors: string[] } {
 export type CatalogItem = {
   vendorSku: string; upc?: string; description?: string; costMinor?: bigint | null; msrpMinor?: bigint | null; mapMinor?: bigint | null;
   effectiveOn?: string | null; heightIn?: number | null; widthIn?: number | null; depthIn?: number | null; weightLb?: number | null; cubicFt?: number | null;
+  /** Best effort, when the vendor sends it (see docs/MODULES.md "Configurator"): the sectional a model is a piece of. */
+  sectional?: { family?: string; familyName?: string; piece?: string; motion?: string; seats?: number; gradeAdders?: { grade: string; priceMinor: bigint }[] };
+  /** A cover (fabric or leather swatch) rather than a product: its grade and how it looks and cleans. */
+  swatch?: { grade: string; color?: string; colorFamily?: string; content?: string; cleaning?: string; discontinuedOn?: string | null };
 };
 export type Catalog832 = { catalogId: string; date: string | null; items: CatalogItem[] };
 
@@ -586,6 +590,22 @@ export function build832(cat: Catalog832): Segment[] {
     if (it.msrpMinor != null) segs.push(["CTP", "", "MSR", fromMinor(it.msrpMinor)]);
     if (it.mapMinor != null) segs.push(["CTP", "", "MAP", fromMinor(it.mapMinor)]);
     if (it.effectiveOn) segs.push(["DTM", "007", dateOut(it.effectiveOn)]);
+    // Configurator extras: REF*ZZ*<value>*<keyword>, a grade adder as CTP*<grade>*GRD*<amount>, a color as PID*F*73.
+    const sx = it.sectional;
+    if (sx?.family) segs.push(["REF", "ZZ", sx.family, sx.familyName ? `SECTIONAL ${sx.familyName}` : "SECTIONAL"]);
+    if (sx?.piece) segs.push(["REF", "ZZ", sx.piece, "PIECE"]);
+    if (sx?.motion) segs.push(["REF", "ZZ", sx.motion, "MOTION"]);
+    if (sx?.seats != null) segs.push(["REF", "ZZ", String(sx.seats), "SEATS"]);
+    for (const g of sx?.gradeAdders ?? []) segs.push(["CTP", g.grade, "GRD", fromMinor(g.priceMinor)]);
+    const sw = it.swatch;
+    if (sw) {
+      segs.push(["REF", "ZZ", sw.grade, "SWATCH"]);
+      if (sw.color) segs.push(["PID", "F", "73", "", "", sw.color]);
+      if (sw.colorFamily) segs.push(["REF", "ZZ", sw.colorFamily, "COLOR"]);
+      if (sw.content) segs.push(["REF", "ZZ", sw.content, "CONTENT"]);
+      if (sw.cleaning) segs.push(["REF", "ZZ", sw.cleaning, "CLEAN"]);
+      if (sw.discontinuedOn) segs.push(["REF", "ZZ", sw.discontinuedOn, "DISCONTINUED"]);
+    }
   }
   segs.push(["CTT", String(cat.items.length)]);
   return segs;
@@ -605,7 +625,23 @@ export function parse832(segs: Segment[]): Catalog832 & { errors: string[] } {
       out.items.push(cur);
     } else if (s[0] === "DTM" && !cur) out.date = x12Date(el(s, 2));
     else if (!cur) continue;
+    else if (s[0] === "PID" && el(s, 2) === "73") { cur.swatch = cur.swatch ?? { grade: "" }; cur.swatch.color = el(s, 5) || cur.swatch.color; }
     else if (s[0] === "PID") cur.description = el(s, 5) || cur.description;
+    else if (s[0] === "REF" && el(s, 1) === "ZZ") {
+      // Configurator extras, best effort: an unknown keyword is ignored.
+      const v = el(s, 2), kw = el(s, 3).toUpperCase();
+      const sx = () => (cur!.sectional = cur!.sectional ?? {});
+      const sw = () => (cur!.swatch = cur!.swatch ?? { grade: "" });
+      if (kw.startsWith("SECTIONAL")) { sx().family = v; const name = el(s, 3).slice(9).trim(); if (name) sx().familyName = name; }
+      else if (kw === "PIECE") sx().piece = v;
+      else if (kw === "MOTION") sx().motion = v;
+      else if (kw === "SEATS" && /^\d{1,2}$/.test(v)) sx().seats = Number(v);
+      else if (kw === "SWATCH") sw().grade = v.toUpperCase();
+      else if (kw === "COLOR") sw().colorFamily = v.toLowerCase();
+      else if (kw === "CONTENT") sw().content = v;
+      else if (kw === "CLEAN") sw().cleaning = v.toUpperCase();
+      else if (kw === "DISCONTINUED") sw().discontinuedOn = x12Date(v) ?? (/^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
+    }
     else if (s[0] === "MEA") {
       const v = num(el(s, 3));
       if (v == null || v < 0) { errors.push(`${cur.vendorSku}: measurement ${el(s, 2)} is not a number`); continue; }
@@ -619,12 +655,17 @@ export function parse832(segs: Segment[]): Catalog832 & { errors: string[] } {
       const m = toMinor(el(s, 3));
       if (m == null || m < 0n) { errors.push(`${cur.vendorSku}: price ${el(s, 3) || "(blank)"} is not a money amount`); continue; }
       const code = el(s, 2);
+      if (code === "GRD") {
+        if (/^[A-Z0-9][A-Z0-9_-]{0,11}$/i.test(el(s, 1))) (cur.sectional = cur.sectional ?? {}).gradeAdders = [...(cur.sectional?.gradeAdders ?? []), { grade: el(s, 1).toUpperCase(), priceMinor: m }];
+        continue;
+      }
       if (code === "UCP" || code === "NET" || code === "CON" || code === "DPR") cur.costMinor = m;
       else if (code === "MSR" || code === "RES" || code === "SLP") cur.msrpMinor = m;
       else if (code === "MAP" || code === "MAX") cur.mapMinor = m;
     } else if (s[0] === "DTM" && el(s, 1) === "007") cur.effectiveOn = x12Date(el(s, 2));
   }
   if (!out.items.length) errors.push("the 832 has no items");
+  for (const it of out.items) if (it.swatch && !it.swatch.grade) { errors.push(`${it.vendorSku}: a color was sent but no grade (REF*ZZ*<grade>*SWATCH); it is read as a product`); delete it.swatch; }
   for (const it of out.items) {
     if (it.heightIn != null && it.widthIn != null && it.depthIn != null && it.cubicFt == null) it.cubicFt = Math.round((it.heightIn * it.widthIn * it.depthIn / 1728) * 100) / 100;
   }

@@ -403,6 +403,28 @@ export const DATASETS: Dataset[] = [
            where ic.entity_id = $1`,
   },
   {
+    id: "as_is_condition", label: "As-is stock by condition", folder: "Inventory", modules: ["inventory"],
+    roles: ["controller", "viewer", "buyer", "warehouse", "store_manager"],
+    description: "Every as-is, floor-sample or returned piece with its condition grade, tag price, retail and how long it has waited.",
+    dateField: "graded_on", detail: ["label", "sku", "product", "grade", "price", "age_days", "location"],
+    fields: [
+      F("label", "Label", "text"), F("sku", "SKU", "text"), F("product", "Product", "text"), F("location", "Location", "text"),
+      F("grade", "Condition", "text"), F("source", "Source", "text"), F("graded_on", "Graded on", "date"), F("age_days", "Age (days)", "number"),
+      F("retail", "Retail", "money"), F("price", "Tag price", "money"), F("markdown", "Markdown", "money"),
+    ],
+    sql: `select x.label, p.sku, p.name as product, l.name as location, coalesce(ic.grade, 'ungraded') as grade, coalesce(ic.source, 'as_is') as source,
+                 ic.graded_at::date as graded_on,
+                 (current_date - coalesce((select min(h.graded_at) from inv_condition h where h.entity_id = $1 and h.unit_id = x.unit_id), x.created_at)::date)::int as age_days,
+                 p.price_minor as retail, coalesce(ic.price_minor, x.as_is_price_minor) as price,
+                 p.price_minor - coalesce(ic.price_minor, x.as_is_price_minor, p.price_minor) as markdown
+            from inv_piece x
+            join product p on p.id = x.product_id and p.entity_id = $1
+            join location l on l.id = x.location_id and l.entity_id = $1
+            left join inv_condition ic on ic.entity_id = $1 and ic.unit_id = x.unit_id and ic.superseded_at is null
+           where x.entity_id = $1 and x.carton_seq = 1
+             and (x.status = 'as_is' or (ic.id is not null and x.status in ('in_stock','returned','damaged','in_repair')))`,
+  },
+  {
     id: "po_lines", label: "Purchase order lines", folder: "Purchasing", modules: ["purchasing"],
     roles: ["controller", "viewer", "buyer", "warehouse", "store_manager"],
     description: "What has been ordered from vendors, what has arrived, and what is still to come.",
