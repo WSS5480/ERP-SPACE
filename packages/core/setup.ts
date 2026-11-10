@@ -4,7 +4,7 @@
 // default settings -- applied to one company. It only ever adds.
 
 import { adoptOpeningBalances } from "./ar.ts";
-import { derivedRate, locationRateChanged } from "./tax.ts";
+import { derivedRate, locationRateChanged, keepStoreRate } from "./tax.ts";
 import { q, one, type Client, type Scope } from "./db.ts";
 import { post } from "./posting.ts";
 import { installStarters } from "./reports.ts";
@@ -514,12 +514,15 @@ export async function saveLocation(c: Client, scope: Scope, input: {
       [input.id, scope.entityId, code, input.name.trim(), input.kind, st, tax, addr, hasGeo ? input.lng : null, hasGeo ? input.lat : null]);
     if (!r.rowCount) throw new SetupError("no such location");
     await locationRateChanged(c, scope, input.id, tax);   // a store kept at a single rate: the new rate from today
+    if (["store", "outlet"].includes(input.kind)) await keepStoreRate(c, scope.entityId, input.id);
     return input.id;
   }
   const id = (await one<{ id: string }>(c,
     `insert into location (entity_id, code, name, kind, state, tax_rate_bps, address, geo)
      values ($1,$2,$3,$4,$5,$6,$7, case when $8::float8 is null then null else point($8, $9) end) returning id`,
     [scope.entityId, code, input.name.trim(), input.kind, st, tax, addr, hasGeo ? input.lng : null, hasGeo ? input.lat : null])).id;
+  // A store's own rate stands until jurisdictions say otherwise (never lowered by a later statewide one).
+  if (["store", "outlet"].includes(input.kind)) await keepStoreRate(c, scope.entityId, id);
   // A selling location is a profit object too, so its sales land in its own P&L column.
   if (["store", "outlet", "web"].includes(input.kind)) {
     await c.query(

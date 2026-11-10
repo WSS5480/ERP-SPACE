@@ -18,6 +18,7 @@
 //   billable service charges              the sale posts 4030; moved  Dr 4030  Cr 4050 service revenue
 
 import { createHash } from "node:crypto";
+import * as tax from "./tax.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post } from "./posting.ts";
 import { profitObjectFor } from "./posting.ts";
@@ -383,15 +384,20 @@ async function ensureOrder(c: Client, scope: Scope, t: TicketRow, which: "servic
 async function addLine(c: Client, scope: Scope, orderId: string, productId: string, qty: number, priceMinor: bigint, fulfilFrom: string | null) {
   const p = await one<{ sku: string; name: string; taxable: boolean; kind: string }>(c,
     `select sku, name, taxable, kind from product where entity_id = $1 and id = $2`, [scope.entityId, productId]);
-  const so = await one<{ location_id: string }>(c, `select location_id from sales_order where entity_id = $1 and id = $2`, [scope.entityId, orderId]);
-  const rate = (await one<{ r: number }>(c, `select tax_rate_bps r from location where entity_id = $1 and id = $2`, [scope.entityId, so.location_id])).r;
+  const so = await one<{ location_id: string; fulfillment: string; ship_address_id: string | null }>(c,
+    `select location_id, fulfillment, ship_address_id from sales_order where entity_id = $1 and id = $2`, [scope.entityId, orderId]);
   const net = BigInt(Math.round(qty * Number(priceMinor)));
-  const tax = p.taxable && net > 0n ? bps(net, rate) : 0n;
+  // Taxed the way the register does: the stack where the order is handed over, labor and plans as each jurisdiction says.
+  const place = await tax.stackForLine(c, scope.entityId, { storeId: so.location_id, fulfillment: so.fulfillment, shipAddressId: so.ship_address_id });
+  const cls = tax.classOf(p.kind);
+  const lt = tax.computeLine(place.stack, { netMinor: net > 0n ? net : 0n, itemClass: cls, taxable: p.taxable, cert: null });
+  const taxMinor = lt.taxMinor;
   const seq = (await one<{ n: number }>(c, `select coalesce(max(seq),0)::int + 1 n from sales_order_line where entity_id = $1 and sales_order_id = $2`, [scope.entityId, orderId])).n;
   const l = await one<{ id: string }>(c, `
     insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, fulfil_from_id)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id`,
-    [scope.entityId, orderId, seq, productId, p.sku, p.name, qty, priceMinor.toString(), tax.toString(), fulfilFrom]);
+    [scope.entityId, orderId, seq, productId, p.sku, p.name, qty, priceMinor.toString(), taxMinor.toString(), fulfilFrom]);
+  if (net > 0n) await tax.writeLineTax(c, scope.entityId, orderId, l.id, lt.rows, place, cls);
   await c.query(`select sales_order_retotal($1) /* unscoped: an order of this entity, just written */`, [orderId]);
   return { lineId: l.id, sku: p.sku, name: p.name };
 }

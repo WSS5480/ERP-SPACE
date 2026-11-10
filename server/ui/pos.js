@@ -21,6 +21,7 @@
   const outBox = () => el('div', { role: 'status', 'aria-live': 'polite' });
   const pad = (node) => { node.style.padding = '4px 16px 14px'; return node; };
   const dollars = (m) => (Number(m || 0) / 100).toFixed(2);
+  const fullDay = (d) => { const [y, m, dd] = String(d).slice(0, 10).split('-').map(Number); return new Date(y, m - 1, dd).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }); };
   const isManager = (setup) => setup.roles.includes('owner') || setup.roles.includes('store_manager');
 
   /** Open delivery windows for an address and the goods going on the truck; a full or locked window cannot be picked. */
@@ -127,7 +128,7 @@
         // Exempt only under a current certificate on file: picked, never typed.
         const certs = c.certificates || [];
         if (cart.taxExemptRef && !certs.some((x) => x.number === cart.taxExemptRef)) cart.taxExemptRef = '';
-        const exempt = select(certs.map((x) => [x.number, `${x.number} · ${x.state} · ${words(x.reason)}${x.expiresOn ? ` · until ${shortDay(x.expiresOn)}` : ''}`]), cart.taxExemptRef, 'Not exempt');
+        const exempt = select(certs.map((x) => [x.number, `${x.number} · ${x.state} · ${words(x.reason)}${x.expiresOn ? ` · until ${fullDay(x.expiresOn)}` : ''}`]), cart.taxExemptRef, 'Not exempt');
         exempt.addEventListener('change', () => { cart.taxExemptRef = exempt.value; });
         custBox.replaceChildren(item({ title: c.name, detail: [c.number, c.phone, c.email].filter(Boolean).join(' · '),
           acts: [el('button', { class: 'btn small', type: 'button', onclick: () => { cart.customer = null; cart.addressId = ''; cart.taxExemptRef = ''; drawCustomer(); } }, 'Change')] }),
@@ -195,7 +196,7 @@
     holdBox.addEventListener('change', () => { cart.hold = holdBox.checked; });
     const holdRow = setup.settings.quoteHoldsAllowed ? el('label', { class: 'check' }, holdBox, el('span', { text: ` Hold the in-stock items for the customer (up to ${plural(setup.settings.quoteHoldMaxDays, 'day')})` })) : null;
     const drawKind = () => { kind.replaceChildren(seg([['sale', 'Sale'], ['quote', 'Quote'], ['layaway', 'Layaway']], cart.kind, (v) => { cart.kind = v; drawKind(); go2.textContent = v === 'quote' ? 'Save the quote' : 'Save and take payment'; }),
-      cart.kind === 'quote' && holdRow ? holdRow : null); };
+      ...(cart.kind === 'quote' && holdRow ? [holdRow] : [])); };
     const promised = input({ type: 'date', min: todayIso(), value: cart.promisedOn });
     promised.addEventListener('change', () => { cart.promisedOn = promised.value; });
     const people = setup.people.map((p) => [p.id, p.name]);
@@ -222,6 +223,7 @@
           try { const h = await post(`/pos/orders/${r.id}/hold`, {}); toast(`Holding ${plural(h.linesHeld, 'line')} until ${shortDay(h.heldUntil)}.`, 'good'); }
           catch (e) { toast(`The quote is saved, but nothing is held: ${friendly(e)}`, 'warning'); }
         }
+        if (r.taxNotes && r.taxNotes.length) toast(r.taxNotes.join(' '), 'warning');
         cart = newCart(); E.render(); openOrder(r.id, k !== 'quote' && !r.pendingOverrides.length ? 'checkout' : null); }) },
       cart.kind === 'quote' ? 'Save the quote' : 'Save and take payment');
     drawKind();
@@ -367,12 +369,15 @@
               await reload();
             } catch (e) { toast(friendly(e), 'critical'); }
           } })));
+      if (o.status === 'draft' && o.customer_id) acts.push(btn(o.tax_exempt_ref ? 'Change tax exemption' : 'Make tax exempt', () => exemptionDialog(o, reload)));
       if (['draft', 'open'].includes(o.status)) acts.push(btn('Cancel', () => cancelDialog(o, reload)));
       if (o.status !== 'cancelled') acts.push(btn(o.signed_at ? 'Sign again' : 'Signature', () => signatureDialog(o, reload)));
       acts.push(btn('Receipt', () => { d.close(); go('pos', 'receipt-' + id); }));
       if (o.kind !== 'return') {
         acts.push(el('a', { class: 'btn', href: `/api/c/${S.co.id}/pos/orders/${id}/tear-sheet`, target: '_blank', rel: 'noopener' }, 'Tear sheet'));
-        if (o.customer_id) acts.push(btn('Send the tear sheet', (e) => run(e.currentTarget, out, () => post(`/pos/orders/${id}/tear-sheet/send`, {}),
+        if (o.sheetLinks && o.sheetLinks.length) acts.push(btn('Stop the shared link', (e) => run(e.currentTarget, out, () => post(`/pos/orders/${id}/tear-sheet/revoke`, {}),
+          'The link the customer has no longer opens.', reload)));
+        if (o.customer_id && o.status !== 'cancelled') acts.push(btn('Send the tear sheet', (e) => run(e.currentTarget, out, () => post(`/pos/orders/${id}/tear-sheet/send`, {}),
           (r) => `Sent by ${r.channel === 'sms' ? 'text' : 'email'} to ${r.to}${r.status === 'skipped' ? ' (no address on file, so it was not sent)' : ''}. The link works until ${shortDay(r.expiresAt)}.`)));
       }
       if (next === 'checkout' && o.status === 'draft') { next = null; setTimeout(() => tenderDialog(o, 'checkout', reload, mgr), 0); }
@@ -394,7 +399,8 @@
         section('Lines', null, null, el('div', { class: 'panel' }, lineItems)),
         o.taxes && o.taxes.length ? section('Sales tax by jurisdiction', null, null, el('div', { class: 'panel' }, o.taxes.map((x) => item({ title: `${x.name} · ${words(x.level)}`,
           amount: money(x.tax_minor), detail: [`${(x.rate_bps / 100).toFixed(2)}%`, x.sourced === 'destination' ? 'where the goods go' : 'at the store',
-            Number(x.taxable_minor) ? `on ${money(x.taxable_minor)}` : null, Number(x.exempt_minor) ? `${money(x.exempt_minor)} exempt (${words(x.exempt_reasons || '')})` : null].filter(Boolean).join(' · ') })))) : null,
+            Number(x.taxable_minor) ? `on ${money(x.taxable_minor)}` : null, Number(x.exempt_minor) ? `${money(x.exempt_minor)} exempt (${words(x.exempt_reasons || '')})` : null].filter(Boolean).join(' · '),
+          why: x.notes || null })))) : null,
         el('div', { class: 'dlg-acts' }, acts), out,
         section('Payments', null, null, el('div', { class: 'panel' }, o.receipts.length ? o.receipts.map((r) => item({ title: `${r.number} · ${TENDER[r.method] || r.method}`, amount: money(r.amount_minor),
           detail: [r.reference, r.received_by, ago(r.received_at)].filter(Boolean).join(' · ') })) : empty('Nothing paid yet.', null, true))),
@@ -459,6 +465,20 @@
     d.body.append(el('p', { class: 'lead', text: 'Keep a copy of the paper certificate. A sale is only exempt in the certificate’s state, and an expired certificate is refused.' }),
       el('div', { class: 'form-grid' }, field('Certificate number', number, { wide: true }), field('State', state), field('Why exempt', reason), field('Expires', expires, { hint: 'Leave empty if it does not expire.' })),
       el('div', { class: 'dlg-acts' }, b, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+  }
+
+  function exemptionDialog(o, after) {
+    const d = openDialog('Tax exemption', `${o.number} · ${o.customer || ''}`);
+    fillDialog(d, async () => {
+      const certs = (await coApi(`/pos/customers/${o.customer_id}/certificates`)).filter((x) => x.current);
+      const pick = select(certs.map((x) => [x.number, `${x.number} · ${x.state} · ${words(x.reason)}${x.expires_on ? ` · until ${fullDay(x.expires_on)}` : ''}`]),
+        certs.some((x) => x.number === o.tax_exempt_ref) ? o.tax_exempt_ref : '', 'Not exempt');
+      const out = outBox();
+      const b = el('button', { class: 'btn primary', type: 'button', onclick: () => run(b, out, () => post(`/pos/orders/${o.id}/exemption`, { taxExemptRef: pick.value || null }),
+        'The lines are taxed again.', async () => { await after(); d.close(); }) }, 'Save');
+      return frag(el('p', { class: 'lead', text: o.tax_exempt_ref ? `Now exempt under ${o.tax_exempt_ref}. Pick a current certificate, or none to tax the sale.` : 'Pick a current certificate on file.' }),
+        field('Certificate', pick), el('div', { class: 'dlg-acts' }, b, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel')), out);
+    });
   }
 
   function extendHoldDialog(o, after) {

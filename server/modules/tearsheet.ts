@@ -105,7 +105,7 @@ export async function orderSheet(c: Client, entityId: string, orderId: string, e
   const h = (await q<{ number: string; kind: string | null; status: string; ordered_at: string; quote_expires_on: string | null;
     subtotal_minor: string; discount_minor: string; tax_minor: string; total_minor: string; paid_minor: string; customer: string | null; location: string;
     address: Record<string, string> | null; company: string; salesperson: string | null; tax_exempt_ref: string | null }>(c, `
-    select so.number, po.kind, so.status, so.ordered_at, po.quote_expires_on::text, so.subtotal_minor, so.discount_minor, so.tax_minor, so.total_minor,
+    select so.number, po.kind, so.status, so.ordered_at::date::text ordered_at, po.quote_expires_on::text, so.subtotal_minor, so.discount_minor, so.tax_minor, so.total_minor,
            so.paid_minor, cu.name customer, l.name location, l.address, e.name company, u.name salesperson, po.tax_exempt_ref
       from sales_order so join location l on l.id = so.location_id join entity e on e.id = so.entity_id
       left join pos_order po on po.sales_order_id = so.id left join customer cu on cu.id = so.customer_id left join app_user u on u.id = so.salesperson_id
@@ -188,11 +188,14 @@ export async function createLink(c: Client, scope: Scope, e: { orderId?: string 
   let expires = new Date(Date.now() + Math.min(Math.max(e.days ?? 30, 1), 90) * 86400000);
   let customer = e.customerId ?? null;
   if (e.orderId) {
-    const o = await q<{ customer_id: string | null; quote_expires_on: string | null; number: string }>(c, `select so.customer_id, po.quote_expires_on::text, so.number
+    const o = await q<{ customer_id: string | null; quote_expires_on: string | null; number: string; kind: string | null; status: string; expired: boolean }>(c, `
+      select so.customer_id, po.quote_expires_on::text, so.number, po.kind, so.status, po.quote_expires_on < current_date expired
        from sales_order so left join pos_order po on po.sales_order_id = so.id where so.id = $1 and so.entity_id = $2`, [e.orderId, scope.entityId]);
     need(o.length, "no such order");
+    need(o[0].status !== "cancelled", `${o[0].number} is cancelled; there is nothing to send`);
+    need(!(o[0].kind === "quote" && o[0].expired), `quote ${o[0].number} expired on ${o[0].quote_expires_on}; make a new quote at today's prices before sending it`);
     customer = customer ?? o[0].customer_id;
-    if (o[0].quote_expires_on) expires = new Date(o[0].quote_expires_on + "T23:59:59Z");
+    if (o[0].kind === "quote" && o[0].quote_expires_on) expires = new Date(o[0].quote_expires_on + "T23:59:59Z");
     await c.query(`update tear_sheet_link set revoked_at = now() where entity_id = $1 and sales_order_id = $2 and revoked_at is null`, [scope.entityId, e.orderId]);
   } else {
     const p = await q(c, `select id from product where id = $1 and entity_id = $2`, [e.productId, scope.entityId]);
@@ -207,6 +210,22 @@ export async function createLink(c: Client, scope: Scope, e: { orderId?: string 
     values ($1,$2,$3,$4,$5,$6,$7) returning id`, [scope.entityId, e.orderId ?? null, e.productId ?? null, customer, sha(token), expires.toISOString(), scope.actor.id || null]);
   await audit(c, scope, { table: "tear_sheet_link", rowId: row.id, action: "insert", after: { orderId: e.orderId ?? null, productId: e.productId ?? null, expires: expires.toISOString() } });
   return { id: row.id, token, path: `/sheet/${token}`, expiresAt: expires.toISOString(), customerId: customer };
+}
+
+/** Stop a link (or every live link to an order) working. The rows are kept, marked revoked. */
+export async function revokeLinks(c: Client, scope: Scope, e: { linkId?: string | null; orderId?: string | null }) {
+  need(e.linkId || e.orderId, "say which link to stop");
+  const r = await q<{ id: string }>(c, `update tear_sheet_link set revoked_at = now() where entity_id = $1 and revoked_at is null
+      and (($2::uuid is not null and id = $2) or ($3::uuid is not null and sales_order_id = $3)) returning id`, [scope.entityId, e.linkId ?? null, e.orderId ?? null]);
+  need(r.length, "there is no live link to stop");
+  for (const x of r) await audit(c, scope, { table: "tear_sheet_link", rowId: x.id, action: "transition", after: { revoked: true } });
+  return { revoked: r.length };
+}
+
+/** The live links to an order, for the order view. */
+export async function linksFor(c: Client, entityId: string, orderId: string) {
+  return q(c, `select k.id, k.expires_at, k.opened_count, k.created_at, cu.name customer from tear_sheet_link k left join customer cu on cu.id = k.customer_id
+     where k.entity_id = $1 and k.sales_order_id = $2 and k.revoked_at is null and k.expires_at > now() order by k.created_at desc`, [entityId, orderId]);
 }
 
 /** Text or email the customer the link, through the customer message log. */

@@ -5,7 +5,7 @@
 import type { ErpModule } from "./kit.ts";
 import { need, requireRole, str, uuid, int } from "./kit.ts";
 import { q } from "../../packages/core/db.ts";
-import { scopeOf } from "../actions.ts";
+import { scopeOf, rolesOf } from "../actions.ts";
 import { ModuleError } from "./kit.ts";
 import * as tax from "../../packages/core/tax.ts";
 import {
@@ -81,7 +81,12 @@ export const module: ErpModule = {
     // ---- sales tax: jurisdictions, their rates over time, where they apply, and origin or destination sourcing
     const taxed = async <T>(fn: () => Promise<T>) => { try { return await fn(); } catch (e) { if (e instanceof tax.TaxError) throw new ModuleError(e.message); throw e; } };
     const TAX = ["owner", "controller"];
-    coGet("/setup/tax", async (c, co) => tax.taxSetup(c, co.id));
+    coGet("/setup/tax", async (c, co, _u, _m, p) => {
+      need(p, "pick who you are acting as; tax setup is for the owner, a controller or a store manager");
+      const held = await rolesOf(c, co, p);
+      need(["owner", "controller", "store_manager"].some((r) => held.has(r)), "seeing the sales tax setup needs one of: owner, controller, store manager");
+      return tax.taxSetup(c, co.id);
+    });
     coPost("/setup/tax/sourcing", async (c, co, a, body) => {
       await requireRole(c, co, a, TAX, "choosing how sales tax is sourced");
       return taxed(() => tax.setSourcing(c, scopeOf(co, a), str(body.sourcing, 20)));

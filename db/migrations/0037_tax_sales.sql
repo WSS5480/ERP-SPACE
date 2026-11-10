@@ -13,8 +13,10 @@
 --      filing can be made and tied to GL 2100. A return reverses the same rows.
 --   4. An exemption certificate belongs to one customer, names its state and
 --      may expire; an expired one is refused at the register.
---   5. A store with no jurisdictions keeps its single location rate: on first
---      use it becomes one 'combined' jurisdiction at exactly that rate.
+--   5. A store with no jurisdictions keeps its single location rate as one
+--      'combined' jurisdiction at exactly that rate. Every store that already
+--      has a rate gets it here, so adding a statewide jurisdiction later never
+--      quietly lowers an existing store's tax.
 
 -- ------------------------------------------------------------- settings --
 create table tax_setting (
@@ -133,6 +135,11 @@ create table sales_order_line_tax (
   exempt_reason       text check (exempt_reason in ('resale','government','nonprofit','agricultural','manufacturing','other_certificate',
                                                     'item_not_taxable','delivery_exempt','labor_exempt','warranty_exempt','not_taxed')),
   tax_minor           bigint not null default 0,
+  -- what this jurisdiction is owed on the line; differs from tax_minor only when another door
+  -- (the web store, service, an import) charged a different amount than the stack gives
+  owed_minor          bigint not null default 0,
+  note                text,                                         -- e.g. ZIP not covered by local jurisdictions
+  uncovered_postal    text,
   original_id         uuid references sales_order_line_tax(id),    -- a return row names the sale row it reverses
   posted_on           date,                                         -- the day it reached GL 2100 (sale handed over, or return)
   journal_entry_id    uuid references journal_entry(id),
@@ -190,3 +197,41 @@ create index tear_sheet_link_order on tear_sheet_link (entity_id, sales_order_id
 alter table customer_message drop constraint customer_message_kind_check;
 alter table customer_message add constraint customer_message_kind_check
   check (kind in ('confirmation','day_before','en_route','delivered','exception','schedule_link','rescheduled','cancelled','service_update','tear_sheet'));
+
+-- ------------------------------------- existing stores keep their rate --
+-- A store with a single rate and no jurisdiction of its own gets its stand-in now.
+-- Kept as a function: setup calls the same rule for a store saved later.
+create or replace function tax_make_standins(p_entity uuid default null) returns integer language plpgsql as $$
+declare
+  l record;
+  jid uuid;
+  n integer := 0;
+  st text;
+  cd text;
+begin
+  for l in select x.id, x.entity_id, x.code, x.name, x.tax_rate_bps, upper(coalesce(x.state, x.address->>'state')) state
+             from location x
+            where x.kind in ('store','outlet') and x.status = 'active' and x.tax_rate_bps > 0
+              and (p_entity is null or x.entity_id = p_entity)
+              and not exists (select 1 from tax_jurisdiction j where j.for_location_id = x.id)
+              and not exists (select 1 from tax_area a where a.location_id = x.id and a.active)
+  loop
+    st := l.state;
+    continue when st is null or st !~ '^[A-Z]{2}$';
+    cd := regexp_replace('LOC-' || upper(l.code), '[^A-Z0-9_-]', '-', 'g');
+    if exists (select 1 from tax_jurisdiction j where j.entity_id = l.entity_id and j.code = cd) then
+      cd := cd || '-' || upper(left(l.id::text, 4));
+    end if;
+    insert into tax_jurisdiction (entity_id, code, name, level, state, taxes_delivery, taxes_labor, taxes_warranty, for_location_id, note, created_by)
+    values (l.entity_id, left(cd, 40), left(l.name || ' (single store rate)', 120), 'combined', st, true, true, true, l.id,
+            'The store''s single sales tax rate, kept as one jurisdiction until local ones are set up.', 'migration')
+    returning id into jid;
+    insert into tax_rate (entity_id, jurisdiction_id, rate_bps, effective_from, note, created_by)
+    values (l.entity_id, jid, l.tax_rate_bps, '2000-01-01', 'from the store''s rate', 'migration');
+    insert into tax_area (entity_id, jurisdiction_id, location_id) values (l.entity_id, jid, l.id);
+    n := n + 1;
+  end loop;
+  return n;
+end $$;
+
+select tax_make_standins();

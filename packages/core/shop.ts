@@ -16,6 +16,7 @@ import { priceConfigured, PricingError, type Choice } from "./pricing.ts";
 import { reserveOrder, InventoryError } from "./inventory.ts";
 import { postReceipt, ArError } from "./ar.ts";
 import { PostingError } from "./posting.ts";
+import * as tax from "./tax.ts";
 
 export class ShopError extends Error {}
 
@@ -575,15 +576,16 @@ export function parseCheckout(b: Record<string, unknown>, quoteOnly = false): Ch
 }
 
 type Built = {
-  lines: (Priced & { fulfilFromId: string; taxMinor: bigint; discountMinor: bigint })[];
+  lines: (Priced & { fulfilFromId: string; taxMinor: bigint; discountMinor: bigint; taxRows: tax.TaxRow[] })[];
   coupon: { code: string; label: string; discountMinor: bigint; merchandiseMinor: bigint } | null;
-  fee: { minor: bigint; taxMinor: bigint; label: string } | null;
+  fee: { minor: bigint; taxMinor: bigint; label: string; taxRows: tax.TaxRow[]; cls: tax.ItemClass } | null;
+  place: tax.Place;
   orderLocationId: string; promisedOn: string | null;
   subtotalMinor: bigint; taxMinor: bigint; totalMinor: bigint; rateBps: number;
 };
 
 /** The order a cart would make: lines priced, sources picked, tax and fees. Writes nothing. */
-async function buildOrder(c: Client, site: Site, inp: CheckoutIn): Promise<Built> {
+async function buildOrder(c: Client, site: Site, inp: CheckoutIn, write = false): Promise<Built> {
   need(inp.lines.length > 0, "The cart is empty.");
   const locs = await locationsOf(c, site.entity_id);
   if (inp.fulfillment === "pickup") need(inp.pickupLocationId && site.pickup_location_ids.includes(inp.pickupLocationId) && locs.has(inp.pickupLocationId),
@@ -616,13 +618,15 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn): Promise<Built
       if (p.kind === "stock" && availAt(dc) >= p.qty) later(addBusinessDays(today, inp.fulfillment === "ship" ? site.ship_days : site.delivery_days));
       else if (p.availability.deliverBy) later(new Date(p.availability.deliverBy));
     }
-    lines.push({ ...p, fulfilFromId: from, taxMinor: 0n, discountMinor: 0n });
+    lines.push({ ...p, fulfilFromId: from, taxMinor: 0n, discountMinor: 0n, taxRows: [] });
   }
   const orderLocationId = inp.fulfillment === "pickup" ? inp.pickupLocationId! : site.web_location_id;
-  const rateOf = (id: string | null) => (id ? locs.get(id)?.tax_rate_bps ?? 0 : 0);
-  const rateBps = inp.fulfillment === "pickup" ? rateOf(inp.pickupLocationId)
-    : rateOf(lines[0]?.fulfilFromId ?? null) || rateOf(site.web_location_id) || rateOf(site.tax_location_id);
-  const bp = (m: bigint) => (m * BigInt(rateBps) + 5000n) / 10000n;
+  // Tax the way the register does: by the stack where the goods are handed over -- the pickup
+  // store, or the delivery address (destination sourcing), else the site's tax location.
+  const origin = inp.fulfillment === "pickup" ? inp.pickupLocationId! : (site.tax_location_id ?? lines[0]?.fulfilFromId ?? site.web_location_id);
+  const place = await tax.stackForLine(c, site.entity_id, { storeId: origin, fulfillment: inp.fulfillment,
+    shipTo: inp.address ? { state: inp.address.state, postal: inp.address.postal } : null, write });
+  const rateBps = tax.goodsRate(place.stack);
   // A coupon (the CRM module's) comes off the merchandise, spread over the lines by value, before tax.
   let coupon: Built["coupon"] = null;
   const merch = lines.reduce((a, l) => a + l.unitPriceMinor * BigInt(l.qty), 0n);
@@ -640,28 +644,31 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn): Promise<Built
       left -= l.discountMinor;
     });
   }
-  let sub = 0n, tax = 0n;
+  let sub = 0n, taxTotal = 0n;
   for (const l of lines) {
     const net = l.unitPriceMinor * BigInt(l.qty);
-    l.taxMinor = l.taxable ? bp(net - l.discountMinor) : 0n;
-    sub += net; tax += l.taxMinor;
+    const lt = tax.computeLine(place.stack, { netMinor: net - l.discountMinor, itemClass: tax.classOf(l.kind), taxable: l.taxable, cert: null });
+    l.taxMinor = lt.taxMinor; l.taxRows = lt.rows;
+    sub += net; taxTotal += l.taxMinor;
   }
   let fee: Built["fee"] = null;
   if (inp.fulfillment === "delivery") {
     const free = site.free_delivery_over_minor != null && sub >= BigInt(site.free_delivery_over_minor);
     const m = free ? 0n : BigInt(site.delivery_fee_minor);
-    fee = { minor: m, taxMinor: 0n, label: free ? "Delivery and setup (free on this order)" : "Delivery and setup" };
+    fee = { minor: m, taxMinor: 0n, label: free ? "Delivery and setup (free on this order)" : "Delivery and setup", taxRows: [], cls: "delivery" };
   } else if (inp.fulfillment === "ship") {
-    fee = { minor: BigInt(site.ship_fee_minor), taxMinor: 0n, label: "Parcel shipping" };
+    fee = { minor: BigInt(site.ship_fee_minor), taxMinor: 0n, label: "Parcel shipping", taxRows: [], cls: "delivery" };
   }
-  if (fee && fee.minor > 0n && site.fee_product_id) {
-    const fp = await q<{ taxable: boolean }>(c, `select taxable from product where id = $1 and entity_id = $2`, [site.fee_product_id, site.entity_id]);
-    if (fp[0]?.taxable) fee.taxMinor = bp(fee.minor);
+  if (fee && fee.minor > 0n) {
+    const fp = site.fee_product_id ? await q<{ taxable: boolean; kind: string }>(c, `select taxable, kind from product where id = $1 and entity_id = $2`, [site.fee_product_id, site.entity_id]) : [];
+    fee.cls = tax.classOf(fp[0]?.kind ?? "fee");
+    const ft = tax.computeLine(place.stack, { netMinor: fee.minor, itemClass: fee.cls, taxable: !!fp[0]?.taxable, cert: null });
+    fee.taxMinor = ft.taxMinor; fee.taxRows = ft.rows;
   }
-  tax += fee?.taxMinor ?? 0n;
+  taxTotal += fee?.taxMinor ?? 0n;
   sub += fee?.minor ?? 0n;
   const disc = coupon?.discountMinor ?? 0n;
-  return { lines, coupon, fee, orderLocationId, promisedOn: promised ? iso(promised) : null, subtotalMinor: sub, taxMinor: tax, totalMinor: sub - disc + tax, rateBps };
+  return { lines, coupon, fee, place, orderLocationId, promisedOn: promised ? iso(promised) : null, subtotalMinor: sub, taxMinor: taxTotal, totalMinor: sub - disc + taxTotal, rateBps };
 }
 
 /** Checkout preview: what the order will cost with this fulfillment, from the server's own prices. */
@@ -775,7 +782,7 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
     `select id from sales_order where entity_id = $1 and channel = 'web' and external_ref = $2`, [site.entity_id, inp.cartId]);
   if (prior[0]) return { duplicate: true, order: (await orderView(c, site.entity_id, prior[0].id))! };
 
-  const b = await buildOrder(c, site, inp);
+  const b = await buildOrder(c, site, inp, true);
   need(b.totalMinor > 0n, "There is nothing to pay for.");
   const customerId = await findOrCreateCustomer(c, site.entity_id, inp, inp.pickupLocationId ?? site.tax_location_id ?? site.web_location_id);
   let addressId: string | null = null;
@@ -795,19 +802,21 @@ export async function placeWebOrder(c: Client, site: Site, inp: CheckoutIn, scop
      [`Web order from ${site.display_name}`, inp.notes].filter(Boolean).join(". ")]);
   let seq = 1;
   for (const l of b.lines) {
-    await c.query(`
+    const row = await one<{ id: string }>(c, `
       insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, config, fulfil_from_id, discount_minor)
-      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning id`,
       [site.entity_id, order.id, seq++, l.productId, l.sku, l.description, l.qty, l.unitPriceMinor.toString(), l.taxMinor.toString(),
        JSON.stringify(l.config), l.fulfilFromId, l.discountMinor.toString()]);
+    await tax.writeLineTax(c, site.entity_id, order.id, row.id, l.taxRows, b.place, tax.classOf(l.kind));
   }
   if (b.fee && b.fee.minor > 0n) {
     const fp = site.fee_product_id ? await q<{ sku: string }>(c, `select sku from product where id = $1 and entity_id = $2`, [site.fee_product_id, site.entity_id]) : [];
-    await c.query(`
+    const row = await one<{ id: string }>(c, `
       insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, fulfil_from_id)
-      values ($1,$2,$3,$4,$5,$6,1,$7,$8,$9)`,
+      values ($1,$2,$3,$4,$5,$6,1,$7,$8,$9) returning id`,
       [site.entity_id, order.id, seq++, fp[0] ? site.fee_product_id : null, fp[0]?.sku ?? "WEB-FEE", b.fee.label,
        b.fee.minor.toString(), b.fee.taxMinor.toString(), b.orderLocationId]);
+    await tax.writeLineTax(c, site.entity_id, order.id, row.id, b.fee.taxRows, b.place, b.fee.cls);
   }
   await c.query(`select sales_order_retotal($1) /* unscoped: the order id was just created for this entity */`, [order.id]);
   const tot = await one<{ total_minor: string }>(c, `select total_minor from sales_order where id = $1 and entity_id = $2`, [order.id, site.entity_id]);

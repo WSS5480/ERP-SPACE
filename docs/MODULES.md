@@ -114,10 +114,17 @@ jurisdiction, so one jurisdiction always gives the old rate. Each line's tax
 is kept per jurisdiction in `sales_order_line_tax`; `ar.invoiceFulfilment`
 marks the rows posted when 2100 is credited (allocating lines written by other
 doors), and POS returns write reversing rows. `tax.filing` ties the period to
-GL 2100. Certificates (`tax_exemption_certificate`) belong to a customer, name
+GL 2100 (everything except payments of the tax to the state, which are shown
+apart). Certificates (`tax_exemption_certificate`) belong to a customer, name
 a state and may expire; an expired one is refused. The web store and service
-still read `location.tax_rate_bps`, which tax.ts keeps equal to the store's
-stack.
+price tax through `stackForLine`/`computeLine` like POS. A line charged by
+another door at a different amount keeps both (`tax_minor` charged,
+`owed_minor` owed) and the filing flags it as tax under/over-collected. A ZIP
+the state's local jurisdictions do not cover is taxed at the selling store's
+stack (same state) or the state alone, with a note on the line and the ZIP
+listed in the filing. Migration 0037 gives every existing store with a rate
+its single-rate stand-in (`tax_make_standins()`), so a later statewide
+jurisdiction never lowers it.
 
 POS: `pos_setting.special_order_deposit_bps` (50%) and `stocked_deposit_bps`
 (0%) are the least a sale must have paid at checkout; a store manager may go

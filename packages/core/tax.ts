@@ -47,7 +47,9 @@ export type Juris = { id: string; code: string; name: string; level: string; sta
   taxesDelivery: boolean; taxesLabor: boolean; taxesWarranty: boolean };
 export type Cert = { id: string; number: string; state: string; reason: string; expiresOn: string | null };
 export type Sourced = "origin" | "destination";
-export type TaxRow = { jurisdictionId: string; rateBps: number; taxableMinor: bigint; exemptMinor: bigint; exemptReason: string | null; taxMinor: bigint };
+export type TaxRow = { jurisdictionId: string; rateBps: number; taxableMinor: bigint; exemptMinor: bigint; exemptReason: string | null; taxMinor: bigint;
+  /** what the jurisdiction is owed; equals taxMinor unless another door charged a different amount */
+  owedMinor?: bigint };
 
 // ================================================================= settings
 
@@ -79,14 +81,34 @@ async function jurisdictionsIn(c: Client, entityId: string, ids: string[], on: s
     taxesDelivery: x.taxes_delivery, taxesLabor: x.taxes_labor, taxesWarranty: x.taxes_warranty }));
 }
 
+/** These jurisdictions as a stack, at the rates in force on the day (re-taxing a draft at the same places). */
+export async function stackJurisdictions(c: Client, entityId: string, ids: string[], on = today()): Promise<Juris[]> {
+  const s = await jurisdictionsIn(c, entityId, ids, on);
+  return ids.map((id) => s.find((j) => j.id === id)).filter(Boolean) as Juris[];
+}
+
 /** The stack at a state and postal code: statewide jurisdictions plus those of that postal code. */
 export async function stackForPlace(c: Client, entityId: string, state: string | null, postal: string | null, on = today()): Promise<Juris[]> {
+  return (await placeStack(c, entityId, state, postal, on)).stack;
+}
+
+/**
+ * The stack at a place, and whether its ZIP is a gap: the state has local
+ * jurisdictions set up by ZIP but none for this one.
+ */
+export async function placeStack(c: Client, entityId: string, state: string | null, postal: string | null, on = today()): Promise<{ stack: Juris[]; uncovered: boolean; postal: string }> {
   const st = String(state ?? "").trim().toUpperCase();
-  if (!/^[A-Z]{2}$/.test(st)) return [];
   const zip = String(postal ?? "").trim().slice(0, 5);
-  const ids = await q<{ id: string }>(c, `select distinct a.jurisdiction_id id from tax_area a
+  if (!/^[A-Z]{2}$/.test(st)) return { stack: [], uncovered: false, postal: zip };
+  const ids = await q<{ id: string; local: boolean }>(c, `select distinct a.jurisdiction_id id, a.postal is not null local from tax_area a
      where a.entity_id = $1 and a.active and a.location_id is null and a.state = $2 and (a.postal is null or a.postal = $3)`, [entityId, st, zip]);
-  return jurisdictionsIn(c, entityId, ids.map((x) => x.id), on);
+  const stack = await jurisdictionsIn(c, entityId, ids.map((x) => x.id), on);
+  let uncovered = false;
+  if (stack.length && !ids.some((x) => x.local)) {
+    const locals = await q(c, `select 1 from tax_area a where a.entity_id = $1 and a.active and a.location_id is null and a.state = $2 and a.postal is not null limit 1`, [entityId, st]);
+    uncovered = locals.length > 0;
+  }
+  return { stack, uncovered, postal: zip };
 }
 
 /** The stack at a customer's address, or empty when its state has nothing set up. */
@@ -96,10 +118,20 @@ export async function stackForAddress(c: Client, entityId: string, addressId: st
   return stackForPlace(c, entityId, a[0].state, a[0].postal, on);
 }
 
+type LocRow = { code: string; name: string; state: string | null; addr_state: string | null; postal: string | null; tax_rate_bps: number };
+async function locationRow(c: Client, entityId: string, locationId: string): Promise<LocRow> {
+  const loc = await q<LocRow>(c, `
+    select code, name, state, address->>'state' addr_state, address->>'postal' postal, tax_rate_bps from location where id = $1 and entity_id = $2`, [locationId, entityId]);
+  need(loc.length, "no such store");
+  return loc[0];
+}
+const stateOf = (l: LocRow) => { const s = String(l.state || l.addr_state || "").trim().toUpperCase(); return /^[A-Z]{2}$/.test(s) ? s : null; };
+
 /**
  * The stack at a store: jurisdictions named for the location, else those of
  * its own address, else its single location rate as a stand-in jurisdiction
- * (made now when `write`, else shown as it would be).
+ * (made now when `write`, else shown as it would be). A store with no state
+ * cannot be taxed until it has one.
  */
 export async function stackForLocation(c: Client, entityId: string, locationId: string, on = today(), write = true): Promise<Juris[]> {
   const named = await q<{ id: string }>(c, `select distinct jurisdiction_id id from tax_area where entity_id = $1 and active and location_id = $2`, [entityId, locationId]);
@@ -107,21 +139,19 @@ export async function stackForLocation(c: Client, entityId: string, locationId: 
     const s = await jurisdictionsIn(c, entityId, named.map((x) => x.id), on);
     if (s.length) return s;
   }
-  const loc = await q<{ code: string; name: string; state: string | null; addr_state: string | null; postal: string | null; tax_rate_bps: number }>(c, `
-    select code, name, state, address->>'state' addr_state, address->>'postal' postal, tax_rate_bps from location where id = $1 and entity_id = $2`, [locationId, entityId]);
-  need(loc.length, "no such store");
-  const l = loc[0];
+  const l = await locationRow(c, entityId, locationId);
   const placed = await stackForPlace(c, entityId, l.addr_state || l.state, l.postal, on);
   if (placed.length) return placed;
-  const state = (l.state || l.addr_state || "ZZ").toUpperCase().slice(0, 2);
-  const standIn: Juris = { id: "", code: `LOC-${l.code}`.slice(0, 40), name: `${l.name} (single store rate)`, level: "combined", state: /^[A-Z]{2}$/.test(state) ? state : "ZZ",
+  const state = stateOf(l);
+  const standIn: Juris = { id: "", code: `LOC-${l.code}`.slice(0, 40), name: `${l.name} (single store rate)`, level: "combined", state: state ?? "",
     rateBps: l.tax_rate_bps, taxesDelivery: true, taxesLabor: true, taxesWarranty: true };
-  if (!write) return [standIn];
+  if (!write) return state ? [standIn] : [];
+  need(state, `${l.name} has no state set, so its sales tax cannot be worked out; add the state to the location in Business setup first`);
   standIn.id = await ensureStandIn(c, entityId, locationId, standIn, l.tax_rate_bps);
   return jurisdictionsIn(c, entityId, [standIn.id], on).then((s) => s.length ? s : [standIn]);
 }
 
-/** A store with no jurisdictions keeps its single rate as one 'combined' jurisdiction, made the first time it is needed. */
+/** A store with no jurisdictions keeps its single rate as one 'combined' jurisdiction. */
 async function ensureStandIn(c: Client, entityId: string, locationId: string, j: Juris, rate: number): Promise<string> {
   const have = await q<{ id: string }>(c, `select id from tax_jurisdiction where entity_id = $1 and for_location_id = $2`, [entityId, locationId]);
   if (have.length) {
@@ -142,16 +172,54 @@ async function ensureStandIn(c: Client, entityId: string, locationId: string, j:
   return row.id;
 }
 
-/** Where a line is taxed: the store, or the ship-to address when sourcing by destination and the address is covered. */
-export async function stackForLine(c: Client, entityId: string, e: { storeId: string; fulfillment: string; shipAddressId: string | null; on?: string; sourcing?: Sourced; write?: boolean }):
-  Promise<{ stack: Juris[]; sourced: Sourced }> {
+/**
+ * A store saved with a single rate that its address's jurisdictions do not
+ * give keeps that rate as its own stand-in, so a later statewide
+ * jurisdiction cannot quietly lower it. Same rule as the migration.
+ */
+export async function keepStoreRate(c: Client, entityId: string, locationId: string) {
+  const named = await q(c, `select 1 from tax_area where entity_id = $1 and active and location_id = $2`, [entityId, locationId]);
+  if (named.length) return false;
+  const l = await locationRow(c, entityId, locationId);
+  if (!l.tax_rate_bps || !stateOf(l)) return false;
+  const placed = await stackForPlace(c, entityId, l.addr_state || l.state, l.postal);
+  if (placed.length && goodsRate(placed) === l.tax_rate_bps) return false;
+  await ensureStandIn(c, entityId, locationId, { id: "", code: `LOC-${l.code}`.slice(0, 40), name: `${l.name} (single store rate)`, level: "combined", state: stateOf(l)!,
+    rateBps: l.tax_rate_bps, taxesDelivery: true, taxesLabor: true, taxesWarranty: true }, l.tax_rate_bps);
+  return true;
+}
+
+export type Place = { stack: Juris[]; sourced: Sourced; note: string | null; uncoveredPostal: string | null };
+
+/**
+ * Where a line is taxed: the store, or the ship-to address when sourcing by
+ * destination and its state is set up. A ZIP the state's local jurisdictions
+ * do not cover is taxed at the selling store's stack when the store is in
+ * that state, else at the state alone; either way the line says so.
+ */
+export async function stackForLine(c: Client, entityId: string, e: { storeId: string; fulfillment: string; shipAddressId?: string | null;
+  shipTo?: { state: string | null; postal: string | null } | null; on?: string; sourcing?: Sourced; write?: boolean }): Promise<Place> {
   const on = e.on ?? today();
   const src = e.sourcing ?? await sourcing(c, entityId);
-  if ((e.fulfillment === "delivery" || e.fulfillment === "ship") && src === "destination" && e.shipAddressId) {
-    const s = await stackForAddress(c, entityId, e.shipAddressId, on);
-    if (s.length) return { stack: s, sourced: "destination" };
+  const away = e.fulfillment === "delivery" || e.fulfillment === "ship";
+  if (away && src === "destination" && (e.shipAddressId || e.shipTo)) {
+    let to = e.shipTo ?? null;
+    if (!to && e.shipAddressId) to = (await q<{ state: string; postal: string }>(c, `select state, postal from customer_address where id = $1 and entity_id = $2`,
+      [e.shipAddressId, entityId]))[0] ?? null;
+    if (to) {
+      const p = await placeStack(c, entityId, to.state, to.postal, on);
+      if (p.stack.length && !p.uncovered) return { stack: p.stack, sourced: "destination", note: null, uncoveredPostal: null };
+      if (p.stack.length && p.uncovered) {
+        const store = await locationRow(c, entityId, e.storeId);
+        const st = String(to.state ?? "").toUpperCase();
+        if (stateOf(store) === st)
+          return { stack: await stackForLocation(c, entityId, e.storeId, on, e.write ?? true), sourced: "origin", uncoveredPostal: p.postal,
+            note: `ZIP ${p.postal} has no local tax set up; taxed at the ${store.name} store's rates` };
+        return { stack: p.stack, sourced: "destination", uncoveredPostal: p.postal, note: `ZIP ${p.postal} has no local tax set up; state tax only` };
+      }
+    }
   }
-  return { stack: await stackForLocation(c, entityId, e.storeId, on, e.write ?? true), sourced: "origin" };
+  return { stack: await stackForLocation(c, entityId, e.storeId, on, e.write ?? true), sourced: "origin", note: null, uncoveredPostal: null };
 }
 
 /** The combined rate a place charges on taxable goods today (what location.tax_rate_bps shows). */
@@ -198,12 +266,15 @@ export function computeLine(stack: Juris[], e: { netMinor: bigint; itemClass: It
   return { rows, taxMinor: rows.reduce((a, r) => a + r.taxMinor, 0n) };
 }
 
-export async function writeLineTax(c: Client, entityId: string, orderId: string, lineId: string, rows: TaxRow[], sourced: Sourced, cls: ItemClass) {
+export async function writeLineTax(c: Client, entityId: string, orderId: string, lineId: string, rows: TaxRow[],
+  place: Sourced | { sourced: Sourced; note?: string | null; uncoveredPostal?: string | null }, cls: ItemClass) {
+  const p = typeof place === "string" ? { sourced: place, note: null, uncoveredPostal: null } : place;
   for (const r of rows) {
     if (!r.jurisdictionId) continue;
     await c.query(`insert into sales_order_line_tax (entity_id, sales_order_id, sales_order_line_id, jurisdiction_id, kind, sourced, item_class, rate_bps,
-        taxable_minor, exempt_minor, exempt_reason, tax_minor) values ($1,$2,$3,$4,'sale',$5,$6,$7,$8,$9,$10,$11)`,
-      [entityId, orderId, lineId, r.jurisdictionId, sourced, cls, r.rateBps, r.taxableMinor.toString(), r.exemptMinor.toString(), r.exemptReason, r.taxMinor.toString()]);
+        taxable_minor, exempt_minor, exempt_reason, tax_minor, owed_minor, note, uncovered_postal) values ($1,$2,$3,$4,'sale',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+      [entityId, orderId, lineId, r.jurisdictionId, p.sourced, cls, r.rateBps, r.taxableMinor.toString(), r.exemptMinor.toString(), r.exemptReason,
+       r.taxMinor.toString(), (r.owedMinor ?? r.taxMinor).toString(), p.note ?? null, p.uncoveredPostal ?? null]);
   }
 }
 
@@ -284,30 +355,40 @@ async function lineFacts(c: Client, entityId: string, lineIds: string[]): Promis
 }
 
 /**
- * A line written by another door (the web store, service, an import) carries
- * its tax as one amount. Spread it over the stack where it was taxed, by the
- * rates that tax it, so every dollar in 2100 belongs to a jurisdiction.
+ * A line written by another door (an import, a hand-made order) carries its
+ * tax as one amount. Its rows say what each jurisdiction is owed (the stack
+ * where it was handed over) and what was actually charged. When the two
+ * differ, the charge is spread by what each is owed, so 2100 still ties,
+ * and the difference stays on the rows for the filing to flag as tax
+ * under- or over-collected. Nothing is spread silently.
  */
 async function allocate(c: Client, entityId: string, l: LineFacts) {
   const net = BigInt(Math.round(Number(l.qty) * Number(l.unit_price_minor))) - BigInt(l.discount_minor);
-  const tax = BigInt(l.tax_minor);
-  const { stack, sourced } = await stackForLine(c, entityId, { storeId: l.location_id, fulfillment: l.fulfillment, shipAddressId: l.ship_address_id });
+  const charged = BigInt(l.tax_minor);
+  const place = await stackForLine(c, entityId, { storeId: l.location_id, fulfillment: l.fulfillment, shipAddressId: l.ship_address_id });
   const cls = classOf(l.kind);
   const taxable = l.taxable !== false && !!l.kind;
-  const why = stack.map((j) => exemptionFor(j, cls, taxable, null));
-  let rows: TaxRow[];
-  if (tax === 0n) {
-    const reason = l.exempt_ref && taxable ? "other_certificate" : null;
-    rows = stack.map((j, i) => ({ jurisdictionId: j.id, rateBps: j.rateBps, taxableMinor: 0n, exemptMinor: net,
-      exemptReason: reason ?? why[i] ?? "not_taxed", taxMinor: 0n }));
-  } else {
-    let w = stack.map((j, i) => (why[i] ? 0n : BigInt(j.rateBps)));
-    if (w.every((x) => x === 0n)) w = stack.map((j) => BigInt(j.rateBps));
-    const parts = split(tax, w);
-    rows = stack.map((j, i) => ({ jurisdictionId: j.id, rateBps: j.rateBps, taxableMinor: w[i] || parts[i] ? net : 0n,
-      exemptMinor: w[i] || parts[i] ? 0n : net, exemptReason: w[i] || parts[i] ? null : (why[i] ?? "not_taxed"), taxMinor: parts[i] }));
+  let cert: Cert | null = null;
+  if (l.exempt_ref) {
+    const r = await q<{ id: string; number: string; state: string; reason: string; expires_on: string | null }>(c, `select id, number, state, reason, expires_on::text
+       from tax_exemption_certificate where entity_id = $1 and number = $2 order by created_at desc limit 1`, [entityId, l.exempt_ref]);
+    cert = r[0] ? { id: r[0].id, number: r[0].number, state: r[0].state, reason: r[0].reason, expiresOn: r[0].expires_on }
+      : { id: "", number: l.exempt_ref, state: place.stack[0]?.state ?? "", reason: "other", expiresOn: null };
   }
-  await writeLineTax(c, entityId, l.sales_order_id, l.id, rows, sourced, cls);
+  const owed = computeLine(place.stack, { netMinor: net, itemClass: cls, taxable, cert });
+  let rows: TaxRow[] = owed.rows.map((r) => ({ ...r, owedMinor: r.taxMinor }));
+  if (charged !== owed.taxMinor) {
+    let w = owed.rows.map((r) => (r.taxMinor < 0n ? -r.taxMinor : r.taxMinor));
+    if (w.every((x) => x === 0n)) w = place.stack.map((j) => (exemptionFor(j, cls, true, null) ? 0n : BigInt(j.rateBps)));
+    if (w.every((x) => x === 0n)) w = place.stack.map((j) => BigInt(j.rateBps));
+    const parts = split(charged, w);
+    rows = owed.rows.map((r, i) => {
+      const taxed = parts[i] !== 0n || r.taxMinor !== 0n;
+      return { ...r, taxMinor: parts[i], owedMinor: r.taxMinor, taxableMinor: taxed ? net : 0n, exemptMinor: taxed ? 0n : net,
+        exemptReason: taxed ? null : (r.exemptReason ?? "not_taxed") };
+    });
+  }
+  await writeLineTax(c, entityId, l.sales_order_id, l.id, rows, place, cls);
 }
 
 /** Make sure each line has its per-jurisdiction rows. */
@@ -329,25 +410,37 @@ export async function postLines(c: Client, entityId: string, lineIds: string[], 
 
 /**
  * A return reverses the original line's jurisdictions, in proportion to the
- * quantity back. The total is what the line's tax gives for that share (as
- * it always was), split over the same jurisdictions by what each collected.
+ * quantity back. Each jurisdiction gives back at most what it still holds
+ * from that line (earlier returns counted), and the last unit back takes
+ * whatever is left, so a line's tax never comes back more than once.
  */
-export async function reverseLine(c: Client, entityId: string, e: { originalLineId: string; returnOrderId: string; returnLineId: string; qty: number; originalQty: number; netMinor: bigint }) {
+export async function reverseLine(c: Client, entityId: string, e: { originalLineId: string; returnOrderId: string; returnLineId: string; qty: number; originalQty: number;
+  netMinor: bigint; qtyLeft?: number }) {
   await ensureRows(c, entityId, [e.originalLineId]);
-  const rows = await q<{ id: string; jurisdiction_id: string; sourced: string; item_class: string; rate_bps: number; taxable_minor: string; tax_minor: string; exempt_reason: string | null }>(c, `
-    select id, jurisdiction_id, sourced, item_class, rate_bps, taxable_minor, tax_minor, exempt_reason from sales_order_line_tax
-     where entity_id = $1 and sales_order_line_id = $2 and kind = 'sale' order by created_at, id`, [entityId, e.originalLineId]);
-  const lineTax = rows.reduce((a, r) => a + BigInt(r.tax_minor), 0n);
-  const total = BigInt(Math.round(Number(lineTax) * e.qty / e.originalQty));
-  const parts = split(total, rows.map((r) => BigInt(r.tax_minor)));
+  const rows = await q<{ id: string; jurisdiction_id: string; sourced: string; item_class: string; rate_bps: number; taxable_minor: string; tax_minor: string; owed_minor: string;
+    exempt_reason: string | null; back_tax: string; back_owed: string }>(c, `
+    select t.id, t.jurisdiction_id, t.sourced, t.item_class, t.rate_bps, t.taxable_minor, t.tax_minor, t.owed_minor, t.exempt_reason,
+           coalesce((select -sum(r.tax_minor) from sales_order_line_tax r where r.entity_id = t.entity_id and r.original_id = t.id), 0)::text back_tax,
+           coalesce((select -sum(r.owed_minor) from sales_order_line_tax r where r.entity_id = t.entity_id and r.original_id = t.id), 0)::text back_owed
+      from sales_order_line_tax t
+     where t.entity_id = $1 and t.sales_order_line_id = $2 and t.kind = 'sale' order by t.created_at, t.id`, [entityId, e.originalLineId]);
+  const last = e.qtyLeft !== undefined && e.qty >= e.qtyLeft;
+  const share = (col: "tax_minor" | "owed_minor", back: "back_tax" | "back_owed") => {
+    const left = rows.map((r) => BigInt(r[col]) - BigInt(r[back]));
+    if (last) return left;
+    const lineTotal = rows.reduce((a, r) => a + BigInt(r[col]), 0n);
+    const parts = split(BigInt(Math.round(Number(lineTotal) * e.qty / e.originalQty)), rows.map((r) => BigInt(r[col])));
+    return parts.map((x, i) => (left[i] >= 0n ? (x > left[i] ? left[i] : x < 0n ? 0n : x) : (x < left[i] ? left[i] : x > 0n ? 0n : x)));
+  };
+  const tx = share("tax_minor", "back_tax"), ow = share("owed_minor", "back_owed");
   for (const [i, r] of rows.entries()) {
-    const taxed = BigInt(r.taxable_minor) !== 0n || parts[i] !== 0n;
+    const taxed = BigInt(r.taxable_minor) !== 0n || tx[i] !== 0n;
     await c.query(`insert into sales_order_line_tax (entity_id, sales_order_id, sales_order_line_id, jurisdiction_id, kind, sourced, item_class, rate_bps,
-        taxable_minor, exempt_minor, exempt_reason, tax_minor, original_id) values ($1,$2,$3,$4,'return',$5,$6,$7,$8,$9,$10,$11,$12)`,
+        taxable_minor, exempt_minor, exempt_reason, tax_minor, owed_minor, original_id) values ($1,$2,$3,$4,'return',$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
       [entityId, e.returnOrderId, e.returnLineId, r.jurisdiction_id, r.sourced, r.item_class, r.rate_bps, (taxed ? -e.netMinor : 0n).toString(),
-       (taxed ? 0n : -e.netMinor).toString(), taxed ? null : (r.exempt_reason ?? "not_taxed"), (-parts[i]).toString(), r.id]);
+       (taxed ? 0n : -e.netMinor).toString(), taxed ? null : (r.exempt_reason ?? "not_taxed"), (-tx[i]).toString(), (-ow[i]).toString(), r.id]);
   }
-  return total;
+  return tx.reduce((a, b) => a + b, 0n);
 }
 
 /** The return reached 2100: its rows are posted on that day under that entry. */
@@ -360,7 +453,7 @@ export async function postReturn(c: Client, entityId: string, returnOrderId: str
 export async function orderTax(c: Client, entityId: string, orderId: string) {
   return q(c, `
     select j.code, j.name, j.level, j.state, t.rate_bps, t.sourced, sum(t.taxable_minor)::text taxable_minor, sum(t.exempt_minor)::text exempt_minor,
-           sum(t.tax_minor)::text tax_minor, string_agg(distinct t.exempt_reason, ', ') exempt_reasons
+           sum(t.tax_minor)::text tax_minor, string_agg(distinct t.exempt_reason, ', ') exempt_reasons, string_agg(distinct t.note, '; ') notes
       from sales_order_line_tax t join tax_jurisdiction j on j.id = t.jurisdiction_id and j.entity_id = t.entity_id
       join sales_order_line l on l.id = t.sales_order_line_id and l.entity_id = t.entity_id
      where t.entity_id = $1 and t.sales_order_id = $2 and l.line_status <> 'cancelled'
@@ -393,6 +486,7 @@ export async function taxSetup(c: Client, entityId: string) {
 export async function saveJurisdiction(c: Client, scope: Scope, e: { id?: string | null; code: string; name: string; level: string; state: string;
   taxesDelivery: boolean; taxesLabor: boolean; taxesWarranty: boolean; filingRef?: string | null; note?: string | null; active?: boolean;
   rateBps?: number; effectiveFrom?: string }) {
+  const before = await storeRates(c, scope.entityId);
   const code = String(e.code ?? "").trim().toUpperCase();
   need(/^[A-Z0-9][A-Z0-9_-]{1,39}$/.test(code), "a jurisdiction code is 2 to 40 letters, digits or dashes, like TX-PALESTINE");
   need(String(e.name ?? "").trim().length >= 2, "name the jurisdiction as it appears on the return");
@@ -417,12 +511,13 @@ export async function saveJurisdiction(c: Client, scope: Scope, e: { id?: string
   }
   await audit(c, scope, { table: "tax_jurisdiction", rowId: id!, action: e.id ? "update" : "insert", after: { code, level: e.level, state: st,
     delivery: !!e.taxesDelivery, labor: !!e.taxesLabor, warranty: !!e.taxesWarranty, rateBps: e.rateBps } });
-  await refreshLocationRates(c, scope.entityId);
+  await refreshLocationRates(c, scope.entityId, before);
   return { id };
 }
 
 /** A new rate from a day on: the rate in force before it ends the day before. */
 export async function addRate(c: Client, scope: Scope, jurisdictionId: string, e: { rateBps: number; effectiveFrom: string; note?: string | null }) {
+  const before = await storeRates(c, scope.entityId);
   need(Number.isInteger(e.rateBps) && e.rateBps >= 0 && e.rateBps <= 2000, "the rate must be between 0% and 20%");
   need(isDay(e.effectiveFrom), "say from which day the rate applies");
   const j = await q(c, `select id from tax_jurisdiction where id = $1 and entity_id = $2`, [jurisdictionId, scope.entityId]);
@@ -434,17 +529,18 @@ export async function addRate(c: Client, scope: Scope, jurisdictionId: string, e
   const r = await one<{ id: string }>(c, `insert into tax_rate (entity_id, jurisdiction_id, rate_bps, effective_from, note, created_by) values ($1,$2,$3,$4,$5,$6) returning id`,
     [scope.entityId, jurisdictionId, e.rateBps, e.effectiveFrom, e.note ?? null, scope.actor.label]);
   await audit(c, scope, { table: "tax_rate", rowId: r.id, action: "insert", after: { jurisdictionId, rateBps: e.rateBps, from: e.effectiveFrom } });
-  await refreshLocationRates(c, scope.entityId);
+  await refreshLocationRates(c, scope.entityId, before);
   return { id: r.id };
 }
 
 /** Where a jurisdiction applies: a whole state, one postal code, or one store. Taking an area off keeps its row (inactive). */
 export async function saveArea(c: Client, scope: Scope, e: { jurisdictionId: string; locationId?: string | null; state?: string | null; postal?: string | null; remove?: boolean; id?: string | null }) {
+  const before = await storeRates(c, scope.entityId);
   if (e.remove) {
     const r = await c.query(`update tax_area set active = false where id = $1 and entity_id = $2 and active`, [e.id, scope.entityId]);
     need(r.rowCount, "no such area");
     await audit(c, scope, { table: "tax_area", rowId: e.id!, action: "update", after: { active: false } });
-    await refreshLocationRates(c, scope.entityId);
+    await refreshLocationRates(c, scope.entityId, before);
     return { ok: true };
   }
   const j = await q<{ state: string }>(c, `select state from tax_jurisdiction where id = $1 and entity_id = $2`, [e.jurisdictionId, scope.entityId]);
@@ -466,21 +562,39 @@ export async function saveArea(c: Client, scope: Scope, e: { jurisdictionId: str
   const r = await one<{ id: string }>(c, `insert into tax_area (entity_id, jurisdiction_id, location_id, state, postal) values ($1,$2,$3,$4,$5) returning id`,
     [scope.entityId, e.jurisdictionId, loc, st, zip]);
   await audit(c, scope, { table: "tax_area", rowId: r.id, action: "insert", after: { jurisdictionId: e.jurisdictionId, locationId: loc, state: st, postal: zip } });
-  await refreshLocationRates(c, scope.entityId);
+  await refreshLocationRates(c, scope.entityId, before);
   return { id: r.id };
+}
+
+/** What each store's stack charges on goods today, before a change (null: it is on its own single rate). */
+export async function storeRates(c: Client, entityId: string): Promise<Map<string, number | null>> {
+  const locs = await q<{ id: string }>(c, `select id from location where entity_id = $1 and status = 'active' and kind in ('store','outlet')`, [entityId]);
+  const out = new Map<string, number | null>();
+  for (const l of locs) {
+    const s = await stackForLocation(c, entityId, l.id, today(), false);
+    out.set(l.id, s.length === 1 && s[0].level === "combined" ? null : s.length ? goodsRate(s) : null);
+  }
+  return out;
 }
 
 /**
  * Keep each store's single rate column showing what its stack charges on
- * goods today (the web store and service read it). A store whose stack is
- * its own stand-in is left alone: there the column is the source.
+ * goods today (the web store's preview and the receipts read it). A store
+ * follows its stack only if it already did before the change; one that was
+ * on its own rate (no stand-in yet, as on a database from before this
+ * module) keeps that rate as a stand-in instead of being lowered or raised.
  */
-export async function refreshLocationRates(c: Client, entityId: string) {
-  const locs = await q<{ id: string }>(c, `select id from location where entity_id = $1 and status = 'active' and kind in ('store','outlet')`, [entityId]);
+export async function refreshLocationRates(c: Client, entityId: string, before?: Map<string, number | null>) {
+  const locs = await q<{ id: string; tax_rate_bps: number }>(c, `select id, tax_rate_bps from location where entity_id = $1 and status = 'active' and kind in ('store','outlet')`, [entityId]);
   for (const l of locs) {
     const s = await stackForLocation(c, entityId, l.id, today(), false);
-    if (s.length === 1 && (s[0].level === "combined")) continue;
-    await c.query(`update location set tax_rate_bps = $3 where id = $1 and entity_id = $2 and tax_rate_bps <> $3`, [l.id, entityId, goodsRate(s)]);
+    if (!s.length || (s.length === 1 && s[0].level === "combined")) continue;
+    const now = goodsRate(s);
+    if (now === l.tax_rate_bps) continue;
+    const was = before?.get(l.id);
+    const following = before ? was === l.tax_rate_bps : false;
+    if (!following && l.tax_rate_bps > 0) { await keepStoreRate(c, entityId, l.id); continue; }
+    await c.query(`update location set tax_rate_bps = $3 where id = $1 and entity_id = $2`, [l.id, entityId, now]);
   }
 }
 
@@ -509,19 +623,25 @@ export async function derivedRate(c: Client, entityId: string, locationId: strin
 
 export type FilingRow = { jurisdictionId: string; code: string; name: string; level: string; state: string; filingRef: string | null;
   grossMinor: bigint; exemptMinor: bigint; exemptBy: Record<string, bigint>; taxableMinor: bigint; taxMinor: bigint;
-  returnsMinor: bigint; returnsTaxableMinor: bigint; returnsTaxMinor: bigint; netTaxMinor: bigint };
+  returnsMinor: bigint; returnsTaxableMinor: bigint; returnsTaxMinor: bigint; netTaxMinor: bigint;
+  /** what the jurisdiction is owed, net of returns; more than netTaxMinor means tax was under-collected */
+  owedMinor: bigint; underCollectedMinor: bigint };
 
 /**
  * The filing for a period: per jurisdiction, gross sales, exempt sales by
  * reason, taxable sales, tax collected and returns, on the day each reached
- * the ledger. It ties to GL 2100's sales and returns activity in the same
- * days; any difference is reported, never hidden.
+ * the ledger, with any tax under- or over-collected against what was owed
+ * and the ZIPs no local jurisdiction covered. It ties to everything in GL
+ * 2100 for those days except payments of the tax to the state (vendor bills
+ * and payments debiting 2100), which are shown on their own line; any
+ * difference is reported, never hidden.
  */
 export async function filing(c: Client, entityId: string, from: string, to: string) {
   need(isDay(from) && isDay(to), "pick the period: a first and a last day");
   need(from <= to, "the period ends before it starts");
-  const rows = await q<{ jurisdiction_id: string; kind: string; exempt_reason: string | null; taxable: string; exempt: string; tax: string }>(c, `
-    select t.jurisdiction_id, t.kind, t.exempt_reason, sum(t.taxable_minor)::text taxable, sum(t.exempt_minor)::text exempt, sum(t.tax_minor)::text tax
+  const rows = await q<{ jurisdiction_id: string; kind: string; exempt_reason: string | null; taxable: string; exempt: string; tax: string; owed: string }>(c, `
+    select t.jurisdiction_id, t.kind, t.exempt_reason, sum(t.taxable_minor)::text taxable, sum(t.exempt_minor)::text exempt, sum(t.tax_minor)::text tax,
+           sum(t.owed_minor)::text owed
       from sales_order_line_tax t where t.entity_id = $1 and t.posted_on between $2::date and $3::date
      group by t.jurisdiction_id, t.kind, t.exempt_reason`, [entityId, from, to]);
   const jur = await q<{ id: string; code: string; name: string; level: string; state: string; filing_ref: string | null }>(c, `
@@ -532,9 +652,11 @@ export async function filing(c: Client, entityId: string, from: string, to: stri
     const mine = rows.filter((r) => r.jurisdiction_id === j.id);
     if (!mine.length) continue;
     const f: FilingRow = { jurisdictionId: j.id, code: j.code, name: j.name, level: j.level, state: j.state, filingRef: j.filing_ref,
-      grossMinor: 0n, exemptMinor: 0n, exemptBy: {}, taxableMinor: 0n, taxMinor: 0n, returnsMinor: 0n, returnsTaxableMinor: 0n, returnsTaxMinor: 0n, netTaxMinor: 0n };
+      grossMinor: 0n, exemptMinor: 0n, exemptBy: {}, taxableMinor: 0n, taxMinor: 0n, returnsMinor: 0n, returnsTaxableMinor: 0n, returnsTaxMinor: 0n, netTaxMinor: 0n,
+      owedMinor: 0n, underCollectedMinor: 0n };
     for (const r of mine) {
       const tx = BigInt(r.taxable), ex = BigInt(r.exempt), tax = BigInt(r.tax);
+      f.owedMinor += BigInt(r.owed);
       if (r.kind === "sale") {
         f.grossMinor += tx + ex; f.taxableMinor += tx; f.exemptMinor += ex; f.taxMinor += tax;
         if (ex !== 0n) f.exemptBy[r.exempt_reason ?? "not_taxed"] = (f.exemptBy[r.exempt_reason ?? "not_taxed"] ?? 0n) + ex;
@@ -543,24 +665,45 @@ export async function filing(c: Client, entityId: string, from: string, to: stri
       }
     }
     f.netTaxMinor = f.taxMinor + f.returnsTaxMinor;
+    f.underCollectedMinor = f.owedMinor - f.netTaxMinor;
     out.push(f);
   }
-  const gl = await one<{ sales: string; other: string }>(c, `
+  const gl = await one<{ sales: string; other: string; remitted: string }>(c, `
     select coalesce(sum(jl.credit_minor - jl.debit_minor) filter (where je.source_type in ('sale','refund')), 0)::text sales,
-           coalesce(sum(jl.credit_minor - jl.debit_minor) filter (where je.source_type not in ('sale','refund')), 0)::text other
+           coalesce(sum(jl.credit_minor - jl.debit_minor) filter (where je.source_type not in ('sale','refund')
+             and not (je.source_type in ('invoice','payment') and jl.debit_minor > 0)), 0)::text other,
+           coalesce(sum(jl.debit_minor) filter (where je.source_type in ('invoice','payment') and jl.debit_minor > 0), 0)::text remitted
       from journal_line jl join journal_entry je on je.id = jl.journal_entry_id
       join gl_account g on g.id = jl.gl_account_id and g.code = '2100'
      where je.entity_id = $1 and je.posting_date between $2::date and $3::date`, [entityId, from, to]);
+  const gaps = await q<{ state: string; postal: string; lines: number; tax: string }>(c, `
+    select j.state, t.uncovered_postal postal, count(distinct t.sales_order_line_id)::int lines, sum(t.tax_minor)::text tax
+      from sales_order_line_tax t join tax_jurisdiction j on j.id = t.jurisdiction_id and j.entity_id = t.entity_id
+     where t.entity_id = $1 and t.posted_on between $2::date and $3::date and t.uncovered_postal is not null
+     group by j.state, t.uncovered_postal order by j.state, t.uncovered_postal`, [entityId, from, to]);
+  const off = await q<{ order_number: string; sku: string; code: string; tax: string; owed: string }>(c, `
+    select so.number order_number, l.sku, j.code, t.tax_minor::text tax, t.owed_minor::text owed
+      from sales_order_line_tax t join tax_jurisdiction j on j.id = t.jurisdiction_id and j.entity_id = t.entity_id
+      join sales_order_line l on l.id = t.sales_order_line_id and l.entity_id = t.entity_id
+      join sales_order so on so.id = t.sales_order_id and so.entity_id = t.entity_id
+     where t.entity_id = $1 and t.posted_on between $2::date and $3::date and t.owed_minor <> t.tax_minor
+     order by so.number, l.sku, j.code limit 200`, [entityId, from, to]);
   const collected = out.reduce((a, r) => a + r.netTaxMinor, 0n);
-  const glSales = BigInt(gl.sales);
+  const glSales = BigInt(gl.sales), glOther = BigInt(gl.other);
   const totals = out.reduce((a, r) => ({ grossMinor: a.grossMinor + r.grossMinor, exemptMinor: a.exemptMinor + r.exemptMinor, taxableMinor: a.taxableMinor + r.taxableMinor,
-    taxMinor: a.taxMinor + r.taxMinor, returnsMinor: a.returnsMinor + r.returnsMinor, returnsTaxMinor: a.returnsTaxMinor + r.returnsTaxMinor, netTaxMinor: a.netTaxMinor + r.netTaxMinor }),
-    { grossMinor: 0n, exemptMinor: 0n, taxableMinor: 0n, taxMinor: 0n, returnsMinor: 0n, returnsTaxMinor: 0n, netTaxMinor: 0n });
-  const diff = glSales - collected;
+    taxMinor: a.taxMinor + r.taxMinor, returnsMinor: a.returnsMinor + r.returnsMinor, returnsTaxMinor: a.returnsTaxMinor + r.returnsTaxMinor, netTaxMinor: a.netTaxMinor + r.netTaxMinor,
+    owedMinor: a.owedMinor + r.owedMinor, underCollectedMinor: a.underCollectedMinor + r.underCollectedMinor }),
+    { grossMinor: 0n, exemptMinor: 0n, taxableMinor: 0n, taxMinor: 0n, returnsMinor: 0n, returnsTaxMinor: 0n, netTaxMinor: 0n, owedMinor: 0n, underCollectedMinor: 0n });
+  const diff = glSales + glOther - collected;
+  const under = totals.underCollectedMinor;
   return { from, to, rows: out, totals,
-    tie: { glSalesMinor: glSales, glOtherMinor: BigInt(gl.other), collectedMinor: collected, differenceMinor: diff, ties: diff === 0n,
-      note: diff === 0n ? "Tax by jurisdiction ties to GL 2100's sales and returns for the period."
-        : `GL 2100 shows ${fmt(glSales)} from sales and returns for the period but the jurisdictions add up to ${fmt(collected)}: a difference of ${fmt(diff)} to look into before filing.` } };
+    collection: { underCollectedMinor: under, ok: under === 0n, lines: off.map((x) => ({ ...x, differenceMinor: (BigInt(x.owed) - BigInt(x.tax)).toString() })),
+      note: under === 0n ? null : `Tax ${under > 0n ? "under" : "over"}-collected: ${fmt(under < 0n ? -under : under)} ${under > 0n ? "less" : "more"} was charged than the jurisdictions are owed. `
+        + `The return is filed on what was owed; the lines are listed.` },
+    uncoveredZips: gaps.map((g) => ({ ...g, note: `ZIP ${g.postal} in ${g.state} has no local jurisdiction set up` })),
+    tie: { glSalesMinor: glSales, glOtherMinor: glOther, glRemittedMinor: BigInt(gl.remitted), collectedMinor: collected, differenceMinor: diff, ties: diff === 0n,
+      note: diff === 0n ? `Tax by jurisdiction ties to GL 2100 for the period${glOther ? ` (including ${fmt(glOther)} of other 2100 entries)` : ""}; payments to the state are left out.`
+        : `GL 2100 shows ${fmt(glSales)} from sales and returns${glOther ? ` and ${fmt(glOther)} from other entries (manual or bills)` : ""} for the period, but the jurisdictions add up to ${fmt(collected)}: a difference of ${fmt(diff)} to look into before filing.` } };
 }
 
 const fmt = (m: bigint) => { const neg = m < 0n; const a = neg ? -m : m; return `${neg ? "-" : ""}$${(a / 100n).toLocaleString("en-US")}.${String(a % 100n).padStart(2, "0")}`; };
@@ -571,15 +714,19 @@ export function filingCsv(f: Awaited<ReturnType<typeof filing>>): string {
   const reasons = EXEMPT_REASONS.filter((r) => f.rows.some((x) => x.exemptBy[r]));
   const esc = (s: string) => { const v = /^[=+\-@\t\r]/.test(s) ? "'" + s : s; return /[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; };
   const head = ["Jurisdiction code", "Jurisdiction", "Level", "State", "Filing account", "Gross sales", "Exempt sales", ...reasons.map((r) => `Exempt: ${EXEMPT_LABEL[r]}`),
-    "Taxable sales", "Tax collected", "Returns", "Returns taxable", "Tax refunded", "Net tax due"];
+    "Taxable sales", "Tax collected", "Returns", "Returns taxable", "Tax refunded", "Net tax collected", "Tax owed", "Under-collected (+) / over-collected (-)"];
   const lines = [head.map(esc).join(",")];
   for (const r of f.rows) lines.push([esc(r.code), esc(r.name), r.level, r.state, esc(r.filingRef ?? ""), money(r.grossMinor), money(r.exemptMinor),
     ...reasons.map((x) => money(r.exemptBy[x] ?? 0n)), money(r.taxableMinor), money(r.taxMinor), money(r.returnsMinor), money(r.returnsTaxableMinor),
-    money(r.returnsTaxMinor), money(r.netTaxMinor)].join(","));
+    money(r.returnsTaxMinor), money(r.netTaxMinor), money(r.owedMinor), money(r.underCollectedMinor)].join(","));
   lines.push("");
   lines.push(["Period", f.from, f.to].join(","));
   lines.push(["GL 2100 sales and returns", money(f.tie.glSalesMinor)].join(","));
+  lines.push(["GL 2100 other entries (manual, bills)", money(f.tie.glOtherMinor)].join(","));
+  lines.push(["GL 2100 paid to the state (not in the tie)", money(f.tie.glRemittedMinor)].join(","));
   lines.push(["Jurisdictions total", money(f.tie.collectedMinor)].join(","));
   lines.push(["Difference", money(f.tie.differenceMinor), f.tie.ties ? "ties" : "DOES NOT TIE"].join(","));
+  if (!f.collection.ok) lines.push(["Tax under/over-collected", money(f.collection.underCollectedMinor), esc(f.collection.note ?? "")].join(","));
+  for (const z of f.uncoveredZips) lines.push(["ZIP not covered by local tax", z.state, z.postal, String(z.lines)].join(","));
   return lines.join("\r\n") + "\r\n";
 }

@@ -375,7 +375,7 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
           discount_minor, tax_minor, config, fulfil_from_id) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning id`,
         [ctx.entityId, ctx.orderId, seq, p.productId, p.sku, p.description.slice(0, 300), p.qty, unit.toString(), (disc < 0n ? 0n : disc).toString(),
          lt.taxMinor.toString(), JSON.stringify(p.config ?? {}), from]);
-      await tax.writeLineTax(c, ctx.entityId, ctx.orderId, row.id, lt.rows, place.sourced, cls);
+      await tax.writeLineTax(c, ctx.entityId, ctx.orderId, row.id, lt.rows, place, cls);
       const needs = why.length && (i === 0 || !isPackage) ? why.join("; ") : null;
       let overrideId: string | null = null;
       if (needs && ctx.managerReason) {
@@ -439,7 +439,7 @@ async function ensureDeliveryFee(c: Client, ctx: Ctx) {
   const row = await one<{ id: string }>(c, `insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, config)
     values ($1,$2,$3,$4,$5,$6,1,$7,$8,$9) returning id`, [ctx.entityId, ctx.orderId, seq, feeProduct, p.sku, fee.zone ? `${p.name} (zone ${fee.zone})` : p.name,
     fee.feeMinor.toString(), lt.taxMinor.toString(), JSON.stringify({ auto: "delivery_fee", zone: fee.zone })]);
-  await tax.writeLineTax(c, ctx.entityId, ctx.orderId, row.id, lt.rows, place.sourced, cls);
+  await tax.writeLineTax(c, ctx.entityId, ctx.orderId, row.id, lt.rows, place, cls);
   await c.query(`insert into pos_line (sales_order_line_id, entity_id, sales_order_id, fulfillment, promised_on, ship_address_id, list_price_minor)
     values ($1,$2,$3,'delivery',$4,$5,$6)`, [row.id, ctx.entityId, ctx.orderId, goods[0].promised_on, goods[0].ship_address_id, fee.feeMinor.toString()]);
   return { lineId: row.id, feeMinor: fee.feeMinor, zone: fee.zone };
@@ -522,7 +522,10 @@ export async function createOrder(c: Client, scope: Scope, roles: Set<string>, e
   const fee = await ensureDeliveryFee(c, ctx);
   await refreshHeader(c, scope.entityId, so.id);
   await audit(c, scope, { table: "sales_order", rowId: so.id, action: "insert", after: { number, kind: e.kind, lines: r.lineIds.length, exemptRef }, sourceRef: "pos" });
-  return { id: so.id, number, pendingOverrides: r.pendingOverrides, deliveryFeeMinor: fee?.feeMinor ?? 0n };
+  // A delivery to a ZIP no local jurisdiction covers is taxed as best it can be, and the salesperson is told.
+  const taxNotes = (await q<{ note: string }>(c, `select distinct note from sales_order_line_tax where entity_id = $1 and sales_order_id = $2 and note is not null`,
+    [scope.entityId, so.id])).map((x) => x.note);
+  return { id: so.id, number, pendingOverrides: r.pendingOverrides, deliveryFeeMinor: fee?.feeMinor ?? 0n, taxNotes };
 }
 
 async function ctxFor(c: Client, scope: Scope, roles: Set<string>, o: OrderRow, reason?: string): Promise<Ctx> {
@@ -598,8 +601,45 @@ export async function convertQuote(c: Client, scope: Scope, orderId: string) {
   // The hold ends here: the sale reserves for itself when it is placed.
   const hold = await endHold(c, scope, orderId, "converted", "the quote became a sale");
   await c.query(`update pos_order set kind = 'sale' where sales_order_id = $1 and entity_id = $2`, [orderId, scope.entityId]);
+  // A link the customer already has keeps working and now shows the order; it no longer ends with the quote.
+  await c.query(`update tear_sheet_link set expires_at = greatest(expires_at, now() + interval '30 days') where entity_id = $1 and sales_order_id = $2 and revoked_at is null`,
+    [scope.entityId, orderId]);
   await audit(c, scope, { table: "sales_order", rowId: orderId, action: "transition", after: { kind: "sale", from: "quote", holdReleased: hold?.released ?? 0 } });
   return { id: orderId, number: o.number };
+}
+
+/**
+ * Clear or swap the exemption certificate on a draft (one voided or expired
+ * since it was written). The lines are taxed again at the same places; only
+ * the certificate changes.
+ */
+export async function setExemption(c: Client, scope: Scope, orderId: string, ref: string | null) {
+  const o = await orderOf(c, scope.entityId, orderId);
+  need(o.status === "draft", `${o.number} has been placed; its tax is settled`);
+  const number = String(ref ?? "").trim() || null;
+  if (number) need(o.customer_id, "a tax-exempt sale needs the customer it is exempt for");
+  const loc = await locationOf(c, scope.entityId, o.location_id);
+  const cert = number ? await tax.certificateFor(c, scope.entityId, o.customer_id!, number, today(), loc.state) : null;
+  await c.query(`update pos_order set tax_exempt_ref = $3, exemption_certificate_id = $4 where sales_order_id = $1 and entity_id = $2`,
+    [orderId, scope.entityId, number, cert?.id || null]);
+  const lines = await q<{ id: string; net: string; kind: string | null; taxable: boolean | null }>(c, `
+    select l.id, (round(l.qty * l.unit_price_minor) - l.discount_minor)::bigint::text net, p.kind, p.taxable
+      from sales_order_line l left join product p on p.id = l.product_id
+     where l.entity_id = $1 and l.sales_order_id = $2 and l.line_status <> 'cancelled'`, [scope.entityId, orderId]);
+  for (const l of lines) {
+    const ids = (await q<{ jurisdiction_id: string }>(c, `select jurisdiction_id from sales_order_line_tax where entity_id = $1 and sales_order_line_id = $2 order by created_at, id`,
+      [scope.entityId, l.id])).map((x) => x.jurisdiction_id);
+    if (!ids.length) continue;
+    const stack = (await tax.stackJurisdictions(c, scope.entityId, ids));
+    const lt = tax.computeLine(stack, { netMinor: BigInt(l.net), itemClass: tax.classOf(l.kind), taxable: l.taxable !== false && !!l.kind, cert });
+    for (const r of lt.rows) await c.query(`update sales_order_line_tax set taxable_minor = $4, exempt_minor = $5, exempt_reason = $6, tax_minor = $7, owed_minor = $7
+        where entity_id = $1 and sales_order_line_id = $2 and jurisdiction_id = $3`, [scope.entityId, l.id, r.jurisdictionId, r.taxableMinor.toString(), r.exemptMinor.toString(),
+      r.exemptReason, r.taxMinor.toString()]);
+    await c.query(`update sales_order_line set tax_minor = $3 where id = $1 and entity_id = $2`, [l.id, scope.entityId, lt.taxMinor.toString()]);
+  }
+  await refreshHeader(c, scope.entityId, orderId);
+  await audit(c, scope, { table: "sales_order", rowId: orderId, action: "update", before: { exemptRef: o.tax_exempt_ref }, after: { exemptRef: number } });
+  return { exemptRef: number };
 }
 
 // ===================================================== deposits and holds
@@ -849,8 +889,12 @@ export async function checkout(c: Client, scope: Scope, orderId: string, e: { se
   let handed = { lines: 0, costMinor: 0n, journalEntryId: null as string | null };
   if (o.kind === "layaway") {
     const set = await settings(c, scope.entityId);
-    const min = bps(total, set.layawayMinDepositBps);
-    need(paid >= min, `a layaway needs a deposit of at least ${usd(min)} (${pct(set.layawayMinDepositBps)})`);
+    // A layaway holding goods ordered for the customer needs the higher of its own minimum and the special-order deposit.
+    const lay = bps(total, set.layawayMinDepositBps);
+    const dep = await depositRequirement(c, scope.entityId, orderId);
+    const min = dep.requiredMinor > lay ? dep.requiredMinor : lay;
+    need(paid >= min, min === lay ? `a layaway needs a deposit of at least ${usd(min)} (${pct(set.layawayMinDepositBps)})`
+      : `this layaway has ${usd(dep.onOrderMinor)} of goods on order, so it needs a deposit of at least ${usd(min)} (the ${pct(dep.specialOrderBps)} special-order deposit, more than the ${pct(set.layawayMinDepositBps)} layaway minimum)`);
     const left = total - paid, n = set.layawayInstallments;
     const step = Math.max(1, Math.floor(set.layawayMaxDays / n));
     const sched = [];
@@ -1028,6 +1072,7 @@ export async function cancelOrder(c: Client, scope: Scope, orderId: string, e: {
     await takeTenders(c, scope, await orderOf(c, scope.entityId, orderId), e.sessionId, [{ method: e.refundMethod!, amountMinor: paid, reference: e.reference }], true);
   }
   await c.query(`update sales_order set status = 'cancelled' where id = $1 and entity_id = $2`, [orderId, scope.entityId]);
+  await c.query(`update tear_sheet_link set revoked_at = now() where entity_id = $1 and sales_order_id = $2 and revoked_at is null`, [scope.entityId, orderId]);
   await c.query(`select sales_order_retotal($1) /* unscoped: order checked above */`, [orderId]);
   await audit(c, scope, { table: "sales_order", rowId: orderId, action: "transition", after: { status: "cancelled", refunded: paid.toString() }, reason: e.reason });
   return { number: o.number, refundedMinor: paid };
@@ -1099,7 +1144,7 @@ export async function returnGoods(c: Client, scope: Scope, originalId: string, e
     await c.query(`insert into pos_line (sales_order_line_id, entity_id, sales_order_id, fulfillment, original_line_id, return_reason, return_disposition)
       values ($1,$2,$3,'carry',$4,$5,$6)`, [nl.id, scope.entityId, ro.id, l.id, r.reason, STOCKED.includes(l.kind ?? "") ? r.disposition : "none"]);
     // The tax comes back from the same jurisdictions that collected it, in proportion to what comes back.
-    const lineTax = await tax.reverseLine(c, scope.entityId, { originalLineId: l.id, returnOrderId: ro.id, returnLineId: nl.id, qty, originalQty: Number(l.qty), netMinor: lineNet });
+    const lineTax = await tax.reverseLine(c, scope.entityId, { originalLineId: l.id, returnOrderId: ro.id, returnLineId: nl.id, qty, originalQty: Number(l.qty), netMinor: lineNet, qtyLeft: left });
     net += lineNet; taxBack += lineTax;
     const code = l.kind === "fee" || l.kind === "service" ? "4030" : l.kind === "warranty" ? "4040" : "4900";
     revByCode.set(code, (revByCode.get(code) ?? 0n) + lineNet);
@@ -1289,7 +1334,9 @@ export async function orderView(c: Client, entityId: string, id: string) {
       from pos_quote_hold h left join app_user u on u.id = h.requested_by left join app_user x on x.id = h.extended_by
      where h.entity_id = $1 and h.sales_order_id = $2 order by h.created_at desc limit 1`, [entityId, id]))[0] ?? null;
   const deposit = head.kind === "sale" || head.kind === "quote" ? await depositRequirement(c, entityId, id) : null;
-  return { ...head, lines, receipts, salespeople: people, overrides, returns, history, storeCreditMinor: credit, taxes, hold, deposit };
+  const sheetLinks = await q(c, `select k.id, k.expires_at, k.opened_count, k.created_at from tear_sheet_link k
+     where k.entity_id = $1 and k.sales_order_id = $2 and k.revoked_at is null and k.expires_at > now() order by k.created_at desc`, [entityId, id]);
+  return { ...head, lines, receipts, salespeople: people, overrides, returns, history, storeCreditMinor: credit, taxes, hold, deposit, sheetLinks };
 }
 
 export async function listOrders(c: Client, entityId: string, f: { kind?: string; status?: string; q?: string; locationId?: string | null }) {

@@ -392,6 +392,12 @@
         const tie = f.tie;
         out.replaceChildren(frag(
           resultBox(tie.ties ? 'good' : 'critical', tie.ties ? 'ok' : 'warn', tie.ties ? 'Ties to GL 2100' : 'Does not tie to GL 2100', tie.note),
+          f.collection && !f.collection.ok ? section('Tax under/over-collected', money(f.collection.underCollectedMinor), null, el('div', { class: 'panel' },
+            resultBox('warning', 'warn', `Tax ${Number(f.collection.underCollectedMinor) > 0 ? 'under' : 'over'}-collected`, f.collection.note),
+            f.collection.lines.map((x) => item({ title: `${x.order_number} · ${x.sku} · ${x.code}`, amount: money(x.differenceMinor),
+              detail: `charged ${money(x.tax)}, owed ${money(x.owed)}` })))) : null,
+          f.uncoveredZips && f.uncoveredZips.length ? section('ZIPs with no local tax set up', plural(f.uncoveredZips.length, 'ZIP'), null, el('div', { class: 'panel' },
+            f.uncoveredZips.map((z) => item({ title: `${z.state} ${z.postal}`, amount: money(z.tax), detail: `${plural(z.lines, 'line')} taxed without a local rate; add the local jurisdictions in Setup → Sales tax` })))) : null,
           E.tilesRow(E.tile({ label: 'Gross sales', value: money(f.totals.grossMinor) }), E.tile({ label: 'Taxable sales', value: money(f.totals.taxableMinor) }),
             E.tile({ label: 'Tax collected', value: money(f.totals.taxMinor) }), E.tile({ label: 'Net tax due', value: money(f.totals.netTaxMinor), tone: 'good' })),
           f.rows.length ? f.rows.map((r) => section(`${r.name} · ${r.state}`, `${r.code}${r.filingRef ? ' · filed under ' + r.filingRef : ''}`, null, el('div', { class: 'panel' },
@@ -401,7 +407,8 @@
             row('Returns', money(r.returnsMinor)), row('Tax refunded on returns', money(r.returnsTaxMinor)), row('Net tax due', money(r.netTaxMinor), true))))
             : el('div', { class: 'panel' }, empty('Nothing reached the ledger in this period.', null, true)),
           el('div', { class: 'panel' }, row('GL 2100, sales and returns', money(tie.glSalesMinor)), row('Jurisdictions together', money(tie.collectedMinor)),
-            row('Difference', money(tie.differenceMinor), true), Number(tie.glOtherMinor) ? row('Other 2100 activity (payments to the state and the like)', money(tie.glOtherMinor)) : null)));
+            row('GL 2100, other entries (manual, bills)', money(tie.glOtherMinor)),
+            row('Difference', money(tie.differenceMinor), true), row('Paid to the state (left out of the tie)', money(tie.glRemittedMinor)))));
       } catch (e) { out.replaceChildren(resultBox('critical', 'fail', 'The filing did not load', friendly(e))); }
     }
     const exp = btn('Export CSV', async (e) => {

@@ -303,7 +303,16 @@ export const module: ErpModule = {
     }));
 
     // ---- exemption certificates
-    coGet(`/pos/customers/${ID}/certificates`, safe((c, co, _u, m) => tax.certificates(c, co.id, m[2])));
+    coGet(`/pos/customers/${ID}/certificates`, safe(async (c, co, _u, m, p) => {
+      need(p, "pick who you are acting as; certificates are shown to the people who sell and keep them");
+      const held = await rolesOf(c, co, p);
+      need(["owner", "controller", "store_manager", "sales", "cashier"].some((r) => held.has(r)), "seeing a customer's tax certificates needs one of: owner, controller, store manager, sales, cashier");
+      return tax.certificates(c, co.id, m[2]);
+    }));
+    coPost(`/pos/orders/${ID}/exemption`, safe(async (c, co, a, b, m) => {
+      await requireRole(c, co, a, SELL, "changing a sale's tax exemption");
+      return pos.setExemption(c, sc(co, a), m[2], str(b.taxExemptRef, 60) || null);
+    }));
     coPost(`/pos/customers/${ID}/certificates`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, CERTS, "keeping a tax-exemption certificate on file");
       return tax.saveCertificate(c, sc(co, a), { customerId: m[2], number: str(b.number, 60), state: str(b.state, 2), reason: str(b.reason, 20),
@@ -326,6 +335,14 @@ export const module: ErpModule = {
     coPost(`/pos/orders/${ID}/tear-sheet/send`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, SELL, "sending a customer their quote");
       return sheet.sendLink(c, sc(co, a), { orderId: m[2], customerId: uuid(b.customerId), baseUrl: publicBase() });
+    }));
+    coPost(`/pos/orders/${ID}/tear-sheet/revoke`, safe(async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, SELL, "stopping a tear sheet link");
+      return sheet.revokeLinks(c, sc(co, a), { orderId: m[2] });
+    }));
+    coPost(`/pos/tear-sheets/${ID}/revoke`, safe(async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, SELL, "stopping a tear sheet link");
+      return sheet.revokeLinks(c, sc(co, a), { linkId: m[2] });
     }));
     coPost(`/pos/products/${ID}/tear-sheet/send`, safe(async (c, co, a, b, m) => {
       await requireRole(c, co, a, SELL, "sending a customer a product sheet");

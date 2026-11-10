@@ -7,7 +7,12 @@
 // (rendered with no script; the public copy only with its token).
 import type { AddressInfo } from "node:net";
 import type { T } from "./harness.ts";
-import { ENTITY, LOC, PEOPLE } from "./harness.ts";
+import { ENTITY, LOC, PEOPLE, TENANT } from "./harness.ts";
+import * as shop from "../../packages/core/shop.ts";
+import * as service from "../../packages/core/service.ts";
+import { invoiceFulfilment } from "../../packages/core/ar.ts";
+import { post as glPost } from "../../packages/core/posting.ts";
+import * as sheet from "../../server/modules/tearsheet.ts";
 import { tx } from "../../packages/core/db.ts";
 import * as tax from "../../packages/core/tax.ts";
 import * as pos from "../../packages/core/pos.ts";
@@ -296,6 +301,28 @@ export async function run(t: T) {
     t.ok("tear sheet: only the token's hash is kept", hashOnly[0].n === "1" && !(await read(`select 1 from tear_sheet_link where entity_id = $1 and token_sha256 = $2`, [ENTITY, sent.token])).length);
     await t.throws("tear sheet: a driver cannot send one", () => R.post(t, "55555555-0000-0000-0000-000000000015", `/pos/orders/${tq.id}/tear-sheet/send`, {}), /needs one of/);
 
+    const yr = String(new Date().getUTCFullYear());
+    t.ok("tear sheet: the header shows the day it was written, never Invalid Date", !html.includes("Invalid Date") && html.includes(yr));
+    const pubOf = (tok: string) => sys((c) => sheet.publicSheet(c, tok));
+    const rq = await order(MARIA, { kind: "quote", locationId: LOC.ENOLA, customerId: CUST.ALICIA, lines: [{ productId: P.LAMP, qty: 1, fulfillment: "pickup" }] });
+    const lk = await R.post(t, MARIA, `/pos/orders/${rq.id}/tear-sheet/send`, {}) as { token: string };
+    await t.throws("tear sheet: a driver cannot stop a link", () => R.post(t, "55555555-0000-0000-0000-000000000015", `/pos/orders/${rq.id}/tear-sheet/revoke`), /needs one of/);
+    await R.post(t, MARIA, `/pos/orders/${rq.id}/tear-sheet/revoke`);
+    t.ok("tear sheet: a revoked link opens nothing", (await pubOf(lk.token)) === null);
+    const cq = await order(MARIA, { kind: "quote", locationId: LOC.ENOLA, customerId: CUST.ALICIA, lines: [{ productId: P.LAMP, qty: 1, fulfillment: "pickup" }] });
+    const cqLink = await R.post(t, MARIA, `/pos/orders/${cq.id}/tear-sheet/send`, {}) as { token: string };
+    await R.post(t, MARIA, `/pos/orders/${cq.id}/cancel`, { reason: "Changed their mind" });
+    t.ok("tear sheet: cancelling the order kills its link", (await pubOf(cqLink.token)) === null);
+    const vq = await order(MARIA, { kind: "quote", locationId: LOC.ENOLA, customerId: CUST.ALICIA, lines: [{ productId: P.LAMP, qty: 1, fulfillment: "pickup" }] });
+    const vqLink = await R.post(t, MARIA, `/pos/orders/${vq.id}/tear-sheet/send`, {}) as { token: string };
+    await R.post(t, MARIA, `/pos/orders/${vq.id}/convert`);
+    const afterConv = await pubOf(vqLink.token);
+    const vqExp = await read<{ ok: boolean }>(`select expires_at > now() + interval '29 days' ok from tear_sheet_link where entity_id = $1 and sales_order_id = $2 and revoked_at is null`, [ENTITY, vq.id]);
+    t.ok("tear sheet: after conversion the customer's link still works and shows the order", !!afterConv && /<h1>Order SO-/.test(afterConv.text) && vqExp[0]?.ok === true);
+    const xq = await order(MARIA, { kind: "quote", locationId: LOC.ENOLA, customerId: CUST.ALICIA, lines: [{ productId: P.LAMP, qty: 1, fulfillment: "pickup" }] });
+    await sys((c) => c.query(`update pos_order set quote_expires_on = current_date - 1 where sales_order_id = $1 and entity_id = $2`, [xq.id, ENTITY]));
+    await t.throws("tear sheet: an expired quote is not sent", () => R.post(t, MARIA, `/pos/orders/${xq.id}/tear-sheet/send`, {}), /expired on .*make a new quote/);
+
     const { createServer } = await import("../../server/index.ts");
     const server = createServer();
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -320,6 +347,154 @@ export async function run(t: T) {
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }
+
+    // ======================================== review fixes: every door taxes by the stack
+    const SCOPE = { tenantId: TENANT, entityId: ENTITY, actor: { kind: "system" as const, label: "tax checks" } };
+    const lineRows = (lineId: string) => read<{ code: string; tax_minor: string; owed_minor: string; sourced: string; exempt_reason: string | null; note: string | null }>(`
+      select j.code, t.tax_minor::text, t.owed_minor::text, t.sourced, t.exempt_reason, t.note from sales_order_line_tax t join tax_jurisdiction j on j.id = t.jurisdiction_id
+       where t.entity_id = $1 and t.sales_order_line_id = $2 and t.kind = 'sale' order by j.code`, [ENTITY, lineId]);
+    const SOC = { line1: "9 Mesa Rd", city: "Socorro", state: "TX", postal: "79927" };
+    const site = (await sys((c) => shop.siteBySlug(c, "buddys")))!;
+    const ck = (over: Record<string, unknown>) => shop.parseCheckout({ cartId: `tax-${Math.random().toString(36).slice(2, 12)}`, email: "taxweb@example.com", name: "Tax Web",
+      phone: "915-555-0177", fulfillment: "delivery", address: SOC, paymentToken: "tok_test_visa_4242", lines: [{ productId: P.LAMP, qty: 1 }], ...over });
+    const prev = await sys((c) => shop.quote(c, site, ck({})));
+    t.ok("web: the checkout preview for a Socorro delivery shows Socorro's 8.25%, not the shop's own rate", prev.taxRateBps === 825
+      && prev.lines[0].taxMinor === half(5999n, 825).toString(), `${prev.taxRateBps} ${prev.lines[0].taxMinor}`);
+    const web = await sys((c) => shop.placeWebOrder(c, site, ck({}), SCOPE));
+    const webLine = (await read<{ id: string; tax_minor: string }>(`select l.id, l.tax_minor::text from sales_order_line l join sales_order so on so.id = l.sales_order_id
+      where so.entity_id = $1 and so.number = $2 and l.sku = 'ACC-LAMP-01'`, [ENTITY, web.order.number]))[0];
+    const webRows = await lineRows(webLine.id);
+    t.ok("web: a delivery to another county is taxed at the address: Texas, El Paso County and Socorro", webLine.tax_minor === half(5999n, 825).toString()
+      && webRows.map((r) => r.code).join(",") === "TX,TX-ELPASO,TX-SOCORRO" && webRows.every((r) => r.sourced === "destination" && r.owed_minor === r.tax_minor), JSON.stringify(webRows));
+    const pk = await sys((c) => shop.placeWebOrder(c, site, ck({ fulfillment: "pickup", pickupLocationId: LOC.PALESTINE, address: undefined }), SCOPE));
+    const pkLine = (await read<{ id: string; tax_minor: string }>(`select l.id, l.tax_minor::text from sales_order_line l join sales_order so on so.id = l.sales_order_id
+      where so.entity_id = $1 and so.number = $2 and l.sku = 'ACC-LAMP-01'`, [ENTITY, pk.order.number]))[0];
+    t.ok("web: a pickup is taxed at the pickup store's jurisdictions", (await lineRows(pkLine.id)).map((r) => r.code).join(",") === "TX,TX-ANDERSON,TX-PALESTINE");
+
+    const svc = await sys(async (c) => {
+      const tk = await service.openTicket(c, SCOPE, { source: "phone", customerId: CUST.DANA, issueType: "other", description: "Recliner squeaks when it reclines" });
+      await c.query(`update service_ticket set coverage = 'billable' where entity_id = $1 and id = $2`, [ENTITY, tk.id]);
+      const labor = await service.addCharge(c, SCOPE, tk.id, { productId: kinds.labor, qty: 1 });
+      const trip = await service.addCharge(c, SCOPE, tk.id, { productId: kinds.fee, qty: 1 });
+      return { labor: labor.lineId, trip: trip.lineId };
+    });
+    const sLabor = await lineRows(svc.labor), sTrip = await lineRows(svc.trip);
+    const tripTax = (await read<{ t: string }>(`select tax_minor::text t from sales_order_line where entity_id = $1 and id = $2`, [ENTITY, svc.trip]))[0].t;
+    t.ok("service: a service charge is taxed by the stack; labor is exempt where the jurisdiction says, with the reason kept",
+      sLabor.length > 0 && sLabor.every((r) => r.tax_minor === "0" && r.exempt_reason === "labor_exempt"), JSON.stringify(sLabor));
+    t.ok("service: a taxable trip fee is split over the same jurisdictions and adds up", sTrip.length > 0 && sTrip.reduce((a, r) => a + BigInt(r.tax_minor), 0n) === BigInt(tripTax)
+      && BigInt(tripTax) > 0n, JSON.stringify(sTrip));
+
+    // ---------------------------- a mismatched charge is flagged, not spread silently
+    const month0 = new Date().toISOString().slice(0, 8) + "01";
+    const mis = await sys(async (c) => {
+      await c.query("savepoint mis");
+      const f0 = await tax.filing(c, ENTITY, month0, plus(0));
+      const ed = (await t.q<{ id: string }>(c, `select id from customer_address where entity_id = $1 and customer_id = '88888888-0000-0000-0000-000000000006' and is_default`, [ENTITY]))[0].id;
+      const o = (await t.q<{ id: string }>(c, `insert into sales_order (entity_id, number, channel, location_id, customer_id, status, fulfillment, ship_address_id)
+        values ($1,'IMPORT-TAX-1','phone',$2,'88888888-0000-0000-0000-000000000006','open','delivery',$3) returning id`, [ENTITY, LOC.ENOLA, ed]))[0];
+      const l = (await t.q<{ id: string }>(c, `insert into sales_order_line (entity_id, sales_order_id, seq, product_id, sku, description, qty, unit_price_minor, tax_minor, line_status)
+        values ($1,$2,1,$3,'TAXCHK-PLAN','plan',1,3000,180,'fulfilled') returning id`, [ENTITY, o.id, kinds.plan]))[0];
+      await c.query(`select sales_order_retotal($1) /* unscoped: test order */`, [o.id]);
+      await invoiceFulfilment(c, SCOPE, o.id, [l.id], 0n);
+      const rows = await t.q<{ tax: string; owed: string }>(c, `select sum(tax_minor)::text tax, sum(owed_minor)::text owed from sales_order_line_tax where entity_id = $1 and sales_order_line_id = $2`, [ENTITY, l.id]);
+      const f = await tax.filing(c, ENTITY, month0, plus(0));
+      await c.query("rollback to savepoint mis");
+      return { rows: rows[0], f, before: f0.collection.underCollectedMinor };
+    });
+    t.ok("mismatch: an imported line charged 6% for a Socorro delivery keeps what was charged and what is owed (8.25%)", mis.rows.tax === "180" && mis.rows.owed === half(3000n, 825).toString());
+    t.ok("mismatch: the filing still ties to 2100 and flags the tax under-collected, line by line", mis.f.tie.ties && mis.f.collection.underCollectedMinor - mis.before === half(3000n, 825) - 180n
+      && /under-collected/.test(mis.f.collection.note ?? "") && mis.f.collection.lines.some((x) => x.order_number === "IMPORT-TAX-1"), mis.f.collection.note ?? "");
+
+    // ------------------------------------ a ZIP no local jurisdiction covers
+    const mca = (await R.post(t, MGR, `/pos/customers/${CUST.DANA}/addresses`, { label: "Lake house", line1: "500 Bicentennial Blvd", city: "McAllen", state: "TX", postal: "78501" })) as { id: string };
+    const gapPal = await order(OWNER, { kind: "sale", locationId: LOC.PALESTINE, customerId: CUST.DANA, shipAddressId: mca.id, promisedOn: plus(9),
+      lines: [{ productId: P.SOFA, qty: 1, fulfillment: "delivery" }] }) as { id: string; taxNotes: string[] };
+    const gpSofa = (await view(gapPal.id)).lines.find((l) => l.sku === "ASH-2930338")!;
+    const gpRows = await lineRows(gpSofa.id);
+    t.ok("ZIP gap: McAllen has no local tax set up, so a Palestine sale is taxed at the Palestine store's stack, and says so",
+      gpSofa.tax_minor === half(79999n, 825).toString() && gpRows.every((r) => r.sourced === "origin" && /ZIP 78501 has no local tax/.test(r.note ?? ""))
+      && gapPal.taxNotes.some((n) => /78501/.test(n)), JSON.stringify(gpRows));
+    const gapEn = await order(OWNER, { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.DANA, shipAddressId: mca.id, promisedOn: plus(9),
+      lines: [{ productId: P.SOFA, qty: 1, fulfillment: "delivery" }] });
+    const geSofa = (await view(gapEn.id)).lines.find((l) => l.sku === "ASH-2930338")!;
+    const geRows = await lineRows(geSofa.id);
+    t.ok("ZIP gap: from a store in another state it is Texas tax only, with the warning", geSofa.tax_minor === half(79999n, 625).toString()
+      && geRows.length === 1 && geRows[0].code === "TX" && /state tax only/.test(geRows[0].note ?? ""));
+    const gapF = await sys(async (c) => {
+      await c.query("savepoint gap");
+      await c.query(`update sales_order_line set line_status = 'fulfilled' where entity_id = $1 and id = $2`, [ENTITY, gpSofa.id]);
+      await invoiceFulfilment(c, SCOPE, gapPal.id, [gpSofa.id], 0n);
+      const f = await tax.filing(c, ENTITY, month0, plus(0));
+      await c.query("rollback to savepoint gap");
+      return f;
+    });
+    t.ok("ZIP gap: the filing lists the ZIPs that were not covered", gapF.uncoveredZips.some((z) => z.postal === "78501" && z.state === "TX") && gapF.tie.ties);
+
+    // ------------------------------- a store that was there before the migration
+    const pre = await sys(async (c) => {
+      const mk = async (code: string) => (await t.q<{ id: string }>(c, `insert into location (entity_id, code, name, kind, state, tax_rate_bps, address)
+        values ($1,$2,$3,'store','TX',825,'{"line1":"1 Tyler Ave","city":"Harlingen","state":"TX","postal":"78550"}') returning id`, [ENTITY, code, `Harlingen ${code}`]))[0].id;
+      const a = await mk("PRE1");
+      const made = (await t.q<{ n: number }>(c, `select tax_make_standins($1) n /* unscoped: the migration's own rule, for this company */`, [ENTITY]))[0].n;
+      const b = await mk("PRE2");   // as if added after the migration by a script, with no stand-in
+      return { a, b, made };
+    });
+    const preA = await read<{ code: string }>(`select j.code from tax_jurisdiction j where j.entity_id = $1 and j.for_location_id = $2`, [ENTITY, pre.a]);
+    t.ok("pre-migration: the migration gives an existing store with a rate its single-rate stand-in", pre.made >= 1 && preA[0]?.code === "LOC-PRE1");
+    await RS.post(t, OWNER, "/setup/tax/jurisdictions", { code: "TX-CAMERON", name: "Cameron County", level: "county", state: "TX", ratePct: "0.5",
+      taxesDelivery: true, taxesLabor: false, taxesWarranty: true, note: "check with your accountant" });
+    const preRates = await read<{ id: string; tax_rate_bps: number }>(`select id, tax_rate_bps from location where entity_id = $1 and id = any($2)`, [ENTITY, [pre.a, pre.b]]);
+    t.ok("pre-migration: a new Texas jurisdiction never cuts an existing 8.25% store to 6.25%", preRates.length === 2 && preRates.every((r) => r.tax_rate_bps === 825), JSON.stringify(preRates));
+    const preSale = await order(OWNER, { kind: "sale", locationId: pre.b, lines: [{ productId: P.LAMP, qty: 1, fulfillment: "pickup" }] });
+    const psr = await rowsOf(preSale.id);
+    t.ok("pre-migration: and its sales keep charging its own rate", psr.length === 1 && psr[0].code === "LOC-PRE2" && BigInt(psr[0].tax_minor) === half(5999n, 825));
+    const noState = await t.as(OWNER, (c, co, a) => saveLocation(c, scopeOf(co, a), { code: "NOST", name: "Pop-up outlet", kind: "outlet", taxRateBps: 700 }));
+    await t.throws("no state: a location with no state is refused at the register, plainly", () => order(OWNER, { kind: "sale", locationId: noState,
+      lines: [{ productId: P.LAMP, qty: 1, fulfillment: "pickup" }] }), /has no state set, so its sales tax cannot be worked out/);
+
+    // ----------------------------------------- partial returns never over-refund
+    const mini = await sys(async (c) => (await t.q<{ id: string }>(c, `insert into product (entity_id, sku, name, kind, price_minor, cost_minor, taxable, ship_class)
+      values ($1,'TAXCHK-MINI','Tax check mini plan','warranty',28,0,true,'none') returning id`, [ENTITY]))[0].id);
+    const ms = await order(OWNER, { kind: "sale", locationId: LOC.ENOLA, sessionId: enola.id, lines: [{ productId: mini, qty: 3, fulfillment: "carry" }] });
+    await R.post(t, OWNER, `/pos/orders/${ms.id}/checkout`, { sessionId: enola.id, tenders: [{ method: "cash", amount: "0.89" }] });
+    const msLine = (await view(ms.id)).lines[0];
+    const backs: bigint[] = [];
+    for (let i = 0; i < 3; i++) backs.push(BigInt((await R.post(t, OWNER, `/pos/orders/${ms.id}/return`, { sessionId: enola.id,
+      lines: [{ lineId: msLine.id, qty: 1, reason: "changed_mind", disposition: "restock" }], tenders: [] }) as { taxMinor: bigint }).taxMinor));
+    t.ok("returns: three single returns give back exactly the 5 cents collected, the last one the remainder", msLine.tax_minor === "5"
+      && backs.reduce((a, b) => a + b, 0n) === 5n && backs[2] === 1n, backs.join(","));
+
+    // --------------------------------------- layaway with special-order goods
+    const lay = await order(MARIA, { kind: "layaway", locationId: LOC.ENOLA, customerId: CUST.ALICIA,
+      lines: [{ productId: P.HUDSON, qty: 1, fulfillment: "pickup", choices: { size: "84", fabric: "linen-oat", legs: "walnut" } }] });
+    await t.throws("layaway: special-order goods need the higher special-order deposit, not just the layaway's 20%", () => R.post(t, MARIA, `/pos/orders/${lay.id}/checkout`,
+      { sessionId: enola.id, tenders: [{ method: "card", amount: "300.00", reference: "4242" }] }), /special-order deposit, more than the 20% layaway minimum/);
+    const layOk = await R.post(t, MARIA, `/pos/orders/${lay.id}/checkout`, { sessionId: enola.id, tenders: [{ method: "card", amount: "688.47", reference: "4242" }] }) as { status: string };
+    t.ok("layaway: the special-order minimum is enough", layOk.status === "open");
+
+    // --------------------------------------------------- an honest 2100 tie
+    const honest = await sys(async (c) => {
+      await c.query("savepoint honest");
+      await glPost(c, SCOPE, { date: plus(0), sourceType: "manual", sourceId: null, description: "test manual tax entry", lines: [{ code: "1050", debit: 123n }, { code: "2100", credit: 123n }] });
+      await glPost(c, SCOPE, { date: plus(0), sourceType: "invoice", sourceId: null, description: "test sales tax remittance", lines: [{ code: "2100", debit: 5000n }, { code: "2010", credit: 5000n }] });
+      const f = await tax.filing(c, ENTITY, month0, plus(0));
+      await c.query("rollback to savepoint honest");
+      return f.tie;
+    });
+    t.ok("tie: a manual 2100 entry is counted and flagged; a payment of the tax to the state is shown but left out", !honest.ties && honest.differenceMinor === 123n
+      && honest.glOtherMinor === 123n && honest.glRemittedMinor === 5000n, `${honest.differenceMinor} ${honest.glOtherMinor} ${honest.glRemittedMinor}`);
+
+    // ---------------------------------------- exemption swapped off a draft
+    await R.post(t, OWNER, `/pos/orders/${ex1.id}/exemption`, { taxExemptRef: null });
+    const ex1v = await view(ex1.id);
+    t.ok("exemption: a draft stuck on a dead certificate is cleared and taxed again", ex1v.tax_minor === half(5999n, 600).toString() && !ex1v.tax_exempt_ref
+      && (await rowsOf(ex1.id)).every((r) => r.exempt_reason === null && r.tax_minor === ex1v.tax_minor));
+    await t.throws("exemption: only a current certificate can be put on", () => R.post(t, OWNER, `/pos/orders/${ex1.id}/exemption`, { taxExemptRef: "PA-NP-77001" }), /expired on/);
+
+    // ---------------------------------------------------- roles on the reads
+    await t.throws("roles: the tax setup is not read anonymously", () => RS.get(t, "/setup/tax"), /pick who you are acting as/);
+    await t.throws("roles: nor a customer's certificates", () => R.get(t, `/pos/customers/${CUST.BRIAN}/certificates`), /pick who you are acting as/);
 
     // -------------------------------------------------- tie still holds at the end
     const fin = await tax.filing(c0, ENTITY, "2000-01-01", "2099-12-31");
