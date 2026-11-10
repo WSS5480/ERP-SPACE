@@ -27,6 +27,7 @@ import * as purchasing from "./purchasing.ts";
 import * as fleet from "./fleet.ts";
 import * as pos from "./pos.ts";
 import { setting } from "./setup.ts";
+import { fromChargeback } from "./debit_memo.ts";
 
 export class ServiceError extends Error {}
 function need(cond: unknown, message: string): asserts cond {
@@ -521,7 +522,13 @@ async function postCost(c: Client, scope: Scope, t: TicketRow, e: { kind: string
                  values ($1,$2,$3,$4,$5,$6,$7,nullif($8,''),$9,$10)`,
     [id, scope.entityId, t.id, e.visitId ?? null, e.kind, e.amountMinor.toString(), e.chargeTo, e.note, je, scope.actor.id || null]);
   await event(c, scope, t.id, "cost", `${e.kind.replace("_", " ")} ${usd(e.amountMinor)} charged to ${e.chargeTo === "vendor" ? "the vendor" : "service expense"}`);
-  return { id, journalEntryId: je };
+  // A chargeback is a debit memo on the vendor's account in payables: it reduces what we owe them.
+  let memo: { id: string; number: string } | null = null;
+  if (e.chargeTo === "vendor" && je && t.vendor_id) {
+    memo = await fromChargeback(c, scope, { vendorId: t.vendor_id, serviceCostId: id, ticketId: t.id, ticketNumber: t.number, amountMinor: e.amountMinor,
+      journalEntryId: je, offsetCode: e.credit, what: `${e.kind.replace("_", " ")}${e.note ? ` — ${e.note}` : ""}` });
+  }
+  return { id, journalEntryId: je, debitMemo: memo };
 }
 
 const defaultChargeTo = (t: TicketRow) => (t.coverage === "manufacturer" && t.vendor_id ? "vendor" : "service_expense");

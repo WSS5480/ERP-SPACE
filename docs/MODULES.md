@@ -96,6 +96,7 @@ Data is placed with textContent only, never innerHTML.
 | reports (report creator and editor) | 0031 | none | Back office |
 | group (multi-company: consolidation, inter-company documents, net-to-zero and settle) | 0035 | 0021 | Back office |
 | edi (vendor EDI X12, API ordering, store orders; extends purchasing) | 0036 | none | Setup (Vendor EDI), Retail (Store orders) |
+| ops (truck loading manifest and lanes, haul-away and recycling, vendor debit memos, time off and holidays; extends fleet, payables, workforce) | 0039 | 0025 | Operations (Loading dock, Haul-away), Back office (Debit memos, Time off) |
 
 ## Group accounting
 

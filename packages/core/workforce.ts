@@ -189,6 +189,10 @@ export async function punch(c: Client, scope: Scope, p: {
       `${e.name}'s last punch in was over ${s.max_shift_hours} hours before that; a manager enters the missing punch`);
     day = r[0].work_day;
   }
+  if (p.kind === "in" && p.source !== "manager") {
+    const off = await leaveOn(c, scope.entityId, p.employeeId, day);
+    need(!off, `${e.name} is on approved ${off?.toLowerCase()} on ${day}; a manager takes the time off back, or enters the punch, before they clock in`);
+  }
   const geo = p.geo && Number.isFinite(p.geo.lng) && Number.isFinite(p.geo.lat) ? `(${p.geo.lng},${p.geo.lat})` : null;
   const r = await one<{ id: string }>(c, `
     insert into time_punch (entity_id, employee_id, location_id, kind, at, work_day, source, geo, recorded_by, reason)
@@ -274,6 +278,14 @@ export async function punchesFor(c: Client, entityId: string, employeeId: string
     [entityId, employeeId, from, to]);
 }
 
+/** Approved time off (leave module) covering a person's day, by its type's name. */
+async function leaveOn(c: Client, entityId: string, employeeId: string, day: string): Promise<string | null> {
+  const r = await q<{ name: string }>(c, `
+    select t.name from leave_request_day d join leave_request r on r.id = d.request_id join leave_type t on t.id = r.leave_type_id
+     where d.entity_id = $1 and r.employee_id = $2 and d.day = $3::date and r.status = 'approved' limit 1`, [entityId, employeeId, day]);
+  return r[0]?.name ?? null;
+}
+
 // ================================================================= shifts
 
 export async function addShift(c: Client, scope: Scope, s: { locationId: string; employeeId: string; startsAt: string; endsAt: string; role?: string | null; notes?: string | null }) {
@@ -290,6 +302,10 @@ export async function addShift(c: Client, scope: Scope, s: { locationId: string;
      where w.entity_id = $1 and w.employee_id = $2 and w.status = 'scheduled' and w.starts_at < $4 and w.ends_at > $3`,
     [scope.entityId, s.employeeId, new Date(a).toISOString(), new Date(b).toISOString()]);
   need(!clash.length, `${e.name} is already on a shift then${clash[0] ? ` at ${clash[0].name}` : ""}`);
+  const tz = await timezoneFor(c, scope.entityId, s.locationId);
+  const onDay = (await one<{ d: string }>(c, `select ($1::timestamptz at time zone $2)::date::text d /* unscoped: arithmetic */`, [new Date(a).toISOString(), tz])).d;
+  const off = await leaveOn(c, scope.entityId, s.employeeId, onDay);
+  need(!off, `${e.name} has approved ${off?.toLowerCase()} on ${onDay}; take the time off back first, or schedule someone else`);
   const r = await one<{ id: string }>(c, `
     insert into work_shift (entity_id, location_id, employee_id, starts_at, ends_at, role, notes, created_by)
     values ($1,$2,$3,$4,$5,$6,$7,$8) returning id`,

@@ -9,6 +9,7 @@ import * as R from "../../packages/core/routing.ts";
 import * as F from "../../packages/core/fleet.ts";
 import { reserveOrder, releaseLines } from "../../packages/core/inventory.ts";
 import { module as fleetModule } from "../../server/modules/fleet.ts";
+import { module as opsModule } from "../../server/modules/ops.ts";
 import type { Company, Actor } from "../../server/modules/kit.ts";
 import { loadCompany } from "../../server/views.ts";
 import { censusGeocoder, setGeocoder, geocoder, CENSUS_URL, type FetchLike } from "../../packages/core/geocode.ts";
@@ -135,7 +136,7 @@ export async function run(t0: T) {
 
   // ===================================================== against the database
   const H: Handler[] = [];
-  fleetModule.register({
+  for (const mod of [fleetModule, opsModule]) mod.register({
     coGet: (tail, fn) => H.push({ method: "GET", re: new RegExp(`^${tail}$`), fn: fn as Handler["fn"], pub: false }),
     coPost: (tail, fn) => H.push({ method: "POST", re: new RegExp(`^${tail}$`), fn: fn as Handler["fn"], pub: false }),
     publicRoute: (method, path, fn) => H.push({ method, re: path, fn: fn as Handler["fn"], pub: true }),
@@ -355,6 +356,11 @@ export async function run(t0: T) {
 
   // lock: the order is fixed
   await t.throws("a driver cannot lock a route", () => post(P.TONY, `/fleet/routes/${RB.id}/lock`), /needs one of/);
+  // the warehouse loads every piece (last stop first) before a route locks
+  for (const rid of [RA.id, RB.id]) {
+    const ld = await post(P.DEE, `/fleet/routes/${rid}/loading/prepare`);
+    for (const it of [...ld.items].filter((x: any) => x.status === "pending")) await post(P.DEE, `/fleet/routes/${rid}/loading/scan`, { itemId: it.id });
+  }
   await post(P.DEE, `/fleet/routes/${RA.id}/lock`);
   await post(P.DEE, `/fleet/routes/${RB.id}/lock`);
   await t.throws("a locked route's stops cannot be reordered", () => post(P.RAY, `/fleet/stops/${firstId}/move`, { dir: "up" }), /locked/);
