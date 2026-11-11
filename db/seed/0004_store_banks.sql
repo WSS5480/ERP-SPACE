@@ -40,11 +40,11 @@ values
 -- What each bank will actually do for us. This is the whole point: the
 -- method is a property of the bank, not a preference.
 update bank_account set supports_zba = true
- where account_last4 = '2210';          -- Enola, same bank as operating
+ where account_last4 = '2210' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d');          -- Enola, same bank as operating
 update bank_account set allows_ach_debit = true
- where account_last4 = '8043';          -- Palestine, debit authorisation on file
+ where account_last4 = '8043' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d');          -- Palestine, debit authorisation on file
 update bank_account set online_transfer_only = true
- where account_last4 = '5512';          -- Socorro, neither: somebody moves it
+ where account_last4 = '5512' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d');          -- Socorro, neither: somebody moves it
 
 -- Every branch sweeps to zero into the one operating account, by whichever
 -- method that bank supports.

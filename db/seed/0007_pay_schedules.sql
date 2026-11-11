@@ -11,7 +11,8 @@ update pay_group g
    set pay_lag_days = greatest(0, least(31, p.pay_date - p.ends_on))
   from (select distinct on (pay_group_id) pay_group_id, pay_date, ends_on
           from pay_period order by pay_group_id, starts_on desc) p
- where p.pay_group_id = g.id and g.pay_lag_days = 0;
+ where p.pay_group_id = g.id and g.pay_lag_days = 0
+   and g.tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d');  -- demo tenants only: this file also runs when an operator resets the demo
 
 -- A placeholder pay date that fell on a weekend moves to the Friday before,
 -- as every pay date worked out from now on does. Only periods nothing has been

@@ -24,7 +24,7 @@ update bank_account
                              where tenant_id = '11111111-1111-1111-1111-111111111111'
                                and code = '6350'),
        settlement_days = 2
- where account_last4 = '8043';        -- Palestine, the store in this example
+ where account_last4 = '8043' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d');        -- Palestine, the store in this example
 
 -- ------------------------------------------------------------- the feed --
 
@@ -33,7 +33,7 @@ insert into pos_deposit (tenant_id, entity_id, location_id, bank_account_id,
 select '11111111-1111-1111-1111-111111111111',
        '22222222-2222-2222-2222-222222222222',
        '33333333-0000-0000-0000-000000000002',
-       (select id from bank_account where account_last4 = '8043'),
+       (select id from bank_account where account_last4 = '8043' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d')),
        d.business_date, d.method, d.amount_minor, d.expected_on, d.source_ref
   from (values
     ((date_trunc('month', current_date) + interval '7 days')::date,  'cash',  41260,
@@ -51,7 +51,7 @@ select '11111111-1111-1111-1111-111111111111',
 insert into bank_statement (id, bank_account_id, statement_date,
                             opening_balance_minor, closing_balance_minor, source)
 values ('ff000000-0000-0000-0000-000000000001',
-        (select id from bank_account where account_last4 = '8043'),
+        (select id from bank_account where account_last4 = '8043' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d')),
         (date_trunc('month', current_date) + interval '12 days')::date,
         0, 227570, 'bai2');
 

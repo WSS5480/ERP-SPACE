@@ -239,7 +239,7 @@ function cleanName(v: unknown): string {
 }
 
 /** What a session cookie carries: n name, e expiry; k 'o' operator (s: support session) or 'c' customer (l login, v version). */
-type CookieData = { n: string; e: number; k?: "o" | "c"; s?: string; l?: string; v?: number };
+type CookieData = { n: string; e: number; k?: "o" | "c"; s?: string; l?: string; v?: number; t?: 1 };
 
 function sessionCookie(d: CookieData): string {
   const payload = Buffer.from(JSON.stringify(d)).toString("base64url");
@@ -277,7 +277,7 @@ type Support = { id: string; tenantId: string; tenantName: string; since: string
 type Who =
   | { via: "token"; kind: "system"; name: string }
   | { via: "apitoken"; kind: "tenant"; name: string; tenantId: string; tokenId: string }
-  | { via: "session"; kind: "operator"; name: string; exp: number; support: Support | null }
+  | { via: "session"; kind: "operator"; name: string; exp: number; support: Support | null; tk?: 1 }
   | { via: "session"; kind: "customer"; name: string; exp: number; loginId: string; userId: string; tenantId: string;
       tenantName: string; tenantKind: string; email: string; prospect: boolean; expiresAt: string | null };
 
@@ -307,6 +307,12 @@ async function authenticate(req: http.IncomingMessage): Promise<Who | null> {
     } finally { c.release(); }
   }
   // An operator. Cookies from before customers existed carry no kind and are operators too.
+  // An operator taken out of ERP_LOGINS (or still on a short key) is signed out at once, not
+  // 12 hours later; a sign-in made with the install token (t) lasts until that token rotates.
+  if (s.t !== 1) {
+    const stored = operatorLogins().get(s.name.toLowerCase());
+    if (!stored || (!stored.startsWith("scrypt$") && stored.length < P.MIN_PASSWORD)) return null;
+  }
   let support: Support | null = null;
   if (s.s) {
     const c = await pool.connect();
@@ -315,7 +321,7 @@ async function authenticate(req: http.IncomingMessage): Promise<Who | null> {
       if (r) support = { id: r.id, tenantId: r.tenant_id, tenantName: r.tenant_name, since: r.started_at, reason: r.reason };
     } finally { c.release(); }
   }
-  return { via: "session", kind: "operator", name: s.name, exp: s.exp, support };
+  return { via: "session", kind: "operator", name: s.name, exp: s.exp, support, ...(s.t === 1 ? { tk: 1 as const } : {}) };
 }
 
 /** What the audit trail records as the actor, when nobody has been chosen. */
@@ -522,6 +528,17 @@ async function personOfTenant(c: Client, co: views.Company, id: string, tenantId
 }
 
 type Acting = { personId: string; personName: string; label: string; preview: boolean } | null;
+
+/** A write outside coPost: refused while a tenant owner previews someone else's view. */
+function refusePreview(req: http.IncomingMessage, who: Who | null): void {
+  if (who?.kind === "customer" && namedSomeone(req) && actingId(req) !== who.userId) {
+    throw new HttpError(403, "previewing someone's view is read-only; switch back to yourself to make changes");
+  }
+}
+/** A write outside coPost, recorded on the customer's platform log when an operator is in support mode. */
+async function supportWrite(c: Client, who: Who | null, tenantId: string, path: string, entityId: string | null): Promise<void> {
+  if (who?.kind === "operator" && who.support) await P.audit(c, auditActor(who), "support.write", tenantId, { path }, entityId);
+}
 
 /**
  * Who a request is done as. A customer user is always themselves; a tenant
@@ -760,6 +777,7 @@ route("POST", /^\/session$/, "none", async (req) => {
   const login = name.toLowerCase();
   signInGate(login, ip);
   const logins = operatorLogins();
+  const viaToken = !logins.has(login);
   if (logins.has(login)) {
     const m = operatorKeyMatches(key, logins.get(login)!);
     if (m === "no") return signInFailed(login, ip, "operator");
@@ -770,11 +788,16 @@ route("POST", /^\/session$/, "none", async (req) => {
   signInOk(login, ip);
   const exp = Math.floor(Date.now() / 1000) + SESSION_HOURS * 3600;
   console.log(`signed in: operator ${name}`);
-  return [200, { name, kind: "operator", until: new Date(exp * 1000).toISOString() }, { "set-cookie": sessionCookie({ n: name, e: exp, k: "o" }) }];
+  return [200, { name, kind: "operator", until: new Date(exp * 1000).toISOString() }, { "set-cookie": sessionCookie({ n: name, e: exp, k: "o", ...(viaToken ? { t: 1 as const } : {}) }) }];
 });
 
 route("POST", /^\/session\/end$/, "none", async (req) => {
   requirePageHeader(req);
+  // A customer's cookie stops working when they sign out, not when it expires (every session of theirs ends).
+  const s = sessionFrom(req);
+  if (s?.k === "c" && s.l && UUID.test(s.l)) {
+    await pool.query("update platform_login set session_version = session_version + 1 where id = $1 and session_version = $2", [s.l, s.v ?? -1]);
+  }
   return [200, { ok: true }, { "set-cookie": CLEAR_COOKIE }];
 });
 
@@ -981,12 +1004,12 @@ route("POST", new RegExp(`^/api/platform/customers/${TID}/support$`), "token", a
   if (who?.kind !== "operator") throw new HttpError(403, "support mode is for the ERP's own team, signed in");
   const body = await readJson(req);
   const s = await tx({ kind: "user", label: `${who.name} (operator)` }, (c) => P.startSupport(c, who.name, tenantParam(m), body.reason));
-  return [200, s, { "set-cookie": sessionCookie({ n: who.name, e: who.exp, k: "o", s: s.id }) }];
+  return [200, s, { "set-cookie": sessionCookie({ n: who.name, e: who.exp, k: "o", s: s.id, t: who.tk }) }];
 });
 route("POST", /^\/api\/platform\/support\/end$/, "token", async (_req, _u, _m, who) => {
   if (who?.kind !== "operator") throw new HttpError(403, "support mode is for the ERP's own team, signed in");
   if (who.support) await tx({ kind: "user", label: `${who.name} (operator)` }, (c) => P.endSupport(c, who.name, who.support!.id));
-  return [200, { ok: true }, { "set-cookie": sessionCookie({ n: who.name, e: who.exp, k: "o" }) }];
+  return [200, { ok: true }, { "set-cookie": sessionCookie({ n: who.name, e: who.exp, k: "o", t: who.tk }) }];
 });
 route("GET", /^\/api\/platform\/audit$/, "token", async (_req, url, _m, who) => {
   operator(who);
@@ -1239,6 +1262,7 @@ async function mayUseConnection(conn: Connection, who: Who | null): Promise<void
 route("POST", /^\/api\/connections\/([^/]+)\/upload$/, "token", async (req, url, m, who) => {
   const conn = await connectionOr404(m[1]);
   await mayUseConnection(conn, who);
+  refusePreview(req, who);
   if (conn.channel !== "manual_upload") {
     throw new HttpError(409, `${conn.name} is a ${conn.channel} connection, not an upload one`);
   }
@@ -1255,6 +1279,7 @@ route("POST", /^\/api\/connections\/([^/]+)\/upload$/, "token", async (req, url,
     } finally { c0.release(); }
   }
   const result = await tx({ kind: "user", label }, async (c) => {
+    await supportWrite(c, who, conn.tenant_id, url.pathname, conn.entity_id);
     const r = await ingest(c, scopeFor(conn, label), conn.id, {
       trigger: "manual",
       offered: [{ origin: filename, bytes, contentType: req.headers["content-type"] }],
@@ -1276,6 +1301,7 @@ route("POST", /^\/api\/connections\/([^/]+)\/upload$/, "token", async (req, url,
 // record; it leaves the list, with their name and reason in the audit trail.
 route("POST", /^\/api\/quarantine\/([^/]+)\/dismiss$/, "token", async (req, url, m, who) => {
   if (!UUID.test(m[1])) throw new HttpError(404, "no such file");
+  refusePreview(req, who);
   const body = await readJson(req);
   const reason = String(body.reason ?? "").trim().slice(0, 500);
   if (!reason) throw new HttpError(400, "say why, so the next person knows");
@@ -1291,21 +1317,27 @@ route("POST", /^\/api\/quarantine\/([^/]+)\/dismiss$/, "token", async (req, url,
     conn = await loadConnection(c0, hit[0].connection_id);
   } finally { c0.release(); }
   const label = labelFor(who, "api dismiss");
-  await tx({ kind: "user", label }, (c) => releaseQuarantine(c, scopeFor(conn, label), m[1], "ignored", reason));
+  await tx({ kind: "user", label }, async (c) => {
+    await supportWrite(c, who, conn.tenant_id, url.pathname, conn.entity_id);
+    await releaseQuarantine(c, scopeFor(conn, label), m[1], "ignored", reason);
+  });
   return [200, { ok: true }];
 });
 
 // Pull on demand. Free hosting has no cron, so this is how a scheduled
 // connection gets run until there is one.
-route("POST", /^\/api\/connections\/([^/]+)\/run$/, "token", async (_req, _url, m, who) => {
+route("POST", /^\/api\/connections\/([^/]+)\/run$/, "token", async (req, url, m, who) => {
   const conn = await connectionOr404(m[1]);
   await mayUseConnection(conn, who);
+  refusePreview(req, who);
   if (conn.channel !== "sftp" && conn.channel !== "api") {
     throw new HttpError(409, `${conn.name} is a push channel; it is run by whatever sends to it`);
   }
   try {
-    const result = await tx({ kind: "system", label: "api run" }, (c) =>
-      ingest(c, scopeFor(conn, "api run", "system"), conn.id, { trigger: "manual" }));
+    const result = await tx({ kind: "system", label: "api run" }, async (c) => {
+      await supportWrite(c, who, conn.tenant_id, url.pathname, conn.entity_id);
+      return ingest(c, scopeFor(conn, "api run", "system"), conn.id, { trigger: "manual" });
+    });
     return [200, result];
   } catch (e) {
     const msg = describeError(e);
