@@ -125,6 +125,10 @@ export async function runDue(opts: { now?: Date; trigger?: "interval" | "manual"
     // a run left 'running' by a process that died is closed off, so its job is not stuck
     await c.query(`update job_run set status = 'failed', finished_at = now(), error = 'the server stopped before this run finished'
                     where status = 'running' and started_at < now() - interval '2 hours' /* unscoped: the install's job log */`);
+    // the job log keeps 90 days (a run every 15 minutes per job adds up)
+    await c.query(`with old as (select id from job_run where started_at < now() - interval '90 days' and status <> 'running' limit 5000),
+                        i as (delete from job_run_item where run_id in (select id from old))
+                   delete from job_run where id in (select id from old) /* unscoped: the install's job log */`).catch(() => {});
     const jobs = opts.force ? JOBS.filter((j) => !opts.only || opts.only.includes(j.id)) : await dueJobs(c, now, opts.only);
     const runs: RunReport[] = [];
     for (const j of jobs) runs.push(await runJob(j, now, opts.trigger ?? "interval", opts.runner ?? RUNNER));

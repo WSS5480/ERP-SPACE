@@ -622,7 +622,7 @@ export async function consolidate(c: Client, tenantId: string, x: { companyIds: 
   const ids = cos.map((e) => e.id);
   const rows = await q<{ entity_id: string; code: string; name: string; account_type: string; range_net: string; asof_net: string }>(c, `
     select je.entity_id, g.code, g.name, g.account_type,
-           sum(case when je.posting_date between $3::date and $4::date then jl.debit_minor - jl.credit_minor else 0 end)::text range_net,
+           sum(case when je.posting_date between $3::date and $4::date and je.source_type <> 'closing' then jl.debit_minor - jl.credit_minor else 0 end)::text range_net,  -- a year-end close is not P&L
            sum(case when je.posting_date <= $5::date then jl.debit_minor - jl.credit_minor else 0 end)::text asof_net
       from journal_line jl join journal_entry je on je.id = jl.journal_entry_id join gl_account g on g.id = jl.gl_account_id
       join entity e on e.id = je.entity_id

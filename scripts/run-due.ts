@@ -209,6 +209,11 @@ export async function runDueConnections(now: Date) {
       out.push({ name: row.name, ok: true, note: `${r.fresh} new of ${r.seen}, ${r.failed} quarantined`, entityId, tenantId: row.tenant_id });
     } catch (e) {
       out.push({ name: row.name, ok: false, note: (e as Error).message, entityId, tenantId: row.tenant_id });
+      // ingest() records the failure inside the transaction it then rolls back, so record it here: without this the
+      // connection stays due, fails again every 15 minutes forever, and never reaches the five failures that stop it.
+      await pool.query(`update connection set last_attempt_at = now(), last_error = $2, consecutive_failures = consecutive_failures + 1,
+                               status = case when consecutive_failures + 1 >= 5 then 'failed' else status end
+                         where id = $1 /* unscoped: connection id is unique */`, [row.id, String((e as Error).message).slice(0, 500)]).catch(() => {});
     }
   }
   return { due: out.length, of: due.rows.length, runs: out };

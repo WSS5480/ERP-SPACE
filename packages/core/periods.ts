@@ -247,8 +247,9 @@ export async function reopenMonth(c: Client, scope: Scope, periodId: string, rea
   const yr = await q<{ id: string; fy_start: string; fy_end: string }>(c, `
     select id, fy_start::text, fy_end::text from fiscal_year_close where entity_id = $1 and status = 'closed' and $2::date between fy_start and fy_end for update`,
     [scope.entityId, p.starts_on]);
-  await c.query(`update fiscal_period set status = 'open', locked_at = null, locked_by = null, closed_reason = null where id = $1 and entity_id = $2`, [periodId, scope.entityId]);
+  // the log row first: the database lets a closed month reopen only with its reason logged (0056)
   await logEvent(c, scope.entityId, p, "reopened", whoOf(scope), why);
+  await c.query(`update fiscal_period set status = 'open', locked_at = null, locked_by = null, closed_reason = null where id = $1 and entity_id = $2`, [periodId, scope.entityId]);
   await audit(c, scope, { table: "fiscal_period", rowId: periodId, action: "transition", before: { status: "closed" }, after: { status: "open" }, reason: why });
   let yearReopened = false;
   if (yr.length) { await reopenYearRow(c, scope, yr[0], why); yearReopened = true; }
@@ -263,8 +264,8 @@ async function reopenYearRow(c: Client, scope: Scope, yr: { id: string; fy_start
     const last = await one<{ id: string; status: string; starts_on: string; ends_on: string }>(c,
       `select id, status, starts_on::text, ends_on::text from fiscal_period where entity_id = $1 and $2::date between starts_on and ends_on`, [scope.entityId, yr.fy_end]);
     if (last.status === "closed") {
-      await c.query(`update fiscal_period set status = 'open', locked_at = null, locked_by = null, closed_reason = null where id = $1 and entity_id = $2`, [last.id, scope.entityId]);
       await logEvent(c, scope.entityId, last, "reopened", whoOf(scope), `the year is reopened: ${why}`);
+      await c.query(`update fiscal_period set status = 'open', locked_at = null, locked_by = null, closed_reason = null where id = $1 and entity_id = $2`, [last.id, scope.entityId]);
     }
     const lines = await q<{ code: string; debit_minor: string; credit_minor: string; profit_object_id: string | null }>(c, `
       select ga.code, jl.debit_minor::text, jl.credit_minor::text, jl.profit_object_id from journal_line jl
@@ -331,6 +332,7 @@ export async function closeYear(c: Client, scope: Scope, fyEnd: string, opts: { 
 
   // The last month must take the closing journal: it is opened for it if a month-end close got there first.
   if (last!.status === "closed") {
+    await logEvent(c, scope.entityId, last!, "reopened", whoOf(scope), "opened for the year-end closing entry, then closed again");
     await c.query(`update fiscal_period set status = 'open' where id = $1 and entity_id = $2`, [last!.id, scope.entityId]);
   }
   const bal = await q<{ code: string; account_type: string; profit_object_id: string | null; net: string }>(c, `

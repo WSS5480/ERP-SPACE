@@ -680,6 +680,7 @@ export async function pnl(c: Client, co: Company, from: string, to: string) {
       join gl_account ga on ga.id = jl.gl_account_id
      where je.entity_id = $1 and je.posting_date between $2::date and $3::date
        and ga.account_type in ('revenue', 'expense')
+       and je.source_type <> 'closing'   -- the year-end closing entry (periods.ts) is not part of the year's P&L
      group by ga.code, ga.name, ga.account_type, jl.profit_object_id
      order by ga.code`, [co.id, from, to]);
   const accounts = new Map<string, { code: string; name: string; type: string; byStore: Record<string, string>; total: bigint }>();
@@ -1082,7 +1083,7 @@ export async function home(c: Client, co: Company, personId: string | null) {
       from journal_line jl
       join journal_entry je on je.id = jl.journal_entry_id
       join gl_account ga on ga.id = jl.gl_account_id
-     where je.entity_id = $1 and je.posting_date between $2::date and $3::date`, [co.id, from, to]);
+     where je.entity_id = $1 and je.posting_date between $2::date and $3::date and je.source_type <> 'closing'`, [co.id, from, to]);
 
   const attention = await q(c, `
     select i.id, coalesce(v.dba, v.legal_name) as vendor, i.reference, i.total_minor, i.status,

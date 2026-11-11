@@ -32,7 +32,8 @@ function scrubbed(s: string): string {
   return s
     .replace(/\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [redacted]")
     .replace(/\berpt_[A-Za-z0-9_-]+/g, "erpt_[redacted]")
-    .replace(/\b(password|passwd|pwd|token|secret|key|code|authorization|cookie|session)(["']?\s*[:=]\s*["']?)[^\s"'&,;}]+/gi, "$1$2[redacted]")
+    .replace(/\b([a-z]+:\/\/[^:\s\/@]+:)[^@\s]+@/gi, "$1[redacted]@")   // a password in a connection URL
+    .replace(/\b([A-Za-z]*_?(?:password|passwd|pwd|token|secret|key|code|authorization|cookie|session))(["']?\s*[:=]\s*["']?)[^\s"'&,;}]+/gi, "$1$2[redacted]")
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[email]")
     .replace(/\b\d[\d -]{11,}\d\b/g, (m) => (m.replace(/\D/g, "").length >= 12 ? "[number]" : m))
     .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[token]");

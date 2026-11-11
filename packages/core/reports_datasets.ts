@@ -94,7 +94,7 @@ export const DATASETS: Dataset[] = [
                  jl.credit_minor - jl.debit_minor as net_income,
                  je.id::text as entry_id
             from journal_line jl
-            join journal_entry je on je.id = jl.journal_entry_id and je.entity_id = $1
+            join journal_entry je on je.id = jl.journal_entry_id and je.entity_id = $1 and je.source_type <> 'closing'  -- the year-end closing entry is not the year's P&L
             join gl_account ga on ga.id = jl.gl_account_id and ga.account_type in ('revenue', 'expense')
             left join profit_object po on po.id = jl.profit_object_id and po.entity_id = $1`,
   },

@@ -182,7 +182,7 @@ async function main() {
 
   await throws("an unbalanced journal entry is refused", () =>
     tx(scope(CONTROLLER, "Controller"), async (c) => {
-      const p = await c.query(`select id from fiscal_period where entity_id=$1 and status<>'closed' limit 1`, [ENTITY]);
+      const p = await c.query(`select id from fiscal_period where entity_id=$1 and status<>'closed' and current_date between starts_on and ends_on limit 1`, [ENTITY]);
       const a = await c.query(`select id from gl_account where tenant_id=$1 and code='6800'`, [TENANT]);
       const je = await c.query(
         `insert into journal_entry (tenant_id, entity_id, period_id, posting_date, source_type, description)
