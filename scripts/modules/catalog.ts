@@ -157,7 +157,7 @@ export async function run(t: T) {
   t.ok("products: an edit lands and the margin view follows it", det.product.price_minor === "52900" && det.product.color === "Charcoal" && det.marginBps === 6030, String(det.marginBps));
   await t.throws("products: activating a product with no price is refused", () => r.post("/catalog/products/:id/status", BUYER, { status: "active" }, P.LIFT), /needs a price/);
   await t.throws("status: a floor sample says why", () => r.post("/catalog/products/:id/status", STORE_MGR, { status: "floor_sample" }, made.id), /say why/);
-  await r.post("/catalog/products/:id/status", STORE_MGR, { status: "floor_sample", note: "Enola showroom model" }, made.id);
+  await r.post("/catalog/products/:id/status", STORE_MGR, { status: "floor_sample", note: "Riverside showroom model" }, made.id);
   await t.throws("status: an AP clerk cannot change it", () => r.post("/catalog/products/:id/status", PEOPLE.CLERK, { status: "active" }, made.id), /needs one of/);
   const live = await r.post<{ id: string }>("/catalog/products", BUYER, { sku: "GLB-CHK-03", name: "Check glider", vendorId: V.GLOBAL, price: "349", cost: "150", status: "active" });
   const liveDet = await r.get<{ product: Record<string, unknown> }>("/catalog/products/:id", "", live.id);

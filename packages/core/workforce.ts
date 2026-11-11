@@ -17,15 +17,16 @@
 // earnings, with a draw guaranteed and (if recoverable) paid back out of
 // later commission.
 
+import { timeZoneFor } from "./clock.ts";
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor, type PostLine } from "./posting.ts";
 import { format, mulBps } from "./money.ts";
 import { lineSplits, accrueReferrals } from "./trade_commission.ts";
 
 export class WorkforceError extends Error {}
-const need = (cond: unknown, msg: string): asserts cond => { if (!cond) throw new WorkforceError(msg); };
+function need(cond: unknown, msg: string): asserts cond { if (!cond) throw new WorkforceError(msg); }
 const B = (v: string | number | bigint | null | undefined) => BigInt(v ?? 0);
-const today = () => new Date().toISOString().slice(0, 10);
 const isDay = (s: unknown): s is string => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 
 // ================================================================= the clock
@@ -47,20 +48,17 @@ export async function instantAt(c: Client, entityId: string, locationId: string,
   return new Date(v);
 }
 
+/** The store's business zone (clock.ts: the store's own, else the time clock's for it, else the company's ...). */
 export async function timezoneFor(c: Client, entityId: string, locationId: string): Promise<string> {
-  const r = await q<{ tz: string }>(c, `
-    select coalesce((select timezone from workforce_location where location_id = $2 and entity_id = $1),
-                    (select timezone from workforce_settings where entity_id = $1), (select time_zone from fleet_setting where entity_id = $1), 'America/New_York') tz`, [entityId, locationId]);
-  return r[0].tz;
+  return timeZoneFor(c, entityId, locationId);
 }
 
 async function settingsOf(c: Client, entityId: string) {
   const r = await q<{ missed_punch_hours: number; max_shift_hours: number; timezone: string }>(c,
     `select missed_punch_hours, max_shift_hours, timezone from workforce_settings where entity_id = $1`, [entityId]);
   if (r[0]) return r[0];
-  // no time settings yet: the delivery settings' zone if there is one
-  const f = await q<{ tz: string }>(c, `select time_zone tz from fleet_setting where entity_id = $1`, [entityId]);
-  return { missed_punch_hours: 12, max_shift_hours: 14, timezone: f[0]?.tz ?? "America/New_York" };
+  // no time settings yet: the company's business zone (clock.ts)
+  return { missed_punch_hours: 12, max_shift_hours: 14, timezone: await timeZoneFor(c, entityId) };
 }
 
 export async function employeeOf(c: Client, entityId: string, id: string) {
@@ -400,8 +398,8 @@ async function splitsOf(c: Client, entityId: string, orderId: string, salesperso
 export async function accrueCommissions(c: Client, scope: Scope, opts: { orderId?: string | null } = {}) {
   const lines = await q<{ line_id: string; order_id: string; salesperson_id: string | null; location_id: string; ordered_on: string; earned_on: string;
     net_minor: string; qty: string; cost_minor: string | null; product_id: string | null; category: string | null; vendor_id: string | null }>(c, `
-    select l.id line_id, so.id order_id, so.salesperson_id, so.location_id, so.ordered_at::date::text ordered_on,
-           coalesce(i.invoice_date, so.ordered_at::date)::text earned_on,
+    select l.id line_id, so.id order_id, so.salesperson_id, so.location_id, (so.ordered_at at time zone business_tz(so.entity_id, so.location_id))::date::text ordered_on,
+           coalesce(i.invoice_date, (so.ordered_at at time zone business_tz(so.entity_id, so.location_id))::date)::text earned_on,
            coalesce(il.net_minor, round(l.qty * l.unit_price_minor)::bigint - l.discount_minor)::text net_minor, l.qty, p.cost_minor, l.product_id, p.category, p.vendor_id
       from sales_order_line l
       join sales_order so on so.id = l.sales_order_id
@@ -482,7 +480,7 @@ export async function accrueCommissions(c: Client, scope: Scope, opts: { orderId
       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) returning id`,
       [scope.entityId, ev.app_user_id, ev.sales_order_id, ev.sales_order_line_id, ev.kind === "earned" ? "chargeback" : "spiff_chargeback", ev.plan_id, ev.spiff_id,
        ev.location_id, ev.split_bps, (-B(ev.sale_minor)).toString(), (-B(ev.cost_minor)).toString(), (-B(ev.basis_minor)).toString(), ev.rate_bps,
-       (-B(ev.amount_minor)).toString(), today()]);
+       (-B(ev.amount_minor)).toString(), (await bizToday(c, scope))]);
     ids.push(x.id); fresh.push({ amount: -B(ev.amount_minor), location: ev.location_id ?? "" }); chargebacks++;
   }
   // The accrual, by store.
@@ -497,7 +495,7 @@ export async function accrueCommissions(c: Client, scope: Scope, opts: { orderId
     else postLines.push({ code: "2160", debit: -amt, profitObjectId: po }, { code: "6130", credit: -amt, profitObjectId: po });
   }
   if (postLines.length) {
-    je = await post(c, scope, { date: today(), sourceType: "commission", sourceId: opts.orderId ?? null,
+    je = await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "commission", sourceId: opts.orderId ?? null,
       description: `Commissions accrued: ${earned} earned, ${spiffs} spiffs, ${chargebacks} charged back`, lines: postLines });
     await c.query(`update commission_event set journal_entry_id = $2 where entity_id = $3 and id = any($1)`, [ids, je, scope.entityId]);
   }
@@ -576,7 +574,7 @@ export async function approveCommissions(c: Client, scope: Scope, payPeriodId: s
     out.push({ name: p.name, commission, payout, topup, recovered, drawBalance: balance });
   }
   if (recoveryLines.length) {
-    const je = await post(c, scope, { date: today(), sourceType: "commission", sourceId: payPeriodId,
+    const je = await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "commission", sourceId: payPeriodId,
       description: `Draws recovered from commission, ${format(recoveredTotal)}`, lines: recoveryLines });
     await c.query(`update commission_payout set journal_entry_id = $2 where entity_id = $3 and pay_period_id = $1 and recovered_minor > 0 and journal_entry_id is null`,
       [payPeriodId, je, scope.entityId]);
@@ -616,7 +614,7 @@ export async function leaderboard(c: Client, entityId: string, from: string, to:
     with s as (
       select so.id, so.subtotal_minor - so.discount_minor net, coalesce(x.app_user_id, so.salesperson_id) app_user_id, coalesce(x.split_bps, 10000) split_bps
         from sales_order so left join sales_order_salesperson x on x.sales_order_id = so.id and x.entity_id = $1
-       where so.entity_id = $1 and so.status not in ('draft','cancelled') and so.ordered_at::date between $2::date and $3::date)
+       where so.entity_id = $1 and so.status not in ('draft','cancelled') and (so.ordered_at at time zone business_tz(so.entity_id, so.location_id))::date between $2::date and $3::date)
     select app_user_id, (sum(net * split_bps) / 10000)::bigint::text written, count(distinct id)::int orders from s where app_user_id is not null group by app_user_id`,
     [entityId, from, to]);
   const delivered = await q<{ app_user_id: string; delivered: string; cost: string; commission: string }>(c, `

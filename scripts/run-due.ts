@@ -1,7 +1,9 @@
 // The scheduler: run every active pull connection whose own schedule has
 // come round since it last tried.
 //
-// Render's cron fires this every fifteen minutes. Each connection keeps its
+// The web server runs these itself (server/scheduler.ts: one runner at a time
+// across instances, each run recorded in job_run). Run by hand, this file runs
+// every job that is due now, through the same scheduler. Each connection keeps its
 // own cron expression -- First Valley at 06:00 on weekdays, Pineywoods hourly
 // -- and this decides which of them are due. One failing connection does not
 // stop the others; each failure is recorded against its own connection, where
@@ -67,23 +69,27 @@ export function isDue(expr: string, since: Date | null, now: Date): boolean {
  * vendor's other feeds.
  */
 export async function runDueVendorFeeds(now: Date, env: FeedEnv = liveEnv(), only?: { entityId: string }) {
-  const rows = await pool.query<{ id: string; name: string; entity_id: string; tenant_id: string; schedule_cron: string | null; every_hours: number | null; last_run_at: Date | null }>(
-    `select f.id, f.name, f.entity_id, e.tenant_id, f.schedule_cron, f.every_hours, f.last_run_at
+  const rows = await pool.query<{ id: string; name: string; entity_id: string; tenant_id: string; schedule_cron: string | null; every_hours: number | null; last_run_at: Date | null; demo: boolean }>(
+    `select f.id, f.name, f.entity_id, e.tenant_id, f.schedule_cron, f.every_hours, f.last_run_at,
+            exists (select 1 from tenant t where t.id = e.tenant_id and t.kind = 'demo') demo
        from vendor_feed f join entity e on e.id = f.entity_id
       where f.active and f.kind = 'api' and f.purpose <> 'orders' and (f.schedule_cron is not null or f.every_hours is not null)
         and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active')
         and ($1::uuid is null or f.entity_id = $1)
       order by f.entity_id, f.vendor_id, array_position(array['products','pricing','images','quantities','freight','acknowledgments'], f.purpose)
       /* unscoped: the scheduler walks every company's feeds */`, [only?.entityId ?? null]);
-  const out: { name: string; ok: boolean; note: string }[] = [];
+  const out: { name: string; ok: boolean; note: string; entityId: string; tenantId: string }[] = [];
   for (const row of rows.rows) {
     if (!feedDue(row, now, isDue)) continue;
+    const ids = { entityId: row.entity_id, tenantId: row.tenant_id };
+    // the demo never calls a real vendor on its own (a check asking for one company still can, against its mocks)
+    if (row.demo && !only) { out.push({ name: row.name, ok: true, note: "demo: skipped", ...ids }); continue; }
     try {
       const r = await tx({ kind: "system", label: "scheduler" }, (cl) =>
         runFeed(cl, { tenantId: row.tenant_id, entityId: row.entity_id, actor: { kind: "system", label: "scheduler" } }, row.id, env, "schedule"));
-      out.push({ name: row.name, ok: r.ok, note: r.note });
+      out.push({ name: row.name, ok: r.ok, note: r.note, ...ids });
     } catch (e) {
-      out.push({ name: row.name, ok: false, note: (e as Error).message });
+      out.push({ name: row.name, ok: false, note: (e as Error).message, ...ids });
     }
   }
   return { due: out.length, of: rows.rows.length, runs: out };
@@ -101,7 +107,7 @@ export async function runDueCrm(now: Date) {
         and (exists (select 1 from entity_module m where m.entity_id = e.id and m.module = 'crm' and m.enabled)
              or not exists (select 1 from entity_module m where m.entity_id = e.id))
       /* unscoped: the scheduler walks every company */`);
-  const out: { entityId: string; sent: number; stopped: number; carts: number; note?: string }[] = [];
+  const out: { entityId: string; tenantId: string; sent: number; stopped: number; carts: number; note?: string }[] = [];
   for (const co of cos.rows) {
     try {
       const r = await tx({ kind: "system", label: "scheduler" }, async (cl) => {
@@ -109,14 +115,14 @@ export async function runDueCrm(now: Date) {
         const carts = await captureAbandonedCarts(cl, co.id);
         return { ...q, carts: typeof carts === "number" ? carts : Number((carts as { added?: number })?.added ?? 0) };
       });
-      out.push({ entityId: co.id, ...r });
+      out.push({ entityId: co.id, tenantId: co.tenant_id, ...r });
       // Clienteling follow-ups (trade module) go on the same task list, and referral commission waiting on
       // payment is earned once paid -- in their own transaction, so a problem there never holds up the messages.
       const sc = { tenantId: co.tenant_id, entityId: co.id, actor: { kind: "system" as const, label: "scheduler" } };
       await tx({ kind: "system", label: "scheduler" }, async (cl) => { await runFollowUps(cl, sc, now); await accrueReferrals(cl, sc); })
-        .catch((e) => out.push({ entityId: co.id, sent: 0, stopped: 0, carts: 0, note: `follow-ups: ${(e as Error).message}` }));
+        .catch((e) => out.push({ entityId: co.id, tenantId: co.tenant_id, sent: 0, stopped: 0, carts: 0, note: `follow-ups: ${(e as Error).message}` }));
     } catch (e) {
-      out.push({ entityId: co.id, sent: 0, stopped: 0, carts: 0, note: (e as Error).message });
+      out.push({ entityId: co.id, tenantId: co.tenant_id, sent: 0, stopped: 0, carts: 0, note: (e as Error).message });
     }
   }
   return out;
@@ -133,21 +139,24 @@ export async function runDueCrm(now: Date) {
  * their own schedules in runDueVendorFeeds.
  */
 export async function runDueEdi(_now: Date, env: EdiEnv = liveEdiEnv(), only?: { entityId: string }) {
-  const rows = await pool.query<{ id: string; entity_id: string; tenant_id: string; vendor: string }>(
-    `select p.id, p.entity_id, e.tenant_id, coalesce(v.dba, v.legal_name) vendor
+  const rows = await pool.query<{ id: string; entity_id: string; tenant_id: string; vendor: string; demo: boolean }>(
+    `select p.id, p.entity_id, e.tenant_id, coalesce(v.dba, v.legal_name) vendor,
+            exists (select 1 from tenant t where t.id = e.tenant_id and t.kind = 'demo') demo
        from edi_partner p join entity e on e.id = p.entity_id join vendor v on v.id = p.vendor_id
       where p.edi_enabled and p.transport <> 'manual' and e.status = 'active' and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active') and ($1::uuid is null or p.entity_id = $1)
         and not exists (select 1 from entity_module m where m.entity_id = p.entity_id and m.module = 'edi' and not m.enabled)
       order by p.entity_id, 4 /* unscoped: the scheduler walks every company's trading partners */`, [only?.entityId ?? null]);
-  const out: { vendor: string; ok: boolean; note: string }[] = [];
+  const out: { vendor: string; ok: boolean; note: string; entityId: string; tenantId: string }[] = [];
   for (const r of rows.rows) {
+    const ids = { entityId: r.entity_id, tenantId: r.tenant_id };
+    if (r.demo && !only) { out.push({ vendor: r.vendor, ok: true, note: "demo: skipped", ...ids }); continue; }
     try {
       // Each file in and each document out commits on its own (see pollPartner), so nothing is lost or sent twice.
       const actor = { kind: "system" as const, label: "scheduler" };
       const res = await pollPartner((fn) => tx(actor, fn), { tenantId: r.tenant_id, entityId: r.entity_id, actor }, env, r.id);
-      out.push({ vendor: r.vendor, ok: res.ok, note: res.note });
+      out.push({ vendor: r.vendor, ok: res.ok, note: res.note, ...ids });
     } catch (e) {
-      out.push({ vendor: r.vendor, ok: false, note: (e as Error).message });
+      out.push({ vendor: r.vendor, ok: false, note: (e as Error).message, ...ids });
     }
   }
   return out;
@@ -158,20 +167,20 @@ export async function runDueEdi(_now: Date, env: EdiEnv = liveEdiEnv(), only?: {
  * the floor. Each company in its own transaction; a failure is reported and
  * does not stop the others.
  */
-export async function runDueHolds(now: Date, only?: { entityId: string }) {
-  const on = now.toISOString().slice(0, 10);
+export async function runDueHolds(_now: Date, only?: { entityId: string }) {
+  // a hold runs out at the end of its day in the company's own time zone (clock.ts), not UTC's
   const rows = await pool.query<{ entity_id: string; tenant_id: string }>(
     `select distinct h.entity_id, e.tenant_id from pos_quote_hold h join entity e on e.id = h.entity_id
-      where h.status = 'active' and h.held_until < $1::date and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active') and ($2::uuid is null or h.entity_id = $2)
-      /* unscoped: the scheduler walks every company's holds */`, [on, only?.entityId ?? null]);
-  const out: { entityId: string; holds: number; released: number; note?: string }[] = [];
+      where h.status = 'active' and h.held_until < business_today(h.entity_id) and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active') and ($1::uuid is null or h.entity_id = $1)
+      /* unscoped: the scheduler walks every company's holds */`, [only?.entityId ?? null]);
+  const out: { entityId: string; tenantId: string; holds: number; released: number; note?: string }[] = [];
   for (const r of rows.rows) {
     try {
       const res = await tx({ kind: "system", label: "scheduler" }, (cl) =>
-        expireHolds(cl, { tenantId: r.tenant_id, entityId: r.entity_id, actor: { kind: "system", label: "scheduler" } }, on));
-      out.push({ entityId: r.entity_id, ...res });
+        expireHolds(cl, { tenantId: r.tenant_id, entityId: r.entity_id, actor: { kind: "system", label: "scheduler" } }));
+      out.push({ entityId: r.entity_id, tenantId: r.tenant_id, ...res });
     } catch (e) {
-      out.push({ entityId: r.entity_id, holds: 0, released: 0, note: (e as Error).message });
+      out.push({ entityId: r.entity_id, tenantId: r.tenant_id, holds: 0, released: 0, note: (e as Error).message });
     }
   }
   return out;
@@ -180,49 +189,53 @@ export async function runDueHolds(now: Date, only?: { entityId: string }) {
 /** The name the earlier scheduler used. */
 export const runDueVendorConnections = runDueVendorFeeds;
 
-async function main() {
-  const now = new Date();
-  const due = await pool.query<{ id: string; name: string; schedule_cron: string; last_attempt_at: Date | null }>(
-    `select c.id, c.name, c.schedule_cron, c.last_attempt_at
+/** Bank and statement connections that pull on their own schedule (SFTP, APIs). */
+export async function runDueConnections(now: Date) {
+  const due = await pool.query<{ id: string; name: string; schedule_cron: string; last_attempt_at: Date | null; tenant_id: string; entity_id: string | null; demo: boolean }>(
+    `select c.id, c.name, c.schedule_cron, c.last_attempt_at, c.tenant_id, c.entity_id,
+            exists (select 1 from tenant t where t.id = c.tenant_id and t.kind = 'demo') demo
        from connection c
        join source_channel sc on sc.source_code = c.source_code and sc.channel = c.channel
       where c.status = 'active' and sc.mode = 'pull' and c.schedule_cron is not null
-        and exists (select 1 from tenant t where t.id = c.tenant_id and t.status = 'active')`
+        and exists (select 1 from tenant t where t.id = c.tenant_id and t.status = 'active')
+      /* unscoped: the scheduler walks every client's connections */`
   );
-
-  let ran = 0;
+  const out: { name: string; ok: boolean; note: string; entityId: string | null; tenantId: string }[] = [];
   for (const row of due.rows) {
     if (!isDue(row.schedule_cron, row.last_attempt_at, now)) continue;
-    ran++;
+    // the demo's pulls point at made-up banks and feeds: never fetched on a schedule
+    if (row.demo) { out.push({ name: row.name, ok: true, note: "demo: skipped", entityId: row.entity_id, tenantId: row.tenant_id }); continue; }
+    let entityId: string | null = null;
     try {
       const c = await pool.connect();
       let conn;
       try { conn = await loadConnection(c, row.id); } finally { c.release(); }
+      entityId = conn.entity_id ?? null;
       const r = await tx({ kind: "system", label: "scheduler" }, (cl) =>
         ingest(cl, { tenantId: conn.tenant_id, entityId: conn.entity_id!, actor: { kind: "system", label: "scheduler" } },
                conn.id, { trigger: "schedule" }));
-      console.log(`${row.name}: ${r.fresh} new of ${r.seen}, ${r.failed} quarantined`);
+      out.push({ name: row.name, ok: true, note: `${r.fresh} new of ${r.seen}, ${r.failed} quarantined`, entityId, tenantId: row.tenant_id });
     } catch (e) {
-      console.log(`${row.name}: failed — ${(e as Error).message}`);
+      out.push({ name: row.name, ok: false, note: (e as Error).message, entityId, tenantId: row.tenant_id });
+      // ingest() records the failure inside the transaction it then rolls back, so record it here: without this the
+      // connection stays due, fails again every 15 minutes forever, and never reaches the five failures that stop it.
+      await pool.query(`update connection set last_attempt_at = now(), last_error = $2, consecutive_failures = consecutive_failures + 1,
+                               status = case when consecutive_failures + 1 >= 5 then 'failed' else status end
+                         where id = $1 /* unscoped: connection id is unique */`, [row.id, String((e as Error).message).slice(0, 500)]).catch(() => {});
     }
   }
-  console.log(`${ran} of ${due.rows.length} scheduled connections were due`);
-  const vendors = await runDueVendorFeeds(now);
-  for (const r of vendors.runs) console.log(`${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
-  console.log(`${vendors.due} of ${vendors.of} scheduled vendor feeds were due`);
-  for (const r of await runDueCrm(now)) {
-    if (r.note || r.sent || r.stopped || r.carts) console.log(`marketing ${r.entityId}: ${r.sent} sent, ${r.stopped} held back, ${r.carts} carts to leads${r.note ? ` — ${r.note}` : ""}`);
-  }
-  for (const r of await runDueEdi(now)) console.log(`EDI ${r.vendor}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
-  for (const r of await runDueHolds(now)) console.log(`quote holds ${r.entityId}: ${r.holds} ran out, ${r.released} lines back on the floor${r.note ? ` — ${r.note}` : ""}`);
-  // Scheduled reports: each keeps a snapshot and prepares its email.
-  const reports = await runDueReports(pool, tx);
-  for (const r of reports.runs) console.log(`report ${r.name}: ${r.ok ? "ok" : "failed"} — ${r.note}`);
-  console.log(`${reports.due} scheduled reports were due`);
-  // The outbox: anything queued after a commit that a restart kept from going (Admin, Connections).
-  const out = await drainQueued({ limit: 1000 });
+  return { due: out.length, of: due.rows.length, runs: out };
+}
+
+/** By hand (or from a cron service): every job that is due now, through the scheduler the web server uses. */
+async function main() {
+  const { runDue } = await import("../server/scheduler.ts");
+  const force = process.argv.includes("--all");
+  const r = await runDue({ trigger: "cron", force, runner: "run-due" });
+  if (r.skipped) console.log(`skipped: ${r.skipped}`);
+  for (const x of r.runs) console.log(`${x.job}: ${x.status}${x.summary ? ` — ${x.summary}` : ""}${x.error ? ` — ${x.error}` : ""}`);
+  console.log(`${r.runs.length} job(s) ran`);
   await idle();
-  console.log(`outbox: ${out.sent} sent, ${out.failed} failed`);
   await pool.end();
 }
 

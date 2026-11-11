@@ -164,7 +164,7 @@ async function productDetail(c: Client, co: Company, id: string) {
     () => q(c, `select id, name, kind, pct_bps, amount_minor, starts_on::text, ends_on::text, respect_map,
                  case when product_id is not null then 'this product' when vendor_id is not null and category is not null then 'vendor and category'
                       when vendor_id is not null then 'vendor' else 'category' end reach
-            from promotion where entity_id = $1 and active and ends_on >= current_date
+            from promotion where entity_id = $1 and active and ends_on >= business_today($1)
              and (product_id = $2 or (product_id is null and (vendor_id is null or vendor_id = $3) and (category is null or category = $4)))
            order by starts_on`, [co.id, id, p.vendor_id, p.category]),
     () => q(c, `select a.location_id, l.name location, a.location_kind, a.on_hand, a.reserved, a.available, a.on_order
@@ -331,9 +331,9 @@ export const module: ErpModule = {
       promotions: await q(c, `
         select pr.id, pr.name, pr.kind, pr.pct_bps, pr.amount_minor, pr.starts_on::text, pr.ends_on::text, pr.respect_map, pr.active,
                pr.category, p.sku, p.name product, coalesce(v.dba, v.legal_name) vendor,
-               case when not pr.active then 'ended' when pr.ends_on < current_date then 'over' when pr.starts_on > current_date then 'scheduled' else 'live' end state
+               case when not pr.active then 'ended' when pr.ends_on < business_today($1) then 'over' when pr.starts_on > business_today($1) then 'scheduled' else 'live' end state
           from promotion pr left join product p on p.id = pr.product_id left join vendor v on v.id = pr.vendor_id
-         where pr.entity_id = $1 order by pr.active desc, pr.ends_on >= current_date desc, pr.starts_on`, [co.id]),
+         where pr.entity_id = $1 order by pr.active desc, pr.ends_on >= business_today($1) desc, pr.starts_on`, [co.id]),
     }));
     coGet("/catalog/import/fields", async () => ({ fields: cat.IMPORT_FIELDS }));
     coGet("/catalog/import/runs", async (c, co) => ({

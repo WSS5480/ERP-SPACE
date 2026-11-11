@@ -376,9 +376,9 @@
   // tied to GL 2100 with any difference shown first. Cards, never a wide table.
   const TAXP = { from: '', to: '' };
   async function taxFiling() {
-    const iso = (d) => d.toISOString().slice(0, 10);
+    const iso = E.isoDay;   // the local calendar day, not UTC's
     const now = new Date();
-    if (!TAXP.from) { TAXP.from = iso(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))); TAXP.to = iso(now); }
+    if (!TAXP.from) { TAXP.from = iso(new Date(now.getFullYear(), now.getMonth(), 1)); TAXP.to = iso(now); }
     const from = input({ type: 'date', value: TAXP.from, 'aria-label': 'First day' }), to = input({ type: 'date', value: TAXP.to, 'aria-label': 'Last day' });
     const out = el('div');
     const month = (k) => { const m = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + k, 1)); const e = new Date(Date.UTC(m.getUTCFullYear(), m.getUTCMonth() + 1, 0));

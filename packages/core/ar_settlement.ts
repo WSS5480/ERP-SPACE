@@ -21,6 +21,7 @@
 // When everything in a file is posted and the lender's bank account is known,
 // the deposit is linked to its bank statement line through reconciliation.
 
+import { today as bizToday } from "./clock.ts";
 import { createHash } from "node:crypto";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, type PostLine } from "./posting.ts";
@@ -32,7 +33,6 @@ export class SettlementError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new SettlementError(msg); };
 const B = (v: string | number | bigint | null | undefined) => BigInt(v ?? 0);
 const $ = (m: bigint) => format(m);
-const today = () => new Date().toISOString().slice(0, 10);
 
 export type RemitMapping = {
   date: string; auth?: string; account?: string; gross?: string; fee?: string; holdback?: string; net?: string;
@@ -174,7 +174,7 @@ export function parseRemit(text: string, mp: RemitMapping): RemitRow[] {
 type Sale = { id: string; amount_minor: string; fee_bps: number; status: string; holdback_open_minor: string; funded_minor: string; fee_taken_minor: string;
   funded_gross_minor: string; refunded_minor: string; plan_id: string | null; on_day: string; auth_code: string | null; receipt: string };
 const SALE_COLS = `f.id, f.amount_minor, f.fee_bps, f.status, f.holdback_open_minor, f.funded_minor, f.fee_taken_minor, f.funded_gross_minor, f.refunded_minor,
-  f.plan_id, f.created_at::date::text on_day, f.auth_code, r.number receipt`;
+  f.plan_id, (f.created_at at time zone business_tz(f.entity_id))::date::text on_day, f.auth_code, r.number receipt`;
 /** What the lender still owes on a sale: the sale, less customer refunds, less what they have funded. */
 const remaining = (s: Sale) => B(s.amount_minor) - B(s.refunded_minor) - B(s.funded_gross_minor);
 /** Which sales a row of each kind can apply to. */
@@ -197,7 +197,7 @@ async function findSale(c: Client, entityId: string, companyId: string, row: Rem
     const amtRule = row.kind === "funding" ? "f.amount_minor - f.refunded_minor - f.funded_gross_minor = $4" : row.kind === "holdback_release" ? "f.holdback_open_minor >= $4" : "f.funded_gross_minor >= $4";
     const r = await q<Sale>(c, `select ${SALE_COLS} from financed_sale f join customer_receipt r on r.id = f.receipt_id
       where f.entity_id = $1 and f.company_id = $2 and f.account_last4 = $3 and ${open} and ${amtRule}
-        and ($5::date is null or abs(f.created_at::date - $5::date) <= case when $6 = 'funding' then 10 else 180 end)
+        and ($5::date is null or abs((f.created_at at time zone business_tz(f.entity_id))::date - $5::date) <= case when $6 = 'funding' then 10 else 180 end)
       order by f.created_at for update of f`, [entityId, companyId, row.last4, amt.toString(), row.txnOn, row.kind]);
     // A row naming an approval code never lands on a sale that carries a different one.
     const fit = r.filter((x) => !row.auth || !x.auth_code || x.auth_code.toUpperCase() === row.auth);
@@ -249,7 +249,7 @@ async function plan(c: Client, entityId: string, lender: Lender, row: RemitRow, 
       await c.query(`update financed_sale set funded_gross_minor = funded_gross_minor + $3, funded_minor = funded_minor + $4, fee_taken_minor = fee_taken_minor + $5,
           holdback_minor = holdback_minor + $6, holdback_open_minor = holdback_open_minor + $6, funded_on = $7,
           status = case when amount_minor - refunded_minor - funded_gross_minor - $3 = 0 then 'funded' else 'awaiting_funding' end
-        where id = $1 and entity_id = $2`, [sale.id, entityId, row.grossMinor.toString(), row.netMinor.toString(), row.feeMinor.toString(), row.holdbackMinor.toString(), row.txnOn ?? today()]);
+        where id = $1 and entity_id = $2`, [sale.id, entityId, row.grossMinor.toString(), row.netMinor.toString(), row.feeMinor.toString(), row.holdbackMinor.toString(), row.txnOn ?? (await bizToday(c, entityId))]);
     } };
   }
   if (row.kind === "holdback_release") {
@@ -325,8 +325,8 @@ export async function importRemittance(c: Client, scope: Scope, e: { companyId: 
   const number = (await q<{ n: string }>(c, `select next_doc_no($1, 'finance_remit', 'FR-') n /* unscoped: numbering keyed by entity argument */`, [scope.entityId]))[0].n;
   const net = rows.reduce((a, r) => a + r.netMinor, 0n);
   const depositOn = e.depositOn && /^\d{4}-\d{2}-\d{2}$/.test(e.depositOn) ? e.depositOn
-    : rows.map((r) => r.txnOn).filter(Boolean).sort().pop() ?? today();
-  need(depositOn <= today(), "the deposit date is today or earlier");
+    : rows.map((r) => r.txnOn).filter(Boolean).sort().pop() ?? (await bizToday(c, scope));
+  need(depositOn <= (await bizToday(c, scope)), "the deposit date is today or earlier");
   const imp = await one<{ id: string }>(c, `insert into finance_remit_import (entity_id, company_id, number, filename, sha256, rows, net_minor, deposit_on, imported_by)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning id`, [scope.entityId, e.companyId, number, e.filename ? maskPan(e.filename).slice(0, 200) : null, sha, rows.length, net.toString(), depositOn, scope.actor.id || null]);
   const done: { lineId: string; saleId: string; p: Plan }[] = [];
@@ -455,7 +455,7 @@ export async function resolveException(c: Client, scope: Scope, lineId: string, 
   const p = await plan(c, scope.entityId, lender, row, s[0]);
   need(!p.problem, p.problem ?? "");
   const fromSuspense = x.status === "suspense";
-  const cash = await postRows(c, scope, lender, x.import_id, x.number, fromSuspense ? today() : x.deposit_on, [{ lineId, saleId: s[0].id, p }], fromSuspense);
+  const cash = await postRows(c, scope, lender, x.import_id, x.number, fromSuspense ? (await bizToday(c, scope)) : x.deposit_on, [{ lineId, saleId: s[0].id, p }], fromSuspense);
   await c.query(`update finance_remit_import set exceptions = exceptions - $4, matched = matched + 1, posted_minor = posted_minor + $3 where id = $1 and entity_id = $2`,
     [x.import_id, scope.entityId, cash.toString(), fromSuspense ? 0 : 1]);
   return { status: "posted", bank: await linkDeposit(c, scope, x.import_id) };
@@ -508,7 +508,7 @@ export async function chargeOff(c: Client, scope: Scope, financedSaleId: string,
   need(s[0].status === "awaiting_funding" && s[0].chargeback_at, "only a sale the lender charged back, and that is waiting to be funded again, is written off here");
   const amt = B(s[0].amount_minor) - B(s[0].refunded_minor) - B(s[0].funded_gross_minor);
   need(amt > 0n, "nothing is owed on that sale");
-  const je = await post(c, scope, { date: today(), sourceType: "finance", sourceId: s[0].id, description: `${s[0].name} chargeback written off: ${s[0].receipt}`,
+  const je = await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "finance", sourceId: s[0].id, description: `${s[0].name} chargeback written off: ${s[0].receipt}`,
     lines: [{ code: "6915", debit: amt, memo: why.slice(0, 200) }, { code: "1110", credit: amt, memo: `financed sale ${s[0].receipt}` }] });
   await c.query(`update financed_sale set status = 'charged_off', chargeback_reason = coalesce(chargeback_reason || ' · ', '') || $3 where id = $1 and entity_id = $2`,
     [s[0].id, scope.entityId, `written off: ${why}`.slice(0, 300)]);
@@ -556,15 +556,16 @@ export async function feeVariances(c: Client, entityId: string) {
  * It ties to 1110: the difference is financing receipts no sale was recorded
  * for, or postings to 1110 that did not come through here.
  */
-export async function lenderAging(c: Client, entityId: string, asOf = today()) {
+export async function lenderAging(c: Client, entityId: string, asOf?: string) {
+  asOf ??= await bizToday(c, entityId);
   const left = `(f.amount_minor - f.refunded_minor - f.funded_gross_minor)`;
   const live = `f.status <> 'charged_off'`;
   const rows = await q<{ id: string; name: string; b0: string; b30: string; b60: string; b90: string; due_back: string; holdback: string; reopened: string; exceptions: string; flags: string; set_aside: string }>(c, `
     select fc.id, fc.name,
-           coalesce(sum(${left}) filter (where ${live} and ${left} > 0 and $2::date - f.created_at::date <= 30), 0)::text b0,
-           coalesce(sum(${left}) filter (where ${live} and ${left} > 0 and $2::date - f.created_at::date between 31 and 60), 0)::text b30,
-           coalesce(sum(${left}) filter (where ${live} and ${left} > 0 and $2::date - f.created_at::date between 61 and 90), 0)::text b60,
-           coalesce(sum(${left}) filter (where ${live} and ${left} > 0 and $2::date - f.created_at::date > 90), 0)::text b90,
+           coalesce(sum(${left}) filter (where ${live} and ${left} > 0 and $2::date - (f.created_at at time zone business_tz(f.entity_id))::date <= 30), 0)::text b0,
+           coalesce(sum(${left}) filter (where ${live} and ${left} > 0 and $2::date - (f.created_at at time zone business_tz(f.entity_id))::date between 31 and 60), 0)::text b30,
+           coalesce(sum(${left}) filter (where ${live} and ${left} > 0 and $2::date - (f.created_at at time zone business_tz(f.entity_id))::date between 61 and 90), 0)::text b60,
+           coalesce(sum(${left}) filter (where ${live} and ${left} > 0 and $2::date - (f.created_at at time zone business_tz(f.entity_id))::date > 90), 0)::text b90,
            coalesce(sum(${left}) filter (where ${live} and ${left} < 0), 0)::text due_back,
            coalesce(sum(f.holdback_open_minor) filter (where ${live}), 0)::text holdback,
            count(f.id) filter (where f.status = 'awaiting_funding' and f.chargeback_at is not null)::text reopened,
@@ -607,11 +608,11 @@ export async function lenders(c: Client, entityId: string) {
     from finance_company fc left join bank_account ba on ba.id = fc.bank_account_id where fc.entity_id = $1 order by fc.cascade_rank, fc.name`, [entityId]);
   const plans = await q(c, `select company_id, code, name, promo_months, fee_bps from finance_plan where entity_id = $1 and active order by company_id, promo_months`, [entityId]);
   const banks = await q(c, `select id, name from bank_account where entity_id = $1 and status = 'active' order by name`, [entityId]);
-  const reopened = await q(c, `select f.id, fc.name company, r.number receipt, f.amount_minor::text, f.chargeback_reason, f.chargeback_at::date::text on_day
+  const reopened = await q(c, `select f.id, fc.name company, r.number receipt, f.amount_minor::text, f.chargeback_reason, (f.chargeback_at at time zone business_tz(f.entity_id))::date::text on_day
     from financed_sale f join finance_company fc on fc.id = f.company_id join customer_receipt r on r.id = f.receipt_id
    where f.entity_id = $1 and f.status = 'awaiting_funding' and f.chargeback_at is not null order by f.chargeback_at desc limit 100`, [entityId]);
   const awaiting = await q(c, `select f.id, f.company_id, f.status, r.number receipt, cu.name customer, f.amount_minor::text,
-      (f.amount_minor - f.refunded_minor - f.funded_gross_minor)::text left_minor, f.funded_gross_minor::text, f.auth_code, f.account_last4, f.created_at::date::text on_day
+      (f.amount_minor - f.refunded_minor - f.funded_gross_minor)::text left_minor, f.funded_gross_minor::text, f.auth_code, f.account_last4, (f.created_at at time zone business_tz(f.entity_id))::date::text on_day
     from financed_sale f join customer_receipt r on r.id = f.receipt_id left join customer cu on cu.id = f.customer_id
    where f.entity_id = $1 and f.status in ('awaiting_funding','funded') order by f.created_at desc limit 300`, [entityId]);
   return { lenders: cos, plans, banks, reopened, sales: awaiting };

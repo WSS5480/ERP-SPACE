@@ -105,7 +105,7 @@ export const SERVICES: Service[] = [
 ];
 
 /** Screens that are always there: the books themselves, and setting the company up. */
-export const CORE_SCREENS = ["home", "approvals", "payables", "books", "chart", "cash", "recon", "feeds", "setup", "business", "services", "connections", "checklist"];
+export const CORE_SCREENS = ["home", "approvals", "payables", "books", "periods", "chart", "cash", "recon", "feeds", "setup", "business", "services", "connections", "checklist", "jobs"];
 
 /** Screens that follow who signed in (an operator, a customer account), not a service switch or a role. */
 export const PLATFORM_SCREENS = ["operator", "account"];

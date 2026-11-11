@@ -8,6 +8,7 @@
 // Nothing below is industry-specific. It runs for a store group, a haulier
 // or a services firm; only the profit object means something different.
 
+import { periodFor } from "./periods.ts";
 import { type Client, type Scope, audit, one, q } from "./db.ts";
 import { openRequest } from "./approvals.ts";
 import { mulBps } from "./money.ts";
@@ -506,11 +507,7 @@ export async function postRun(c: Client, scope: Scope, runId: string): Promise<s
   );
   if (run.status !== "released") throw new PayrollError(`run is ${run.status}; release it first`);
 
-  const period = await one<{ id: string }>(
-    c,
-    `select id from fiscal_period where entity_id=$1 and $2::date between starts_on and ends_on`,
-    [scope.entityId, run.pay_date]
-  );
+  const period = { id: await periodFor(c, scope, run.pay_date) };
 
   const acct = async (code: string) =>
     (await one<{ id: string }>(

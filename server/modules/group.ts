@@ -5,6 +5,7 @@
 // Who: the group view, the net check and settling are for the owner, or a
 // controller in every company they cover. Billing a sibling needs a
 // controller in both companies; a one-sided entry, a controller in this one.
+import { today as bizToday } from "../../packages/core/clock.ts";
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
 import { ModuleError, need, requireRole, str, uuid, minor } from "./kit.ts";
 import { scopeOf } from "../actions.ts";
@@ -16,8 +17,6 @@ import { ArError } from "../../packages/core/ar.ts";
 import { TransitionError } from "../../packages/core/invoice.ts";
 
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
-const today = () => new Date().toISOString().slice(0, 10);
-const monthStart = () => today().slice(0, 8) + "01";
 
 async function refuse<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn(); }
@@ -61,8 +60,8 @@ export const module: ErpModule = {
       const pick = idList(url.searchParams.get("companies"));
       const ids = pick.length ? pick : all.map((x) => x.id);
       await g.requireGroupRole(c, co.tenantId, personId, ids, "the group view");
-      const from = DAY.test(url.searchParams.get("from") ?? "") ? url.searchParams.get("from")! : monthStart();
-      const to = DAY.test(url.searchParams.get("to") ?? "") ? url.searchParams.get("to")! : today();
+      const from = DAY.test(url.searchParams.get("from") ?? "") ? url.searchParams.get("from")! : (await bizToday(c, co.id)).slice(0, 8) + "01";
+      const to = DAY.test(url.searchParams.get("to") ?? "") ? url.searchParams.get("to")! : await bizToday(c, co.id);
       const asOf = DAY.test(url.searchParams.get("asOf") ?? "") ? url.searchParams.get("asOf")! : to;
       return plain(await g.consolidate(c, co.tenantId, { companyIds: ids, from, to, asOf }));
     }));

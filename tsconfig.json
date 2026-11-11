@@ -1,0 +1,17 @@
+{
+  // Type checks only: Node runs the .ts files itself (--experimental-strip-types), so nothing is emitted.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": false,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["packages/**/*.ts", "server/**/*.ts", "scripts/**/*.ts"]
+}

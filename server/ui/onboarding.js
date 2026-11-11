@@ -120,7 +120,8 @@
       const f = { legal: input({ value: c.legalName || '', maxlength: '120' }), ein: input({ value: c.einLast4 || '', maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' }),
         line1: input({ value: a.line1 || '', maxlength: '120', autocomplete: 'address-line1' }), city: input({ value: a.city || '', maxlength: '60' }),
         postal: input({ value: a.postal || '', maxlength: '10' }), state: input({ value: c.state || '', maxlength: '2', autocapitalize: 'characters' }),
-        fy: select(MONTHS.map((m, i) => [i + 1, m]), c.fiscalYearStartMonth) };
+        fy: select(MONTHS.map((m, i) => [i + 1, m]), c.fiscalYearStartMonth),
+        tz: E.zonePicker(c.timeZone, `Not set (in use now: ${c.zoneInUse})`) };
       if (!c.canChangeYear) f.fy.disabled = true;
       const own = isOwner();
       if (!own) for (const x of Object.values(f)) x.disabled = true;
@@ -129,11 +130,12 @@
         own ? null : resultBox('warning', 'warn', 'Only the owner changes these', 'You can see them; switch who you are acting as to change them.'),
         el('div', { class: 'form-grid' }, field('Legal name', f.legal, 'As on its tax filings', true), field('Federal tax id (EIN)', f.ein, 'Last four digits only'),
           field('Fiscal year starts', f.fy, c.canChangeYear ? null : 'Fixed once entries are posted'),
-          field('Street', f.line1, null, true), field('City', f.city), field('State', f.state, 'Two letters'), field('ZIP or postal code', f.postal)),
+          field('Street', f.line1, null, true), field('City', f.city), field('State', f.state, 'Two letters'), field('ZIP or postal code', f.postal),
+          field('Business time zone', f.tz, 'The day a sale, bill or payment is dated; stores can keep their own')),
         err,
         el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel'),
           own ? el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post('/onboarding/company', { legalName: f.legal.value, einLast4: f.ein.value,
-            address: { line1: f.line1.value, city: f.city.value, postal: f.postal.value }, state: f.state.value, fiscalYearStartMonth: c.canChangeYear ? f.fy.value : null }),
+            address: { line1: f.line1.value, city: f.city.value, postal: f.postal.value }, state: f.state.value, fiscalYearStartMonth: c.canChangeYear ? f.fy.value : null, timeZone: f.tz.value }),
             'Company details saved', { close: d.close, errorInto: (x) => err.replaceChildren(resultBox('critical', 'fail', 'Not saved', E.friendly(x))) }) }, 'Save') : null));
     });
   }

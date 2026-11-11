@@ -12,6 +12,7 @@
 //   the refund itself         ar.postReceipt on a negative receipt: Dr 2300 Cr 1050 (or the tender's account)
 // Receipts and sales go through ar.postReceipt and ar.invoiceFulfilment.
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor } from "./posting.ts";
 import { priceConfigured, type Choice } from "./pricing.ts";
@@ -26,7 +27,6 @@ import * as sectionals from "./configurator.ts";
 
 export class PosError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new PosError(msg); };
-const today = () => new Date().toISOString().slice(0, 10);
 const addDays = (d: string, n: number) => { const x = new Date(d + "T12:00:00Z"); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
 const bps = (m: bigint, rate: number): bigint => { const neg = m < 0n; const a = neg ? -m : m; const r = (a * BigInt(rate) + 5000n) / 10000n; return neg ? -r : r; };
 const usd = (m: bigint) => { const neg = m < 0n; const a = neg ? -m : m; return `${neg ? "-" : ""}$${(a / 100n).toLocaleString("en-US")}.${String(a % 100n).padStart(2, "0")}`; };
@@ -42,32 +42,61 @@ const MANAGERS = ["store_manager", "owner"];
 export type Settings = { discountLimitBps: number; quoteValidDays: number; layawayMinDepositBps: number; layawayMaxDays: number;
   layawayInstallments: number; deliveryProductId: string | null; protectionProductId: string | null;
   /** the least a sale with goods on order must have paid at checkout: this share of the on-order goods, and the other of stocked goods */
-  specialOrderDepositBps: number; stockedDepositBps: number; quoteHoldsAllowed: boolean; quoteHoldMaxDays: number };
+  specialOrderDepositBps: number; stockedDepositBps: number; quoteHoldsAllowed: boolean; quoteHoldMaxDays: number;
+  /** the tenders this company's registers take */
+  tenders: string[] };
 
+/**
+ * The company's selling rules: its pos_setting row; with no row yet, the values its setup pack
+ * set (pos.discount_limit_bps, pos.quote_days, pos.layaway_days, pos.deposit_min_bps, pos.tenders), then the defaults.
+ */
 export async function settings(c: Client, entityId: string): Promise<Settings> {
   const r = await q<Record<string, unknown>>(c, `select * from pos_setting where entity_id = $1`, [entityId]);
-  const x = r[0] ?? {};
+  const pk = new Map((await q<{ key: string; value: unknown }>(c,
+    `select key, value from entity_setting where entity_id = $1 and key in ('pos.discount_limit_bps','pos.quote_days','pos.layaway_days','pos.deposit_min_bps','pos.tenders')`,
+    [entityId])).map((x) => [x.key, x.value]));
+  const pack = (k: string, d: number) => { const v = Number(pk.get(k)); return Number.isFinite(v) && pk.has(k) ? v : d; };
+  const x = r[0] ?? { discount_limit_bps: pack("pos.discount_limit_bps", 1000), quote_valid_days: pack("pos.quote_days", 30),
+    layaway_max_days: pack("pos.layaway_days", 90), special_order_deposit_bps: pack("pos.deposit_min_bps", 5000) };
+  const packTenders = Array.isArray(pk.get("pos.tenders")) ? (pk.get("pos.tenders") as string[]).filter((t) => (TENDERS as readonly string[]).includes(t)) : null;
+  const tenders = Array.isArray(x.tenders) && (x.tenders as string[]).length ? x.tenders as string[] : r[0] ? [...TENDERS] : packTenders?.length ? packTenders : [...TENDERS];
   return { discountLimitBps: Number(x.discount_limit_bps ?? 1000), quoteValidDays: Number(x.quote_valid_days ?? 30),
     layawayMinDepositBps: Number(x.layaway_min_deposit_bps ?? 2000), layawayMaxDays: Number(x.layaway_max_days ?? 90),
     layawayInstallments: Number(x.layaway_installments ?? 4), deliveryProductId: (x.delivery_product_id as string) ?? null,
     protectionProductId: (x.protection_product_id as string) ?? null,
     specialOrderDepositBps: Number(x.special_order_deposit_bps ?? 5000), stockedDepositBps: Number(x.stocked_deposit_bps ?? 0),
-    quoteHoldsAllowed: x.quote_holds_allowed === true, quoteHoldMaxDays: Number(x.quote_hold_max_days ?? 3) };
+    quoteHoldsAllowed: x.quote_holds_allowed === true, quoteHoldMaxDays: Number(x.quote_hold_max_days ?? 3), tenders };
 }
 
-/** A manager changes the deposit minimums and whether quotes may hold stock. */
-export async function saveSettings(c: Client, scope: Scope, e: { specialOrderDepositBps?: number; stockedDepositBps?: number; quoteHoldsAllowed?: boolean; quoteHoldMaxDays?: number }) {
+export type SettingsIn = { specialOrderDepositBps?: number; stockedDepositBps?: number; quoteHoldsAllowed?: boolean; quoteHoldMaxDays?: number;
+  discountLimitBps?: number; quoteValidDays?: number; layawayMinDepositBps?: number; layawayMaxDays?: number; layawayInstallments?: number; tenders?: string[] };
+const RULE_KEYS = ["specialOrderDepositBps", "stockedDepositBps", "quoteHoldsAllowed", "quoteHoldMaxDays", "discountLimitBps", "quoteValidDays",
+  "layawayMinDepositBps", "layawayMaxDays", "layawayInstallments", "tenders"] as const;
+
+/** A manager (or the controller) sets the selling rules: deposits, quote holds, the discount limit, quote life, layaway terms, tenders. */
+export async function saveSettings(c: Client, scope: Scope, e: SettingsIn) {
   const cur = await settings(c, scope.entityId);
   const n = { ...cur, ...Object.fromEntries(Object.entries(e).filter(([, v]) => v !== undefined)) } as Settings;
-  for (const [k, label] of [["specialOrderDepositBps", "the special-order deposit"], ["stockedDepositBps", "the stocked-goods deposit"]] as const)
+  for (const [k, label] of [["specialOrderDepositBps", "the special-order deposit"], ["stockedDepositBps", "the stocked-goods deposit"],
+    ["discountLimitBps", "the discount a salesperson may give without a manager"], ["layawayMinDepositBps", "the layaway deposit"]] as const)
     need(Number.isInteger(n[k]) && n[k] >= 0 && n[k] <= 10000, `${label} is between 0% and 100%`);
   need(Number.isInteger(n.quoteHoldMaxDays) && n.quoteHoldMaxDays >= 1 && n.quoteHoldMaxDays <= 30, "a quote holds stock for 1 to 30 days");
-  await c.query(`insert into pos_setting (entity_id, special_order_deposit_bps, stocked_deposit_bps, quote_holds_allowed, quote_hold_max_days) values ($1,$2,$3,$4,$5)
-    on conflict (entity_id) do update set special_order_deposit_bps = $2, stocked_deposit_bps = $3, quote_holds_allowed = $4, quote_hold_max_days = $5`,
-    [scope.entityId, n.specialOrderDepositBps, n.stockedDepositBps, n.quoteHoldsAllowed === true, n.quoteHoldMaxDays]);
-  await audit(c, scope, { table: "pos_setting", rowId: scope.entityId, action: "update", before: { specialOrderDepositBps: cur.specialOrderDepositBps,
-    stockedDepositBps: cur.stockedDepositBps, quoteHoldsAllowed: cur.quoteHoldsAllowed, quoteHoldMaxDays: cur.quoteHoldMaxDays },
-    after: { specialOrderDepositBps: n.specialOrderDepositBps, stockedDepositBps: n.stockedDepositBps, quoteHoldsAllowed: n.quoteHoldsAllowed, quoteHoldMaxDays: n.quoteHoldMaxDays } });
+  need(Number.isInteger(n.quoteValidDays) && n.quoteValidDays >= 1 && n.quoteValidDays <= 365, "a quote is good for 1 to 365 days");
+  need(Number.isInteger(n.layawayMaxDays) && n.layawayMaxDays >= 7 && n.layawayMaxDays <= 365, "a layaway runs 7 to 365 days");
+  need(Number.isInteger(n.layawayInstallments) && n.layawayInstallments >= 1 && n.layawayInstallments <= 24, "a layaway is paid in 1 to 24 payments");
+  need(n.quoteHoldMaxDays <= n.quoteValidDays, "a quote cannot hold stock longer than the quote is good for");
+  const tenders = [...new Set(n.tenders)];
+  need(tenders.length >= 1, "the registers need at least one way to pay");
+  need(tenders.every((t) => (TENDERS as readonly string[]).includes(t)), `a tender is one of: ${TENDERS.join(", ").replace(/_/g, " ")}`);
+  await c.query(`insert into pos_setting (entity_id, special_order_deposit_bps, stocked_deposit_bps, quote_holds_allowed, quote_hold_max_days,
+                   discount_limit_bps, quote_valid_days, layaway_min_deposit_bps, layaway_max_days, layaway_installments, tenders)
+                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    on conflict (entity_id) do update set special_order_deposit_bps = $2, stocked_deposit_bps = $3, quote_holds_allowed = $4, quote_hold_max_days = $5,
+      discount_limit_bps = $6, quote_valid_days = $7, layaway_min_deposit_bps = $8, layaway_max_days = $9, layaway_installments = $10, tenders = $11`,
+    [scope.entityId, n.specialOrderDepositBps, n.stockedDepositBps, n.quoteHoldsAllowed === true, n.quoteHoldMaxDays,
+     n.discountLimitBps, n.quoteValidDays, n.layawayMinDepositBps, n.layawayMaxDays, n.layawayInstallments, tenders]);
+  const pick = (s: Settings) => Object.fromEntries(RULE_KEYS.map((k) => [k, s[k]]));
+  await audit(c, scope, { table: "pos_setting", rowId: scope.entityId, action: "update", before: pick(cur), after: pick({ ...n, tenders }) });
   return settings(c, scope.entityId);
 }
 
@@ -117,7 +146,7 @@ export async function cashMovement(c: Client, scope: Scope, sessionId: string, e
   return { ok: true };
 }
 
-async function expectedCash(c: Client, entityId: string, sessionId: string): Promise<bigint> {
+export async function expectedCash(c: Client, entityId: string, sessionId: string): Promise<bigint> {
   const r = await one<{ f: string; cash: string; drops: string; ins: string; outs: string }>(c, `
     select s.float_minor::text f,
       (select coalesce(sum(amount_minor),0) from customer_receipt r where r.entity_id = s.entity_id and r.register_session_id = s.id and r.method = 'cash' and r.voided_at is null)::text cash,
@@ -185,7 +214,7 @@ export async function closeSession(c: Client, scope: Scope, sessionId: string, e
   if (diff !== 0n) {
     const po = await profitObjectFor(c, scope.entityId, s.location_id);
     const abs = diff < 0n ? -diff : diff;
-    je = await post(c, scope, { date: today(), sourceType: "receipt", sourceId: sessionId, description: `Drawer ${s.number} ${diff < 0n ? "short" : "over"}`,
+    je = await post(c, scope, { date: (await bizToday(c, scope, s.location_id)), sourceType: "receipt", sourceId: sessionId, description: `Drawer ${s.number} ${diff < 0n ? "short" : "over"}`,
       lines: diff < 0n ? [{ code: "6800", debit: abs, profitObjectId: po, memo: "cash short" }, { code: "1050", credit: abs, profitObjectId: po }]
                        : [{ code: "1050", debit: abs, profitObjectId: po }, { code: "6800", credit: abs, profitObjectId: po, memo: "cash over" }] });
   }
@@ -395,7 +424,7 @@ async function insertLines(c: Client, scope: Scope, ctx: Ctx, lines: LineIn[]): 
         need(ctx.customerId, "a delivery needs a customer");
         need(shipAddr, "a delivery needs an address");
         need(promised, "a delivery needs a promised date");
-        need(promised! >= today(), "the promised date has passed");
+        need(promised! >= (await bizToday(c, scope)), "the promised date has passed");
       }
       if (f === "ship") need(shipAddr, "direct ship needs an address");
       if (shipAddr) {
@@ -551,7 +580,7 @@ export async function createOrder(c: Client, scope: Scope, roles: Set<string>, e
   const exemptRef = (e.taxExemptRef ?? "").trim() || null;
   if (exemptRef) need(customer, "a tax-exempt sale needs the customer it is exempt for");
   // The certificate must be the customer's, not void and not expired.
-  const cert = exemptRef ? await tax.certificateFor(c, scope.entityId, customer!.id, exemptRef, today(), loc.state) : null;
+  const cert = exemptRef ? await tax.certificateFor(c, scope.entityId, customer!.id, exemptRef, (await bizToday(c, scope)), loc.state) : null;
   const addr = e.shipAddressId ?? (customer ? (await q<{ id: string }>(c,
     `select id from customer_address where entity_id = $1 and customer_id = $2 order by is_default desc limit 1`, [scope.entityId, customer.id]))[0]?.id ?? null : null);
   const number = await nextNo(c, scope.entityId, "order", "SO-");
@@ -563,7 +592,7 @@ export async function createOrder(c: Client, scope: Scope, roles: Set<string>, e
     need(w.length, "that delivery window is not offered any more; pick the day again");
   }
   await c.query(`insert into pos_order (sales_order_id, entity_id, kind, quote_expires_on, tax_exempt_ref, register_session_id, created_by, delivery_day, delivery_window_id,
-      exemption_certificate_id) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [so.id, scope.entityId, e.kind, e.kind === "quote" ? addDays(today(), set.quoteValidDays) : null, exemptRef,
+      exemption_certificate_id) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [so.id, scope.entityId, e.kind, e.kind === "quote" ? addDays((await bizToday(c, scope)), set.quoteValidDays) : null, exemptRef,
     e.sessionId ?? null, scope.actor.id, dl?.day ?? null, dl?.windowId ?? null, cert?.id || null]);
   if (dl) await c.query(`update sales_order set promised_on = $3 where id = $1 and entity_id = $2`, [so.id, scope.entityId, dl.day]);
   const sp = e.salespeople?.length ? e.salespeople : [{ id: scope.actor.id!, splitBps: 10000 }];
@@ -589,7 +618,7 @@ export async function createOrder(c: Client, scope: Scope, roles: Set<string>, e
 async function ctxFor(c: Client, scope: Scope, roles: Set<string>, o: OrderRow, reason?: string): Promise<Ctx> {
   const loc = await locationOf(c, scope.entityId, o.location_id);
   const isManager = MANAGERS.some((r) => roles.has(r));
-  const cert = o.tax_exempt_ref && o.customer_id ? await tax.certificateFor(c, scope.entityId, o.customer_id, o.tax_exempt_ref, today(), loc.state) : null;
+  const cert = o.tax_exempt_ref && o.customer_id ? await tax.certificateFor(c, scope.entityId, o.customer_id, o.tax_exempt_ref, (await bizToday(c, scope)), loc.state) : null;
   return { entityId: scope.entityId, orderId: o.id, customerId: o.customer_id, storeId: o.location_id, cert, sourcing: await tax.sourcing(c, scope.entityId),
     settings: await settings(c, scope.entityId), defaultAddress: o.ship_address_id, defaultPromised: o.promised_on, actorId: scope.actor.id!, kind: o.kind,
     priceList: await priceListOf(c, scope.entityId, o.customer_id),
@@ -658,8 +687,8 @@ export async function convertQuote(c: Client, scope: Scope, orderId: string) {
   const o = await orderOf(c, scope.entityId, orderId);
   need(o.kind === "quote", `${o.number} is not a quote`);
   need(o.status === "draft", `${o.number} is ${o.status}`);
-  need(!o.quote_expires_on || o.quote_expires_on >= today(), `quote ${o.number} expired on ${o.quote_expires_on}; make a new one at today's prices`);
-  if (o.tax_exempt_ref && o.customer_id) await tax.certificateFor(c, scope.entityId, o.customer_id, o.tax_exempt_ref, today());
+  need(!o.quote_expires_on || o.quote_expires_on >= (await bizToday(c, scope)), `quote ${o.number} expired on ${o.quote_expires_on}; make a new one at today's prices`);
+  if (o.tax_exempt_ref && o.customer_id) await tax.certificateFor(c, scope.entityId, o.customer_id, o.tax_exempt_ref, (await bizToday(c, scope)));
   // The hold ends here: the sale reserves for itself when it is placed.
   const hold = await endHold(c, scope, orderId, "converted", "the quote became a sale");
   await c.query(`update pos_order set kind = 'sale' where sales_order_id = $1 and entity_id = $2`, [orderId, scope.entityId]);
@@ -681,7 +710,7 @@ export async function setExemption(c: Client, scope: Scope, orderId: string, ref
   const number = String(ref ?? "").trim() || null;
   if (number) need(o.customer_id, "a tax-exempt sale needs the customer it is exempt for");
   const loc = await locationOf(c, scope.entityId, o.location_id);
-  const cert = number ? await tax.certificateFor(c, scope.entityId, o.customer_id!, number, today(), loc.state) : null;
+  const cert = number ? await tax.certificateFor(c, scope.entityId, o.customer_id!, number, (await bizToday(c, scope)), loc.state) : null;
   await c.query(`update pos_order set tax_exempt_ref = $3, exemption_certificate_id = $4 where sales_order_id = $1 and entity_id = $2`,
     [orderId, scope.entityId, number, cert?.id || null]);
   const lines = await q<{ id: string; net: string; kind: string | null; taxable: boolean | null }>(c, `
@@ -756,8 +785,8 @@ export async function holdQuote(c: Client, scope: Scope, orderId: string, e: { d
   need(!(await activeHold(c, scope.entityId, orderId)), `${o.number} already holds its stock; a manager can extend the hold`);
   const days = Math.trunc(Number(e.days ?? set.quoteHoldMaxDays));
   need(days >= 1 && days <= set.quoteHoldMaxDays, `a quote holds stock for 1 to ${set.quoteHoldMaxDays} days; a manager can extend it after`);
-  need(!o.quote_expires_on || o.quote_expires_on >= today(), `quote ${o.number} has expired`);
-  let until = addDays(today(), days);
+  need(!o.quote_expires_on || o.quote_expires_on >= (await bizToday(c, scope)), `quote ${o.number} has expired`);
+  let until = addDays((await bizToday(c, scope)), days);
   if (o.quote_expires_on && until > o.quote_expires_on) until = o.quote_expires_on;
   const open = await q<{ id: string }>(c, `select l.id from sales_order_line l join product p on p.id = l.product_id
      where l.entity_id = $1 and l.sales_order_id = $2 and l.line_status = 'open' and p.kind = 'stock' and l.qty > 0 and l.fulfil_from_id is not null`, [scope.entityId, orderId]);
@@ -808,7 +837,8 @@ export async function releaseHold(c: Client, scope: Scope, orderId: string, reas
 }
 
 /** Holds past their day give the stock back (the scheduler runs this). */
-export async function expireHolds(c: Client, scope: Scope, on = today()) {
+export async function expireHolds(c: Client, scope: Scope, on?: string) {
+  on ??= await bizToday(c, scope);
   const due = await q<{ sales_order_id: string }>(c, `select sales_order_id from pos_quote_hold where entity_id = $1 and status = 'active' and held_until < $2::date`,
     [scope.entityId, on]);
   let released = 0;
@@ -846,8 +876,10 @@ async function takeTenders(c: Client, scope: Scope, o: OrderRow, sessionId: stri
   const sum = tenders.reduce((a, t) => a + t.amountMinor, 0n);
   need(sum > 0n, "the tender amount must be more than zero");
   if (refund) need(sum === due, `the refund is ${usd(due)}; the tenders add up to ${usd(sum)}`);
+  const takes = (await settings(c, scope.entityId)).tenders;
   for (const t of tenders) {
     need((TENDERS as readonly string[]).includes(t.method), `${t.method} is not a tender this register takes`);
+    need(refund || takes.includes(t.method), `${t.method.replace(/_/g, " ")} is not taken here; the selling rules list ${takes.map((x) => x.replace(/_/g, " ")).join(", ")}`);
     need(t.amountMinor > 0n, "each tender must be more than zero");
     const ref = String(t.reference ?? "").trim() || null;
     if (t.method === "card") need(!ref || /^\d{4}$/.test(ref), "for a card keep only the last four digits");
@@ -935,7 +967,7 @@ export async function checkout(c: Client, scope: Scope, orderId: string, e: { se
   const live = await q<{ n: string }>(c, `select count(*) n from sales_order_line where entity_id = $1 and sales_order_id = $2 and line_status <> 'cancelled'`, [scope.entityId, orderId]);
   need(Number(live[0].n) > 0, "the order has nothing on it");
   // A certificate that has expired since the order was written no longer exempts it.
-  if (o.tax_exempt_ref && o.customer_id) await tax.certificateFor(c, scope.entityId, o.customer_id, o.tax_exempt_ref, today());
+  if (o.tax_exempt_ref && o.customer_id) await tax.certificateFor(c, scope.entityId, o.customer_id, o.tax_exempt_ref, (await bizToday(c, scope)));
   await c.query(`update sales_order set status = 'open', ordered_at = now() where id = $1 and entity_id = $2`, [orderId, scope.entityId]);
   await c.query(`update pos_order set register_session_id = coalesce($3, register_session_id) where sales_order_id = $1 and entity_id = $2`, [orderId, scope.entityId, e.sessionId]);
   const res = await reserveOrder(c, scope.entityId, orderId);
@@ -965,7 +997,7 @@ export async function checkout(c: Client, scope: Scope, orderId: string, e: { se
     for (let i = 1; i <= n && left > 0n; i++) {
       const amt = i === n ? rest : left / BigInt(n);
       rest -= amt;
-      sched.push({ due: addDays(today(), step * i), amount: amt.toString() });
+      sched.push({ due: addDays((await bizToday(c, scope)), step * i), amount: amt.toString() });
     }
     await c.query(`update pos_order set layaway_schedule = $3 where sales_order_id = $1 and entity_id = $2`, [orderId, scope.entityId, JSON.stringify(sched)]);
   } else {
@@ -1232,14 +1264,15 @@ export async function returnGoods(c: Client, scope: Scope, originalId: string, e
   // The sale comes off the books: returns and tax against the deposit the refund will clear; the goods back at cost.
   const po = await profitObjectFor(c, scope.entityId, loc);
   const refund = net + taxBack;
-  const je = await post(c, scope, { date: today(), sourceType: "refund", sourceId: ro.id, description: `Return ${number} against ${o.number}`, lines: [
+  const retDay = await bizToday(c, scope, loc);
+  const je = await post(c, scope, { date: retDay, sourceType: "refund", sourceId: ro.id, description: `Return ${number} against ${o.number}`, lines: [
     ...[...revByCode.entries()].map(([code, v]) => ({ code, debit: v, profitObjectId: po })),
     { code: "2100", debit: taxBack, profitObjectId: po },
     { code: "2300", credit: refund, profitObjectId: po },
     { code: "1300", debit: cost, profitObjectId: po },
     { code: "5000", credit: cost, profitObjectId: po },
   ] });
-  await tax.postReturn(c, scope.entityId, ro.id, je, today());
+  await tax.postReturn(c, scope.entityId, ro.id, je, retDay);
   const ret = await orderOf(c, scope.entityId, ro.id);
   // No tenders named: refund the way the customer paid (the web order's card, most recent first).
   const tenders = e.tenders?.length ? e.tenders : await refundToOriginal(c, scope.entityId, originalId, refund);

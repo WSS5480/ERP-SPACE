@@ -5,6 +5,7 @@
 // packages/core/ar.ts; this file decides who may do what, reads requests,
 // and turns the engine's refusals into sentences.
 
+import { today as bizToday } from "../../packages/core/clock.ts";
 import * as msg from "../../packages/core/messaging.ts";
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
 import { ModuleError, need, requireRole, str, uuid, int, minor } from "./kit.ts";
@@ -13,7 +14,6 @@ import { q, one } from "../../packages/core/db.ts";
 import { PostingError } from "../../packages/core/posting.ts";
 import * as ar from "../../packages/core/ar.ts";
 
-const today = () => new Date().toISOString().slice(0, 10);
 const day = (v: unknown, dflt: string) => { const s = str(v, 10); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : dflt; };
 const B = (v: unknown) => BigInt(String(v ?? 0));
 
@@ -120,8 +120,8 @@ export const H = {
     const storeCredit = await ar.storeCreditBalance(c, co.id, cid);
     const invoices = await ar.openInvoices(c, co.id, cid);
     const deposits = await ar.depositsOnHand(c, co.id, cid);
-    const ag = await ar.aging(c, co.id, today(), cid);
-    const orders = await q(c, `select so.id, so.number, so.status, so.channel, so.ordered_at::date::text ordered_on, so.total_minor, so.paid_minor,
+    const ag = await ar.aging(c, co.id, await bizToday(c, co.id), cid);
+    const orders = await q(c, `select so.id, so.number, so.status, so.channel, (so.ordered_at at time zone business_tz(so.entity_id, so.location_id))::date::text ordered_on, so.total_minor, so.paid_minor,
                                       lo.name location from sales_order so join location lo on lo.id = so.location_id
                                 where so.entity_id = $1 and so.customer_id = $2 order by so.ordered_at desc limit 50`, [co.id, cid]);
     const receipts = await q(c, `select r.id, r.number, r.method, r.amount_minor, r.received_at::text, r.voided_at, so.number order_number,
@@ -201,7 +201,7 @@ export const H = {
     select k.id, k.number, k.status, k.principal_minor, k.apr_bps, k.term_months, k.payment_minor, k.first_due_on::text, cu.name customer, k.customer_id,
            coalesce((select sum(l.amount_minor) from ar_ledger l where l.entity_id = $1 and l.contract_id = k.id), 0)::text balance_minor,
            (select min(i.due_on)::text from ar_contract_installment i where i.entity_id = $1 and i.contract_id = k.id and i.status = 'due') next_due,
-           (select count(*)::int from ar_contract_installment i where i.entity_id = $1 and i.contract_id = k.id and i.status = 'due' and i.due_on < current_date) late_installments
+           (select count(*)::int from ar_contract_installment i where i.entity_id = $1 and i.contract_id = k.id and i.status = 'due' and i.due_on < business_today($1)) late_installments
       from ar_contract k join customer cu on cu.id = k.customer_id
      where k.entity_id = $1 order by (k.status in ('active','defaulted')) desc, k.opened_at desc limit 200`, [co.id])),
 
@@ -237,7 +237,7 @@ export const H = {
     const companies = await q(c, `select id, name, cascade_rank, default_fee_bps, apply_url, status from finance_company where entity_id = $1 order by cascade_rank, name`, [co.id]);
     const plans = await q(c, `select id, company_id, code, name, promo_months, customer_apr_bps, fee_bps, min_amount_minor, max_amount_minor, active
                                 from finance_plan where entity_id = $1 order by company_id, promo_months desc`, [co.id]);
-    const awaiting = await q(c, `select f.id, f.company_id, f.amount_minor, f.expected_fee_minor, f.fee_bps, f.created_at::date::text on_date,
+    const awaiting = await q(c, `select f.id, f.company_id, f.amount_minor, f.expected_fee_minor, f.fee_bps, (f.created_at at time zone business_tz(f.entity_id))::date::text on_date,
                                         r.number receipt, cu.name customer, so.number order_number, p.name plan
                                    from financed_sale f join customer_receipt r on r.id = f.receipt_id
                                    left join customer cu on cu.id = f.customer_id left join sales_order so on so.id = f.sales_order_id
@@ -247,7 +247,7 @@ export const H = {
                                            s.fee_minor, s.expected_fee_minor, (s.fee_minor - s.expected_fee_minor)::text variance_minor
                                       from finance_settlement s join finance_company fc on fc.id = s.company_id
                                      where s.entity_id = $1 order by s.funded_on desc, s.created_at desc limit 50`, [co.id]);
-    const unrecorded = await q(c, `select r.id, r.number, r.amount_minor, r.received_at::date::text on_date, cu.name customer
+    const unrecorded = await q(c, `select r.id, r.number, r.amount_minor, (r.received_at at time zone business_tz(r.entity_id, r.location_id))::date::text on_date, cu.name customer
                                      from customer_receipt r left join customer cu on cu.id = r.customer_id
                                     where r.entity_id = $1 and r.method = 'financing' and r.voided_at is null
                                       and not exists (select 1 from financed_sale f where f.receipt_id = r.id) order by r.received_at`, [co.id]);
@@ -319,7 +319,7 @@ export const H = {
 
   lateFees: wrap(async (c: Client, co: Company, a: Actor, b: Record<string, unknown>) => {
     await requireRole(c, co, a, ROLES.clerk, "charging late fees");
-    const fees = await ar.assessLateFees(c, scopeOf(co, a), day(b.asOf, today()));
+    const fees = await ar.assessLateFees(c, scopeOf(co, a), day(b.asOf, await bizToday(c, co.id)));
     return { charged: fees.length, totalMinor: fees.reduce((x, f) => x + f.feeMinor, 0n), fees };
   }),
 
@@ -485,20 +485,20 @@ export const module: ErpModule = {
     kit.coGet("/ar/summary", (c, co) => H.summary(c, co));
     kit.coGet("/ar/customers", (c, co, u) => H.customers(c, co, g(u, "q")));
     kit.coGet(`/ar/customers/${ID}`, (c, co, _u, m) => H.account(c, co, m[2]));
-    kit.coGet(`/ar/customers/${ID}/statement`, (c, co, u, m) => {
-      const t = day(g(u, "to"), today());
+    kit.coGet(`/ar/customers/${ID}/statement`, async (c, co, u, m) => {
+      const t = day(g(u, "to"), await bizToday(c, co.id));
       return H.statement(c, co, m[2], day(g(u, "from"), t.slice(0, 8) + "01"), t);
     });
     kit.coGet(`/ar/customers/${ID}/credit-check`, (c, co, u, m) => H.creditCheck(c, co, m[2], g(u, "amount"), g(u, "order") || null));
     kit.coGet(`/ar/invoices/${ID}`, (c, co, _u, m) => H.invoice(c, co, m[2]));
-    kit.coGet("/ar/aging", (c, co, u) => H.aging(c, co, day(g(u, "asOf"), today())));
-    kit.coGet("/ar/collections", (c, co, u) => H.callList(c, co, day(g(u, "asOf"), today())));
+    kit.coGet("/ar/aging", async (c, co, u) => H.aging(c, co, day(g(u, "asOf"), await bizToday(c, co.id))));
+    kit.coGet("/ar/collections", async (c, co, u) => H.callList(c, co, day(g(u, "asOf"), await bizToday(c, co.id))));
     kit.coGet("/ar/templates", (c, co) => H.templates(c, co));
     kit.coGet("/ar/writeoffs", (c, co) => H.writeoffs(c, co));
     kit.coGet("/ar/contracts", (c, co) => H.contracts(c, co));
     kit.coGet(`/ar/contracts/${ID}`, (c, co, _u, m) => H.contract(c, co, m[2]));
-    kit.coGet(`/ar/contracts/${ID}/payoff`, (c, co, u, m) => H.payoff(c, co, m[2], day(g(u, "asOf"), today())));
-    kit.coGet("/ar/amortize", (c, co, u) => H.amortize(c, co, g(u, "principal"), g(u, "apr"), g(u, "term"), day(g(u, "first"), today())));
+    kit.coGet(`/ar/contracts/${ID}/payoff`, async (c, co, u, m) => H.payoff(c, co, m[2], day(g(u, "asOf"), await bizToday(c, co.id))));
+    kit.coGet("/ar/amortize", async (c, co, u) => H.amortize(c, co, g(u, "principal"), g(u, "apr"), g(u, "term"), day(g(u, "first"), await bizToday(c, co.id))));
     kit.coGet("/ar/finance", (c, co) => H.finance(c, co));
     kit.coGet("/ar/finance/cascade", (c, co, u) => H.cascade(c, co, g(u, "amount"), g(u, "order") || null));
     kit.coGet("/ar/deposits", (c, co) => H.deposits(c, co));

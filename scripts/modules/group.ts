@@ -177,7 +177,7 @@ export async function run(t: T) {
   const rst = (await sql<{ status: string; from_entity_id: string; number: string }>(t, `select status, from_entity_id, number from inv_transfer where id = $1 and entity_id = $2`, [doc.to_transfer_id, TX]))[0];
   t.ok("across: the transfer is done in one step, with a received copy in Texas naming where it came from",
     sst.status === "received" && sst.to_entity_id === TX && rst.status === "received" && rst.from_entity_id === ENTITY && rst.number === sent.toTransferNumber);
-  t.ok("across: the stock left the DC and is on hand at Tyler", (await onHand(t, ENTITY, pick.sku, DC)) === dcBefore - 3 && (await onHand(t, TX, pick.sku, TYL)) === txBefore + 3);
+  t.ok("across: the stock left the DC and is on hand at Oak Hollow", (await onHand(t, ENTITY, pick.sku, DC)) === dcBefore - 3 && (await onHand(t, TX, pick.sku, TYL)) === txBefore + 3);
   const txProduct = (await sql<{ sku: string; status: string }>(t, `select sku, status from product where entity_id = $1 and sku = $2`, [TX, pick.sku]))[0];
   t.ok("across: the product was copied into the Texas catalog by SKU", txProduct?.sku === pick.sku && txProduct.status === "active");
   const tieDemo = await read(t, (c) => inv.tieOut(c, ENTITY)), tieTx = await read(t, (c) => inv.tieOut(c, TX));
@@ -217,7 +217,7 @@ export async function run(t: T) {
   const ce = await entry(t, charge.fromEntryId), cr = await entry(t, charge.toEntryId);
   t.ok("bill: the warehouse company charges the store: Dr 1195 / Cr 4090 here, Dr 5090 / Cr 2190 there, both balanced",
     B(charge.amountMinor) === 25000n && ce.balanced && ce.by("1195").dr === 25000n && ce.by("4090").cr === 25000n && cr.balanced && cr.by("5090").dr === 25000n && cr.by("2190").cr === 25000n);
-  const back = await g.post<{ amountMinor: bigint }>("/group/bill", PEOPLE.STEVE, { to: ENTITY, description: "Showroom staff lent to Enola", amount: "40.00" }, TX);
+  const back = await g.post<{ amountMinor: bigint }>("/group/bill", PEOPLE.STEVE, { to: ENTITY, description: "Showroom staff lent to Riverside", amount: "40.00" }, TX);
   t.ok("bill: and Texas bills Demo the other way (the owner may)", B(back.amountMinor) === 4000n);
 
   // ------------------------------------------------------------ net to zero

@@ -78,7 +78,7 @@ async function makeCustomers() {
     for (const [k, name, loc] of mk) {
       i++;
       const r = await one<{ id: string }>(c, `insert into customer (entity_id, number, name, email, phone, home_location_id)
-        values ($1,$2,$3,$4,$5,$6) returning id`, [ENTITY, `AR-${tag}-${i}`, `${name} (A/R check)`, `ar-${tag}-${i}@example.com`, `717-555-01${String(60 + i)}`, loc]);
+        values ($1,$2,$3,$4,$5,$6) returning id`, [ENTITY, `AR-${tag}-${i}`, `${name} (A/R check)`, `ar-${tag}-${i}@example.com`, `555-555-01${String(60 + i)}`, loc]);
       out[k] = r.id;
     }
     await H.setAccount(c, co, a, out.CHEN, { houseAccount: true, creditLimit: "3000", termsDays: 30 });

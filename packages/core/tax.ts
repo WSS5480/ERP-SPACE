@@ -20,11 +20,11 @@
 //      single rate would give), split over them by rate. So one jurisdiction
 //      always gives what the old single store rate gave.
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 
 export class TaxError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new TaxError(msg); };
-const today = () => new Date().toISOString().slice(0, 10);
 const isDay = (s: unknown) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 const bps = (m: bigint, rate: number): bigint => { const neg = m < 0n; const a = neg ? -m : m; const r = (a * BigInt(rate) + 5000n) / 10000n; return neg ? -r : r; };
 
@@ -82,13 +82,15 @@ async function jurisdictionsIn(c: Client, entityId: string, ids: string[], on: s
 }
 
 /** These jurisdictions as a stack, at the rates in force on the day (re-taxing a draft at the same places). */
-export async function stackJurisdictions(c: Client, entityId: string, ids: string[], on = today()): Promise<Juris[]> {
+export async function stackJurisdictions(c: Client, entityId: string, ids: string[], on?: string): Promise<Juris[]> {
+  on ??= await bizToday(c, entityId);
   const s = await jurisdictionsIn(c, entityId, ids, on);
   return ids.map((id) => s.find((j) => j.id === id)).filter(Boolean) as Juris[];
 }
 
 /** The stack at a state and postal code: statewide jurisdictions plus those of that postal code. */
-export async function stackForPlace(c: Client, entityId: string, state: string | null, postal: string | null, on = today()): Promise<Juris[]> {
+export async function stackForPlace(c: Client, entityId: string, state: string | null, postal: string | null, on?: string): Promise<Juris[]> {
+  on ??= await bizToday(c, entityId);
   return (await placeStack(c, entityId, state, postal, on)).stack;
 }
 
@@ -96,7 +98,8 @@ export async function stackForPlace(c: Client, entityId: string, state: string |
  * The stack at a place, and whether its ZIP is a gap: the state has local
  * jurisdictions set up by ZIP but none for this one.
  */
-export async function placeStack(c: Client, entityId: string, state: string | null, postal: string | null, on = today()): Promise<{ stack: Juris[]; uncovered: boolean; postal: string }> {
+export async function placeStack(c: Client, entityId: string, state: string | null, postal: string | null, on?: string): Promise<{ stack: Juris[]; uncovered: boolean; postal: string }> {
+  on ??= await bizToday(c, entityId);
   const st = String(state ?? "").trim().toUpperCase();
   const zip = String(postal ?? "").trim().slice(0, 5);
   if (!/^[A-Z]{2}$/.test(st)) return { stack: [], uncovered: false, postal: zip };
@@ -112,7 +115,8 @@ export async function placeStack(c: Client, entityId: string, state: string | nu
 }
 
 /** The stack at a customer's address, or empty when its state has nothing set up. */
-export async function stackForAddress(c: Client, entityId: string, addressId: string, on = today()): Promise<Juris[]> {
+export async function stackForAddress(c: Client, entityId: string, addressId: string, on?: string): Promise<Juris[]> {
+  on ??= await bizToday(c, entityId);
   const a = await q<{ state: string; postal: string }>(c, `select state, postal from customer_address where id = $1 and entity_id = $2`, [addressId, entityId]);
   if (!a.length) return [];
   return stackForPlace(c, entityId, a[0].state, a[0].postal, on);
@@ -133,7 +137,8 @@ const stateOf = (l: LocRow) => { const s = String(l.state || l.addr_state || "")
  * (made now when `write`, else shown as it would be). A store with no state
  * cannot be taxed until it has one.
  */
-export async function stackForLocation(c: Client, entityId: string, locationId: string, on = today(), write = true): Promise<Juris[]> {
+export async function stackForLocation(c: Client, entityId: string, locationId: string, on?: string, write = true): Promise<Juris[]> {
+  on ??= await bizToday(c, entityId);
   const named = await q<{ id: string }>(c, `select distinct jurisdiction_id id from tax_area where entity_id = $1 and active and location_id = $2`, [entityId, locationId]);
   if (named.length) {
     const s = await jurisdictionsIn(c, entityId, named.map((x) => x.id), on);
@@ -199,7 +204,7 @@ export type Place = { stack: Juris[]; sourced: Sourced; note: string | null; unc
  */
 export async function stackForLine(c: Client, entityId: string, e: { storeId: string; fulfillment: string; shipAddressId?: string | null;
   shipTo?: { state: string | null; postal: string | null } | null; on?: string; sourcing?: Sourced; write?: boolean }): Promise<Place> {
-  const on = e.on ?? today();
+  const on = e.on ?? (await bizToday(c, entityId));
   const src = e.sourcing ?? await sourcing(c, entityId);
   const away = e.fulfillment === "delivery" || e.fulfillment === "ship";
   if (away && src === "destination" && (e.shipAddressId || e.shipTo)) {
@@ -282,7 +287,7 @@ export async function writeLineTax(c: Client, entityId: string, orderId: string,
 
 export async function certificates(c: Client, entityId: string, customerId: string) {
   return q(c, `select id, number, state, reason, expires_on::text, status, void_reason, created_by, created_at,
-      (status = 'active' and (expires_on is null or expires_on >= current_date)) current
+      (status = 'active' and (expires_on is null or expires_on >= business_today($1))) current
     from tax_exemption_certificate where entity_id = $1 and customer_id = $2 order by status, expires_on desc nulls first, number`, [entityId, customerId]);
 }
 
@@ -293,7 +298,7 @@ export async function saveCertificate(c: Client, scope: Scope, e: { customerId: 
   need(/^[A-Z]{2}$/.test(st), "the state on the certificate is two letters");
   need((CERT_REASONS as readonly string[]).includes(e.reason), "pick why the customer is exempt: resale, government, nonprofit, agricultural, manufacturing or other");
   const exp = e.expiresOn ? String(e.expiresOn) : null;
-  if (exp) { need(isDay(exp), "the expiry is a date"); need(exp >= today(), "that certificate has already expired; ask the customer for a current one"); }
+  if (exp) { need(isDay(exp), "the expiry is a date"); need(exp >= (await bizToday(c, scope)), "that certificate has already expired; ask the customer for a current one"); }
   const cu = await q<{ name: string }>(c, `select name from customer where id = $1 and entity_id = $2`, [e.customerId, scope.entityId]);
   need(cu.length, "no such customer");
   const dup = await q(c, `select 1 from tax_exemption_certificate where entity_id = $1 and customer_id = $2 and number = $3`, [scope.entityId, e.customerId, number]);
@@ -322,7 +327,8 @@ export async function voidCertificate(c: Client, scope: Scope, id: string, reaso
  * row (from before certificates were kept) is accepted as it always was,
  * for the store's state, with no expiry.
  */
-export async function certificateFor(c: Client, entityId: string, customerId: string, number: string, on = today(), storeState: string | null = null): Promise<Cert> {
+export async function certificateFor(c: Client, entityId: string, customerId: string, number: string, on?: string, storeState: string | null = null): Promise<Cert> {
+  on ??= await bizToday(c, entityId);
   const r = await q<{ id: string; number: string; state: string; reason: string; expires_on: string | null; status: string }>(c, `
     select id, number, state, reason, expires_on::text, status from tax_exemption_certificate where entity_id = $1 and customer_id = $2 and number = $3`,
     [entityId, customerId, number.trim()]);
@@ -466,7 +472,7 @@ export async function orderTax(c: Client, entityId: string, orderId: string) {
 export async function taxSetup(c: Client, entityId: string) {
   const jur = await q(c, `select j.id, j.code, j.name, j.level, j.state, j.taxes_delivery, j.taxes_labor, j.taxes_warranty, j.filing_ref, j.note, j.active,
       j.for_location_id, (select r.rate_bps from tax_rate r where r.entity_id = j.entity_id and r.jurisdiction_id = j.id
-        and r.effective_from <= current_date and (r.effective_to is null or r.effective_to >= current_date)) rate_bps
+        and r.effective_from <= business_today($1) and (r.effective_to is null or r.effective_to >= business_today($1))) rate_bps
     from tax_jurisdiction j where j.entity_id = $1
     order by j.state, array_position(array['state','county','city','special','combined'], j.level), j.code`, [entityId]);
   const rates = await q(c, `select id, jurisdiction_id, rate_bps, effective_from::text, effective_to::text, note, checked_by, checked_at
@@ -477,7 +483,7 @@ export async function taxSetup(c: Client, entityId: string) {
     `select id, name, kind, tax_rate_bps from location where entity_id = $1 and status = 'active' and kind in ('store','outlet') order by name`, [entityId]);
   const stores = [];
   for (const l of locs) {
-    const s = await stackForLocation(c, entityId, l.id, today(), false);
+    const s = await stackForLocation(c, entityId, l.id, (await bizToday(c, entityId)), false);
     stores.push({ id: l.id, name: l.name, rateBps: goodsRate(s), stack: s.map((j) => ({ code: j.code, name: j.name, level: j.level, rateBps: j.rateBps })) });
   }
   const chosen = await q(c, `select 1 from tax_setting where entity_id = $1`, [entityId]);
@@ -509,7 +515,7 @@ export async function saveJurisdiction(c: Client, scope: Scope, e: { id?: string
       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning id`, [scope.entityId, code, e.name.trim(), e.level, st, !!e.taxesDelivery, !!e.taxesLabor, !!e.taxesWarranty,
       e.filingRef ?? null, e.note ?? null, scope.actor.label])).id;
     await c.query(`insert into tax_rate (entity_id, jurisdiction_id, rate_bps, effective_from, created_by) values ($1,$2,$3,$4,$5)`,
-      [scope.entityId, id, e.rateBps, isDay(e.effectiveFrom) ? e.effectiveFrom : today(), scope.actor.label]);
+      [scope.entityId, id, e.rateBps, isDay(e.effectiveFrom) ? e.effectiveFrom : (await bizToday(c, scope)), scope.actor.label]);
   }
   await audit(c, scope, { table: "tax_jurisdiction", rowId: id!, action: e.id ? "update" : "insert", after: { code, level: e.level, state: st,
     delivery: !!e.taxesDelivery, labor: !!e.taxesLabor, warranty: !!e.taxesWarranty, rateBps: e.rateBps } });
@@ -573,7 +579,7 @@ export async function storeRates(c: Client, entityId: string): Promise<Map<strin
   const locs = await q<{ id: string }>(c, `select id from location where entity_id = $1 and status = 'active' and kind in ('store','outlet')`, [entityId]);
   const out = new Map<string, number | null>();
   for (const l of locs) {
-    const s = await stackForLocation(c, entityId, l.id, today(), false);
+    const s = await stackForLocation(c, entityId, l.id, (await bizToday(c, entityId)), false);
     out.set(l.id, s.length === 1 && s[0].level === "combined" ? null : s.length ? goodsRate(s) : null);
   }
   return out;
@@ -589,7 +595,7 @@ export async function storeRates(c: Client, entityId: string): Promise<Map<strin
 export async function refreshLocationRates(c: Client, entityId: string, before?: Map<string, number | null>) {
   const locs = await q<{ id: string; tax_rate_bps: number }>(c, `select id, tax_rate_bps from location where entity_id = $1 and status = 'active' and kind in ('store','outlet')`, [entityId]);
   for (const l of locs) {
-    const s = await stackForLocation(c, entityId, l.id, today(), false);
+    const s = await stackForLocation(c, entityId, l.id, (await bizToday(c, entityId)), false);
     if (!s.length || (s.length === 1 && s[0].level === "combined")) continue;
     const now = goodsRate(s);
     if (now === l.tax_rate_bps) continue;
@@ -607,16 +613,16 @@ export async function locationRateChanged(c: Client, scope: Scope, locationId: s
   const cur = await q<{ id: string; rate_bps: number; effective_from: string }>(c, `select id, rate_bps, effective_from::text from tax_rate
      where entity_id = $1 and jurisdiction_id = $2 and effective_to is null order by effective_from desc limit 1`, [scope.entityId, j[0].id]);
   if (cur[0]?.rate_bps === rateBps) return;
-  if (cur[0]?.effective_from === today()) {
+  if (cur[0]?.effective_from === (await bizToday(c, scope))) {
     await c.query(`update tax_rate set rate_bps = $3 where id = $1 and entity_id = $2`, [cur[0].id, scope.entityId, rateBps]);
     return;
   }
-  await addRate(c, scope, j[0].id, { rateBps, effectiveFrom: today(), note: "the store's rate changed in setup" });
+  await addRate(c, scope, j[0].id, { rateBps, effectiveFrom: (await bizToday(c, scope)), note: "the store's rate changed in setup" });
 }
 
 /** The rate a stacked store charges, or null when its single rate column is the source. */
 export async function derivedRate(c: Client, entityId: string, locationId: string): Promise<number | null> {
-  const s = await stackForLocation(c, entityId, locationId, today(), false);
+  const s = await stackForLocation(c, entityId, locationId, (await bizToday(c, entityId)), false);
   if (s.length === 1 && s[0].level === "combined") return null;
   return goodsRate(s);
 }
@@ -632,7 +638,7 @@ export async function uncheckedRates(c: Client, entityId: string) {
   return q<{ id: string; jurisdiction_id: string; code: string; name: string; state: string; rate_bps: number; effective_from: string }>(c, `
     select r.id, r.jurisdiction_id, j.code, j.name, j.state, r.rate_bps, r.effective_from::text
       from tax_rate r join tax_jurisdiction j on j.id = r.jurisdiction_id and j.entity_id = r.entity_id
-     where r.entity_id = $1 and j.active and r.checked_at is null and (r.effective_to is null or r.effective_to >= current_date)
+     where r.entity_id = $1 and j.active and r.checked_at is null and (r.effective_to is null or r.effective_to >= business_today($1))
      order by j.state, j.code, r.effective_from`, [entityId]);
 }
 
@@ -645,9 +651,9 @@ export async function confirmRates(c: Client, scope: Scope) {
   need(scope.actor.kind === "user", "only a person can say the rates were checked");
   const locs = await q<{ id: string; state: string | null; tax_rate_bps: number }>(c, `select id, coalesce(state, address->>'state') state, tax_rate_bps from location
      where entity_id = $1 and status = 'active' and kind in ('store','outlet')`, [scope.entityId]);
-  for (const l of locs) if (l.state && l.tax_rate_bps > 0) await stackForLocation(c, scope.entityId, l.id, today(), true);
+  for (const l of locs) if (l.state && l.tax_rate_bps > 0) await stackForLocation(c, scope.entityId, l.id, (await bizToday(c, scope)), true);
   const r = await c.query(`update tax_rate set checked_by = $2, checked_at = now()
-     where entity_id = $1 and checked_at is null and (effective_to is null or effective_to >= current_date)
+     where entity_id = $1 and checked_at is null and (effective_to is null or effective_to >= business_today($1))
        and jurisdiction_id in (select id from tax_jurisdiction where entity_id = $1 and active)`, [scope.entityId, scope.actor.label]);
   await audit(c, scope, { table: "tax_rate", rowId: scope.entityId, action: "update", after: { checked: r.rowCount ?? 0 }, reason: "rates checked by a person" });
   return { checked: r.rowCount ?? 0 };

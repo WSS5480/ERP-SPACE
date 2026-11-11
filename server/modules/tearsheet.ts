@@ -105,7 +105,7 @@ export async function orderSheet(c: Client, entityId: string, orderId: string, e
   const h = (await q<{ number: string; kind: string | null; status: string; ordered_at: string; quote_expires_on: string | null;
     subtotal_minor: string; discount_minor: string; tax_minor: string; total_minor: string; paid_minor: string; customer: string | null; location: string;
     address: Record<string, string> | null; company: string; salesperson: string | null; tax_exempt_ref: string | null }>(c, `
-    select so.number, po.kind, so.status, so.ordered_at::date::text ordered_at, po.quote_expires_on::text, so.subtotal_minor, so.discount_minor, so.tax_minor, so.total_minor,
+    select so.number, po.kind, so.status, (so.ordered_at at time zone business_tz(so.entity_id, so.location_id))::date::text ordered_at, po.quote_expires_on::text, so.subtotal_minor, so.discount_minor, so.tax_minor, so.total_minor,
            so.paid_minor, cu.name customer, l.name location, l.address, e.name company, u.name salesperson, po.tax_exempt_ref
       from sales_order so join location l on l.id = so.location_id join entity e on e.id = so.entity_id
       left join pos_order po on po.sales_order_id = so.id left join customer cu on cu.id = so.customer_id left join app_user u on u.id = so.salesperson_id
@@ -189,7 +189,7 @@ export async function createLink(c: Client, scope: Scope, e: { orderId?: string 
   let customer = e.customerId ?? null;
   if (e.orderId) {
     const o = await q<{ customer_id: string | null; quote_expires_on: string | null; number: string; kind: string | null; status: string; expired: boolean }>(c, `
-      select so.customer_id, po.quote_expires_on::text, so.number, po.kind, so.status, po.quote_expires_on < current_date expired
+      select so.customer_id, po.quote_expires_on::text, so.number, po.kind, so.status, po.quote_expires_on < business_today($2) expired
        from sales_order so left join pos_order po on po.sales_order_id = so.id where so.id = $1 and so.entity_id = $2`, [e.orderId, scope.entityId]);
     need(o.length, "no such order");
     need(o[0].status !== "cancelled", `${o[0].number} is cancelled; there is nothing to send`);

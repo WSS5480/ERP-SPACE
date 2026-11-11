@@ -436,7 +436,7 @@
     const rows = await coApi('/crm/coupons');
     const make = () => {
       const d = openDialog('New coupon', 'Works at the register and on the web store, once per order');
-      const today = new Date().toISOString().slice(0, 10), later = new Date(Date.now() + 30 * 86400_000).toISOString().slice(0, 10);
+      const today = E.isoDay(new Date()), later = E.isoDay(new Date(Date.now() + 30 * 86400_000));   // local days, not UTC's
       const f = { code: input({ maxlength: '24', class: 'upper', placeholder: 'SPRING15' }), kind: select([['percent', 'Percent off'], ['amount', 'Amount off']], 'percent'),
         pct: input({ inputmode: 'decimal', placeholder: '10' }), amt: input({ inputmode: 'decimal', placeholder: '25' }), min: input({ inputmode: 'decimal', placeholder: '0' }),
         starts: input({ type: 'date', value: today }), ends: input({ type: 'date', value: later }), uses: input({ inputmode: 'numeric', placeholder: 'No limit' }),

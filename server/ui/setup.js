@@ -109,19 +109,21 @@
       tax: input({ value: l ? (Number(l.tax_rate_bps) / 100).toString() : '', inputmode: 'decimal' }),
       lat: input({ value: l && l.lat != null ? String(l.lat) : '', inputmode: 'decimal' }),
       lng: input({ value: l && l.lng != null ? String(l.lng) : '', inputmode: 'decimal' }),
+      tz: E.zonePicker(l ? l.time_zone : '', l && !l.time_zone ? `The company's (${l.zone_in_use})` : "The company's"),
     };
     const err = el('div', { class: 'result critical', role: 'alert', hidden: true });
     d.body.append(el('div', { class: 'form-grid' },
       field('Code', f.code, 'Short, like ST1 or DC1'), field('Name', f.name), field('Kind', f.kind),
       field('Street', f.line1, null, true), field('City', f.city), field('State', f.state), field('ZIP', f.postal),
       field('Sales tax %', f.tax, 'Charged on taxable sales here'),
+      field('Time zone', f.tz, 'Sales here are dated by this clock'),
       field('Latitude', f.lat, 'For delivery routing, in decimal degrees'), field('Longitude', f.lng)), err,
       el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel'),
         el('button', { class: 'btn primary', type: 'button', onclick: (e) => {
           const tax = f.tax.value.trim() === '' ? 0 : Math.round(Number(f.tax.value) * 100);
           act(e.currentTarget, () => post('/setup/location', { id: l ? l.id : null, code: f.code.value, name: f.name.value, kind: f.kind.value,
             taxRateBps: tax, address: { line1: f.line1.value, city: f.city.value, state: f.state.value, postal: f.postal.value },
-            lat: f.lat.value.trim() || null, lng: f.lng.value.trim() || null }), 'Saved', { close: d.close,
+            lat: f.lat.value.trim() || null, lng: f.lng.value.trim() || null, timeZone: f.tz.value }), 'Saved', { close: d.close,
             errorInto: (x) => { err.hidden = false; err.textContent = E.friendly(x); } });
         } }, 'Save')));
   }
@@ -191,17 +193,30 @@
     let rules = null;
     if (pos && pos.settings) {
       const st = pos.settings;
+      const TENDER_LABEL = { cash: 'Cash', card: 'Card', check: 'Check', financing: 'Financing', gift_card: 'Gift card', store_credit: 'Store credit' };
       const f = { special: input({ inputmode: 'decimal', value: String(st.specialOrderDepositBps / 100) }), stocked: input({ inputmode: 'decimal', value: String(st.stockedDepositBps / 100) }),
-        holds: el('input', { type: 'checkbox', checked: st.quoteHoldsAllowed || null }), days: input({ inputmode: 'numeric', value: String(st.quoteHoldMaxDays) }) };
+        holds: el('input', { type: 'checkbox', checked: st.quoteHoldsAllowed || null }), days: input({ inputmode: 'numeric', value: String(st.quoteHoldMaxDays) }),
+        discount: input({ inputmode: 'decimal', value: String(st.discountLimitBps / 100) }), quoteDays: input({ inputmode: 'numeric', value: String(st.quoteValidDays) }),
+        layDeposit: input({ inputmode: 'decimal', value: String(st.layawayMinDepositBps / 100) }), layDays: input({ inputmode: 'numeric', value: String(st.layawayMaxDays) }),
+        layPayments: input({ inputmode: 'numeric', value: String(st.layawayInstallments) }) };
+      const tenderBoxes = Object.entries(TENDER_LABEL).map(([k, label]) => { const cb = el('input', { type: 'checkbox', value: k, checked: (st.tenders || []).includes(k) || null }); return [cb, el('label', { class: 'check' }, cb, el('span', { text: ` ${label}` }))]; });
       const edit = canRules();
-      for (const x of Object.values(f)) if (!edit) x.disabled = true;
+      for (const x of [...Object.values(f), ...tenderBoxes.map(([cb]) => cb)]) if (!edit) x.disabled = true;
       rules = section('Selling rules', null, null, el('div', { class: 'panel' }, padded(el('div', {}, el('div', { class: 'form-grid' },
         field('Deposit on special orders %', f.special, 'At least this much of goods ordered for the customer is paid when the sale is placed'),
         field('Deposit on stocked goods %', f.stocked, 'Usually 0'),
         el('label', { class: 'check' }, f.holds, el('span', { text: ' Quotes may hold stock for the customer' })),
-        field('Longest hold, days', f.days, 'A store manager can extend one, never past the quote')),
+        field('Longest hold, days', f.days, 'A store manager can extend one, never past the quote'),
+        field('Discount limit %', f.discount, 'More off than this needs a store manager'),
+        field('Quotes are good for, days', f.quoteDays, 'A quote past this asks for a new one at today’s prices'),
+        field('Layaway deposit %', f.layDeposit, 'The least paid when a layaway is placed'),
+        field('Layaway runs, days', f.layDays, 'The whole layaway is paid within this'),
+        field('Layaway payments', f.layPayments, 'How many payments the rest is split into')),
+        el('div', { class: 'field' }, el('span', { text: 'Ways to pay the registers take' }), el('div', { class: 'checks' }, tenderBoxes.map(([, l]) => l))),
         edit ? el('div', { class: 'dlg-acts' }, el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post('/pos/settings', {
-          specialOrderDepositPct: f.special.value, stockedDepositPct: f.stocked.value, quoteHoldsAllowed: f.holds.checked, quoteHoldMaxDays: f.days.value }), 'Selling rules saved') }, 'Save')) : null))));
+          specialOrderDepositPct: f.special.value, stockedDepositPct: f.stocked.value, quoteHoldsAllowed: f.holds.checked, quoteHoldMaxDays: f.days.value,
+          discountLimitPct: f.discount.value, quoteValidDays: f.quoteDays.value, layawayDepositPct: f.layDeposit.value, layawayDays: f.layDays.value,
+          layawayPayments: f.layPayments.value, tenders: tenderBoxes.filter(([cb]) => cb.checked).map(([cb]) => cb.value) }), 'Selling rules saved') }, 'Save')) : null))));
     }
     return frag(
       head('Sales tax', ctl ? [el('button', { class: 'btn primary', type: 'button', onclick: () => jurisdictionDialog(null) }, 'Add a jurisdiction')] : null, 'Setup'),

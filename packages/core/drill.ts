@@ -73,7 +73,7 @@ async function bookWindow(c: Client, entityId: string, p: Record<string, string 
   if (p.since === "all") return [null];
   if (p.since) return [p.since];
   const r = await one<{ d: string }>(c, `
-    select make_date(extract(year from current_date)::int - case when extract(month from current_date) >= (e.fiscal_year_end_month % 12) + 1 then 0 else 1 end, /* store-local date: harden */
+    select make_date(extract(year from business_today($1))::int - case when extract(month from business_today($1)) >= (e.fiscal_year_end_month % 12) + 1 then 0 else 1 end, /* store-local date */
                      (e.fiscal_year_end_month % 12) + 1, 1)::text d
       from entity e where e.id = $1 /* unscoped: the company itself */`, [entityId]);
   return [r.d];
@@ -96,10 +96,10 @@ export const DEFS: Record<string, Def> = {
              initcap(i.status) detail,
              i.due_date::text as on_day,
              (i.total_minor - coalesce((select sum(a.amount_minor) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id), 0))::text amount_minor,
-             null::text qty, case when i.due_date < current_date /* store-local date: harden */ then 'Past due' end badge, 'bill' open_kind, i.id::text open_id,
+             null::text qty, case when i.due_date < business_today($1) /* store-local date */ then 'Past due' end badge, 'bill' open_kind, i.id::text open_id,
              i.due_date ord1, i.created_at ord2
         from invoice i join vendor v on v.id = i.vendor_id
-       where i.entity_id = $1 and i.ic_document_id is null and i.status in ('approved','scheduled') and i.due_date <= current_date /* store-local date: harden */ + 7`,
+       where i.entity_id = $1 and i.ic_document_id is null and i.status in ('approved','scheduled') and i.due_date <= business_today($1) /* store-local date */ + 7`,
     order: "ord1, ord2, id",
   },
 
@@ -127,7 +127,7 @@ export const DEFS: Record<string, Def> = {
     title: "Card fees posted by matching", measure: "money",
     sql: `
       select rr.id, ba.name title, rr.lines_matched || ' of ' || rr.lines_total || ' lines matched' detail,
-             rr.ran_at::date /* store-local date: harden */::text as on_day, rr.variance_minor::text amount_minor, null::text qty, null::text badge,
+             (rr.ran_at at time zone business_tz($1))::date /* store-local date */::text as on_day, rr.variance_minor::text amount_minor, null::text qty, null::text badge,
              null::text open_kind, null::text open_id, rr.ran_at ord1
         from reconciliation_run rr join bank_account ba on ba.id = rr.bank_account_id
        where ba.entity_id = $1 and ba.status = 'active' and rr.variance_minor <> 0`,
@@ -253,7 +253,7 @@ export const DEFS: Record<string, Def> = {
     sql: `
       select t.id, t.number || coalesce(' · ' || coalesce(cu.name, t.contact_name), '') title,
              concat_ws(' · ', initcap(t.priority) || ' priority', 'due ' || to_char(t.sla_due_at, 'Mon DD')) detail,
-             t.created_at::date /* store-local date: harden */::text as on_day, null::text amount_minor, null::text qty,
+             (t.created_at at time zone business_tz($1))::date /* store-local date */::text as on_day, null::text amount_minor, null::text qty,
              case when t.sla_due_at < now() then 'Past due' else initcap(replace(t.status, '_', ' ')) end badge,
              'ticket' open_kind, t.id::text open_id, t.sla_due_at ord1
         from service_ticket t left join customer cu on cu.id = t.customer_id
@@ -268,7 +268,7 @@ export const DEFS: Record<string, Def> = {
     sql: `
       select t.id, t.number || coalesce(' · ' || coalesce(cu.name, t.contact_name), '') title,
              concat_ws(' · ', initcap(t.priority) || ' priority', 'due ' || to_char(t.sla_due_at, 'Mon DD HH12:MI am')) detail,
-             t.sla_due_at::date /* store-local date: harden */::text as on_day, null::text amount_minor, null::text qty, initcap(replace(t.status, '_', ' ')) badge,
+             (t.sla_due_at at time zone business_tz($1))::date /* store-local date */::text as on_day, null::text amount_minor, null::text qty, initcap(replace(t.status, '_', ' ')) badge,
              'ticket' open_kind, t.id::text open_id, t.sla_due_at ord1
         from service_ticket t left join customer cu on cu.id = t.customer_id
        where t.entity_id = $1 and t.status in (${OPEN_SQL})
@@ -288,7 +288,7 @@ export const DEFS: Record<string, Def> = {
          where t.entity_id = $1 and t.status in ('resolved','closed') group by t.id, cu.name)
       select v.id, v.number || coalesce(' · ' || v.customer, '') title,
              v.visits || case when v.visits = 1 then ' visit' else ' visits' end || coalesce(' · first: ' || replace(v.first_outcome, '_', ' '), '') detail,
-             v.resolved_at::date /* store-local date: harden */::text as on_day, null::text amount_minor, null::text qty,
+             (v.resolved_at at time zone business_tz($1))::date /* store-local date */::text as on_day, null::text amount_minor, null::text qty,
              case when v.visits = 1 and v.first_outcome in ('fixed','no_fault') then 'First visit' else 'More than one' end badge,
              'ticket' open_kind, v.id::text open_id, v.resolved_at ord1
         from v`,
@@ -300,7 +300,7 @@ export const DEFS: Record<string, Def> = {
     sql: `
       select sc.id, t.number || ' · ' || initcap(replace(sc.kind, '_', ' ')) title,
              concat_ws(' · ', 'charged to ' || replace(sc.charge_to, '_', ' '), sc.note) detail,
-             sc.created_at::date /* store-local date: harden */::text as on_day, sc.amount_minor::text amount_minor, null::text qty, null::text badge,
+             (sc.created_at at time zone business_tz($1))::date /* store-local date */::text as on_day, sc.amount_minor::text amount_minor, null::text qty, null::text badge,
              'ticket' open_kind, t.id::text open_id, sc.created_at ord1
         from service_cost sc join service_ticket t on t.id = sc.ticket_id
        where sc.entity_id = $1 and sc.created_at > now() - interval '30 days'`,
@@ -341,7 +341,7 @@ export const DEFS: Record<string, Def> = {
              concat_ws(' · ', 'sale ' || to_char(f.amount_minor / 100.0, 'FM$999,999,990.00'),
                        case when f.holdback_open_minor <> 0 then 'holdback ' || to_char(f.holdback_open_minor / 100.0, 'FM$999,999,990.00') end,
                        replace(f.status, '_', ' ')) detail,
-             f.created_at::date /* store-local date: harden */::text as on_day,
+             (f.created_at at time zone business_tz($1))::date /* store-local date */::text as on_day,
              ((f.amount_minor - f.refunded_minor - f.funded_gross_minor) + f.holdback_open_minor)::text amount_minor,
              null::text qty, case when (f.amount_minor - f.refunded_minor - f.funded_gross_minor) < 0 then 'Refund to reverse' end badge,
              case when f.sales_order_id is not null then 'order' end open_kind, f.sales_order_id::text open_id, f.created_at ord1
@@ -359,7 +359,7 @@ export const DEFS: Record<string, Def> = {
     params: [{ name: "customer", kind: "uuid", missing: "Pick a customer first." }],
     sql: `
       select so.id, so.number || ' · ' || initcap(so.channel) title,
-             concat_ws(' · ', initcap(replace(so.status, '_', ' ')), lo.name) detail, so.ordered_at::date /* store-local date: harden */::text as on_day,
+             concat_ws(' · ', initcap(replace(so.status, '_', ' ')), lo.name) detail, (so.ordered_at at time zone business_tz($1, so.location_id))::date /* store-local date */::text as on_day,
              so.total_minor::text amount_minor, null::text qty, null::text badge, 'order' open_kind, so.id::text open_id, so.ordered_at ord1
         from sales_order so left join location lo on lo.id = so.location_id
        where so.entity_id = $1 and so.customer_id = $2 and so.status not in ('draft','cancelled')`,
@@ -370,11 +370,11 @@ export const DEFS: Record<string, Def> = {
     title: "Store credit, issued and used", measure: "money",
     params: [{ name: "customer", kind: "uuid", missing: "Pick a customer first." }],
     sql: `
-      select l.id, 'Issued' title, l.reason detail, l.created_at::date /* store-local date: harden */::text as on_day, l.amount_minor::text amount_minor, null::text qty, null::text badge,
+      select l.id, 'Issued' title, l.reason detail, (l.created_at at time zone business_tz($1))::date /* store-local date */::text as on_day, l.amount_minor::text amount_minor, null::text qty, null::text badge,
              null::text open_kind, null::text open_id, l.created_at ord1
         from store_credit_ledger l where l.entity_id = $1 and l.customer_id = $2
       union all
-      select r.id, 'Used', concat_ws(' · ', r.number, so.number), r.received_at::date /* store-local date: harden */::text, (-r.amount_minor)::text, null::text, null::text,
+      select r.id, 'Used', concat_ws(' · ', r.number, so.number), (r.received_at at time zone business_tz($1, r.location_id))::date /* store-local date */::text, (-r.amount_minor)::text, null::text, null::text,
              case when r.sales_order_id is not null then 'order' end, r.sales_order_id::text, r.received_at
         from customer_receipt r left join sales_order so on so.id = r.sales_order_id
        where r.entity_id = $1 and r.customer_id = $2 and r.method = 'store_credit' and r.voided_at is null`,
@@ -402,7 +402,7 @@ export const DEFS: Record<string, Def> = {
       select l.id, coalesce(l.number || ' · ', '') || coalesce(l.name, 'Lead') title,
              concat_ws(' · ', initcap(replace(l.source, '_', ' ')), u.name,
                        case when l.first_response_at is not null then 'answered in ' || round(extract(epoch from l.first_response_at - l.created_at) / 60) || ' min' end) detail,
-             l.created_at::date /* store-local date: harden */::text as on_day, l.estimate_minor::text amount_minor, null::text qty, initcap(l.stage) badge,
+             (l.created_at at time zone business_tz($1))::date /* store-local date */::text as on_day, l.estimate_minor::text amount_minor, null::text qty, initcap(l.stage) badge,
              'lead' open_kind, l.id::text open_id, l.created_at ord1
         from crm_lead l left join app_user u on u.id = l.assigned_to
        where l.entity_id = $1
@@ -418,7 +418,7 @@ export const DEFS: Record<string, Def> = {
   "crm-overdue": {
     title: "Overdue follow-ups", measure: "count",
     sql: `
-      select t.id, t.title, concat_ws(' · ', u.name, cu.name, l.name) detail, t.due_at::date /* store-local date: harden */::text as on_day, null::text amount_minor, null::text qty,
+      select t.id, t.title, concat_ws(' · ', u.name, cu.name, l.name) detail, (t.due_at at time zone business_tz($1))::date /* store-local date */::text as on_day, null::text amount_minor, null::text qty,
              'Overdue' badge, case when t.lead_id is not null then 'lead' when t.customer_id is not null then 'customer' end open_kind,
              coalesce(t.lead_id, t.customer_id)::text open_id, t.due_at ord1
         from crm_task t join app_user u on u.id = t.assigned_to left join customer cu on cu.id = t.customer_id left join crm_lead l on l.id = t.lead_id
@@ -432,7 +432,7 @@ export const DEFS: Record<string, Def> = {
     params: [{ name: "order", kind: "uuid", missing: "Pick an order first." }],
     sql: `
       select r.id, r.number || ' · ' || initcap(replace(r.method, '_', ' ')) title, concat_ws(' · ', initcap(r.channel), r.reference) detail,
-             r.received_at::date /* store-local date: harden */::text as on_day, r.amount_minor::text amount_minor, null::text qty, case when r.amount_minor < 0 then 'Refund' end badge,
+             (r.received_at at time zone business_tz($1, r.location_id))::date /* store-local date */::text as on_day, r.amount_minor::text amount_minor, null::text qty, case when r.amount_minor < 0 then 'Refund' end badge,
              null::text open_kind, null::text open_id, r.received_at ord1
         from customer_receipt r
        where r.entity_id = $1 and r.sales_order_id = $2 and r.voided_at is null`,
@@ -446,7 +446,7 @@ export const DEFS: Record<string, Def> = {
     params: [{ name: "status", kind: "word", words: ["quarantined", "queued", "failed"], missing: "Say which documents to show." }],
     sql: `
       select d.id, d.doc_type || ' · ' || case d.direction when 'in' then 'from ' else 'to ' end || coalesce(v.dba, v.legal_name, 'a vendor') title,
-             concat_ws(' · ', d.reason, d.filename) detail, d.created_at::date /* store-local date: harden */::text as on_day, null::text amount_minor, null::text qty,
+             concat_ws(' · ', d.reason, d.filename) detail, (d.created_at at time zone business_tz($1))::date /* store-local date */::text as on_day, null::text amount_minor, null::text qty,
              initcap(d.status) badge, 'edi' open_kind, d.id::text open_id, d.created_at ord1
         from edi_document d left join vendor v on v.id = d.vendor_id
        where d.entity_id = $1 and case $2::text when 'failed' then d.status in ('failed','rejected') else d.status = $2::text end`,
@@ -463,7 +463,7 @@ export const DEFS: Record<string, Def> = {
              l.occurred_on::text as on_day, l.amount_minor::text amount_minor, null::text qty, null::text badge,
              case when l.journal_entry_id is not null then 'entry' end open_kind, l.journal_entry_id::text open_id, l.occurred_on ord1, l.created_at ord2
         from ar_ledger l left join customer_invoice i on i.id = l.invoice_id left join location lo on lo.id = l.location_id
-       where l.entity_id = $1 and l.customer_id = $2 and l.occurred_on <= current_date /* store-local date: harden */`,
+       where l.entity_id = $1 and l.customer_id = $2 and l.occurred_on <= business_today($1) /* store-local date */`,
     order: "ord1 desc, ord2 desc, id",
   },
   /** Trade account → On order, unbilled (trade credit pending): open trade orders, less what is paid or billed */
@@ -474,7 +474,7 @@ export const DEFS: Record<string, Def> = {
       select x.* from (
         select so.id, so.number title, concat_ws(' · ', initcap(so.status), 'total ' || to_char(so.total_minor / 100.0, 'FM$999,999,990.00'),
                          case when so.paid_minor <> 0 then 'paid ' || to_char(so.paid_minor / 100.0, 'FM$999,999,990.00') end) detail,
-               so.ordered_at::date /* store-local date: harden */::text as on_day,
+               (so.ordered_at at time zone business_tz($1, so.location_id))::date /* store-local date */::text as on_day,
                greatest(so.total_minor - so.paid_minor - coalesce((select sum(i.charged_minor) from customer_invoice i
                  where i.entity_id = so.entity_id and i.sales_order_id = so.id), 0), 0)::text amount_minor,
                null::text qty, null::text badge, 'order' open_kind, so.id::text open_id, so.ordered_at ord1
@@ -507,7 +507,7 @@ export const DEFS: Record<string, Def> = {
       select so.id, so.number || coalesce(' · ' || cu.name, '') title,
              concat_ws(' · ', initcap(po.kind), 'tax ' || to_char(so.tax_minor / 100.0, 'FM$999,999,990.00'),
                        case when so.discount_minor <> 0 then 'discount ' || to_char(so.discount_minor / 100.0, 'FM$999,999,990.00') end) detail,
-             so.ordered_at::date /* store-local date: harden */::text as on_day, so.total_minor::text amount_minor, null::text qty, initcap(so.status) badge,
+             (so.ordered_at at time zone business_tz($1, so.location_id))::date /* store-local date */::text as on_day, so.total_minor::text amount_minor, null::text qty, initcap(so.status) badge,
              'order' open_kind, so.id::text open_id, so.number ord1
         from pos_order po join sales_order so on so.id = po.sales_order_id left join customer cu on cu.id = so.customer_id
        where po.entity_id = $1 and po.register_session_id = $2 and po.kind in ('sale','layaway') and so.status <> 'draft' and so.status <> 'cancelled'`,
@@ -520,7 +520,7 @@ export const DEFS: Record<string, Def> = {
     prep: sessionHere,
     sql: `
       select so.id, so.number || coalesce(' · ' || cu.name, '') title, coalesce(po.return_note, 'Return') detail,
-             so.ordered_at::date /* store-local date: harden */::text as on_day, (-so.total_minor)::text amount_minor, null::text qty, null::text badge,
+             (so.ordered_at at time zone business_tz($1, so.location_id))::date /* store-local date */::text as on_day, (-so.total_minor)::text amount_minor, null::text qty, null::text badge,
              'order' open_kind, so.id::text open_id, so.number ord1
         from pos_order po join sales_order so on so.id = po.sales_order_id left join customer cu on cu.id = so.customer_id
        where po.entity_id = $1 and po.register_session_id = $2 and po.kind = 'return'`,
@@ -537,7 +537,7 @@ export const DEFS: Record<string, Def> = {
     sql: `
       select r.id, r.number || coalesce(' · ' || cu.name, '') title,
              concat_ws(' · ', initcap(replace(r.method, '_', ' ')), so.number, r.reference) detail,
-             r.received_at::date /* store-local date: harden */::text as on_day, r.amount_minor::text amount_minor, null::text qty,
+             (r.received_at at time zone business_tz($1, r.location_id))::date /* store-local date */::text as on_day, r.amount_minor::text amount_minor, null::text qty,
              case when r.amount_minor < 0 then 'Refund' end badge,
              case when r.sales_order_id is not null then 'order' end open_kind, r.sales_order_id::text open_id, r.received_at ord1
         from customer_receipt r left join customer cu on cu.id = r.customer_id left join sales_order so on so.id = r.sales_order_id
@@ -554,7 +554,7 @@ export const DEFS: Record<string, Def> = {
     prep: sessionHere,
     sql: `
       select m.id, case m.kind when 'drop' then 'Drop to the safe' when 'paid_in' then 'Paid in' when 'paid_out' then 'Paid out' else m.kind end title,
-             concat_ws(' · ', m.note, u.name) detail, m.at::date /* store-local date: harden */::text as on_day, m.amount_minor::text amount_minor, null::text qty, null::text badge,
+             concat_ws(' · ', m.note, u.name) detail, (m.at at time zone business_tz($1))::date /* store-local date */::text as on_day, m.amount_minor::text amount_minor, null::text qty, null::text badge,
              null::text open_kind, null::text open_id, m.at ord1
         from pos_cash_movement m left join app_user u on u.id = m.by_user
        where m.entity_id = $1 and m.session_id = $2 and ($3::text is null or m.kind = $3)`,

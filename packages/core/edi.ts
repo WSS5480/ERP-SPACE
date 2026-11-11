@@ -21,6 +21,7 @@
 // in words: this build has no SSH or AS2 library (package.json carries only
 // pg), and adding one is a decision for the owner, not a side effect.
 
+import { today as bizToday } from "./clock.ts";
 import { applyVendorExtras, pieceTypeFrom, type VendorExtra } from "./configurator.ts";
 import { readdir, readFile, writeFile, mkdir, rename, stat } from "node:fs/promises";
 import { join, resolve, sep as pathSep } from "node:path";
@@ -641,7 +642,7 @@ export async function sendTest850(c: Client, s: Scope, env: EdiEnv, partnerId: s
     text = b.text; ctl = b.ctl; summary = { test: true, poNumber: b.po850.poNumber, lines: b.po850.lines.length, note: "a copy of an open PO, marked test" };
   } else {
     ctl = await nextControls(c, p);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = await bizToday(c, s);
     const po850: x12.Po850 = { poNumber: `TEST-${String(ctl.isa).padStart(6, "0")}`, date: today, shipTo: { code: "TEST", name: "Test ship-to" },
       lines: [{ line: 1, qty: 1, unitMinor: 100n, vendorSku: "TEST-ITEM", description: "Test line, do not ship" }] };
     text = x12.writeInterchange(envelopeFor(p, ctl, "T"), [{ type: "850", control: ctl.st, segments: x12.build850(po850) }], sepsOf(p), { newline: true });

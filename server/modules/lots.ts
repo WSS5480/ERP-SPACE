@@ -91,7 +91,7 @@ async function labelOptions(c: Client, co: Company) {
     q(c, `select gr.id, po.number, gr.received_on::text received_on, count(gl.id)::int lines from goods_receipt gr join purchase_order po on po.id = gr.purchase_order_id
            join goods_receipt_line gl on gl.goods_receipt_id = gr.id where po.entity_id = $1 group by gr.id, po.number order by gr.received_on desc, po.number desc limit 20`, [co.id]),
     q(c, `select r.id, r.number, r.route_on::text route_on, (select count(*) from route_load_item i where i.entity_id = r.entity_id and i.route_id = r.id and i.status <> 'removed')::int pieces
-           from delivery_route r where r.entity_id = $1 and r.status <> 'cancelled' and r.route_on >= current_date - 1 order by r.route_on, r.number limit 30`, [co.id]),
+           from delivery_route r where r.entity_id = $1 and r.status <> 'cancelled' and r.route_on >= business_today($1) - 1 order by r.route_on, r.number limit 30`, [co.id]),
     q<{ n: number }>(c, `select count(*)::int n from wms_prep_job where entity_id = $1 and status in ('queued','in_progress','problem')`, [co.id]),
   ]);
   return { ...tpl, printers, jobs, locations, receipts, routes, prepOpen: prepCount[0]?.n ?? 0, kinds: L.KINDS };

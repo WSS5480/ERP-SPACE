@@ -5,6 +5,7 @@
 // adds tax rates, locations or any sample data: those are the company's own,
 // entered by a person (scripts/modules/onboarding.ts checks this).
 
+import { validTimeZone } from "./clock.ts";
 import { adoptOpeningBalances } from "./ar.ts";
 import { derivedRate, locationRateChanged, keepStoreRate } from "./tax.ts";
 import { q, one, type Client, type Scope } from "./db.ts";
@@ -559,6 +560,8 @@ const KINDS = ["store", "warehouse", "outlet", "yard", "office", "web"];
 export async function saveLocation(c: Client, scope: Scope, input: {
   id?: string | null; code: string; name: string; kind: string; state?: string | null; taxRateBps?: number;
   address?: { line1?: string; city?: string; state?: string; postal?: string }; lng?: number | null; lat?: number | null;
+  /** the store's own business time zone; empty means the company's (clock.ts); undefined leaves it */
+  timeZone?: string | null;
 }) {
   const code = input.code.trim().toUpperCase();
   if (!/^[A-Z0-9-]{2,10}$/.test(code)) throw new SetupError("a location code is 2 to 10 letters or digits");
@@ -578,6 +581,8 @@ export async function saveLocation(c: Client, scope: Scope, input: {
   const hasGeo = typeof input.lng === "number" && typeof input.lat === "number";
   if (hasGeo && (Math.abs(input.lat!) > 90 || Math.abs(input.lng!) > 180)) throw new SetupError("that map point is off the map");
   const addr = JSON.stringify(input.address ?? {});
+  const tz = input.timeZone === undefined ? undefined : (input.timeZone || "").trim() || null;
+  if (tz && !validTimeZone(tz)) throw new SetupError(`${tz} is not a time zone; pick one from the list, or leave it to the company's`);
   if (input.id) {
     // A store taxed by its jurisdictions shows their combined rate; that rate is changed there, not here.
     const derived = ["store", "outlet"].includes(input.kind) ? await derivedRate(c, scope.entityId, input.id).catch(() => null) : null;
@@ -589,6 +594,7 @@ export async function saveLocation(c: Client, scope: Scope, input: {
        where id = $1 and entity_id = $2`,
       [input.id, scope.entityId, code, input.name.trim(), input.kind, st, tax, addr, hasGeo ? input.lng : null, hasGeo ? input.lat : null]);
     if (!r.rowCount) throw new SetupError("no such location");
+    if (tz !== undefined) await c.query(`update location set time_zone = $3 where id = $1 and entity_id = $2`, [input.id, scope.entityId, tz]);
     await locationRateChanged(c, scope, input.id, tax);   // a store kept at a single rate: the new rate from today
     if (["store", "outlet"].includes(input.kind)) await keepStoreRate(c, scope.entityId, input.id);
     return input.id;
@@ -597,6 +603,7 @@ export async function saveLocation(c: Client, scope: Scope, input: {
     `insert into location (entity_id, code, name, kind, state, tax_rate_bps, address, geo)
      values ($1,$2,$3,$4,$5,$6,$7, case when $8::float8 is null then null else point($8, $9) end) returning id`,
     [scope.entityId, code, input.name.trim(), input.kind, st, tax, addr, hasGeo ? input.lng : null, hasGeo ? input.lat : null])).id;
+  if (tz) await c.query(`update location set time_zone = $3 where id = $1 and entity_id = $2`, [id, scope.entityId, tz]);
   // A store's own rate stands until jurisdictions say otherwise (never lowered by a later statewide one).
   if (["store", "outlet"].includes(input.kind)) await keepStoreRate(c, scope.entityId, id);
   // A selling location is a profit object too, so its sales land in its own P&L column.

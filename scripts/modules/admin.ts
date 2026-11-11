@@ -203,7 +203,7 @@ export async function run(t: T) {
   // presets and apply to all companies
   const chk = await A.get<{ open: { service: string; count: number }[] }>("/admin/services/preset-check", PEOPLE.CONTROLLER, [], "?preset=delivery");
   t.ok("preset: the check route answers", Array.isArray(chk.open));
-  const openWork = await inTx((c) => svc.presetCheck(c, [{ id: ENTITY, name: "Enola" }], "delivery"));
+  const openWork = await inTx((c) => svc.presetCheck(c, [{ id: ENTITY, name: "Riverside" }], "delivery"));
   t.ok("preset: what it would hide with open work is listed", openWork.some((o) => o.service === "purchasing" || o.service === "ar") && openWork.every((o) => o.count > 0), JSON.stringify(openWork));
   await t.throws("preset: switching off services with open records needs a confirmation", () => A.post("/admin/services/preset", PEOPLE.STEVE, { preset: "delivery" }), /still have open records: .*Confirm/);
   const pr = await A.post<{ companies: number; state: svc.ServiceState; openHidden: unknown[] }>("/admin/services/preset", PEOPLE.STEVE, { preset: "delivery", confirm: true });
@@ -280,7 +280,7 @@ export async function run(t: T) {
     { accountSid: "AC" + "a".repeat(32), fromNumber: "+17175550100" }, { authToken: "t" }, { personId: PEOPLE.STEVE, personName: "Steve" }, { ...env(), secretKey: null })), /ERP_SECRET_KEY/);
 
   // trade code: logged when no email is connected
-  const site = (await inTx((c) => shop.siteBySlug(c, "buddys")))!;
+  const site = (await inTx((c) => shop.siteBySlug(c, "riverside-home")))!;
   // a trade account of our own, so these checks stand alone
   await inTx(async (c) => {
     const u = randomBytes(3).toString("hex");
@@ -302,12 +302,12 @@ export async function run(t: T) {
 
   // email by HTTP provider (SendGrid), set for the whole client
   await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "sendgrid", scope: "client",
-    settings: { fromName: "Buddy's", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.bad-key" } });
+    settings: { fromName: "Riverside", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.bad-key" } });
   const bad = await A.post<{ ok: boolean; words: string }>("/admin/connections/test", PEOPLE.STEVE, { kind: "email", scope: "client", to: "me@example.com" });
   t.ok("http email: a refused key is failing, in plain words", !bad.ok && /did not accept the key/.test(bad.words));
   let cv = await A.get<{ kinds: { id: string; status: string; statusWords: string; using: string; client: { secrets: Record<string, string> } }[] }>("/admin/connections", PEOPLE.CONTROLLER);
   t.ok("status: failing shows its last error", cv.kinds.find((k) => k.id === "email")!.status === "failing" && /did not accept/.test(cv.kinds.find((k) => k.id === "email")!.statusWords));
-  await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "sendgrid", scope: "client", settings: { fromName: "Buddy's", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.good-key" } });
+  await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "sendgrid", scope: "client", settings: { fromName: "Riverside", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.good-key" } });
   const good = await A.post<{ ok: boolean; message: { providerRef: string } }>("/admin/connections/test", PEOPLE.STEVE, { kind: "email", scope: "client", to: "me@example.com" });
   const sg = net0.log.filter((r) => r.url.includes("sendgrid")).pop()!;
   t.ok("http email: the test goes to SendGrid with the key and comes back with its id", good.ok && good.message.providerRef === "sg-msg-1" && JSON.parse(sg.body).personalizations[0].to[0].email === "me@example.com");
@@ -325,7 +325,7 @@ export async function run(t: T) {
   });
   await t.throws("scope: testing the client's connection needs the role in every company", () => A.post("/admin/connections/test", ONLY, { kind: "email", scope: "client", to: "me@example.com" }), /for the whole client .* too/);
   // a failed PO email keeps its log row through the savepoint rollback
-  await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "sendgrid", scope: "client", settings: { fromName: "Buddy's", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.bad-key" } });
+  await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "sendgrid", scope: "client", settings: { fromName: "Riverside", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.bad-key" } });
   const poTo = `vendor-${randomBytes(3).toString("hex")}@example.com`;
   const failedRows = await inTx(async (c) => {
     const ml = (await msg.mailerFor(c, ENTITY, "purchase_order"))!;
@@ -335,7 +335,7 @@ export async function run(t: T) {
     return q<{ status: string }>(c, `select status from outbound_message where entity_id = $1 and purpose = 'purchase_order' and to_addr = $2`, [ENTITY, poTo]);
   });
   t.ok("purchase orders: a failed email stays in the log after the rollback", failedRows.length === 1 && failedRows[0].status === "failed");
-  await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "sendgrid", scope: "client", settings: { fromName: "Buddy's", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.good-key" } });
+  await A.post("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "sendgrid", scope: "client", settings: { fromName: "Riverside", fromAddress: "orders@example.com" }, secrets: { apiKey: "SG.good-key" } });
 
   // trade code through the connection
   if (acct) {
@@ -355,7 +355,7 @@ export async function run(t: T) {
   const relay = await fakeSmtp("PLAIN", "relay", "relay-pw");
   ports.push(relay.port);
   const saved = await A.post<{ missing: string[] }>("/admin/connections/save", PEOPLE.STEVE, { kind: "email", provider: "smtp", scope: "company",
-    settings: { host: "127.0.0.1", port: relay.port, security: "none", user: "relay", fromName: "Enola store", fromAddress: "enola@example.com" }, secrets: { password: "relay-pw" } });
+    settings: { host: "127.0.0.1", port: relay.port, security: "none", user: "relay", fromName: "Riverside store", fromAddress: "enola@example.com" }, secrets: { password: "relay-pw" } });
   t.ok("smtp: saved with nothing missing", saved.missing.length === 0);
   const viaSmtp = await inTx((c) => msg.sendEmail(c, ENTITY, { to: ["cust@example.com"], subject: "Your order", text: "Thanks.\n.\nBye" }, { purpose: "test" }));
   t.ok("scope: the company's own SMTP wins, through the fake server", viaSmtp.status === "sent" && viaSmtp.provider === "smtp" && relay.got.to[0] === "cust@example.com" && relay.got.data.includes("\r\n..\r\n"));
@@ -364,10 +364,10 @@ export async function run(t: T) {
   relay.close();
 
   // SMS through a mock: Twilio, then delivery texts
-  await A.post("/admin/connections/save", PEOPLE.CONTROLLER, { kind: "sms", provider: "twilio", settings: { accountSid: "AC" + "a".repeat(32), fromNumber: "+1 (717) 555-0100" }, secrets: { authToken: "tw-token" } });
+  await A.post("/admin/connections/save", PEOPLE.CONTROLLER, { kind: "sms", provider: "twilio", settings: { accountSid: "AC" + "a".repeat(32), fromNumber: "+1 (555) 555-0100" }, secrets: { authToken: "tw-token" } });
   const tt = await A.post<{ ok: boolean; words: string }>("/admin/connections/test", PEOPLE.CONTROLLER, { kind: "sms", to: "717 555 0199" });
   const tw = net0.log.filter((r) => r.url.includes("twilio")).pop()!;
-  t.ok("sms: the test text goes through Twilio", tt.ok && new URLSearchParams(tw.body).get("To") === "+17175550199" && new URLSearchParams(tw.body).get("From") === "+17175550100");
+  t.ok("sms: the test text goes through Twilio", tt.ok && new URLSearchParams(tw.body).get("To") === "+17175550199" && new URLSearchParams(tw.body).get("From") === "+15555550100");
   const cust = (await sql<{ id: string }>(`select id from customer where entity_id = $1 and phone is not null limit 1`, [ENTITY]))[0];
   const cmId = await t.as(PEOPLE.STEVE, (c, co) => fleet.messageCustomer(c, { tenantId: co.tenantId, entityId: ENTITY, actor: { kind: "user", id: PEOPLE.STEVE, label: "x" } },
     { customerId: cust.id, body: "your delivery is booked" }));
@@ -393,7 +393,7 @@ export async function run(t: T) {
   if (webCust) {
     const n1 = net0.log.length;
     await inTx((c) => shop.ConnectedMessages.send(c, { entityId: ENTITY, siteId: site.id, orderId: null, customerId: webCust.id, channel: "email", toRef: "m***@example.com",
-      template: "order_confirmed", body: "Buddy's: order W-1 is confirmed." }));
+      template: "order_confirmed", body: "Riverside: order W-1 is confirmed." }));
     await msg.idle();
     const wr = (await sql<{ status: string }>(`select status from outbound_message where entity_id = $1 and purpose = 'web_order' order by created_at desc limit 1`, [ENTITY]))[0];
     t.ok("web orders: the confirmation goes through the email connection after commit", wr?.status === "sent", JSON.stringify(wr));

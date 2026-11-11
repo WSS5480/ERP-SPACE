@@ -1000,7 +1000,7 @@ export async function applyPriceHistory(c: Client, s: Scope, vendorId: string, r
            p.cost_minor p_cost, p.map_minor p_map, p.msrp_minor p_msrp, p.price_minor p_price, p.status
       from vendor_price_history h join product p on p.id = h.product_id and p.entity_id = h.entity_id
      where h.entity_id = $1 and h.vendor_id = $2 and h.product_id is not null
-       and (h.effective_from is null or h.effective_from <= current_date) and (h.effective_to is null or h.effective_to >= current_date)
+       and (h.effective_from is null or h.effective_from <= business_today($1)) and (h.effective_to is null or h.effective_to >= business_today($1))
      order by h.product_id, h.effective_from desc nulls last, h.recorded_at desc`, [s.entityId, vendorId]);
   const markup = rule.mode === "markup" ? Number(rule.markupBps ?? 0) : 0;
   let changed = 0;

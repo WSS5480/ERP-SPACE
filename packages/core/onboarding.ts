@@ -12,6 +12,9 @@
 // inventory.adjust (reason 'opening_balance': Dr 1300 / Cr 3000), and the bank
 // opening balance through posting.post, like every other posting.
 
+import { today as bizToday } from "./clock.ts";
+import { periodFor, PeriodError } from "./periods.ts";
+import { validTimeZone } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, PostingError } from "./posting.ts";
 import { effectiveServices } from "./services.ts";
@@ -23,7 +26,6 @@ import { netCheck } from "./group.ts";
 
 export class OnboardingError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new OnboardingError(msg); };
-const today = () => new Date().toISOString().slice(0, 10);
 const isDay = (s: unknown) => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const fmt = (m: bigint) => { const neg = m < 0n; const a = neg ? -m : m; return `${neg ? "-" : ""}$${(a / 100n).toLocaleString("en-US")}.${String(a % 100n).padStart(2, "0")}`; };
@@ -179,7 +181,7 @@ export async function tieOuts(c: Client, tenantId: string, entityId: string, mul
       : `The books show ${fmt(t.gl1300Minor + t.gl1310Minor)} in 1300/1310 but stock at cost is ${fmt(t.stockMinor + t.inTransitMinor)}: a difference of ${fmt(t.differenceMinor)}.` };
   });
   await run("tax", "Sales tax ties to 2100", async () => {
-    const f = await tax.filing(c, entityId, "2000-01-01", today());
+    const f = await tax.filing(c, entityId, "2000-01-01", (await bizToday(c, entityId)));
     return { ok: f.tie.ties, detail: f.tie.note };
   });
   await run("financing", "Financing receivables tie to 1110", async () => {
@@ -273,7 +275,7 @@ export async function checklist(c: Client, tenantId: string, entityId: string, o
     const noTax: string[] = [];
     let standIns = 0;   // a store on its single rate whose stand-in is not made yet: a rate nobody has checked either
     for (const l of selling) {
-      const s = l.state ? await tax.stackForLocation(c, entityId, l.id, today(), false) : [];
+      const s = l.state ? await tax.stackForLocation(c, entityId, l.id, (await bizToday(c, entityId)), false) : [];
       if (!s.length || !s.some((j) => j.rateBps > 0 || (j.id && j.level !== "combined"))) noTax.push(l.name);
       if (s.some((j) => !j.id && j.rateBps > 0)) standIns++;
     }
@@ -416,7 +418,7 @@ export async function dismiss(c: Client, scope: Scope, on: boolean) {
 // ========================================================= company details
 
 export async function saveCompanyDetails(c: Client, scope: Scope, x: { legalName: string; einLast4?: string | null;
-  address: { line1?: string; city?: string; postal?: string }; state?: string | null; fiscalYearStartMonth?: number | null }) {
+  address: { line1?: string; city?: string; postal?: string }; state?: string | null; fiscalYearStartMonth?: number | null; timeZone?: string | null }) {
   const legal = String(x.legalName ?? "").trim();
   need(legal.length >= 2 && legal.length <= 120, "enter the company's legal name, as on its tax filings");
   const ein = String(x.einLast4 ?? "").trim() || null;
@@ -438,9 +440,13 @@ export async function saveCompanyDetails(c: Client, scope: Scope, x: { legalName
       fyEnd = want;
     }
   }
+  // The company's business time zone (stores without their own use it); empty leaves the fallbacks in clock.ts.
+  const tz = x.timeZone === undefined ? undefined : String(x.timeZone ?? "").trim() || null;
+  need(!tz || validTimeZone(tz), `${tz} is not a time zone; pick one from the list`);
   await c.query(`update entity set legal_name = $3, ein_last4 = coalesce($4, ein_last4), address = $5, state = $6, fiscal_year_end_month = $7
      where id = $1 and tenant_id = $2 /* unscoped: the company itself */`, [scope.entityId, scope.tenantId, legal, ein, JSON.stringify(addr), st, fyEnd]);
-  await audit(c, scope, { table: "entity", rowId: scope.entityId, action: "update", after: { legalName: legal, einLast4: ein ? "set" : null, state: st, fiscalYearEndMonth: fyEnd } });
+  if (tz !== undefined) await c.query(`update entity set time_zone = $3 where id = $1 and tenant_id = $2 /* unscoped: the company itself */`, [scope.entityId, scope.tenantId, tz]);
+  await audit(c, scope, { table: "entity", rowId: scope.entityId, action: "update", after: { legalName: legal, einLast4: ein ? "set" : null, state: st, fiscalYearEndMonth: fyEnd, timeZone: tz } });
   return { ok: true };
 }
 
@@ -454,12 +460,11 @@ function cents(s: string): bigint | null {
   return BigInt(m[1]) * 100n + BigInt((m[2] ?? "").padEnd(2, "0"));
 }
 
-/** The day must fall in one of the company's open periods. */
+/** The day must fall in one of the company's open periods (a near month opens on its own, see periods.ts). */
 async function openDay(c: Client, entityId: string, day: unknown, what: string) {
   need(isDay(day), `give the day ${what} is as of`);
-  const p = await q<{ status: string }>(c, `select status from fiscal_period where entity_id = $1 and $2::date between starts_on and ends_on`, [entityId, day]);
-  need(p.length, `there is no fiscal period holding ${day}; open one in Books or pick a day inside the periods you have`);
-  need(p[0].status !== "closed", `the period holding ${day} is closed; pick a day in an open period`);
+  try { await periodFor(c, { entityId }, day as string); }
+  catch (e) { if (e instanceof PeriodError) need(false, e.message); throw e; }
 }
 
 /** Opening stock is for before trading starts: once sales are posted, stock comes in through receiving, counts or adjustments. */

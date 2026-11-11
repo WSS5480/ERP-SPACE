@@ -85,7 +85,7 @@ export async function run(t: T) {
   await r.post("/purchasing/budgets", PEOPLE.STEVE, { month: coaMonth.slice(0, 7), category: "Dining", locationId: LOC.ENOLA, budget: "100" });
   const tableLine = [{ productId: P.TABLE, locationId: LOC.ENOLA, qty: 1 }];
   const tableBefore = await stock(t, P.TABLE, LOC.ENOLA);
-  await t.throws("open-to-buy: a buyer cannot place a PO over budget", () => r.post("/purchasing/order-form", BUYER, { lines: tableLine }), /over budget: Dining at Enola.*\$100\.00 left.*\$190\.00/);
+  await t.throws("open-to-buy: a buyer cannot place a PO over budget", () => r.post("/purchasing/order-form", BUYER, { lines: tableLine }), /over budget: Dining at Riverside.*\$100\.00 left.*\$190\.00/);
   await t.throws("open-to-buy: the owner goes over only with a reason", () => r.post("/purchasing/order-form", PEOPLE.STEVE, { lines: tableLine }), /Say why/);
   const over = await r.post<Placed>("/purchasing/order-form", PEOPLE.STEVE, { lines: tableLine, overBudgetReason: "Floor model sold, need a replacement now" });
   t.ok("open-to-buy: the owner's over-budget PO is placed and says so", over.placed[0].warnings.some((w) => /placed over budget/.test(w)));
