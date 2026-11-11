@@ -331,7 +331,7 @@ export async function run(t: T) {
     const ediEnv: edi.EdiEnv = { ...feeds.liveEnv(), secretKey: KEY, dropDir: null };
     const buyerScope = await (async () => { const co = await companyOf(t); return scopeOf(co, { personId: BUYER, personName: "Buyer", label: "Buyer" }); })();
     await tx(buyerScope.actor, async (c) => {
-      await c.query(`update edi_partner set transport = 'sftp', transport_config = $3 where id = $1 and entity_id = $2`,
+      await c.query(`update edi_partner set transport = 'sftp', edi_enabled = true, transport_config = $3 where id = $1 and entity_id = $2`,
         [ashley.id, ENTITY, JSON.stringify({ host: "127.0.0.1", port: String(port), user: "buddys", inFolder: "/edi/out", outFolder: "/edi/in", archiveFolder: "/edi/out/done" })]);
       await edi.setPartnerSecrets(c, buyerScope, ediEnv, ashley.id, { sftpPassword: "Sftp-Pass-7788" });
     });

@@ -673,7 +673,7 @@ export function maxBytesOf(conn: Pick<Connection, "config">): number {
 
 // ---------------------------------------------------------- server keys
 
-export type PinOwner = { kind: "connection" | "edi_partner"; id: string; tenantId: string; entityId: string };
+export type PinOwner = { kind: "connection" | "edi_partner" | "vendor_feed"; id: string; tenantId: string; entityId: string };
 export type Pin = { host: string; port: number; key_type: string; fingerprint: string; pinned_at: string; pinned_by_name: string | null;
   offered_type: string | null; offered_fingerprint: string | null; offered_at: string | null };
 
@@ -830,7 +830,7 @@ async function postRun(conn: Connection, runId: string, names: string[]): Promis
     }
   } catch (e) {
     problems.push((e as Error).message);
-  } finally { t?.close(); }
+  } finally { t?.close?.(); }
   const note = problems.length
     ? `after the run, ${done} of ${names.length} files were ${after === "move" ? "moved" : "deleted"}; ${problems.slice(0, 3).join("; ")}`.slice(0, 1000)
     : null;

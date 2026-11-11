@@ -169,15 +169,16 @@ async function applyParts(c: Client, s: Scope, conn: Connection, parts: Part[], 
       applied += n;
       notes.push(`${p.name}: availability for ${n} models`);
     } else {
+      const e = p as Extract<Part, { kind: "edi" }>;
       const { partnerForVendor, receiveFile, liveEdiEnv } = await import("./edi.ts");
       const partner = await partnerForVendor(c, s.entityId, vendorId);
       need(partner, `${p.name} is EDI, but this vendor is not set up as a trading partner; set it up under Setup, Vendor EDI, then release this file`);
-      const r = await receiveFile(c, s, liveEdiEnv(), { text: p.text, filename: p.name, partnerId: partner!.id });
+      const r = await receiveFile(c, s, liveEdiEnv(), { text: e.text, filename: p.name, partnerId: partner!.id });
       const ok = r.documents.filter((d) => d.status === "applied").length;
       const held = r.documents.filter((d) => d.status === "quarantined").length;
       const same = r.documents.filter((d) => d.status === "ignored").length;
       applied += ok;
-      notes.push(`${p.name}: ${r.documents.length} EDI ${r.documents.length === 1 ? "document" : "documents"} (${p.types.join(", ")}): ${ok} applied${held ? `, ${held} held in Vendor EDI's inbox` : ""}${same ? `, ${same} seen before` : ""}`);
+      notes.push(`${p.name}: ${r.documents.length} EDI ${r.documents.length === 1 ? "document" : "documents"} (${e.types.join(", ")}): ${ok} applied${held ? `, ${held} held in Vendor EDI's inbox` : ""}${same ? `, ${same} seen before` : ""}`);
     }
   }
   if (skipped.length) notes.push(`left out (no pattern matched): ${skipped.slice(0, 5).join(", ")}${skipped.length > 5 ? "…" : ""}`);

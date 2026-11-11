@@ -136,14 +136,14 @@ const safeName = (n: string) => {
 function plain(e: unknown, what: string): TransportError {
   if (e instanceof TransportError) return e;
   const m = String((e as Error)?.message ?? e);
-  const code = (e as { code?: string; level?: string })?.code ?? "";
+  const code = String((e as { code?: string | number })?.code ?? "");
   const level = (e as { level?: string })?.level ?? "";
   if (level === "client-authentication" || /authentication methods failed/i.test(m)) return new TransportError(`${what} refused the user name or password/key`);
   if (/Timed out while waiting for handshake/i.test(m)) return new TransportError(`${what} did not answer in time`);
   if (code === "ECONNREFUSED") return new TransportError(`${what} refused the connection; check the host and port`);
   if (code === "ETIMEDOUT" || code === "EHOSTUNREACH" || code === "ENETUNREACH") return new TransportError(`${what} could not be reached`);
-  if (code === 2 || /No such file/i.test(m)) return new TransportError(`${what}: no such file or folder`);
-  if (code === 3 || /Permission denied/i.test(m)) return new TransportError(`${what}: permission denied`);
+  if (code === "2" || /No such file/i.test(m)) return new TransportError(`${what}: no such file or folder`);
+  if (code === "3" || /Permission denied/i.test(m)) return new TransportError(`${what}: permission denied`);
   return new TransportError(`${what}: ${m.slice(0, 160)}`);
 }
 
