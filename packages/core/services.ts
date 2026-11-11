@@ -105,7 +105,7 @@ export const SERVICES: Service[] = [
 ];
 
 /** Screens that are always there: the books themselves, and setting the company up. */
-export const CORE_SCREENS = ["home", "approvals", "payables", "books", "chart", "cash", "recon", "feeds", "setup", "business", "services", "connections"];
+export const CORE_SCREENS = ["home", "approvals", "payables", "books", "chart", "cash", "recon", "feeds", "setup", "business", "services", "connections", "checklist"];
 
 export const SCREEN_SERVICE: Record<string, ModuleId | null> = Object.fromEntries([
   ...CORE_SCREENS.map((s) => [s, null]),

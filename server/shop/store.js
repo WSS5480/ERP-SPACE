@@ -553,7 +553,7 @@ async function pageCheckout() {
     line1: el('input', { type: 'text', autocomplete: 'address-line1', maxlength: '100', value: saved.line1 || '' }),
     line2: el('input', { type: 'text', autocomplete: 'address-line2', maxlength: '100', value: saved.line2 || '' }),
     city: el('input', { type: 'text', autocomplete: 'address-level2', maxlength: '60', value: saved.city || '' }),
-    state: el('input', { type: 'text', autocomplete: 'address-level1', maxlength: '2', value: saved.state || '', placeholder: 'PA' }),
+    state: el('input', { type: 'text', autocomplete: 'address-level1', maxlength: '2', value: saved.state || '', placeholder: 'ST' }),
     postal: el('input', { type: 'text', autocomplete: 'postal-code', inputmode: 'numeric', maxlength: '10', value: saved.postal || '' }),
     notes: el('textarea', { maxlength: '300', placeholder: 'Gate code, stairs, best time to call…' }),
     store: el('select', {}, s.pickupStores.map((p) => el('option', { value: p.id, text: `${p.name}${p.address ? ' — ' + p.address : ''}`, selected: saved.store === p.id || null }))),

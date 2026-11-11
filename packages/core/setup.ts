@@ -1,7 +1,9 @@
 // Industry packs: what makes the ERP work out of the box for a furniture
 // store, a general retailer, a rent-to-own chain, an appliance dealer or a
 // trucking company. A pack is data -- labels, modules, accounts, reasons and
-// default settings -- applied to one company. It only ever adds.
+// default settings -- applied to one company. It only ever adds. A pack never
+// adds tax rates, locations or any sample data: those are the company's own,
+// entered by a person (scripts/modules/onboarding.ts checks this).
 
 import { adoptOpeningBalances } from "./ar.ts";
 import { derivedRate, locationRateChanged, keepStoreRate } from "./tax.ts";
@@ -236,6 +238,13 @@ export const PACKS: Pack[] = [
       ["3000", "Owner equity", "equity", "C"],
       ["4000", "Freight revenue", "revenue", "C"],
       ["4020", "Fees and other revenue", "revenue", "C"],
+      ["1150", "Vendor chargebacks receivable", "asset", "D"],
+      ["2160", "Commissions payable", "liability", "C"],
+      ["4030", "Delivery and accessorial revenue", "revenue", "C"],
+      ["4095", "Trade-in allowances", "revenue", "D"],
+      ["5000", "Cost of services", "expense", "D"],
+      ["6130", "Commissions", "expense", "D"],
+      ["6150", "Warranty and service expense", "expense", "D"],
       ["6300", "Fleet repairs and maintenance", "expense", "D"],
       ["6310", "Fuel", "expense", "D"],
       ["6800", "Other operating", "expense", "D"],

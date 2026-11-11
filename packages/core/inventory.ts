@@ -1668,11 +1668,18 @@ export const REASONS = ["found", "lost", "theft", "damaged_beyond_repair", "data
 
 /** A stock adjustment with a reason code, posted at cost. Serialized write-downs name the pieces by label. */
 export async function adjust(c: Client, scope: Scope, e: { locationId: string; productId: string; qty: number; reasonCode: string; note?: string;
-  binId?: string | null; labels?: string[] }) {
+  binId?: string | null; labels?: string[];
+  /** opening stock only: what each unit cost in the old books (otherwise today's average) */
+  unitCostMinor?: bigint | null;
+  /** opening stock only: serial numbers (one per unit) and a lot for serialized pieces */
+  serials?: string[]; lot?: string | null }) {
   need(REASONS.includes(e.reasonCode), "pick a reason");
   const qty = Number(e.qty);
   need(qty !== 0 && Number.isFinite(qty), "adjust by a quantity other than zero");
   if (e.reasonCode === "other") need(String(e.note ?? "").trim(), "say what the adjustment is for");
+  const given = e.unitCostMinor ?? null;
+  if (given !== null || e.serials?.length || e.lot) need(e.reasonCode === "opening_balance" && qty > 0, "a unit cost, serials or a lot are given only when bringing opening stock in");
+  if (given !== null) need(given >= 0n, "a unit cost cannot be negative");
   const p = await productOf(c, scope.entityId, e.productId);
   need(STOCKED_KINDS.includes(p.kind), `${p.name} is not a stocked product`);
   const loc = await q(c, `select id from location where id = $1 and entity_id = $2`, [e.locationId, scope.entityId]);
@@ -1682,10 +1689,19 @@ export async function adjust(c: Client, scope: Scope, e: { locationId: string; p
   const number = await nextNo(c, scope.entityId, "adjustment", "ADJ-");
   const adjId = (await q<{ u: string }>(c, `select gen_random_uuid()::text u /* unscoped: no table */`))[0].u;
   // The value moves through the cost pool first: out at the average, or in at today's average.
-  const unitNow = await unitCost(c, scope.entityId, p.id);
+  const unitNow = given ?? await unitCost(c, scope.entityId, p.id);
   let value: bigint;
   if (qty < 0) value = -(await costOut(c, scope.entityId, p.id, -qty));
   else { value = BigInt(Math.round(qty * Number(unitNow))); await costIn(c, scope.entityId, p.id, qty, value); }
+  const serials = (e.serials ?? []).map((x) => cleanId(x, "serial")).filter(Boolean) as string[];
+  const lot = cleanId(e.lot ?? null, "lot");
+  if (serials.length) {
+    need(p.serialized, `${p.name} is not tracked by serial number`);
+    need(serials.length === qty, `${serials.length} serial number${serials.length === 1 ? "" : "s"} for ${qty} unit${qty === 1 ? "" : "s"}; give one per unit`);
+    need(new Set(serials).size === serials.length, "the same serial number is given twice");
+    const dup = await q<{ serial_no: string }>(c, `select distinct serial_no from inv_piece where entity_id = $1 and product_id = $2 and serial_no = any($3)`, [scope.entityId, p.id, serials]);
+    need(!dup.length, `serial ${dup[0]?.serial_no} is already on a ${p.name}`);
+  }
   let labels: string[] = [];
   if (p.serialized) {
     need(Number.isInteger(qty), `${p.name} is adjusted in whole units`);
@@ -1701,7 +1717,8 @@ export async function adjust(c: Client, scope: Scope, e: { locationId: string; p
       labels = given;
     } else {
       const made = await createUnits(c, scope.entityId, p, { locationId: e.locationId, binId: bin, qty, status: "in_stock", costMinor: unitNow,
-        kind: "adjust", refType: "adjustment", refId: adjId, reason: e.reasonCode, by });
+        kind: "adjust", refType: "adjustment", refId: adjId, reason: e.reasonCode, by,
+        ids: serials.length || lot ? Array.from({ length: qty }, (_, i) => ({ serial: serials[i] ?? null, lot })) : undefined });
       await bump(c, scope.entityId, p.id, e.locationId, { onHand: qty });
       labels = made.labels;
     }

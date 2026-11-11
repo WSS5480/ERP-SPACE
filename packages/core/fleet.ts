@@ -98,7 +98,7 @@ async function busyElsewhere(c: Client, entityId: string, day: string, exceptRou
   return r[0]?.number ?? null;
 }
 
-/** "Alicia Gomez at 12 Oak Ln, Camp Hill" -- how a stop without a map point is named to a person. */
+/** "Alicia Gomez at 12 Oak Ln, Springfield" -- how a stop without a map point is named to a person. */
 const whereWords = (x: { customer?: string | null; line1?: string | null; city?: string | null }) =>
   `${x.customer ?? "the customer"} at ${x.line1 ?? "an address"}${x.city ? ", " + x.city : ""}`;
 

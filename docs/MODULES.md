@@ -103,6 +103,7 @@ Data is placed with textContent only, never innerHTML.
 | trade (trade and designer accounts, the trade portal, room projects and follow-ups, the designer as a commission role; extends crm, catalog, tax, ar, shop, workforce) | 0044, 0047 | 0027 | Retail (Trade accounts, Room projects) |
 | configurator (sectionals, fabric/leather grades and swatches, option rules, condition grades; extends catalog, pos, inventory, shop, edi) | 0043 | 0026 | Retail (Sectionals), Operations (As-is grades) |
 | admin (service switches and presets, single-store rule, connections, outbound message log) | 0049 | none | Setup (Services, Connections) |
+| onboarding (setup checklist, opening stock import, bank opening balance, tax rates checked) | 0052 | none | Setup (Setup checklist), a Home card |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -468,3 +469,36 @@ services with open records lists them and needs `confirm`. Also through
 messaging now: CRM campaigns (consent checked again at send), store order
 decisions to the submitter, vendor feed alerts, A/R collections texts and
 emails. Review requests (`RecordOnlyReviews`) and letters stay record-only.
+
+## Onboarding: the setup checklist (migration 0052)
+
+`packages/core/onboarding.ts`. The checklist is worked out from the company's
+data on every read; nothing stores a tick. Steps: company details (legal name,
+EIN, address, state, fiscal year), stores and warehouses, business type and
+services (single or multi-store counted), chart of accounts (a pack or an
+imported chart, and every code in `POSTS_TO` for the services that are on;
+the onboarding checks grep `code: "NNNN"` in packages/core so the list stays
+complete), sales tax, users and roles (required only with more than one
+location), connections (email tested; texts if Delivery is on; card payments
+if POS or the web store is on), vendors (a feed or EDI partner if Buying or EDI
+is on), products (a price-tag label if Labels is on), opening balances (open
+A/R if Receivables is on, opening stock if Warehouse is on, a bank balance),
+delivery, web store / trade portal, and the go-live check (1300 vs stock, 2100
+vs tax by jurisdiction, 1110 vs the lenders' aging, inter-company net). Steps
+for a service that is off do not show. A step may be skipped with a reason
+(`onboarding_skip`, never deleted; the go-live check cannot be skipped). The
+Home card shows for the owner and controllers until the list is complete or
+hidden (`onboarding_dismissal`).
+
+Sales tax: every rate starts unchecked (`tax_rate.checked_by/checked_at`),
+whether a seed, a migration stand-in or typed in; a person confirms them on
+the Sales tax screen (`tax.confirmRates`, owner or controller), which first
+makes the stand-in for stores still on a single rate.
+
+Opening stock: a CSV (sku, location code, bin code, qty, unit_cost, serial,
+lot) is previewed into `opening_stock_run/row`; applying it calls
+`inventory.adjust` with reason `opening_balance` and the row's unit cost (Dr
+1300 / Cr 3000), one savepoint per row. A SKU at a location comes in from an
+opening import once. A bank account's opening balance posts Dr its cash
+account / Cr 3000 once (`opening_bank_balance`). Packs never add tax rates,
+locations or sample data.

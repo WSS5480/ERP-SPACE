@@ -109,6 +109,11 @@ export const module: ErpModule = {
       need(body.ratePct !== undefined && body.ratePct !== "", "give the new rate");
       return taxed(() => tax.addRate(c, scopeOf(co, a), m[2], { rateBps: Math.round(Number(body.ratePct) * 100), effectiveFrom: str(body.effectiveFrom, 10), note: str(body.note, 300) || null }));
     });
+    // A person says the rates were checked against what the states publish (every rate starts unchecked).
+    coPost("/setup/tax/confirm", async (c, co, a) => {
+      await requireRole(c, co, a, TAX, "confirming the sales tax rates were checked");
+      return taxed(() => tax.confirmRates(c, scopeOf(co, a)));
+    });
     coPost("/setup/tax/areas", async (c, co, a, body) => {
       await requireRole(c, co, a, TAX, "changing where a tax applies");
       return taxed(() => tax.saveArea(c, scopeOf(co, a), { id: uuid(body.id), remove: body.remove === true, jurisdictionId: uuid(body.jurisdictionId) ?? "",

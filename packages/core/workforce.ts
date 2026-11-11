@@ -36,7 +36,7 @@ const KIND_WORDS: Record<PunchKind, string> = { in: "punch in", out: "punch out"
 /**
  * A time from a form. With a zone (an ISO instant) it is taken as is; a bare
  * "2026-11-06T09:00" from a phone's date and time pickers is read in the
- * store's own time zone, so a manager in another state enters Enola's 9 a.m.
+ * store's own time zone, so a manager in another state enters that store's 9 a.m.
  */
 export async function instantAt(c: Client, entityId: string, locationId: string, v: string): Promise<Date> {
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(v)) {
