@@ -42,7 +42,7 @@ export const PRIORITIES = ["low", "normal", "high", "urgent"] as const;
 export const COVERAGES = ["manufacturer", "protection_plan", "goodwill", "billable"] as const;
 export const RESOLUTIONS = ["in_home_repair", "replace_part", "replace_item", "credit_refund", "pickup_repair", "no_fault_found"] as const;
 export const OUTCOMES = ["fixed", "needs_parts", "needs_return", "no_fault", "not_home", "other"] as const;
-const OPEN = ["new", "triage", "awaiting_parts", "scheduled", "in_progress"];
+export const OPEN = ["new", "triage", "awaiting_parts", "scheduled", "in_progress"];
 
 const UUIDRX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (v: unknown): v is string => typeof v === "string" && UUIDRX.test(v);

@@ -89,10 +89,26 @@
   async function todayScreen() {
     const d = await coApi(`/fleet/home?day=${st.day}`);
     const tiles = tilesRow(
-      tile({ label: 'Stops done', value: `${d.stops.done}/${d.stops.total}`, tone: d.stops.failed ? 'warning' : 'neutral', text: d.stops.failed ? plural(d.stops.failed, 'failed stop') : null, ic: 'warn' }),
-      tile({ label: 'On time', value: d.onTimePct == null ? '—' : `${d.onTimePct}%`, tone: d.onTimePct != null && d.onTimePct < 90 ? 'warning' : 'neutral' }),
-      tile({ label: 'Stops per hour', value: d.stopsPerHour == null ? '—' : String(d.stopsPerHour) }),
-      tile({ label: 'Cost per stop', value: d.costPerStopMinor == null ? '—' : money(d.costPerStopMinor), text: `${d.miles} mi planned`, ic: 'info' }));
+      tile({ label: 'Stops done', value: `${d.stops.done}/${d.stops.total}`, tone: d.stops.failed ? 'warning' : 'neutral', text: d.stops.failed ? plural(d.stops.failed, 'failed stop') : null, ic: 'warn',
+        onClick: () => E.drillList('fleet-stops', `Stops on ${dayLabel(d.day)}`, { day: d.day }, { noun: 'stop', expect: { count: d.stops.total }, none: 'No stops that day.',
+          note: `${d.stops.done} done (delivered, partial or failed), ${d.stops.failed} failed, ${d.stops.partial} partial. Will-calls are counted apart.` }) }),
+      tile({ label: 'On time', value: d.onTimePct == null ? '—' : `${d.onTimePct}%`, tone: d.onTimePct != null && d.onTimePct < 90 ? 'warning' : 'neutral',
+        onClick: () => E.drillList('fleet-stops', `On time, ${dayLabel(d.day)}`, { day: d.day, show: 'timed' }, { noun: 'stop', none: 'No finished stops with a window yet.',
+          note: d.onTimePct == null ? 'Nothing finished with a delivery window yet.' : `${d.onTimePct}% arrived by the end of their window. Each finished stop with a window is here, marked on time or late.` }) }),
+      tile({ label: 'Stops per hour', value: d.stopsPerHour == null ? '—' : String(d.stopsPerHour),
+        onClick: () => E.drillItems(`Routes on ${dayLabel(d.day)}`, d.routes.map(routeItem), { noun: 'route', note: `${d.stops.done} stops done over the hours the started routes have been out.` }) }),
+      tile({ label: 'Cost per stop', value: d.costPerStopMinor == null ? '—' : money(d.costPerStopMinor), text: `${d.miles} mi planned`, ic: 'info',
+        onClick: () => E.drillNode('Cost per stop', async () => frag(
+          E.drillSum({ count: d.stops.total, noun: 'stop', totalMinor: (BigInt(d.fuelCostMinor) + BigInt(d.laborCostMinor)).toString(),
+            note: d.costPerStopMinor == null ? 'No stops that day.' : `${money(d.costPerStopMinor)} a stop: fuel and crew time for the planned routes, over the day’s stops.` }),
+          panel([item({ title: 'Fuel', amount: money(d.fuelCostMinor), detail: `${d.miles} planned miles at each truck’s mileage and the last 60 days’ fuel price` }),
+            item({ title: 'Crew time', amount: money(d.laborCostMinor), detail: 'Planned minutes on each route, for the driver and any helper' })]),
+          section('Routes', null, null, d.routes.length ? panel(d.routes.map(routeItem)) : empty('No routes that day.', null, true)))) }));
+    function routeItem(r) {
+      return item({ title: `${r.number} · ${r.unit_no || 'no truck'}`, amount: `${r.done}/${r.stops}`, badge: routeChip(r.status),
+        detail: [r.driver || 'no driver', r.helper, `${r.planned_miles} mi`, r.planned_minutes ? `${Math.floor(r.planned_minutes / 60)}h ${r.planned_minutes % 60}m planned` : null].filter(Boolean).join(' · '),
+        onClick: () => go('fleet', 'route:' + r.id) });
+    }
     const routes = d.routes.map((r) => item({
       title: `${r.number} · ${r.unit_no || 'no truck'}`, amount: `${r.done}/${r.stops}`, badge: routeChip(r.status),
       detail: [r.driver || 'no driver', r.helper, `${r.planned_miles} mi`, r.failed ? plural(r.failed, 'failed stop') : null].filter(Boolean).join(' · '),
@@ -206,6 +222,14 @@
     if (!slots.length) return empty('No open windows', 'Every window in the next two weeks is full or closed.', true);
     const byDay = new Map();
     for (const s of slots) { if (!byDay.has(s.day)) byDay.set(s.day, []); byDay.get(s.day).push(s); }
+    // What fills each window: the stops booked in it that count against its limits.
+    const booked = (day, list) => E.drillNode(`Booked ${dayLabel(day)}`, async () => {
+      const parts = await Promise.all(list.map((s) => coApi(`/drill/window-stops?window=${s.windowId}&day=${day}`)));
+      return frag(list.map((s, i) => section(s.label, `${s.used.stops}${s.caps.stops != null ? ` of ${s.caps.stops}` : ''} stops · ${s.used.pieces}${s.caps.pieces != null ? ` of ${s.caps.pieces}` : ''} pcs`, null,
+        E.drillSum({ count: parts[i].count, noun: 'stop', expect: { count: s.used.stops } }),
+        parts[i].rows.length ? panel(parts[i].rows.map(E.drillRow)) : empty('Nothing booked in this window.', null, true))),
+        el('p', { class: 'foot', text: 'Stops a dispatcher booked past a full window (an override) do not count against it and are not listed.' }));
+    });
     return el('div', {}, [...byDay.entries()].map(([day, list]) => el('div', { class: 'field' }, el('span', { text: dayLabel(day) }),
       el('div', { class: 'toolbar' }, list.map((s) => {
         const left = s.caps.stops != null ? `${Math.max(s.caps.stops - s.used.stops, 0)} left` : 'open';
@@ -213,7 +237,7 @@
           el('b', { text: s.label }), el('span', { class: 'sub', text: s.fits ? left : 'full' }));
         b.style.minHeight = '48px';
         return b;
-      })))));
+      }), el('button', { class: 'linkbtn', type: 'button', onclick: () => booked(day, list) }, 'Who is booked')))));
   }
 
   function bookDialog(o) {

@@ -225,9 +225,11 @@
   async function screenSettlements() {
     const d = await coApi('/settlements');
     const ag = d.aging;
+    const owes = (l) => () => E.drillList('lender-owed', `${l.name} owes`, { lender: l.companyId }, { noun: 'sale', expect: { minor: l.owedMinor }, none: 'Nothing owed by this lender.',
+      foot: 'What is left to fund on each financed sale, plus holdbacks not yet released. A negative row is a refund the lender has still to take back.' });
     const tiles = ag.lenders.map((l) => tile({ label: l.name, value: money(l.owedMinor), tone: l.exceptions ? 'warning' : 'neutral',
-      text: l.exceptions ? `${plural(l.exceptions, 'exception')}` : 'owed to us', ic: l.exceptions ? 'warn' : 'info' }));
-    const agingCards = ag.lenders.map((l) => item({ title: l.name, amount: money(l.owedMinor),
+      text: l.exceptions ? `${plural(l.exceptions, 'exception')}` : 'owed to us', ic: l.exceptions ? 'warn' : 'info', onClick: owes(l) }));
+    const agingCards = ag.lenders.map((l) => item({ title: l.name, amount: money(l.owedMinor), onClick: owes(l),
       detail: `0-30 ${money(l.current)} · 31-60 ${money(l.d31_60)} · 61-90 ${money(l.d61_90)} · 90+ ${money(l.over90)} · holdbacks ${money(l.holdbackMinor)}`
         + (Number(l.refundsDueBackMinor) ? ` · refunds to reverse ${money(l.refundsDueBackMinor)}` : ''),
       why: [l.reopened ? `${plural(l.reopened, 'chargeback')} reopened` : null, l.feeFlags ? `${plural(l.feeFlags, 'fee')} off the plan rate` : null].filter(Boolean).join(' · ') || null,

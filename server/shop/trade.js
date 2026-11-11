@@ -156,15 +156,41 @@ async function pageHome() {
     el('span', { class: 'd', text: `${cap(x.reason)}${x.expiresOn ? ' · expires ' + day(x.expiresOn) : ' · no expiry'}` }))))
     : el('p', { class: 'tr-muted', text: 'No resale certificate on file. Orders are taxed until you send one to the store.' });
   setMain(wrap(el('h1', { text: m.company }), el('p', { class: 'tr-muted', text: `${m.contact} · ${m.email}${m.priceList ? ' · trade pricing ' + m.priceList : ''}` }),
+    // Each figure opens what is behind it: the invoices, the orders, and how the limit is used.
     el('div', { class: 'tr-tiles' },
-      el('div', { class: 'tr-tile' }, el('span', { class: 'k', text: 'Available on account' }), el('span', { class: 'v', text: money(cr.availableMinor) })),
-      el('div', { class: 'tr-tile' }, el('span', { class: 'k', text: 'Owed now' }), el('span', { class: 'v', text: money(cr.balanceMinor) })),
-      el('div', { class: 'tr-tile' }, el('span', { class: 'k', text: 'On order, not yet billed' }), el('span', { class: 'v', text: money(cr.onOrderMinor) })),
-      el('div', { class: 'tr-tile' }, el('span', { class: 'k', text: 'Credit limit' }), el('span', { class: 'v', text: money(cr.limitMinor) }))),
+      el('a', { class: 'tr-tile', href: '#/credit' }, el('span', { class: 'k', text: 'Available on account' }), el('span', { class: 'v', text: money(cr.availableMinor) })),
+      el('a', { class: 'tr-tile', href: '#/invoices' }, el('span', { class: 'k', text: 'Owed now' }), el('span', { class: 'v', text: money(cr.balanceMinor) })),
+      el('a', { class: 'tr-tile', href: '#/orders' }, el('span', { class: 'k', text: 'On order, not yet billed' }), el('span', { class: 'v', text: money(cr.onOrderMinor) })),
+      el('a', { class: 'tr-tile', href: '#/credit' }, el('span', { class: 'k', text: 'Credit limit' }), el('span', { class: 'v', text: money(cr.limitMinor) }))),
     card(el('h2', { text: 'Terms' }), el('p', { text: Number(cr.limitMinor) > 0 ? `Net ${cr.termsDays} on account, up to ${money(cr.limitMinor)}.` : 'Card only for now. Ask the store about terms.' })),
     card(el('h2', { text: 'Resale certificates' }), certs),
     el('div', { class: 'tr-acts' }, el('a', { class: 'btn primary', href: '#/catalog', text: 'Browse at trade prices' }), el('a', { class: 'btn', href: '#/projects', text: 'Your projects' }))));
 }
+
+/** How the credit limit is used: what is owed, what is on order, what is left. */
+async function pageCredit() {
+  nav('#/');
+  const cr = (await me()).credit;
+  const line = (k, v, href) => el(href ? 'a' : 'div', { class: 'tr-item', href: href || null }, el('div', { class: 'tr-row' }, el('span', { class: 't', text: k }), el('span', { class: 'amt', text: v })));
+  setMain(wrap(backLink(), el('h1', { text: 'Your account' }),
+    card(el('div', { class: 'tr-list' }, line('Credit limit', money(cr.limitMinor)), line('Less owed now', money(-Number(cr.balanceMinor)), '#/invoices'),
+      line('Less on order, not yet billed', money(-Number(cr.onOrderMinor)), '#/orders'), line('Available on account', money(cr.availableMinor))),
+      el('p', { class: 'tr-muted', text: Number(cr.limitMinor) > 0 ? `Net ${cr.termsDays} on account. Available never goes below zero.` : 'Card only for now. Ask the store about terms.' }))));
+}
+/** Back to where you came from in the portal (the phone's Back does the same). */
+/** The account summary's on-order figure, over the orders list that holds it. */
+const notBilled = () => (ME && ME.credit ? el('div', {}, row('On order, not yet billed', money(ME.credit.onOrderMinor)),
+  el('p', { class: 'tr-muted', text: 'Open and part-delivered orders, less what is paid or already invoiced.' })) : null);
+// Each portal page's history entry carries its depth in the portal, so Back only steps back to a portal page:
+// opened straight onto a page (depth 0), it goes to the account page instead of off the portal.
+let DEPTH = -1;
+function markDepth() {
+  const st = history.state;
+  if (!st || typeof st.portal !== 'number') history.replaceState({ ...(st || {}), portal: DEPTH + 1 }, '');
+  DEPTH = history.state.portal;
+}
+const backLink = () => el('div', { class: 'tr-acts' }, el('button', { type: 'button', class: 'btn', text: '‹ Back',
+  onclick: () => (history.state && history.state.portal > 0 ? history.back() : go('#/')) }));
 
 // ------------------------------------------------------------- catalog
 const ph = (p) => el('div', { class: 'ph', 'aria-hidden': 'true', text: (p.category || p.name || '').slice(0, 1) });
@@ -356,7 +382,7 @@ function orderCard(p, m) {
 async function pageOrders() {
   nav('#/orders');
   const list = await get('/orders');
-  setMain(wrap(el('h1', { text: 'Orders' }), list.length ? el('div', { class: 'tr-list' }, list.map((o) => el('a', { class: 'tr-item', href: `#/order/${o.id}` },
+  setMain(wrap(backLink(), el('h1', { text: 'Orders' }), notBilled(), list.length ? el('div', { class: 'tr-list' }, list.map((o) => el('a', { class: 'tr-item', href: `#/order/${o.id}` },
     el('div', { class: 'tr-row' }, el('span', { class: 't', text: o.number }), el('span', { class: 'amt', text: money(o.total_minor) })),
     el('span', { class: 'd', text: [day(o.ordered_at), o.project, o.delivery_on ? 'delivery ' + day(o.delivery_on) : o.promised_on ? 'expected ' + day(o.promised_on) : null].filter(Boolean).join(' · ') }),
     el('span', {}, chip(TONE[o.status] || '', STATUS[o.status] || o.status)))))
@@ -396,12 +422,14 @@ async function pageInvoices() {
       el('span', { class: 'd', text: `${day(i.invoice_date)} · due ${day(i.due_date)}` }), el('span', {}, open ? chip(i.pastDue ? 'bad' : 'warn', `${money(i.openMinor)} open${i.pastDue ? ', past due' : ''}`) : chip('good', 'Paid')),
       open ? el('div', { class: 'tr-acts' }, field('Card', cardSel), pay) : null);
   });
-  setMain(wrap(el('h1', { text: 'Invoices' }), row('Owed now', money(d.credit.balanceMinor)), items.length ? el('div', { class: 'tr-list' }, items) : el('p', { class: 'tr-muted', text: 'No invoices yet.' }),
+  setMain(wrap(backLink(), el('h1', { text: 'Invoices' }), row('Owed now', money(d.credit.balanceMinor)),
+    row('Open on these invoices', money(d.invoices.reduce((a, i) => a + Math.max(0, Number(i.openMinor) || 0), 0))), items.length ? el('div', { class: 'tr-list' }, items) : el('p', { class: 'tr-muted', text: 'No invoices yet.' }),
     el('p', { class: 'tr-muted', text: 'Test mode: no card is charged.' }), err));
 }
 
 // --------------------------------------------------------------- router
 async function render() {
+  markDepth();
   const h = location.hash || '#/';
   const [path, qs] = h.slice(1).split('?');
   const parts = path.split('/').filter(Boolean);
@@ -417,6 +445,7 @@ async function render() {
     if (parts[0] === 'orders') return await pageOrders();
     if (parts[0] === 'order' && parts[1]) return await pageOrder(parts[1]);
     if (parts[0] === 'invoices') return await pageInvoices();
+    if (parts[0] === 'credit') return await pageCredit();
     return await pageHome();
   } catch (e) {
     if (e instanceof SignedOut) { ME = null; return pageSignIn(); }

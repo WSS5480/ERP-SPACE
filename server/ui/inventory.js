@@ -89,12 +89,33 @@
     for (const r of val.rows) { const x = byLoc.get(r.location) || { value: 0, units: 0, cats: [] }; x.value += Number(r.value_minor); x.units += Number(r.units); x.cats.push(r); byLoc.set(r.location, x); }
     return frag(
       tilesRow(
-        tile({ label: 'Stock at cost', value: money(ov.valueMinor), ic: 'book', text: Number(ov.inTransitMinor) ? `${money(ov.inTransitMinor)} more in transit` : 'Nothing in transit' }),
+        tile({ label: 'Stock at cost', value: money(ov.valueMinor), ic: 'book', text: Number(ov.inTransitMinor) ? `${money(ov.inTransitMinor)} more in transit` : 'Nothing in transit',
+          onClick: () => drillValue(ov.valueMinor) }),
         tile({ label: 'Ties to the ledger', value: ov.tie.ties ? 'Yes' : money(ov.tie.differenceMinor), word: ov.tie.ties, tone: ov.tie.ties ? 'good' : 'critical', ic: ov.tie.ties ? 'ok' : 'fail',
           text: `1300 ${money(ov.tie.gl1300Minor)}${Number(ov.tie.gl1310Minor) ? ` + 1310 ${money(ov.tie.gl1310Minor)}` : ''}`, onClick: () => openTie(ov.tie) }),
-        tile({ label: 'Damage open', value: String(ov.openDamage), tone: ov.openDamage ? 'warning' : 'good', ic: ov.openDamage ? 'warn' : 'ok', text: 'Repair, claim or write off', onClick: () => go('inventory', 'damage') }),
-        tile({ label: 'Counts to approve', value: String(ov.countsToApprove), tone: ov.countsToApprove ? 'warning' : 'good', ic: 'check', text: 'A manager who did not count', onClick: () => go('inventory', 'counts') }),
-        tile({ label: 'Deliveries due', value: String(ov.receivingThisWeek), ic: 'clock', text: 'Booked at the dock this week', onClick: () => go('inventory', 'receive') })),
+        tile({ label: 'Damage open', value: String(ov.openDamage), tone: ov.openDamage ? 'warning' : 'good', ic: ov.openDamage ? 'warn' : 'ok', text: 'Repair, claim or write off',
+          onClick: () => E.drill('Damage open', async () => {
+            const rows = (await coApi('/inventory/damage')).filter((x) => x.status !== 'resolved');
+            return damageList(rows, ov.openDamage);
+          }) }),
+        tile({ label: 'Counts to approve', value: String(ov.countsToApprove), tone: ov.countsToApprove ? 'warning' : 'good', ic: 'check', text: 'A manager who did not count',
+          onClick: () => E.drill('Counts to approve', async () => {
+            const rows = (await coApi('/inventory/counts')).filter((x) => x.status === 'submitted');
+            return frag(E.drillSum({ count: rows.length, noun: 'count', expect: { count: ov.countsToApprove }, totalMinor: rows.reduce((a, x) => a + BigInt(x.variance_minor || 0), 0n).toString(),
+              note: 'Submitted counts; the total is their variance at cost. A manager who did not count approves each one on the Counts tab.' }),
+              el('div', { class: 'panel' }, rows.length ? rows.map((x) => item({ title: `${x.number} · ${x.location}${x.bin ? ' · ' + x.bin : ''}`, amount: money(x.variance_minor || 0),
+                detail: [plural(x.lines, 'line'), x.created_by ? `counted by ${x.created_by}` : null, x.submitted_by ? `submitted by ${x.submitted_by}` : null, ago(x.created_at)].filter(Boolean).join(' · '),
+                onClick: () => go('inventory', 'counts') })) : empty('Nothing waiting for approval.', null, true)));
+          }) }),
+        tile({ label: 'Deliveries due', value: String(ov.receivingThisWeek), ic: 'clock', text: 'Booked at the dock this week',
+          onClick: () => E.drill('Deliveries due this week', async () => {
+            const today = todayIso(), until = E.isoDay(new Date(Date.now() + 7 * 86400000));
+            const rows = (await coApi('/inventory/receiving')).appointments.filter((a) => a.status === 'booked' && a.day >= today && a.day <= until);
+            return frag(E.drillSum({ count: rows.length, noun: 'appointment', expect: { count: ov.receivingThisWeek }, note: 'Booked at a dock from today through the next 7 days.' }),
+              el('div', { class: 'panel' }, rows.length ? rows.map((a) => item({ title: `${a.vendor || a.carrier || 'Delivery'}${a.po_number ? ' · ' + a.po_number : ''}`,
+                detail: [dayLabel(a.day), a.window_label, a.location, a.expected_pieces ? plural(a.expected_pieces, 'piece') : null, a.note].filter(Boolean).join(' · '),
+                onClick: () => go('inventory', 'receive') })) : empty('Nothing booked at the dock this week.', null, true)));
+          }) })),
       section('Stock', 'tap a product for availability', null, el('div', { class: 'toolbar' }, el('div', { class: 'grow' }, q), loc), list),
       section('Pick lists', null, [el('button', { class: 'btn small', type: 'button', onclick: openPickPicker }, 'Build a pick list')]),
       section('Value by location', 'on hand at cost', null, el('div', { class: 'panel' },
@@ -103,14 +124,30 @@
           : empty('No stock on hand.', null, true))));
   }
 
+  /** Stock at cost, product by product: the cost pool, else on hand at the product's cost. */
+  const drillValue = (expect) => E.drillList('stock-value', 'Stock at cost', {}, { noun: 'product', expect: { minor: expect }, none: 'No stock on hand.',
+    foot: 'Each product at its average cost (the cost pool), or on hand at the product’s cost where it has no pool yet. Goods in transit are counted apart.' });
+  function damageList(rows, expect) {
+    return frag(E.drillSum({ count: rows.length, noun: 'damage report', expect: expect != null ? { count: expect } : null, totalMinor: rows.reduce((a, x) => a + BigInt(x.cost_minor || 0), 0n).toString(),
+      note: 'Open reports; the total is their cost. Repair, claim or write each off on the Damage tab.' }),
+      el('div', { class: 'panel' }, rows.length ? rows.map((x) => item({ title: `${x.number} · ${x.name}`, amount: money(x.cost_minor || 0), badge: statusChip(x.status),
+        detail: [x.sku, x.location, x.qty ? `qty ${qty(x.qty)}` : null, x.description, ago(x.opened_at)].filter(Boolean).join(' · '),
+        onClick: () => go('inventory', 'damage') })) : empty('No damage open.', null, true)));
+  }
+  /** The tie-out: each side opens what it is made of. */
   function openTie(t) {
-    const d = openDialog('Inventory tie-out', 'Stock at cost against the ledger');
-    d.body.append(el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Stock at cost', money(t.stockMinor)), fact('In transit', money(t.inTransitMinor)),
-      fact('GL 1300 inventory', money(t.gl1300Minor)), fact('GL 1310 in transit', money(t.gl1310Minor)), fact('Difference', money(t.differenceMinor)),
-      fact('Ties', t.ties ? 'Yes' : 'No'))),
+    const line = (title, amount, onClick, detail) => item({ title, amount: money(amount), detail, onClick });
+    return E.drill('Inventory tie-out', async () => frag(
+      el('div', { class: 'panel' },
+        line('Stock at cost', t.stockMinor, () => drillValue(t.stockMinor), 'Every product on hand at average cost'),
+        line('In transit', t.inTransitMinor, null, 'Transfers on the road, at the value they left at'),
+        line('GL 1300 inventory', t.gl1300Minor, () => E.drillList('gl-lines', 'GL 1300 inventory', { code: '1300' }, { noun: 'entry', plural: 'entries', expect: { minor: t.gl1300Minor } }), 'The ledger’s side'),
+        line('GL 1310 in transit', t.gl1310Minor, () => E.drillList('gl-lines', 'GL 1310 in transit', { code: '1310' }, { noun: 'entry', plural: 'entries', expect: { minor: t.gl1310Minor } }), null),
+        item({ title: t.ties ? 'Ties' : 'Difference', amount: money(t.differenceMinor), badge: t.ties ? chip('good', 'ok', 'Ties') : chip('critical', 'fail', 'Off') })),
       t.quantityOutOfStep.length ? section('Quantities out of step', 'cost pool vs stock on hand', null, el('div', { class: 'panel' },
         t.quantityOutOfStep.map((x) => item({ title: x.sku, detail: `costed ${qty(x.pool)} · on hand ${qty(x.stock)}` })))) : null,
-      el('p', { class: 'sub', text: 'Receipts post Dr 1300 Cr 2050; sales, returns, transfers, counts and write-offs post the same value their stock moves at average cost.' }));
+      el('p', { class: 'foot', text: 'Receipts post Dr 1300 Cr 2050; sales, returns, transfers, counts and write-offs post the same value their stock moves at average cost.' })),
+      { sub: 'Stock at cost against the ledger' });
   }
 
   function openAtp(productId) {
