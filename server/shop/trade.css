@@ -55,3 +55,7 @@ a.tr-item:hover{background:var(--soft)}
 @media (max-width:420px){.tr-acts .btn.tr-small{min-height:38px;padding:0 12px}}
 a.tr-tile{display:block;color:inherit;text-decoration:none;cursor:pointer}
 a.tr-tile:hover,a.tr-tile:focus-visible{border-color:var(--ink-2)}
+
+/* long words (an email, an address, a link) wrap inside the box on a phone, never push past it */
+p,li,dd,dt,label,h1,h2,h3,.muted,.note{overflow-wrap:anywhere}
+input,textarea,select{max-width:100%}

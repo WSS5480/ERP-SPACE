@@ -231,3 +231,7 @@ details.more p{color:var(--ink-2);margin-top:8px;white-space:pre-line}
 .coupon input{flex:1;min-width:0;height:50px;border:1px solid #cfc8bc;border-radius:10px;padding:0 12px;text-transform:uppercase}
 .leadform{margin-top:10px}
 .leadform .f textarea{height:90px}
+
+/* long words (an email, an address, a link) wrap inside the box on a phone, never push past it */
+p,li,dd,dt,label,h1,h2,h3,.muted,.note{overflow-wrap:anywhere}
+input,textarea,select{max-width:100%}
