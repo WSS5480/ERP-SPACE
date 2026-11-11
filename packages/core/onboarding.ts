@@ -569,7 +569,9 @@ export async function applyOpeningStock(c: Client, scope: Scope, runId: string) 
       added++; value += adj.valueMinor;
     } catch (e) {
       await c.query("rollback to savepoint opening_stock_row");
-      const msg = (e as Error).message;
+      // another import brought this SKU in at this place at the same moment: say so plainly, not the constraint's name
+      const msg = (e as { code?: string; constraint?: string }).code === "23505" && (e as { constraint?: string }).constraint === "opening_stock_row_once"
+        ? `${r.sku} at ${r.location_code} already came in from an opening stock import` : (e as Error).message;
       problems.push({ row: r.row_no, problem: msg });
       await c.query(`update opening_stock_row set action = 'refuse', message = $3 where id = $1 and entity_id = $2`, [r.id, scope.entityId, msg]);
     }
@@ -605,8 +607,15 @@ export async function openingBankBalance(c: Client, scope: Scope, x: { bankAccou
         ? [{ code: b[0].code, debit: abs, bankAccountId: x.bankAccountId }, { code: "3000", credit: abs }]
         : [{ code: "3000", debit: abs }, { code: b[0].code, credit: abs, bankAccountId: x.bankAccountId }] });
   } catch (e) { if (e instanceof PostingError) throw new OnboardingError(e.message); throw e; }
-  const r = await one<{ id: string }>(c, `insert into opening_bank_balance (entity_id, bank_account_id, as_of, amount_minor, journal_entry_id, entered_by)
-    values ($1,$2,$3,$4,$5,$6) returning id`, [scope.entityId, x.bankAccountId, x.asOf, x.amountMinor.toString(), je, scope.actor.label]);
+  let r: { id: string };
+  try {
+    r = await one<{ id: string }>(c, `insert into opening_bank_balance (entity_id, bank_account_id, as_of, amount_minor, journal_entry_id, entered_by)
+      values ($1,$2,$3,$4,$5,$6) returning id`, [scope.entityId, x.bankAccountId, x.asOf, x.amountMinor.toString(), je, scope.actor.label]);
+  } catch (e) {
+    // entered twice at the same moment: the unique key keeps one; the whole transaction (with its posting) rolls back
+    if ((e as { code?: string }).code === "23505") throw new OnboardingError(`${b[0].name} already has its opening balance; correct it with a journal entry in Books`);
+    throw e;
+  }
   await audit(c, scope, { table: "opening_bank_balance", rowId: r.id, action: "insert", after: { bankAccountId: x.bankAccountId, asOf: x.asOf, amount: x.amountMinor.toString() } });
   return { id: r.id, journalEntryId: je };
 }
