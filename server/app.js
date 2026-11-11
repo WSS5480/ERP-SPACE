@@ -263,22 +263,39 @@ function tilesRow(...list) {
 // and comes back on Back, or on the phone's own Back: each drill is a history
 // entry on the same address. A drill view that goes on to another screen is
 // parked, so Back from that screen returns to the list, then to the tiles.
-const DRILL = [];            // [{ under: Node[], y, title, sub, load, token, stale }]
+const DRILL = [];            // [{ under: Node[], y, title, sub, load, token, stale, hash }]
 const PARKED = new Map();    // history token -> { frames, own, y }
-let drillSeq = 0, quietRoute = 0;
+// Every drill opened in this company, by its history token, so Forward can open it again.
+const KNOWN = new Map();     // token -> { title, sub, load, hash, parent, dialog }
+let drillSeq = 0;
+// Set when Back brings back a parked drill: the hashchange that follows, to exactly this address,
+// only moves the route and the menu (the drill is already on the page). Cleared by the next history event.
+let restoringHash = null;
 const DLG_DRILL = [];        // drills opened from inside a dialog: [{ token, close }]
+const newToken = () => `${Date.now().toString(36)}.${++drillSeq}`;
+// Each history entry this page makes carries its position, so a Back or Forward knows which way it went.
+let navPos = 0;
+const stampPos = () => { const st = history.state; if (st && typeof st.pos === 'number') navPos = st.pos; else history.replaceState({ ...(st || {}), pos: ++navPos }, ''); };
+function remember(token, info) { KNOWN.set(token, info); while (KNOWN.size > 60) KNOWN.delete(KNOWN.keys().next().value); }
+/** Another company (or signing out): no drill, parked or remembered, belongs to it. */
+function resetDrills() { DRILL.length = 0; PARKED.clear(); KNOWN.clear(); restoringHash = null; }
+function openFrame(token, info) {
+  DRILL.push({ under: [...$('#main').childNodes], y: window.scrollY, title: info.title, sub: info.sub, load: info.load, token, stale: false, hash: info.hash });
+}
 /** Open the detail behind a figure: load() returns the node to show. */
 function drill(title, load, opts = {}) {
   // From inside a dialog the detail opens over it, so the dialog (and what was typed or picked in it) is still there on Back.
   if (document.querySelector('dialog[open]')) return drillInDialog(title, load, opts);
-  const main = $('#main');
-  const token = `${Date.now().toString(36)}.${++drillSeq}`;
-  DRILL.push({ under: [...main.childNodes], y: window.scrollY, title, sub: opts.sub || null, load, token, stale: false, hash: location.hash });
-  history.pushState({ drill: token }, '', location.href);
+  const token = newToken();
+  const info = { title, sub: opts.sub || null, load, hash: location.hash, parent: DRILL.length ? DRILL[DRILL.length - 1].token : null, dialog: false };
+  remember(token, info);
+  openFrame(token, info);
+  history.pushState({ drill: token, pos: ++navPos }, '', location.href);
   return paintDrill(true);
 }
 function drillInDialog(title, load, opts) {
-  const token = `${Date.now().toString(36)}.${++drillSeq}`;
+  const token = newToken();
+  remember(token, { title, dialog: true });
   let viaHistory = false;
   const frame = { token, close: null };
   const d = openDialog(title, opts.sub || null, { wide: true, onClose: () => {
@@ -289,7 +306,7 @@ function drillInDialog(title, load, opts) {
   } });
   frame.close = () => { viaHistory = true; d.close(); };
   DLG_DRILL.push(frame);
-  history.pushState({ drill: token }, '', location.href);
+  history.pushState({ drill: token, pos: ++navPos }, '', location.href);
   fillDialog(d, async () => frag(el('div', { class: 'drill-bar' }, el('button', { class: 'btn drill-back', type: 'button', onclick: () => history.back() }, icon('back'), 'Back')), await load()));
 }
 async function paintDrill(toTop) {
@@ -329,25 +346,38 @@ function drillPop(keep) {
 }
 function onDrillHistory(e) {
   const st = e.state || {};
+  restoringHash = null;
+  const forward = typeof st.pos === 'number' && st.pos > navPos;
+  if (typeof st.pos === 'number') navPos = st.pos;
   // Back from a detail opened over a dialog: close it (and any opened from it)
   while (DLG_DRILL.length && DLG_DRILL[DLG_DRILL.length - 1].token !== st.drill) DLG_DRILL.pop().close();
   if (st.drill && DLG_DRILL.some((f) => f.token === st.drill)) return;
   const parked = st.drill && PARKED.get(st.drill);
   if (parked) {
-    // back to a drill view that had gone on to another screen: the hash changes back too, quietly
+    // back to a drill view that had gone on to another screen: the address changes back too, quietly
     PARKED.delete(st.drill);
     DRILL.length = 0; DRILL.push(...parked.frames);
     ++S.seq;
-    quietRoute = Date.now();
+    restoringHash = location.hash;
     $('#main').replaceChildren(...parked.own);
     window.scrollTo(0, parked.y);
     return;
   }
   // Going on to another screen (a new address) also fires popstate in some browsers: hashchange parks the drill then.
-  if (!st.drill && DRILL.length && location.hash !== DRILL[0].hash) return;
-  const i = st.drill ? DRILL.findIndex((f) => f.token === st.drill) : -1;
-  const keep = i + 1;
-  if (DRILL.length > keep) drillPop(keep);
+  if (!st.drill) { if (DRILL.length && location.hash === DRILL[0].hash) drillPop(0); return; }
+  const i = DRILL.findIndex((f) => f.token === st.drill);
+  if (i >= 0) { if (DRILL.length > i + 1) drillPop(i + 1); return; }
+  // Forward to a drill that was closed with Back: open it again, on top of what is showing.
+  const info = KNOWN.get(st.drill);
+  const top = DRILL.length ? DRILL[DRILL.length - 1].token : null;
+  if (info && !info.dialog && info.hash === location.hash && info.parent === top) {
+    openFrame(st.drill, info);
+    paintDrill(true);
+    return;
+  }
+  // An entry this page can no longer show (a detail over a dialog that has closed, one from before a
+  // reload or from another company): step over it the way you were going, so history stays usable both ways.
+  if (forward) history.forward(); else history.back();
 }
 /** Leaving a drill view for another screen: park it so Back finds it again. */
 function parkDrill() {
@@ -402,9 +432,21 @@ function drillList(key, title, params = {}, opts = {}) {
       catch (e) { page--; if (!(e instanceof Stop)) toast(friendly(e), 'critical'); }
       finally { if (more.isConnected) busy(more, false); }
     } }, `Show more of ${first.count}`);
+    // A books list opens on the fiscal year: what came before it is carried in as one line, so the rows plus it still make the tile.
+    const windowed = first.balanceMinor != null;
+    let carried = null;
+    if (windowed && first.since) {
+      const earlier = `${Number(first.since.slice(0, 4)) - 1}${first.since.slice(4)}`;
+      carried = frag(el('div', { class: 'panel' }, item({ title: `Brought forward from before ${fmtDate.format(parseDay(first.since))}`, amount: money(first.openingMinor),
+        detail: 'Every entry before then, added up', acts: [
+          el('button', { class: 'btn small', type: 'button', onclick: () => drillList(key, title, { ...params, since: earlier }, opts) }, `From ${fmtDate.format(parseDay(earlier))}`),
+          el('button', { class: 'btn small', type: 'button', onclick: () => drillList(key, title, { ...params, since: 'all' }, opts) }, 'Show everything')] })),
+        el('p', { class: 'sub drill-note', text: `${plural(first.count, opts.noun || 'row', opts.plural)} since ${fmtDate.format(parseDay(first.since))}: ${money(first.totalMinor)}.` }));
+    }
     panel.append(...(first.rows.length ? first.rows.map(row) : [empty(opts.none || 'Nothing here.', null, true)]));
     if (first.pages > 1) panel.append(more);
-    return frag(drillSum({ count: first.count, noun: opts.noun, plural: opts.plural, totalMinor: first.totalMinor, totalHours: first.totalHours, expect: opts.expect, note: opts.note }), panel, opts.foot ? el('p', { class: 'foot', text: opts.foot }) : null);
+    return frag(drillSum({ count: first.count, noun: opts.noun, plural: opts.plural, totalMinor: windowed ? first.balanceMinor : first.totalMinor, totalHours: first.totalHours, expect: opts.expect,
+      note: windowed && first.since ? [opts.note, `The balance: ${money(first.openingMinor)} brought forward, plus the rows below.`].filter(Boolean).join(' ') : opts.note }), carried, panel, opts.foot ? el('p', { class: 'foot', text: opts.foot }) : null);
   }, opts);
 }
 /** A drill whose rows the screen already has: nodes (items) with their count and total. */
@@ -615,6 +657,7 @@ function showVersion() {
 /** Overriding a gate or writing an entry is a sign-off: the controller's or the owner's. The server checks it too. */
 const signsOff = () => !!(S.person && S.person.roles.some((r) => r === 'controller' || r === 'owner'));
 async function setCompany(c) {
+  if (!S.co || S.co.id !== c.id) resetDrills();
   S.co = c;
   store.set('erp.company', c.id);
   S.people = await api(`/api/c/${c.id}/people`);
@@ -662,7 +705,7 @@ async function render() {
     // a drill opened from that screen goes with it (it would otherwise stay painted over Home)
     DRILL.length = 0;
     S.route = { screen: 'home', sub: '' };
-    history.replaceState(null, '', `#/${S.co.id}/home`);
+    history.replaceState({ pos: navPos }, '', `#/${S.co.id}/home`);
     renderNav();
   }
   // Drilled in: refresh the list being looked at; what is under it is drawn again on Back.
@@ -2497,7 +2540,7 @@ async function linkFromHash() {
 }
 async function signOut() {
   try { await fetch('/session/end', { method: 'POST', credentials: 'same-origin', headers: { 'x-erp-page': '1' } }); } catch (_) { /* gone anyway */ }
-  S.me = null; S.co = null;
+  S.me = null; S.co = null; resetDrills();
   showSignIn('Signed out.');
 }
 
@@ -2572,7 +2615,7 @@ async function boot() {
     await setCompany(c);
     S.route = { screen: SCREENS.some(([n]) => n === r.screen) ? r.screen : 'home', sub: r.sub };
     show('app');
-    if (r.co !== c.id) history.replaceState(null, '', `#/${c.id}/${S.route.screen}${S.route.sub ? '/' + S.route.sub : ''}`);
+    if (r.co !== c.id) history.replaceState({ pos: navPos }, '', `#/${c.id}/${S.route.screen}${S.route.sub ? '/' + S.route.sub : ''}`);
     renderNav();
     await render();
   } catch (e) {
@@ -2618,7 +2661,14 @@ function wire() {
     if (/^#(invite|reset)=/.test(location.hash)) { boot(); return; }
     if (!S.co && isOperator()) { operatorOnly(); return; }
     // Back to a parked drill view: it is already on the page; only the route and the menu follow.
-    if (quietRoute && Date.now() - quietRoute < 1500) { quietRoute = 0; const r = parseHash(); if (!r.co || r.co === S.co.id) { S.route = { screen: SCREENS.some(([n]) => n === r.screen) ? r.screen : 'home', sub: r.sub }; renderNav(); return; } }
+    if (restoringHash !== null) {
+      stampPos();
+      const expected = restoringHash;
+      restoringHash = null;
+      const r = parseHash();
+      if (location.hash === expected && (!r.co || r.co === S.co.id)) { S.route = { screen: SCREENS.some(([n]) => n === r.screen) ? r.screen : 'home', sub: r.sub }; renderNav(); return; }
+    }
+    stampPos();
     parkDrill();
     onRoute();
   });
@@ -2628,5 +2678,5 @@ function wire() {
     else if (S.co && hiddenAt && Date.now() - hiddenAt > 60000 && !document.querySelector('dialog[open]')) render();
   });
 }
-document.addEventListener('DOMContentLoaded', () => { wire(); boot(); }, { once: true });
+document.addEventListener('DOMContentLoaded', () => { stampPos(); wire(); boot(); }, { once: true });
 })();

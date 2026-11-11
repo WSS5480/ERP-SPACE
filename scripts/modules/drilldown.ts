@@ -38,7 +38,13 @@ export async function run(t: T) {
     const bits: string[] = [`${r.count} rows`];
     let ok = pagesOk;
     if (want.count != null) { ok = ok && r.count === want.count; bits.push(`count ${r.count} vs ${want.count}`); }
-    if (want.minor != null) { ok = ok && sumRows(r.rows) === B(want.minor) && B(r.totalMinor) === B(want.minor); bits.push(`total ${sumRows(r.rows)} vs ${B(want.minor)}`); }
+    if (want.minor != null) {
+      // a books list is windowed: what came before the window is carried in, and opening + rows is the figure
+      const opening = r.openingMinor != null ? B(r.openingMinor) : 0n;
+      const got = opening + sumRows(r.rows);
+      ok = ok && got === B(want.minor) && B(r.balanceMinor ?? r.totalMinor) === B(want.minor) && B(r.totalMinor) === sumRows(r.rows);
+      bits.push(`total ${got} vs ${B(want.minor)}${r.openingMinor != null ? ` (${opening} brought forward from before ${r.since ?? "the start"})` : ""}`);
+    }
     if (want.hours != null) {
       const h = r.rows.reduce((a, x) => a + Number(x.qty ?? 0), 0);
       ok = ok && Math.abs(h - want.hours) < 0.001 && Math.abs(Number(r.totalHours) - want.hours) < 0.001; bits.push(`hours ${h} vs ${want.hours}`);
@@ -67,6 +73,30 @@ export async function run(t: T) {
       const row = (tb.rows as { code: string; account_type: string; balance_minor: string }[]).find((x) => x.code === code);
       const bal = row ? (["liability", "equity", "revenue"].includes(row.account_type) ? -B(row.balance_minor) : B(row.balance_minor)) : 0n;
       await ties(`GL ${code} entries (trial balance)`, "gl-lines", { code }, { minor: bal });
+    }
+    // the window: by default the fiscal year; any earlier day, or all, still adds up to the same balance
+    // an account whose entries span more than one day, opened the day after its first: something is carried in
+    const spread = (await one<{ code: string; d: string }>(`select g.code, (min(je.posting_date) + 1)::text d from journal_line jl
+      join journal_entry je on je.id = jl.journal_entry_id join gl_account g on g.id = jl.gl_account_id where je.entity_id = $1
+      group by g.code having min(je.posting_date) < max(je.posting_date) and sum(jl.debit_minor - jl.credit_minor) filter (where je.posting_date = min_d.d) <> 0
+      order by g.code limit 1`.replace("min_d.d", "(select min(je2.posting_date) from journal_line jl2 join journal_entry je2 on je2.id = jl2.journal_entry_id where je2.entity_id = $1 and jl2.gl_account_id = g.id)"), [ENTITY]))[0];
+    if (spread) {
+      const row = (tb.rows as { code: string; account_type: string; balance_minor: string }[]).find((x) => x.code === spread.code)!;
+      const bal = ["liability", "equity", "revenue"].includes(row.account_type) ? -B(row.balance_minor) : B(row.balance_minor);
+      const w = await ties(`GL ${spread.code} from ${spread.d}, with an opening carried in`, "gl-lines", { code: spread.code, since: spread.d }, { minor: bal });
+      t.ok("a window after the account's first day carries an opening balance in", B(w.openingMinor) !== 0n, `${w.openingMinor} before ${spread.d}`);
+    } else t.ok("an account with entries on more than one day to window", false);
+    const mid = "2026-11-01";
+    for (const since of [mid, "2026-06-15", "all"]) {
+      const row = (tb.rows as { code: string; balance_minor: string }[]).find((x) => x.code === "1300");
+      const w = await ties(`GL 1300 entries from ${since}`, "gl-lines", { code: "1300", since }, { minor: row ? B(row.balance_minor) : 0n });
+      t.ok(`GL 1300 from ${since}: the window is what was asked for`, since === "all" ? w.since === null && B(w.openingMinor) === 0n : w.since === since && w.rows.every((x) => !x.on_day || x.on_day >= since));
+    }
+    const fy = await all("gl-lines", { code: "1300" });
+    t.ok("a books list opens on the fiscal year's first day by default", /^\d{4}-\d{2}-01$/.test(String(fy.since)), String(fy.since));
+    await t.throws("a window that is not a day or all is refused in a sentence", () => all("gl-lines", { code: "1300", since: "last year" }), /Show from a day/);
+    for (const p of (cash.positions as { bank_account_id: string; ledger_balance_minor: string }[]).slice(0, 2)) {
+      await ties("Cash → a bank account from Nov 1", "bank-lines", { account: p.bank_account_id, since: "2026-11-01" }, { minor: p.ledger_balance_minor });
     }
     const gl2160 = (await one<{ b: string }>(`select coalesce(sum(jl.credit_minor - jl.debit_minor),0)::text b from journal_line jl join journal_entry je on je.id = jl.journal_entry_id
       join gl_account g on g.id = jl.gl_account_id where je.entity_id = $1 and g.code = '2160'`, [ENTITY]))[0].b;
@@ -150,6 +180,15 @@ export async function run(t: T) {
     await ties("Marketing → Overdue follow-ups", "crm-overdue", {}, { count: (dash.overdue as { n: number }[]).reduce((a, o) => a + o.n, 0) });
     const sellers = await one<{ id: string }>(`select assigned_to id from crm_lead where entity_id = $1 and assigned_to is not null group by 1 order by count(*) desc limit 2`, [ENTITY]);
     for (const { id } of sellers) await ties("My day → Open leads", "crm-leads", { show: "open", person: id }, { count: (await crm.myDay(c, ENTITY, id)).openLeads });
+    if (sellers.length) {
+      // open leads are the signed-in person's own; the person in the address counts only for a manager
+      const mine = await drill.all(c, ENTITY, "crm-leads", { show: "open" }, new Set(["sales"]), sellers[0].id);
+      t.ok("My day → Open leads with no person given are the signed-in person's", mine.count === (await crm.myDay(c, ENTITY, sellers[0].id)).openLeads);
+      if (sellers[1]) await t.throws("a salesperson cannot list someone else's open leads by naming them",
+        () => drill.list(c, ENTITY, "crm-leads", { show: "open", person: sellers[1].id }, 1, new Set(["sales"]), sellers[0].id), /You see your own open leads/);
+      const mgr = await drill.all(c, ENTITY, "crm-leads", { show: "open", person: sellers[0].id }, new Set(["store_manager"]), PEOPLE.MANAGER);
+      t.ok("a store manager lists the open leads of the day they are looking at", mgr.count === (await crm.myDay(c, ENTITY, sellers[0].id)).openLeads);
+    }
 
     // ----------------------------------------------------- web store order
     const paid = await one<{ id: string; paid_minor: string }>(`select so.id, so.paid_minor::text from sales_order so where so.entity_id = $1
@@ -192,6 +231,14 @@ export async function run(t: T) {
     await t.throws("a list that needs a parameter says which", () => all("bank-lines"), /Pick a bank account first/);
     await t.throws("a bad day is refused in a sentence", () => all("fleet-stops", { day: "11/11/2026" }), /not a day/);
     await t.throws("a page past the end is refused in a sentence", () => drill.list(c, ENTITY, "bills-due7", {}, 999, owner), /only one page|only \d+ pages/);
+    {
+      // paging: the count and total come with each page (one query), the same on every page
+      const big = await all("gl-lines", { code: "2300", since: "all" });
+      const p1 = await drill.list(c, ENTITY, "gl-lines", { code: "2300", since: "all" }, 1, owner);
+      const p2 = big.pages > 1 ? await drill.list(c, ENTITY, "gl-lines", { code: "2300", since: "all" }, 2, owner) : p1;
+      t.ok("each page carries the whole list's count and total", big.pages > 1 && p1.count === p2.count && p1.totalMinor === p2.totalMinor && p2.rows.length > 0
+        && new Set([...p1.rows, ...p2.rows].map((r) => r.id)).size === p1.rows.length + p2.rows.length, `${big.count} rows, ${big.pages} pages`);
+    }
     await t.throws("a word outside the list is refused, naming the choices", () => all("edi-docs", { status: "everything" }), /Show one of: quarantined, queued, failed/);
     await t.throws("the books' entries are refused to a role that does not see them, in a sentence",
       () => drill.list(c, ENTITY, "gl-lines", { code: "1100" }, 1, new Set(["sales"])), /Seeing the entries in an account needs one of: controller/);

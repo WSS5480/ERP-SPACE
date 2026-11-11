@@ -425,7 +425,19 @@ and total, with a warning when they no longer match the tile). From inside a
 dialog the detail opens over it. A drill row that goes on to another screen is
 parked, so Back returns to the list. `E.opener(kind, fn)` says what a row opens
 (bill, entry, order, product, ticket, lead, customer, edi). A labelled figure
-is `fact(k, v, onClick)`.
+is `fact(k, v, onClick)`. Each history entry carries its position; Forward
+re-opens a drill closed with Back, and an entry that can no longer be shown (a
+detail over a dialog that has closed, from before a reload or another company)
+is stepped over in the direction of travel. Switching company or signing out
+drops every drill. Back to a parked drill sets an explicit flag naming the
+address it expects; the hashchange to that address only moves the route.
+
+Lists over the books' whole history (`gl-lines`, `bank-lines`) open on the
+fiscal year's first day and carry what came before as one opening figure
+(`since=` a day or `all`), so opening + rows = the tile. Each page comes with
+the whole list's count and total from one query. `db/migrations/0060` indexes
+the lists that read by company. Dates in `drill.ts` are marked
+`store-local date: harden` for the posting-date work on mod-harden.
 
 Where no list existed, `packages/core/drill.ts` adds one: `GET
 /api/c/<co>/drill/<key>?page=&...` (`server/modules/drill.ts`), read-only, one

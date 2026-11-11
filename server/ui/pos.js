@@ -663,7 +663,8 @@
         onClick: id ? L('pos-receipts', `${TENDER[t.method] || t.method} taken`, { method: t.method }, { minor: String(Number(t.taken) - Number(t.refunded)) }, { noun: 'receipt' }) : null })) : empty('Nothing taken yet.', null, true))),
       section('Cash drawer', null, null, el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Float', money(c.floatMinor)), fact('Cash taken, net', money(c.cashNetMinor), id ? cashTaken : null),
         fact('Drops', money(c.dropsMinor), id ? moves('drop', 'Drops to the safe', c.dropsMinor) : null),
-        fact('Paid in / out', `${money(c.paidInMinor)} / ${money(c.paidOutMinor)}`, id ? L('pos-cash', 'Paid in and out', {}, null, { noun: 'movement', note: 'Every cash movement on this drawer: drops, paid in and paid out.' }) : null),
+        fact('Paid in', money(c.paidInMinor), id ? moves('paid_in', 'Paid in', c.paidInMinor) : null),
+        fact('Paid out', money(c.paidOutMinor), id ? moves('paid_out', 'Paid out', c.paidOutMinor) : null),
         fact('Should hold', money(c.expectedMinor), id ? () => E.drillNode('What the drawer should hold', async () => frag(
           E.drillSum({ count: 5, noun: 'part', totalMinor: String(c.expectedMinor), note: 'Float, plus cash taken, plus paid in, less drops and paid out.' }),
           el('div', { class: 'panel' }, item({ title: 'Float', amount: money(c.floatMinor) }), item({ title: 'Cash taken, net', amount: money(c.cashNetMinor), onClick: cashTaken }),

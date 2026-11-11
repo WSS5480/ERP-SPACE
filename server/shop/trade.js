@@ -181,7 +181,16 @@ async function pageCredit() {
 /** The account summary's on-order figure, over the orders list that holds it. */
 const notBilled = () => (ME && ME.credit ? el('div', {}, row('On order, not yet billed', money(ME.credit.onOrderMinor)),
   el('p', { class: 'tr-muted', text: 'Open and part-delivered orders, less what is paid or already invoiced.' })) : null);
-const backLink = () => el('div', { class: 'tr-acts' }, el('button', { type: 'button', class: 'btn', text: '‹ Back', onclick: () => (history.length > 1 ? history.back() : go('#/')) }));
+// Each portal page's history entry carries its depth in the portal, so Back only steps back to a portal page:
+// opened straight onto a page (depth 0), it goes to the account page instead of off the portal.
+let DEPTH = -1;
+function markDepth() {
+  const st = history.state;
+  if (!st || typeof st.portal !== 'number') history.replaceState({ ...(st || {}), portal: DEPTH + 1 }, '');
+  DEPTH = history.state.portal;
+}
+const backLink = () => el('div', { class: 'tr-acts' }, el('button', { type: 'button', class: 'btn', text: '‹ Back',
+  onclick: () => (history.state && history.state.portal > 0 ? history.back() : go('#/')) }));
 
 // ------------------------------------------------------------- catalog
 const ph = (p) => el('div', { class: 'ph', 'aria-hidden': 'true', text: (p.category || p.name || '').slice(0, 1) });
@@ -420,6 +429,7 @@ async function pageInvoices() {
 
 // --------------------------------------------------------------- router
 async function render() {
+  markDepth();
   const h = location.hash || '#/';
   const [path, qs] = h.slice(1).split('?');
   const parts = path.split('/').filter(Boolean);
