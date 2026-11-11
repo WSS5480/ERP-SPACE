@@ -183,8 +183,10 @@ function router(mod: { register: (k: never) => void }) {
 }
 
 const read = async <R>(t: T, fn: (c: Client) => Promise<R>): Promise<R> => { const c = await t.pool.connect(); try { return await fn(c); } finally { c.release(); } };
+// The receiving server's SPF verdict for the From line's own domain, as Postmark writes it (a vendor's real mail).
+const spfPass = (from: string) => [{ Name: "Received-SPF", Value: `Pass (sender SPF authorized) identity=mailfrom; client-ip=203.0.113.7; envelope-from=bounce@${/@([^>\s]+)/.exec(from)?.[1] ?? ""}; receiver=in.example.com` }];
 const mail = (to: string, from: string, atts: { name: string; content: Buffer | string; type?: string }[], extra: Record<string, unknown> = {}) => ({
-  From: from, To: to, Subject: "Files", MessageID: `m-${randomBytes(4).toString("hex")}`,
+  From: from, To: to, Subject: "Files", MessageID: `m-${randomBytes(4).toString("hex")}`, Headers: spfPass(from),
   Attachments: atts.map((a) => ({ Name: a.name, ContentType: a.type ?? "text/csv", Content: Buffer.from(a.content).toString("base64") })), ...extra,
 }) as vf.InboundMail;
 
@@ -288,16 +290,21 @@ export async function run(t: T) {
 
     // ---- move-after, private key
     srv.put("/vendor/keyed/coaster_inv_2.csv", "sku,qty\nVF-100,9\n", now);
+    srv.put("/vendor/keyed/coaster_inv_bad.csv", "nothing,useful\n1,2\n", now);
     srv.mkdirs("/vendor/keyed/done");
     const keyed = await R.post<{ id: string }>("/vendor-files/save", BUYER, { connection: { vendor_id: V.COASTER, channel: "sftp", name: "Coaster SFTP (key)", host: "127.0.0.1", port,
       user: "keyuser", path: "/vendor/keyed", schedule: "0 * * * *", after: "move", moveTo: "/vendor/keyed/done", carries: [{ kind: "inventory", glob: "*.csv" }] },
       secrets: { privateKey: clientKey.private } });
     const kt = await R.post("/vendor-files/:id/test", BUYER, {}, keyed.id);
-    t.ok("sftp: a private key signs in (no password)", kt.ok && kt.files === 1, kt.words);
+    t.ok("sftp: a private key signs in (no password)", kt.ok && kt.files === 2, kt.words);
     const kr = await R.post("/vendor-files/:id/run", BUYER, {}, keyed.id);
     await C.postRunSettled();
     const avail9 = await read(t, (c) => q<{ qty_available: number }>(c, `select qty_available from vendor_availability where entity_id = $1 and vendor_id = $2 and vendor_sku = 'VF-100'`, [ENTITY, V.COASTER]));
     t.ok("sftp: move-after moves the file once the run has committed", kr.ok && Number(avail9[0]?.qty_available) === 9 && srv.files.has("/vendor/keyed/done/coaster_inv_2.csv") && !srv.files.has("/vendor/keyed/coaster_inv_2.csv"),
+      JSON.stringify([...srv.files.keys()].filter((k) => k.includes("keyed"))));
+    t.ok("sftp: a quarantined file is left on the server by move-after (no copy is kept here), and a second run neither fetches nor moves it",
+      srv.files.has("/vendor/keyed/coaster_inv_bad.csv") && !srv.files.has("/vendor/keyed/done/coaster_inv_bad.csv")
+      && await R.post("/vendor-files/:id/run", BUYER, {}, keyed.id).then(async (r2) => { await C.postRunSettled(); return r2.result?.fresh === 0 && srv.files.has("/vendor/keyed/coaster_inv_bad.csv"); }),
       JSON.stringify([...srv.files.keys()].filter((k) => k.includes("keyed"))));
 
     // ---- the server key changes
@@ -410,6 +417,12 @@ export async function run(t: T) {
     const r3 = await vf.receiveMail(mail(ov2.address!, "inventory@coaster.example", [{ name: "coaster_inv_7.csv", content: "sku,qty\nVF-101,77\n" }],
       { Headers: [{ Name: "Received-SPF", Value: "fail (domain does not designate)" }] }));
     t.ok("email: a sender whose domain did not vouch for it (SPF fail) is held", r3?.held.length === 1 && r3.accepted === 0, JSON.stringify(r3));
+    const spoof = await vf.receiveMail(mail(ov2.address!, "Coaster <inventory@coaster.example>", [{ name: "coaster_inv_spoof.csv", content: "sku,qty\nVF-101,4242\n" }],
+      { Headers: [{ Name: "Received-SPF", Value: "Pass (sender SPF authorized) identity=mailfrom; client-ip=198.51.100.9; envelope-from=x@attacker.example" }, ...spfPass("a@coaster.example")] }));
+    t.ok("email: a forged From (SPF passed for the attacker's own domain, a pass for the vendor's added below it) is held, not read",
+      spoof?.held.length === 1 && spoof.accepted === 0, JSON.stringify(spoof));
+    const bare = await vf.receiveMail(mail(ov2.address!, "inventory@coaster.example", [{ name: "coaster_inv_bare.csv", content: "sku,qty\nVF-101,4243\n" }], { Headers: [] }));
+    t.ok("email: mail with no SPF verdict at all is held, not read", bare?.held.length === 1 && bare.accepted === 0, JSON.stringify(bare));
     t.ok("email: an address that is no company's is left to the older routes", (await vf.receiveMail(mail("vendors+zzzzzzzzzzzzzzzzzzzz@in.example.com", "a@coaster.example", [{ name: "a.csv", content: "x" }]))) === null);
     await R.post("/vendor-files/held/:id/assign", BUYER, { connectionId: emailConn.id, addSender: true }, h1.id);
     const a6 = await read(t, (c) => q<{ qty_available: number }>(c, `select qty_available from vendor_availability where entity_id = $1 and vendor_id = $2 and vendor_sku = 'VF-101'`, [ENTITY, V.COASTER]));
@@ -450,6 +463,24 @@ export async function run(t: T) {
     const a8 = await read(t, (c) => q<{ qty_available: number }>(c, `select qty_available from vendor_availability where entity_id = $1 and vendor_id = $2 and vendor_sku = 'VF-101'`, [ENTITY, V.COASTER]));
     t.ok("isolation: mail to another client's address stays theirs (held there), even from this company's vendor", rioMail?.company === RIO_ENTITY && rioMail.held.length === 1 && Number(a8[0]?.qty_available) === 99);
     await t.throws("isolation: another client cannot trust this company's feed key", () => CR.post("/catalog/feeds/:id/trust-key", RIO_OWNER, { fingerprint: fp2 }, qf.id).then(() => { throw new Error("allowed"); }), /no such feed|needs one of|allowed/);
+
+    // ============================================================ hostile input (review)
+    {
+      const { globTest, readZip } = await import("../../packages/core/filekit.ts");
+      const t0 = Date.now();
+      const slow = C.globMatch("a".repeat(5000), "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b");
+      t.ok("glob: a pattern of many stars against a long name answers at once (no backtracking)", !slow && Date.now() - t0 < 200 && globTest("Price_2026.CSV", "price*.csv") && !globTest("price.csv.bak", "price*.csv"), `${Date.now() - t0} ms`);
+      const blk = Buffer.alloc(1048576, 65), nm = Buffer.from("a.csv");
+      const loc = Buffer.alloc(30); loc.writeUInt32LE(0x04034b50, 0); loc.writeUInt32LE(crc32(blk), 14); loc.writeUInt32LE(blk.length, 18); loc.writeUInt32LE(blk.length, 22); loc.writeUInt16LE(nm.length, 26);
+      const cds = Array.from({ length: 100 }, () => { const cd = Buffer.alloc(46); cd.writeUInt32LE(0x02014b50, 0); cd.writeUInt32LE(blk.length, 20); cd.writeUInt32LE(0, 24); cd.writeUInt16LE(nm.length, 28); return Buffer.concat([cd, nm]); });
+      const bodyB = Buffer.concat([loc, nm, blk]), cdB = Buffer.concat(cds), eo = Buffer.alloc(22);
+      eo.writeUInt32LE(0x06054b50, 0); eo.writeUInt16LE(100, 8); eo.writeUInt16LE(100, 10); eo.writeUInt32LE(cdB.length, 12); eo.writeUInt32LE(bodyB.length, 16);
+      let bomb = "";
+      try { readZip(Buffer.concat([bodyB, cdB, eo]), "bomb.zip"); bomb = "read"; } catch (e) { bomb = (e as Error).message; }
+      t.ok("zip: 100 stored entries sharing one 1 MB block (declared size 0) are refused, not unpacked to 100 MB", /damaged|unpacks to more/.test(bomb), bomb);
+      const ips = ["::ffff:7f00:1", "::ffff:a9fe:a9fe", "0::1", "0:0:0:0:0:0:0:1", "64:ff9b::a9fe:a9fe", "fec0::1"];
+      t.ok("network: every spelling of a private IPv6 address is private (mapped, expanded, NAT64, site-local)", ips.every((x) => cat.isPrivateIp(x)) && !cat.isPrivateIp("2606:4700:4700::1111") && !cat.isPrivateIp("::ffff:808:808"));
+    }
 
     // ============================================================ the catalog import template
     const names = cat.IMPORT_FIELDS.map((f) => f.name);

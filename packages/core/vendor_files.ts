@@ -30,7 +30,7 @@ import {
   type Connection, type Offered, type Parsed, type SftpTestResult, type RunResult,
 } from "./connections.ts";
 import { httpGet, sftpPort, TransportError, DEFAULT_MAX_MB, MAX_MB, type HttpAuth } from "./transports.ts";
-import { unzip, isZip, isXlsx, xlsxRows, FileError } from "./filekit.ts";
+import { unzip, isZip, isXlsx, xlsxRows, FileError, globTest } from "./filekit.ts";
 import {
   mapFields, missingFor, unwrapRecords, flatten, applyCatalogRows, recordVendorPrices, recordAvailability, FeedError,
 } from "./vendor_feeds.ts";
@@ -61,7 +61,7 @@ const plainError = (e: unknown) => (REFUSED.some((K) => e instanceof K) || (e as
 export const carriesOf = (conn: Pick<Connection, "config">): Carry[] =>
   (Array.isArray(conn.config.carries) ? conn.config.carries as Carry[] : []).filter((x) => KINDS.includes(x?.kind));
 
-const globRx = (g: string) => new RegExp("^" + g.trim().replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i");
+const globRx = (g: string) => ({ test: (name: string) => globTest(name, g) });
 const looksX12 = (b: Buffer) => /^﻿?\s*ISA/.test(b.subarray(0, 120).toString("latin1"));
 
 /** Which kind a file is: X12 content to EDI (when carried), else the first carried kind whose pattern matches. */
@@ -502,13 +502,32 @@ const senderOf = (m: InboundMail) => {
   return s.includes("<") ? s.slice(s.lastIndexOf("<") + 1, s.lastIndexOf(">")) : s;
 };
 
-/** SPF or DMARC said this sender's domain did not send it. */
+const domainOf = (addr: string) => addr.slice(addr.lastIndexOf("@") + 1).replace(/[>\s]+$/, "").toLowerCase();
+const sameOrg = (a: string, b: string) => !!a && !!b && (a === b || a.endsWith("." + b) || b.endsWith("." + a));
+
+/**
+ * Why this message's sender cannot be believed, or null when it can.
+ *
+ * SPF checks the envelope sender, not the From line a person reads, so an SPF
+ * pass alone proves nothing about From: anyone can send from their own domain
+ * (SPF pass) with "From: prices@vendor.com". So a message is believed only
+ * when the receiving server's own Received-SPF (the first one; a sender can
+ * add more below it, never above) says pass AND its envelope-from is the From
+ * domain (or a sub- or parent domain of it). Anything else is held for a
+ * person, who can still assign it.
+ */
 export function failedAuthentication(m: InboundMail): string | null {
   for (const h of m.Headers ?? []) {
     const n = String(h.Name ?? "").toLowerCase(), v = String(h.Value ?? "").toLowerCase();
     if (n === "received-spf" && /^\s*(fail|softfail)\b/.test(v)) return "the sender's domain says it did not send this message (SPF failed)";
     if (n === "authentication-results" && /\bdmarc=fail\b/.test(v)) return "the sender's domain says it did not send this message (DMARC failed)";
   }
+  const spf = (m.Headers ?? []).find((h) => String(h.Name ?? "").toLowerCase() === "received-spf");
+  const v = String(spf?.Value ?? "");
+  if (!/^\s*pass\b/i.test(v)) return "the sender could not be confirmed (no SPF pass from the receiving server), so the From line may be forged";
+  const env = /envelope-from=["<]?([^\s;"<>]+)/i.exec(v)?.[1] ?? /smtp\.mailfrom=([^\s;]+)/i.exec(v)?.[1] ?? "";
+  const from = domainOf(senderOf(m));
+  if (!sameOrg(domainOf(env), from)) return `the sender could not be confirmed: the message came from ${domainOf(env) || "an unnamed sender"}, not from ${from || "the sender's own domain"}, so the From line may be forged`;
   return null;
 }
 

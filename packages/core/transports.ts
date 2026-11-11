@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import net from "node:net";
 import { isPrivateIp } from "./catalog.ts";
 import { call, secretKeyFromEnv, type FeedEnv } from "./vendor_feeds.ts";
+import { globTest } from "./filekit.ts";
 
 export class TransportError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new TransportError(msg); };
@@ -99,7 +100,7 @@ export const fingerprintOf = (key: Buffer) => "SHA256:" + createHash("sha256").u
 export function globAny(name: string, globs?: string[]): boolean {
   const gs = (globs ?? []).map((g) => g.trim()).filter(Boolean);
   if (!gs.length) return true;
-  return gs.some((g) => new RegExp("^" + g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i").test(name));
+  return gs.some((g) => globTest(name, g));
 }
 
 export function sftpPort(port: unknown): number {

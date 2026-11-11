@@ -30,6 +30,7 @@ import {
   type NetEnv, type SftpSession, type SftpTarget, type HttpAuth,
 } from "./transports.ts";
 export { HostKeyError, TransportError } from "./transports.ts";
+import { globTest } from "./filekit.ts";
 
 export type Channel = "manual_upload" | "sftp" | "email" | "api" | "webhook";
 export type Mode = "pull" | "push";
@@ -173,11 +174,7 @@ export function signatureValid(body: Buffer, signature: string | undefined, secr
 /** Glob with `*` and `?` only, which is all any bank has ever needed. */
 export function globMatch(name: string, pattern?: string): boolean {
   if (!pattern) return true;
-  const rx = new RegExp(
-    "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
-    "i"
-  );
-  return rx.test(name);
+  return globTest(name, pattern);
 }
 
 export class ChannelRefused extends Error {}
@@ -385,12 +382,20 @@ export async function ingest(
     const maxBytes = maxBytesOf(conn);
     const hints: CollectHints = { maxBytes, vouched: opts.vouched, onKnown: (n) => taken.push(n) };
     if (conn.channel === "sftp") {
-      const had = await q<{ k: string }>(c, `
-        select origin || '|' || byte_size || '|' || coalesce(origin_detail->>'modifiedAt', '') k
+      const had = await q<{ k: string; status: string }>(c, `
+        select origin || '|' || byte_size || '|' || coalesce(origin_detail->>'modifiedAt', '') k, status
           from inbound_file where connection_id = $1 and not (origin_detail ? 'refused')
           /* unscoped: keyed by connection, which carries the entity */`, [conn.id]);
-      const known = new Set(had.map((x) => x.k));
-      hints.known = (f) => !!f.modifiedAt && known.has(`${f.name}|${f.size}|${f.modifiedAt}`);
+      const known = new Map(had.map((x) => [x.k, x.status]));
+      // Known and done with (applied, or set aside by a person): moved or deleted like any taken file.
+      // Known and still quarantined: not downloaded again, and left on the server -- no copy is kept here.
+      const seenAs = new Map<string, string>();
+      hints.known = (f) => {
+        const st = f.modifiedAt ? known.get(`${f.name}|${f.size}|${f.modifiedAt}`) : undefined;
+        if (st) seenAs.set(f.name, st);
+        return !!st;
+      };
+      hints.onKnown = (n) => { const st = seenAs.get(n); if (st === "applied" || st === "ignored") taken.push(n); };
     }
     const arrivals = await collect(conn, opts.offered ?? [], transports ?? {}, opts.secrets, hints);
     seen = arrivals.length;
@@ -434,9 +439,13 @@ export async function ingest(
       );
 
       // Already had these exact bytes on this connection. Overlapping
-      // statement windows are normal, not an error.
-      taken.push(a.origin);
-      if (inserted.length === 0) continue;
+      // statement windows are normal, not an error. Taken off the server only
+      // when that copy was applied or set aside; a quarantined one stays there.
+      if (inserted.length === 0) {
+        const prior = (await q<{ status: string }>(c, `select status from inbound_file where connection_id = $1 and sha256 = $2 /* unscoped: connection carries the entity */`, [conn.id, digest]))[0];
+        if (prior && (prior.status === "applied" || prior.status === "ignored")) taken.push(a.origin);
+        continue;
+      }
       fresh++;
       const fileId = inserted[0].id;
 
@@ -471,6 +480,7 @@ export async function ingest(
           after: { status: "applied", rows: applied, format: parsed.format },
           sourceRef: a.origin,
         });
+        taken.push(a.origin);
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
         await quarantine(c, fileId, reason);

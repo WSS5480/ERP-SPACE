@@ -1566,10 +1566,10 @@ const sha = async (b: Buffer) => (await import("node:crypto")).createHash("sha25
 /** Rows from one file: a zip is opened and each file in it read (CSV, TSV, .xlsx or JSON). */
 async function rowsOfFile(name: string, bytes: Buffer, pattern: string | null): Promise<Record<string, string>[]> {
   const { tableOf } = await import("./vendor_files.ts");
-  const { unzip, isZip, isXlsx } = await import("./filekit.ts");
+  const { unzip, isZip, isXlsx, globTest } = await import("./filekit.ts");
   need(!/^﻿?\s*ISA/.test(bytes.subarray(0, 80).toString("latin1")), `${name} is an X12 (EDI) file; EDI goes to Vendor EDI, not to a feed`);
   if (isZip(bytes) && !isXlsx(bytes)) {
-    const rx = pattern ? new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i") : null;
+    const rx = pattern ? { test: (n: string) => globTest(n, pattern) } : null;
     const out: Record<string, string>[] = [];
     for (const e of unzip(bytes, name)) if (!rx || rx.test(e.name) || /\.(csv|tsv|txt|xlsx|json)$/i.test(e.name)) out.push(...await tableOf(e.name, e.bytes));
     need(out.length, `${name} holds no readable file`);

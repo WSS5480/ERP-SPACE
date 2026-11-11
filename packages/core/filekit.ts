@@ -7,6 +7,24 @@ import { inflateRawSync } from "node:zlib";
 export class FileError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new FileError(msg); };
 
+/**
+ * A file-name pattern with * and ? only, case-insensitive, matched in linear
+ * time. (A pattern turned into a RegExp backtracks: "*a*a*a*a*a*a*a*a*b"
+ * against a 60-letter name holds the event loop for minutes.)
+ */
+export function globTest(name: string, pattern: string): boolean {
+  const n = String(name).toLowerCase(), p = String(pattern).trim().toLowerCase();
+  let i = 0, j = 0, star = -1, mark = 0;
+  while (i < n.length) {
+    if (j < p.length && (p[j] === "?" || (p[j] !== "*" && p[j] === n[i]))) { i++; j++; }
+    else if (j < p.length && p[j] === "*") { star = j++; mark = i; }
+    else if (star >= 0) { j = star + 1; i = ++mark; }
+    else return false;
+  }
+  while (j < p.length && p[j] === "*") j++;
+  return j === p.length;
+}
+
 export const MAX_ENTRIES = 200;
 export const MAX_UNPACKED = 50 * 1024 * 1024;
 
@@ -38,15 +56,22 @@ export function readZip(buf: Buffer, label = "the archive", maxEntries = MAX_ENT
     need(!(flags & 1), `${path} in ${label} is password-protected; ask the vendor for it without a password`);
     need(local + 30 <= buf.length && buf.readUInt32LE(local) === 0x04034b50, `${label} is damaged at ${path}`);
     const start = local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
+    need(start + csize <= buf.length, `${label} is damaged at ${path}`);
     const data = buf.subarray(start, start + csize);
-    total += usize;
-    need(total <= MAX_UNPACKED, `${label} unpacks to more than ${MAX_UNPACKED / 1048576} MB; send it in parts`);
+    // Counted by what each entry really unpacks to, not what the archive says: entries may share
+    // their bytes (200 stored entries pointing at one 2 MB block would otherwise become 400 MB).
+    const room = MAX_UNPACKED - total;
+    need(usize <= room, `${label} unpacks to more than ${MAX_UNPACKED / 1048576} MB; send it in parts`);
     let bytes: Buffer;
-    if (method === 0) bytes = Buffer.from(data);
-    else if (method === 8) {
-      try { bytes = inflateRawSync(data, { maxOutputLength: Math.min(MAX_UNPACKED, usize + 1024) }); }
+    if (method === 0) {
+      need(csize === usize, `${label} is damaged at ${path} (its stored size does not match)`);
+      bytes = Buffer.from(data);
+    } else if (method === 8) {
+      try { bytes = inflateRawSync(data, { maxOutputLength: Math.max(1, Math.min(room, usize)) }); }
       catch { throw new FileError(`${path} in ${label} could not be unpacked`); }
     } else throw new FileError(`${path} in ${label} uses a kind of compression this does not read (method ${method})`);
+    total += bytes.length;
+    need(total <= MAX_UNPACKED, `${label} unpacks to more than ${MAX_UNPACKED / 1048576} MB; send it in parts`);
     out.push({ path, bytes });
   }
   return out;

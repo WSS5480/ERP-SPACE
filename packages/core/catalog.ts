@@ -924,18 +924,46 @@ function publicHttps(raw: string): URL {
 }
 
 /** Loopback, private, link-local, carrier-grade NAT, multicast/reserved, and their IPv6 forms. */
+const v4Private = (a: number, b: number) =>
+  a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+  || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19));
+
+/** An IPv6 address as its eight 16-bit groups (any spelling: ::1, 0:0::1, ::ffff:7f00:1, ::ffff:127.0.0.1); null if it is not one. */
+function v6Groups(ip: string): number[] | null {
+  let x = ip.toLowerCase().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+  const tail = /(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(x);
+  if (tail) {
+    const o = tail.slice(1).map(Number);
+    if (o.some((n) => n > 255)) return null;
+    x = x.slice(0, tail.index) + ((o[0] << 8) | o[1]).toString(16) + ":" + ((o[2] << 8) | o[3]).toString(16);
+  }
+  const halves = x.split("::");
+  if (halves.length > 2) return null;
+  const part = (s: string) => (s ? s.split(":") : []);
+  const head = part(halves[0]), back = halves.length === 2 ? part(halves[1]) : [];
+  const fill = 8 - head.length - back.length;
+  if (halves.length === 1 ? head.length !== 8 : fill < 0) return null;
+  const all = [...head, ...Array(halves.length === 2 ? fill : 0).fill("0"), ...back];
+  if (all.length !== 8 || all.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+  return all.map((g) => parseInt(g, 16));
+}
+
 export function isPrivateIp(ip: string): boolean {
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip.replace(/^::ffff:/i, ""));
-  if (v4) {
-    const [a, b] = [Number(v4[1]), Number(v4[2])];
-    return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19));
-  }
-  if (ip.includes(":")) {
-    const x = ip.toLowerCase();
-    return x === "::" || x === "::1" || /^f[cd]/.test(x) || /^fe[89ab]/.test(x) || /^ff/.test(x);
-  }
-  return false;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (v4) return v4Private(Number(v4[1]), Number(v4[2]));
+  if (!ip.includes(":")) return false;
+  const g = v6Groups(ip);
+  if (!g) return true;                                   // not readable as an address: not called
+  const zero = (n: number) => g.slice(0, n).every((v) => v === 0);
+  const embedded = (hi: number) => v4Private(hi >> 8, hi & 0xff);   // the first two octets decide
+  if (zero(8) || (zero(7) && g[7] === 1)) return true;  // :: and ::1
+  if (zero(5) && g[5] === 0xffff) return embedded(g[6]);          // ::ffff:a.b.c.d (IPv4-mapped)
+  if (zero(6)) return true;                              // ::a.b.c.d (IPv4-compatible, deprecated)
+  if (zero(4) && g[4] === 0xffff && g[5] === 0) return true;            // ::ffff:0:a.b.c.d (SIIT)
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((v) => v === 0)) return embedded(g[6]); // NAT64
+  if (g[0] === 0x2002) return embedded(g[1]);      // 6to4
+  if (g[0] === 0x2001 && g[1] === 0) return true;        // Teredo: tunnels to anywhere
+  return (g[0] & 0xfe00) === 0xfc00 || (g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xffc0) === 0xfec0 || (g[0] & 0xff00) === 0xff00;
 }
 
 /** Every address a host name resolves to must be public, or nothing is fetched. */
