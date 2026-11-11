@@ -420,3 +420,7 @@ dialog.sheet{margin:auto auto 0;width:100%;max-width:520px;border-radius:16px 16
 .row-acts{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
 .btn svg.back{transform:rotate(90deg)}
 .facts dd .linkbtn{font-variant-numeric:tabular-nums}
+
+/* operator console: an error's stack wraps, never scrolls sideways */
+pre.stack{white-space:pre-wrap;word-break:break-word;font-size:.8em;max-height:40vh;overflow-y:auto;background:var(--panel-2,#f6f6f4);padding:10px;border-radius:8px}
+.checks{display:flex;flex-wrap:wrap;gap:6px 14px}

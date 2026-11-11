@@ -2,6 +2,7 @@
 // The owner's buying program: budgets and open-to-buy, the order form, POs
 // per vendor per ship-to, the special-order queue, acknowledgments and ETAs,
 // landed cost, reorder points and the vendor CSV files.
+import { today as bizToday } from "../../packages/core/clock.ts";
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
 import { ModuleError, need, requireRole, str, uuid, int, minor } from "./kit.ts";
 import { q } from "../../packages/core/db.ts";
@@ -16,12 +17,11 @@ import { currentFeedEnv } from "./catalog.ts";
 const ID = "([0-9a-fA-F-]{36})";
 const BUY = ["buyer"];
 const STORE = ["buyer", "store_manager"];
-const thisMonth = () => new Date().toISOString().slice(0, 8) + "01";
-const monthParam = (url: URL) => {
+const monthParam = async (c: Client, co: Company, url: URL) => {
   const m = str(url.searchParams.get("month"), 10);
   if (/^\d{4}-\d{2}$/.test(m)) return m + "-01";
   if (/^\d{4}-\d{2}-\d{2}$/.test(m)) return m.slice(0, 8) + "01";
-  return thisMonth();
+  return (await bizToday(c, co.id)).slice(0, 8) + "01";
 };
 
 async function refuse<T>(fn: () => Promise<T>): Promise<T> {
@@ -41,14 +41,14 @@ async function home(c: Client, co: Company) {
     select count(*) filter (where po.status = 'open') open_n,
            coalesce(sum(t.total) filter (where po.status = 'open'), 0) open_minor,
            count(*) filter (where po.status = 'open' and po.acknowledged_on is null) unack_n,
-           count(*) filter (where po.status = 'open' and po.expected_on < current_date) late_n
+           count(*) filter (where po.status = 'open' and po.expected_on < business_today($1)) late_n
       from purchase_order po
       left join lateral (select sum(round((l.quantity - l.cancelled_qty) * l.unit_price_minor))::bigint total
                            from purchase_order_line l where l.purchase_order_id = po.id) t on true
      where po.entity_id = $1 and po.ship_to_location_id is not null`, [co.id]);
   const queue = await pur.specialOrderQueue(c, co.id);
   const sugg = await pur.replenishment(c, co.id);
-  const otb = await pur.openToBuy(c, co.id, thisMonth());
+  const otb = await pur.openToBuy(c, co.id, (await bizToday(c, co.id)).slice(0, 8) + "01");
   const sum = (k: "budget_minor" | "committed_minor" | "open_minor") => otb.reduce((a, r) => a + BigInt(r[k]), 0n).toString();
   return { pos, queue: queue.length, suggestions: sugg.length, otb: { budget: sum("budget_minor"), committed: sum("committed_minor"), open: sum("open_minor"),
     over: otb.filter((r) => BigInt(r.open_minor) < 0n).length } };
@@ -63,7 +63,7 @@ async function listPOs(c: Client, co: Company, url: URL) {
            t.total total_minor, t.lines, t.landed landed_minor,
            (select count(*) from po_line_sales_line k join purchase_order_line x on x.id = k.purchase_order_line_id
              where k.entity_id = po.entity_id and x.purchase_order_id = po.id and k.active) customer_lines,
-           (po.status = 'open' and po.expected_on < current_date) late
+           (po.status = 'open' and po.expected_on < business_today($1)) late
       from purchase_order po join vendor v on v.id = po.vendor_id join location l on l.id = po.ship_to_location_id
       left join lateral (select sum(round((x.quantity - x.cancelled_qty) * x.unit_price_minor))::bigint total, count(*) lines, sum(x.landed_minor) landed
                            from purchase_order_line x where x.purchase_order_id = po.id) t on true
@@ -112,7 +112,7 @@ async function orderForm(c: Client, co: Company, url: URL) {
   const locations = await q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' and kind in ('warehouse','store','outlet')
                                  order by kind <> 'warehouse', name`, [co.id]);
   const vendorId = uuid(url.searchParams.get("vendor")) ?? vendors[0]?.id ?? null;
-  const month = monthParam(url);
+  const month = await monthParam(c, co, url);
   if (!vendorId) return { vendors, locations, vendor: null, products: [], otb: [], month };
   const vendor = vendors.find((v) => v.id === vendorId);
   need(vendor, "that vendor is not active for this company");
@@ -157,7 +157,7 @@ export const module: ErpModule = {
                           where r.entity_id = $1 order by p.name, l.name`, [co.id]),
     }));
     coGet("/purchasing/budgets", async (c, co, url) => {
-      const month = monthParam(url);
+      const month = await monthParam(c, co, url);
       const locations = await q(c, `select id, name, kind from location where entity_id = $1 and status = 'active' and kind in ('warehouse','store','outlet') order by kind <> 'warehouse', name`, [co.id]);
       const categories = await q<{ category: string }>(c, `select distinct category from product where entity_id = $1 and category is not null and kind = 'stock' order by 1`, [co.id]);
       return { month, rows: await pur.openToBuy(c, co.id, month), locations, categories: categories.map((x) => x.category) };

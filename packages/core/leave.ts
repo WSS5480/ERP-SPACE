@@ -27,6 +27,7 @@
 // posted is refused, and paid leave for an hourly person with no pay group is
 // refused -- hours are never taken that are never paid.
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { WorkforceError, cancelShift } from "./workforce.ts";
 import { addBlackout } from "./fleet.ts";
@@ -112,7 +113,7 @@ export async function balances(c: Client, entityId: string, employeeId: string) 
            coalesce((select sum(l.hours) from leave_ledger l where l.entity_id = $1 and l.employee_id = $2 and l.leave_type_id = t.id),0)::float balance,
            coalesce((select sum(r.total_hours) from leave_request r where r.entity_id = $1 and r.employee_id = $2 and r.leave_type_id = t.id and r.status = 'requested'),0)::float pending,
            coalesce((select -sum(l.hours) from leave_ledger l where l.entity_id = $1 and l.employee_id = $2 and l.leave_type_id = t.id
-                      and l.kind in ('taken','reversal') and extract(year from l.occurred_on) = extract(year from current_date)),0)::float taken_ytd
+                      and l.kind in ('taken','reversal') and extract(year from l.occurred_on) = extract(year from business_today($1))),0)::float taken_ytd
       from leave_type t where t.entity_id = $1 and t.active order by t.name`, [entityId, employeeId]);
   return { employee: { id: p.id, name: p.name }, types: rows.map((r) => ({ ...r, balance: r3(r.balance), available: r3(r.balance - r.pending) })) };
 }
@@ -131,7 +132,7 @@ export async function adjust(c: Client, scope: Scope, b: { employeeId: string; l
   }
   return one(c, `insert into leave_ledger (entity_id, employee_id, leave_type_id, occurred_on, kind, hours, note, created_by)
                  values ($1,$2,$3,$4,'adjustment',$5,$6,$7) returning id`,
-    [scope.entityId, b.employeeId, b.leaveTypeId, isDay(b.on) ? b.on : new Date().toISOString().slice(0, 10), h, String(b.note).trim().slice(0, 300), scope.actor.id || null]);
+    [scope.entityId, b.employeeId, b.leaveTypeId, isDay(b.on) ? b.on : await bizToday(c, scope), h, String(b.note).trim().slice(0, 300), scope.actor.id || null]);
 }
 
 /**
@@ -286,7 +287,7 @@ export async function decide(c: Client, scope: Scope, id: string, d: { approve: 
       [scope.entityId, r.employee_id, t.id, r.starts_on, -n(r.total_hours), id, `${dayWords(r.starts_on)} to ${dayWords(r.ends_on)}`, scope.actor.id || null]);
   }
   // the schedule: shifts on those days are cancelled, and said so
-  const tz = await one<{ tz: string }>(c, `select coalesce((select timezone from workforce_settings where entity_id = $1), (select time_zone from fleet_setting where entity_id = $1), 'America/New_York') tz`, [scope.entityId]);
+  const tz = await one<{ tz: string }>(c, `select business_tz($1) tz /* unscoped: keyed by the entity argument */`, [scope.entityId]);
   const shifts = await q<{ id: string; on_day: string }>(c, `
     select w.id, (w.starts_at at time zone $4)::date::text on_day from work_shift w
      where w.entity_id = $1 and w.employee_id = $2 and w.status = 'scheduled'
@@ -317,7 +318,7 @@ export async function cancel(c: Client, scope: Scope, id: string, reason: string
     const taken = await q<{ hours: string }>(c, `select coalesce(sum(hours),0)::text hours from leave_ledger where entity_id = $1 and request_id = $2`, [scope.entityId, id]);
     if (n(taken[0].hours) !== 0) {
       await c.query(`insert into leave_ledger (entity_id, employee_id, leave_type_id, occurred_on, kind, hours, request_id, note, created_by)
-                     values ($1,$2,$3,current_date,'reversal',$4,$5,$6,$7)`,
+                     values ($1,$2,$3,business_today($1),'reversal',$4,$5,$6,$7)`,
         [scope.entityId, r.employee_id, r.leave_type_id, -n(taken[0].hours), id, String(reason).trim().slice(0, 300), scope.actor.id || null]);
     }
   }
@@ -498,8 +499,8 @@ export async function leavePayForPeriod(c: Client, scope: Scope, payPeriodId: st
  * was due on a shift that has started but has not punched in.
  */
 export async function absentToday(c: Client, entityId: string, locationId: string | null) {
-  const tz = (await one<{ tz: string }>(c, `select coalesce((select timezone from workforce_settings where entity_id = $1), (select time_zone from fleet_setting where entity_id = $1), 'America/New_York') tz`, [entityId])).tz;
-  const day = (await one<{ d: string }>(c, `select (now() at time zone $1)::date::text d /* unscoped: the clock */`, [tz])).d;
+  const tz = (await one<{ tz: string }>(c, `select business_tz($1, $2) tz /* unscoped: keyed by the entity argument */`, [entityId, locationId])).tz;
+  const day = (await one<{ d: string }>(c, `select (erp_now() at time zone $1)::date::text d /* unscoped: the clock */`, [tz])).d;
   const onLeaveToday = await q(c, `
     select e.id employee_id, e.first_name || ' ' || e.last_name name, t.name type, t.kind, r.ends_on::text back_after, d.hours::float hours
       from leave_request_day d join leave_request r on r.id = d.request_id join leave_type t on t.id = r.leave_type_id join employee e on e.id = r.employee_id

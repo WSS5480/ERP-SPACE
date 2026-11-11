@@ -18,6 +18,7 @@
 // Every portal read and write names the account; another account's order,
 // project or invoice reads exactly like one that does not exist.
 
+import { today as bizToday } from "./clock.ts";
 import * as messaging from "./messaging.ts";
 import { ConfigError } from "./configurator.ts";
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
@@ -35,7 +36,6 @@ const U = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL = /^[^@\s<>"]{1,64}@[^@\s<>"]{1,180}\.[^@\s<>".]{2,24}$/;
 const clean = (v: unknown, max: number) => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f<>]/g, " ").replace(/\s+/g, " ").trim().slice(0, max) : "");
 const sha = (t: string) => createHash("sha256").update(t).digest("hex");
-const today = () => new Date().toISOString().slice(0, 10);
 export const KINDS = ["designer", "contractor", "stager", "hospitality", "other"] as const;
 
 /** Refusals a person reads as they are. */
@@ -102,7 +102,7 @@ export async function submitApplication(c: Client, site: shop.Site, a: Applicati
     need(resale.length >= 3, "Enter the resale certificate number as printed.");
     need(/^[A-Z]{2}$/.test(st), "Enter the two-letter state on the resale certificate.");
     need(!exp || /^\d{4}-\d{2}-\d{2}$/.test(exp), "The certificate's expiry is a date.");
-    need(!exp || exp >= today(), "That resale certificate has expired; apply with a current one, or leave it off and add it later.");
+    need(!exp || exp >= (await bizToday(c, site.entity_id)), "That resale certificate has expired; apply with a current one, or leave it off and add it later.");
   }
   const ad = (a.address ?? {}) as Record<string, unknown>;
   const address = { line1: clean(ad.line1, 100), line2: clean(ad.line2, 100), city: clean(ad.city, 60), state: clean(ad.state, 2).toUpperCase(), postal: clean(ad.postal, 10) };
@@ -200,7 +200,7 @@ export async function decideApplication(c: Client, scope: Scope, id: string, d: 
   await ar.setAccount(c, scope, customerId, { houseAccount: true, creditLimitMinor: limit, termsDays: terms });
   const warnings: string[] = [];
   if (a!.resale_number) {
-    if (a!.resale_expires && a!.resale_expires < today()) warnings.push(`The resale certificate ${a!.resale_number} has expired since the application; ask for a current one.`);
+    if (a!.resale_expires && a!.resale_expires < (await bizToday(c, scope))) warnings.push(`The resale certificate ${a!.resale_number} has expired since the application; ask for a current one.`);
     else {
       const dup = await q(c, `select 1 from tax_exemption_certificate where entity_id = $1 and customer_id = $2 and number = $3`, [scope.entityId, customerId, a!.resale_number]);
       if (!dup.length) await tax.saveCertificate(c, scope, { customerId, number: a!.resale_number, state: a!.resale_state!, reason: "resale", expiresOn: a!.resale_expires });
@@ -563,7 +563,8 @@ export async function invoices(c: Client, site: shop.Site, s: Session) {
     select i.id, i.number, i.kind, i.invoice_date::text, i.due_date::text, i.total_minor, i.status, so.number order_number
       from customer_invoice i left join sales_order so on so.id = i.sales_order_id
      where i.entity_id = $1 and i.customer_id = $2 order by i.invoice_date desc, i.number desc limit 200`, [site.entity_id, s.customerId]);
-  return { invoices: rows.map((r) => ({ ...r, openMinor: open.get(r.id) ?? "0", pastDue: (open.get(r.id) ?? "0") !== "0" && r.due_date < today() })),
+  const t = await bizToday(c, site.entity_id);
+  return { invoices: rows.map((r) => ({ ...r, openMinor: open.get(r.id) ?? "0", pastDue: (open.get(r.id) ?? "0") !== "0" && r.due_date < t })),
     credit: await credit(c, site.entity_id, s.customerId) };
 }
 

@@ -5,6 +5,7 @@
 // entity_id or says out loud that it is deliberately unscoped.
 
 import pg from "pg";
+import { pinnedIso } from "./clock.ts";
 
 // bigint columns come back as strings by default; keep them exact.
 pg.types.setTypeParser(20, (v) => v); // int8 -> string, caller converts to BigInt
@@ -58,6 +59,9 @@ export async function tx<T>(actor: Actor, fn: (c: Client) => Promise<T>): Promis
     await c.query("select set_config('erp.actor_kind', $1, true)", [actor.kind]);
     await c.query("select set_config('erp.actor_label', $1, true)", [actor.label]);
     await c.query("select set_config('erp.actor_id', $1, true)", [actor.id ?? ""]);
+    // a check that pinned the clock: SQL's erp_now() / business_today() see the same instant as the code
+    const at = pinnedIso();
+    if (at) await c.query("select set_config('erp.now', $1, true)", [at]);
     const out = await fn(c);
     await c.query("commit");
     committed = true;

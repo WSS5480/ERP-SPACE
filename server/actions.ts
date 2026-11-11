@@ -8,6 +8,8 @@
 // same pattern as payroll: build, send for approval, release by someone else,
 // post on release.
 
+import { today as bizToday } from "../packages/core/clock.ts";
+import { periodFor } from "../packages/core/periods.ts";
 import { type Client, type Scope, q, one, audit } from "../packages/core/db.ts";
 import { categoryInfo, VendorCategoryError } from "../packages/core/vendor_categories.ts";
 import { decide, openRequest } from "../packages/core/approvals.ts";
@@ -32,7 +34,6 @@ export const scopeOf = (co: Company, a: Actor, kind: "user" | "agent" | "system"
   actor: { kind, id: a.personId, label: a.label },
 });
 
-const today = () => new Date().toISOString().slice(0, 10);
 const isDay = (s: unknown): s is string => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new ActionError(msg); };
@@ -452,7 +453,7 @@ export async function createPaymentRun(c: Client, co: Company, a: Actor, input: 
                                        opts: { allowPast?: boolean } = {}) {
   need(isDay(input.payDate), "pick the pay date");
   // Only the trial's sample history is ever dated in the past.
-  need(opts.allowPast || (input.payDate as string) >= today(), "the pay date cannot be in the past");
+  need(opts.allowPast || (input.payDate as string) >= (await bizToday(c, co.id)), "the pay date cannot be in the past");
   const method = ["ach", "check"].includes(String(input.method)) ? String(input.method) as "ach" | "check" : null;
   need(method, "pay by ACH or check");
   const ids = Array.isArray(input.invoiceIds) ? input.invoiceIds.filter((x) => typeof x === "string" && UUID.test(x)) : [];
@@ -532,8 +533,7 @@ export async function releasePaymentRun(c: Client, co: Company, a: Actor, input:
       join payment_run pr on pr.id = p.payment_run_id and pr.entity_id = $2
       join invoice i on i.id = p.invoice_id join vendor v on v.id = i.vendor_id
      where p.payment_run_id = $1 order by label`, [run.id, co.id]);
-  const period = await one<{ id: string }>(c, `
-    select id from fiscal_period where entity_id = $1 and $2::date between starts_on and ends_on`, [co.id, run.pay_date]);
+  const period = { id: await periodFor(c, scopeOf(co, a), run.pay_date) };
   const ap = await one<{ id: string }>(c, `
     select id from gl_account where tenant_id = $1 and code = '2010' /* unscoped: chart is tenant-wide */`, [co.tenantId]);
   const bank = await one<{ gl_account_id: string; name: string }>(c, `
@@ -689,13 +689,13 @@ export async function planTodaysSweeps(c: Client, co: Company, a: Actor) {
     select count(*)::int as n from bank_transfer where entity_id = $1 and status in ('expected', 'planned')`, [co.id]);
   need(outstanding[0].n === 0,
     `confirm the ${outstanding[0].n === 1 ? "sweep" : `${outstanding[0].n} sweeps`} still outstanding first; planning now would count that money twice`);
-  const planned = await planSweeps(c, scopeOf(co, a), { asOf: today(), createdBy: a.personId });
+  const planned = await planSweeps(c, scopeOf(co, a), { asOf: await bizToday(c, co.id), createdBy: a.personId });
   return { planned: planned.map((p) => ({ ...p, amountMinor: p.amountMinor.toString() })) };
 }
 
 export async function confirmSweep(c: Client, co: Company, a: Actor, input: { transferId: unknown }) {
   need(typeof input.transferId === "string" && UUID.test(input.transferId), "no such transfer");
-  const je = await confirmTransfer(c, scopeOf(co, a), { transferId: input.transferId as string, confirmedBy: a.personId, onDate: today() });
+  const je = await confirmTransfer(c, scopeOf(co, a), { transferId: input.transferId as string, confirmedBy: a.personId, onDate: await bizToday(c, co.id) });
   return { journalEntryId: je };
 }
 
@@ -774,8 +774,7 @@ export async function bookLine(c: Client, co: Company, a: Actor, input: { lineId
   need(acct.length, "that account is not in this company's chart");
   need(acct[0].id !== line.gl_account_id, "book it to the other side, not the bank's own account");
   const amount = BigInt(line.amount_minor);
-  const period = await one<{ id: string }>(c, `
-    select id from fiscal_period where entity_id = $1 and $2::date between starts_on and ends_on`, [co.id, line.posted_on]);
+  const period = { id: await periodFor(c, scopeOf(co, a), line.posted_on) };
   const je = await one<{ id: string }>(c, `
     insert into journal_entry (tenant_id, entity_id, period_id, posting_date, source_type, description, posted_by, actor_kind)
     values ($1, $2, $3, $4, 'manual', $5, $6, 'user') returning id`,
@@ -966,7 +965,7 @@ export async function changeEmployee(c: Client, co: Company, a: Actor, input: Re
   need(!pending.length, "a pay change for this person is already waiting on approval");
   const ch = await one<{ id: string }>(c, `
     insert into employee_change (tenant_id, entity_id, employee_id, before, after, effective_on, reason, requested_by)
-    values ($1, $2, $3, $4, $5, current_date, $6, $7) returning id`,
+    values ($1, $2, $3, $4, $5, business_today($2), $6, $7) returning id`,
     [co.tenantId, co.id, e.id,
      JSON.stringify({ pay_group_id: e.pay_group_id, pay_type: e.pay_type, base_rate_minor: e.base_rate_minor }),
      JSON.stringify({ pay_group_id: group, pay_type: payType, base_rate_minor: rate.toString() }),

@@ -252,10 +252,10 @@ export async function run(t: T) {
   // ---------------------------------------------------- billable work by an outside company
   await t.throws("a charge on a covered ticket is refused", () => post(P.RAY, `/service/tickets/${T2.id}/charges`, { productId: PROD.CALL }), /is covered/);
   await post(P.RAY, `/service/tickets/${T3.id}/charges`, { productId: PROD.CALL });
-  const keystone = (await get("/service/options", P.RAY)).providers.find((p: any) => p.name === "Keystone Furniture Repair");
+  const keystone = (await get("/service/options", P.RAY)).providers.find((p: any) => p.name === "Hearthstone Furniture Repair");
   const v3 = await post(P.RAY, `/service/tickets/${T3.id}/visits`, { providerId: keystone.id, day: D });
   await t.throws("a technician cannot finish an outside company's visit", () => post(P.PAT, `/service/visits/${v3.visitId}/complete`, { outcome: "fixed" }), /another technician's route/);
-  const done3 = await post(P.RAY, `/service/visits/${v3.visitId}/complete`, { outcome: "fixed", minutes: 60, workNotes: "Keystone re-glued and braced the seat frame", thirdPartyCost: "60.00" });
+  const done3 = await post(P.RAY, `/service/visits/${v3.visitId}/complete`, { outcome: "fixed", minutes: 60, workNotes: "Hearthstone re-glued and braced the seat frame", thirdPartyCost: "60.00" });
   const t3 = await get(`/service/tickets/${T3.id}`, P.RAY);
   const inv3 = await one<{ total: string; charged: string; status: string }>(`select i.total_minor::text total, i.charged_minor::text charged, i.status from customer_invoice i
      where i.entity_id = $1 and i.sales_order_id = $2`, [ENTITY, t3.billing_order_id]);
@@ -328,31 +328,31 @@ export async function run(t: T) {
   await t.throws("the same delivery line does not open a second ticket", () => post(P.DEE, `/service/tickets/from-stop/${dl}`), /already open for that line/);
 
   // ---------------------------------------------------- the public request form
-  const [pst, page] = await pub("GET", "/service-request/buddys");
+  const [pst, page] = await pub("GET", "/service-request/riverside-home");
   t.ok("the public form is a page with our own script", pst === 200 && page instanceof PublicPage && page.text.includes('src="/service-request/assets/form.js"')
     && page.text.includes('name="website"'));
   t.ok("an unknown store has no form", (await pub("GET", "/service-request/nosuchstore"))[0] === 404);
   const before = await one<{ n: number }>(`select count(*)::int n from service_ticket where entity_id = $1 and source = 'web'`, [ENTITY]);
-  const [, hp] = await pub("POST", "/service-request/buddys/api/request", { name: "Bot", phone: "7175550000", description: "Buy cheap stuff now at our site", website: "http://spam.example", elapsedMs: 9000 });
+  const [, hp] = await pub("POST", "/service-request/riverside-home/api/request", { name: "Bot", phone: "5555550000", description: "Buy cheap stuff now at our site", website: "http://spam.example", elapsedMs: 9000 });
   const afterHp = await one<{ n: number }>(`select count(*)::int n from service_ticket where entity_id = $1 and source = 'web'`, [ENTITY]);
   t.ok("a honeypot hit looks accepted but opens nothing", hp.received === true && hp.number === null && afterHp.n === before.n);
-  const [, w1] = await pub("POST", "/service-request/buddys/api/request", { name: "Alicia Gomez", phone: "(717) 555-0101", orderNumber: fresh.number,
+  const [, w1] = await pub("POST", "/service-request/riverside-home/api/request", { name: "Alicia Gomez", phone: "(555) 555-0101", orderNumber: fresh.number,
     issueType: "defect", description: "The recliner makes a clicking noise when it reclines.", elapsedMs: 30000 });
   const wt1 = await one<{ customer_id: string | null; sales_order_id: string | null }>(`select customer_id, sales_order_id from service_ticket where entity_id = $1 and number = $2`, [ENTITY, w1.number]);
   t.ok("a web request whose order number matches the phone is linked to the customer and order", wt1.customer_id === CUST.ALICIA && wt1.sales_order_id === fresh.orderId, w1.number);
-  const [, w2] = await pub("POST", "/service-request/buddys/api/request", { name: "Mallory", phone: "212-555-9999", orderNumber: fresh.number,
+  const [, w2] = await pub("POST", "/service-request/riverside-home/api/request", { name: "Mallory", phone: "212-555-9999", orderNumber: fresh.number,
     issueType: "defect", description: "Trying someone else's order number to see what comes back.", elapsedMs: 30000 });
   const wt2 = await one<{ customer_id: string | null; description: string }>(`select customer_id, description from service_ticket where entity_id = $1 and number = $2`, [ENTITY, w2.number]);
   t.ok("a mismatched order number links nothing and says nothing about the order", wt2.customer_id === null && /Order number given/.test(wt2.description)
     && Object.keys(w2).sort().join() === "number,received");
-  await t.throws("a description that is too short is refused", () => pub("POST", "/service-request/buddys/api/request", { name: "Ann", phone: "7175551234", description: "broken", elapsedMs: 30000 }),
+  await t.throws("a description that is too short is refused", () => pub("POST", "/service-request/riverside-home/api/request", { name: "Ann", phone: "5555551234", description: "broken", elapsedMs: 30000 }),
     /tell us what is wrong/);
   await t.throws("the form's sender limit holds (5 an hour)", async () => {
-    for (let i = 0; i < 3; i++) await pub("POST", "/service-request/buddys/api/request", { name: "Repeat Caller", phone: "7175551234", description: "Still broken, writing again about it.", elapsedMs: 30000 });
+    for (let i = 0; i < 3; i++) await pub("POST", "/service-request/riverside-home/api/request", { name: "Repeat Caller", phone: "5555551234", description: "Still broken, writing again about it.", elapsedMs: 30000 });
   }, /too many requests from here/);
-  await t.throws("another sender is not blocked, but links are kept out", () => pub("POST", "/service-request/buddys/api/request",
+  await t.throws("another sender is not blocked, but links are kept out", () => pub("POST", "/service-request/riverside-home/api/request",
     { name: "Link Spammer", phone: "7175554321", description: "see http://a.example http://b.example http://c.example for details", elapsedMs: 30000 }, "198.51.100.9"), /leave links out/);
-  await t.throws("photos are links or pictures, five at most", () => pub("POST", "/service-request/buddys/api/request",
+  await t.throws("photos are links or pictures, five at most", () => pub("POST", "/service-request/riverside-home/api/request",
     { name: "Photo Person", phone: "7175554322", description: "Pictures of the damage are attached here.", photos: ["javascript:alert(1)"], elapsedMs: 30000 }, "198.51.100.10"), /https link or an image/);
 
   // ---------------------------------------------------- isolation

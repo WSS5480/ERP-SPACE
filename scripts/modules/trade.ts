@@ -24,7 +24,7 @@ const inTx = <R>(fn: (c: Client) => Promise<R>) => tx(sys, fn);
 const MARIA = "55555555-0000-0000-0000-000000000011";      // sales
 const RAY = "55555555-0000-0000-0000-000000000014";        // dispatcher
 const ANA = "55555555-0000-0000-0000-000000000016";        // buyer
-const MGR = "55555555-0000-0000-0000-000000000018";        // Enola store manager
+const MGR = "55555555-0000-0000-0000-000000000018";        // Riverside store manager
 const DESIGNER = "55555555-0000-0000-0000-0000000000d1";   // made here: an internal designer
 const P = { LAMP: "77777777-0000-0000-0000-000000000009", RECLINER: "77777777-0000-0000-0000-000000000007", HUDSON: "77777777-0000-0000-0000-000000000010",
   MATTRESS: "77777777-0000-0000-0000-000000000008", DRESSER: "77777777-0000-0000-0000-000000000004" };
@@ -48,7 +48,7 @@ function catcher() {
 }
 
 export async function run(t: T) {
-  const site = (await inTx((c) => shop.siteBySlug(c, "buddys")))!;
+  const site = (await inTx((c) => shop.siteBySlug(c, "riverside-home")))!;
 
   // A vendor to pay referral commission to, and an internal designer.
   const vendorId = await inTx(async (c) => {
@@ -69,8 +69,8 @@ export async function run(t: T) {
   await t.throws("apply: a bad email is refused in plain words", () => inTx((c) => trade.submitApplication(c, site, { companyName: "X Co", kind: "designer", contactName: "Xi", email: "nope" }, "ip")), /valid email/);
   await t.throws("apply: an expired resale certificate is refused", () => inTx((c) => trade.submitApplication(c, site, { companyName: "Old Cert", kind: "designer", contactName: "Ola",
     email: `old-${uniq}@example.com`, resaleNumber: "PA-OLD-1", resaleState: "PA", resaleExpires: "2020-01-01" }, "ip")), /has expired/);
-  const app1 = await inTx((c) => trade.submitApplication(c, site, { companyName: "Hartley Design Studio", kind: "designer", contactName: "Jo Hartley", email: email1, phone: "717-555-0199",
-    resaleNumber: `PA-RS-${uniq}`, resaleState: "PA", resaleExpires: nextYear, address: { line1: "200 Market St", city: "Harrisburg", state: "PA", postal: "17101" } }, "ip-a"));
+  const app1 = await inTx((c) => trade.submitApplication(c, site, { companyName: "Hartley Design Studio", kind: "designer", contactName: "Jo Hartley", email: email1, phone: "555-555-0199",
+    resaleNumber: `PA-RS-${uniq}`, resaleState: "PA", resaleExpires: nextYear, address: { line1: "200 Market St", city: "Hillcrest", state: "PA", postal: "00101" } }, "ip-a"));
   const again = await inTx((c) => trade.submitApplication(c, site, { companyName: "Hartley Design Studio", kind: "designer", contactName: "Jo Hartley", email: email1 }, "ip-a"));
   t.ok("apply: the answer is the same thanks every time and shows no number", JSON.stringify(app1) === JSON.stringify(again) && !("number" in app1) && /in touch/.test(app1.message));
   const app2 = await inTx((c) => trade.submitApplication(c, site, { companyName: "Riverside Staging", kind: "stager", contactName: "Sam Rivers", email: email2 }, "ip-b"));
@@ -175,7 +175,7 @@ export async function run(t: T) {
   t.ok("portal: a product page carries no cost or vendor", !/cost|vendor|margin/i.test(pubLeak));
 
   // ----------------------------------------------------- projects
-  const proj = await inTx((c) => trade.createProject(c, site, s1, { name: "Living room 2027", clientName: "The Parkers", clientAddress: { line1: "14 Elm St", city: "Palestine", state: "TX", postal: "75801" },
+  const proj = await inTx((c) => trade.createProject(c, site, s1, { name: "Living room 2027", clientName: "The Parkers", clientAddress: { line1: "14 Elm St", city: "Mesa Verde", state: "TX", postal: "00181" },
     lengthIn: 240, widthIn: 180, heightIn: 108, openings: [{ kind: "door", wall: "north", widthIn: 36, heightIn: 80 }, { kind: "window", wall: "east", widthIn: 60, heightIn: 48 }],
     styleNotes: "Warm modern, walnut and navy", budgetMinor: 1500000n }));
   await t.throws("projects: a door needs a sensible size", () => inTx((c) => trade.updateProject(c, site, s1, proj.id, { openings: [{ kind: "door", widthIn: -3 }] })), /size is in inches/);
@@ -215,7 +215,7 @@ export async function run(t: T) {
   const cart = () => `trade-${uniq}-${Math.random().toString(36).slice(2, 10)}`;
   const toClient = await inTx((c) => trade.quoteOrder(c, site, s1, { projectId: proj.id, fulfillment: "delivery", shipTo: "client", payBy: "account", cartId: cart() }));
   const recLine = toClient.lines.find((l) => l.productId === P.RECLINER)!;
-  t.ok("tax: shipped to the client in Palestine, TX, with no resale, it is taxed at the destination (8.25%)",
+  t.ok("tax: shipped to the client in Mesa Verde, TX, with no resale, it is taxed at the destination (8.25%)",
     recLine.taxMinor === bps(BigInt(recLine.lineMinor), 825).toString(), `${recLine.taxMinor} on ${recLine.lineMinor}`);
   const resaleAway = await inTx((c) => trade.quoteOrder(c, site, s1, { projectId: proj.id, fulfillment: "delivery", shipTo: "client", resale: true, payBy: "account", cartId: cart() }));
   t.ok("tax: a Pennsylvania resale certificate does not exempt a Texas delivery", resaleAway.lines.find((l) => l.productId === P.RECLINER)!.taxMinor === recLine.taxMinor);
@@ -223,7 +223,7 @@ export async function run(t: T) {
   t.ok("projects: quoting the project marks it quoted", !!(await inTx((c) => trade.myProject(c, site, s1, proj.id)))!.quoted_at);
 
   // ----------------------------------------------- orders on account and for resale
-  const PA = { line1: "9 River Rd", city: "Camp Hill", state: "PA", postal: "17011" };
+  const PA = { line1: "9 River Rd", city: "Maple Grove", state: "PA", postal: "00111" };
   const resale = await inTx((c) => trade.placeOrder(c, site, s1, { lines: [{ productId: P.LAMP, qty: 4 }], fulfillment: "delivery", shipTo: "address", address: PA,
     resale: true, payBy: "account", cartId: cart() }));
   const resaleTax = await inTx((c) => q<{ exempt_reason: string | null; tax_minor: string }>(c, `select t.exempt_reason, t.tax_minor from sales_order_line_tax t
@@ -339,7 +339,7 @@ export async function run(t: T) {
   t.ok("split: the line carries the primary rep, the designer's 40% and the referral", lc.split.length === 2 && lc.split.some((x) => x.app_user_id === DESIGNER && x.split_bps === 4000)
     && (lc.referral as { rate_bps: number } | null)?.rate_bps === 1000);
   const cost = await inTx(async (c) => {
-    // enough lamps on the Enola floor to take two home
+    // enough lamps on the Riverside floor to take two home
     await c.query(`update stock_level set on_hand = greatest(on_hand, reserved + held + 10) where entity_id = $1 and product_id = $2 and location_id = $3`, [ENTITY, P.LAMP, LOC.ENOLA]);
     return BigInt((await q<{ cost_minor: string }>(c, `select cost_minor from product where id = $1 and entity_id = $2`, [P.LAMP, ENTITY]))[0].cost_minor);
   });
@@ -495,7 +495,7 @@ export async function run(t: T) {
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   try {
     _resetLimits();
-    const page = await fetch(`${base}/trade/buddys/`);
+    const page = await fetch(`${base}/trade/riverside-home/`);
     const html = await page.text();
     const csp = page.headers.get("content-security-policy") ?? "";
     t.ok("portal page: served with the CSP, its script from /trade/assets and no inline script", page.status === 200 && /script-src 'self'/.test(csp)
@@ -503,20 +503,20 @@ export async function run(t: T) {
     const js = await fetch(`${base}/trade/assets/trade.js`);
     t.ok("portal script is served as JavaScript", js.status === 200 && /javascript/.test(js.headers.get("content-type") ?? ""));
     const H = { "content-type": "application/json", "x-erp-shop": "1" };
-    const noHeader = await fetch(`${base}/trade/buddys/api/code`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: email1 }) });
+    const noHeader = await fetch(`${base}/trade/riverside-home/api/code`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: email1 }) });
     t.ok("portal: a POST without the page header is refused", noHeader.status === 403);
-    const anon = await fetch(`${base}/trade/buddys/api/orders`);
-    const forged = await fetch(`${base}/trade/buddys/api/orders/${resale.orderId}`, { headers: { "x-trade-session": s2tok } });
+    const anon = await fetch(`${base}/trade/riverside-home/api/orders`);
+    const forged = await fetch(`${base}/trade/riverside-home/api/orders/${resale.orderId}`, { headers: { "x-trade-session": s2tok } });
     t.ok("portal: no session, or a suspended account's, gets nothing", anon.status === 401 && forged.status === 401);
-    const own = await fetch(`${base}/trade/buddys/api/orders/${resale.orderId}`, { headers: { "x-trade-session": token1 } });
+    const own = await fetch(`${base}/trade/riverside-home/api/orders/${resale.orderId}`, { headers: { "x-trade-session": token1 } });
     t.ok("portal: the account's own order over HTTP", own.status === 200 && (await own.json()).number === resale.order.number);
-    const other = await fetch(`${base}/trade/buddys/api/orders/${qt.id}`, { headers: { "x-trade-session": token1 } });
+    const other = await fetch(`${base}/trade/riverside-home/api/orders/${qt.id}`, { headers: { "x-trade-session": token1 } });
     t.ok("portal: someone else's order id over HTTP is refused", other.status === 422 && /No such order/.test((await other.json()).error));
-    const badCode = await fetch(`${base}/trade/buddys/api/verify`, { method: "POST", headers: H, body: JSON.stringify({ email: email1, code: "123456" }) });
+    const badCode = await fetch(`${base}/trade/riverside-home/api/verify`, { method: "POST", headers: H, body: JSON.stringify({ email: email1, code: "123456" }) });
     t.ok("portal: a wrong or stale code over HTTP is a plain refusal", badCode.status === 422 && /code/.test((await badCode.json()).error));
     let limitedHit = false;
     for (let i = 0; i < 8 && !limitedHit; i++) {
-      const r = await fetch(`${base}/trade/buddys/api/code`, { method: "POST", headers: H, body: JSON.stringify({ email: `flood-${i}@example.com` }) });
+      const r = await fetch(`${base}/trade/riverside-home/api/code`, { method: "POST", headers: H, body: JSON.stringify({ email: `flood-${i}@example.com` }) });
       if (r.status === 429) limitedHit = true;
     }
     t.ok("portal: asking for codes is rate limited per address", limitedHit);
@@ -525,14 +525,14 @@ export async function run(t: T) {
     _resetLimits();
     let emailLimited = false;
     for (let i = 0; i < 8 && !emailLimited; i++) {
-      const r = await fetch(`${base}/trade/buddys/api/code`, { method: "POST", headers: { ...H, "x-forwarded-for": `192.0.2.${i + 1}` }, body: JSON.stringify({ email: "same-one@example.com" }) });
+      const r = await fetch(`${base}/trade/riverside-home/api/code`, { method: "POST", headers: { ...H, "x-forwarded-for": `192.0.2.${i + 1}` }, body: JSON.stringify({ email: "same-one@example.com" }) });
       if (r.status === 429) emailLimited = true;
     }
     t.ok("portal: codes for one email are limited whatever address asks", emailLimited);
     _resetLimits();
     const big = "data:image/jpeg;base64," + "A".repeat(600_000);
-    const photo = await fetch(`${base}/trade/buddys/api/projects/${proj.id}/photos`, { method: "POST", headers: { ...H, "x-trade-session": token1 }, body: JSON.stringify({ dataUrl: big, caption: "big" }) });
-    const overCap = await fetch(`${base}/trade/buddys/api/projects/${proj.id}`, { method: "POST", headers: { ...H, "x-trade-session": token1 }, body: JSON.stringify({ styleNotes: "x".repeat(600_000) }) });
+    const photo = await fetch(`${base}/trade/riverside-home/api/projects/${proj.id}/photos`, { method: "POST", headers: { ...H, "x-trade-session": token1 }, body: JSON.stringify({ dataUrl: big, caption: "big" }) });
+    const overCap = await fetch(`${base}/trade/riverside-home/api/projects/${proj.id}`, { method: "POST", headers: { ...H, "x-trade-session": token1 }, body: JSON.stringify({ styleNotes: "x".repeat(600_000) }) });
     t.ok("photos: a 600 KB photo uploads on the photo route; other routes keep the 256 KB cap", photo.status === 200 && overCap.status === 413, `${photo.status} / ${overCap.status}`);
   } finally {
     await new Promise<void>((r) => server.close(() => r()));

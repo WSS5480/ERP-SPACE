@@ -2,6 +2,8 @@
 // See docs/MODULES.md for the contract. Handlers are exported (H) so the
 // checks call exactly what a route calls, role checks included.
 
+import { today as bizToday } from "../../packages/core/clock.ts";
+import { addDays } from "../../packages/core/clock.ts";
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
 import { ModuleError, need, requireRole, str, uuid, int, minor } from "./kit.ts";
 import { scopeOf, rolesOf } from "../actions.ts";
@@ -9,7 +11,6 @@ import { q, one } from "../../packages/core/db.ts";
 import { PostingError } from "../../packages/core/posting.ts";
 import * as wf from "../../packages/core/workforce.ts";
 
-const today = () => new Date().toISOString().slice(0, 10);
 const day = (v: unknown, dflt: string) => { const s = str(v, 10); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : dflt; };
 const bpsOf = (v: unknown) => { const n = Number(v); need(Number.isFinite(n) && n >= 0 && n <= 100, "a rate is 0% to 100%"); return Math.round(n * 100); };
 
@@ -64,16 +65,15 @@ export const H = {
     const last = await q<{ kind: string; at: string; work_day: string; location_id: string; location: string }>(c, `
       select p.kind, p.at::text, p.work_day::text, p.location_id, lo.name location from time_punch p join location lo on lo.id = p.location_id
        where p.entity_id = $1 and p.employee_id = $2 and p.voided_at is null order by p.at desc limit 1`, [co.id, id]);
-    const recent = await wf.punchesFor(c, co.id, id, new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10), today());
+    const recent = await wf.punchesFor(c, co.id, id, addDays(await bizToday(c, co.id), -7), await bizToday(c, co.id));
     const hours = await q(c, `select t.worked_on::text, t.hours::text, t.status from timecard t join employee e on e.id = t.employee_id and e.entity_id = $1
-                               where t.employee_id = $2 and t.worked_on >= current_date - 13 order by t.worked_on desc`, [co.id, id]);
+                               where t.employee_id = $2 and t.worked_on >= business_today($1) - 13 order by t.worked_on desc`, [co.id, id]);
     // In the store's own time, whatever zone the phone is in.
     const shifts = await q(c, `select w.id, w.role, lo.name location, x.tz,
                                       (w.starts_at at time zone x.tz)::date::text on_day,
                                       to_char(w.starts_at at time zone x.tz, 'HH24:MI') starts, to_char(w.ends_at at time zone x.tz, 'HH24:MI') ends
                                  from work_shift w join location lo on lo.id = w.location_id
-                                 cross join lateral (select coalesce((select timezone from workforce_location wl where wl.location_id = w.location_id and wl.entity_id = $1),
-                                                                     (select timezone from workforce_settings ws where ws.entity_id = $1), (select time_zone from fleet_setting fs where fs.entity_id = $1), 'America/New_York') tz) x
+                                 cross join lateral (select business_tz($1, w.location_id) tz) x
                                 where w.entity_id = $1 and w.employee_id = $2 and w.status = 'scheduled' and w.ends_at >= now() order by w.starts_at limit 7`, [co.id, id]);
     return { employee: e, last: last[0] ?? null, recent, hours, shifts };
   }),
@@ -139,7 +139,7 @@ export const H = {
     const assignments = await q(c, `select a.id, a.app_user_id, u.name, a.plan_id, p.name plan, a.effective_from::text, a.effective_to::text, a.draw_minor, a.draw_recoverable,
                                            exists (select 1 from employee e where e.entity_id = $1 and e.app_user_id = a.app_user_id and e.status = 'active') on_payroll
                                       from commission_assignment a join app_user u on u.id = a.app_user_id join commission_plan p on p.id = a.plan_id
-                                     where a.entity_id = $1 and (a.effective_to is null or a.effective_to >= current_date) order by u.name`, [co.id]);
+                                     where a.entity_id = $1 and (a.effective_to is null or a.effective_to >= business_today($1)) order by u.name`, [co.id]);
     const spiffs = await q(c, `select s.id, s.name, s.product_id, pr.sku, pr.name product, s.vendor_id, v.legal_name vendor, s.amount_minor, s.starts_on::text, s.ends_on::text, s.active
                                  from spiff s left join product pr on pr.id = s.product_id left join vendor v on v.id = s.vendor_id
                                 where s.entity_id = $1 order by s.active desc, s.ends_on desc`, [co.id]);
@@ -196,7 +196,7 @@ export const H = {
     await requireRole(c, co, a, PAYPLANS, "putting someone on a commission plan");
     const user = uuid(b.appUserId), plan = uuid(b.planId); need(user && plan, "pick the person and the plan");
     const p = await q(c, `select 1 from commission_plan where id = $1 and entity_id = $2 and active`, [plan, co.id]); need(p.length, "no such plan");
-    const from = day(b.from, today());
+    const from = day(b.from, await bizToday(c, co.id));
     // A new assignment ends the one before it.
     await c.query(`update commission_assignment set effective_to = $3::date - 1 where entity_id = $1 and app_user_id = $2
                      and (effective_to is null or effective_to >= $3::date) and effective_from < $3::date`, [co.id, user, from]);
@@ -278,16 +278,16 @@ export const module: ErpModule = {
   id: "workforce",
   register(kit) {
     const g = (u: URL, k: string) => u.searchParams.get(k) ?? "";
-    const monthStart = () => today().slice(0, 8) + "01";
+    const monthStart = async (c: Client, co: Company) => (await bizToday(c, co.id)).slice(0, 8) + "01";
     kit.coGet("/workforce/options", (c, co, _u, _m, p) => H.options(c, co, p));
     kit.coGet("/workforce/me", (c, co, _u, _m, p) => H.me(c, co, p));
     kit.coGet("/workforce/clock", (c, co, u) => H.board(c, co, g(u, "location") || null));
     kit.coGet("/workforce/exceptions", (c, co) => H.exceptions(c, co));
-    kit.coGet("/workforce/punches", (c, co, u) => H.punches(c, co, g(u, "employee"), day(g(u, "from"), today()), day(g(u, "to"), today())));
-    kit.coGet("/workforce/schedule", (c, co, u) => H.schedule(c, co, g(u, "location"), day(g(u, "week"), today())));
+    kit.coGet("/workforce/punches", async (c, co, u) => H.punches(c, co, g(u, "employee"), day(g(u, "from"), await bizToday(c, co.id)), day(g(u, "to"), await bizToday(c, co.id))));
+    kit.coGet("/workforce/schedule", async (c, co, u) => H.schedule(c, co, g(u, "location"), day(g(u, "week"), await bizToday(c, co.id, uuid(g(u, "location"))))));
     kit.coGet("/workforce/commissions", (c, co) => H.commissions(c, co));
     kit.coGet("/workforce/commissions/statement", (c, co, u, _m, p) => H.statement(c, co, g(u, "period"), g(u, "person"), p));
-    kit.coGet("/workforce/leaderboard", (c, co, u) => H.leaderboard(c, co, day(g(u, "from"), monthStart()), day(g(u, "to"), today())));
+    kit.coGet("/workforce/leaderboard", async (c, co, u) => H.leaderboard(c, co, day(g(u, "from"), await monthStart(c, co)), day(g(u, "to"), await bizToday(c, co.id))));
 
     kit.coPost("/workforce/punch", (c, co, a, b) => H.punch(c, co, a, b));
     kit.coPost(`/workforce/punches/${ID}/fix`, (c, co, a, b, m) => H.fix(c, co, a, m[2], b));

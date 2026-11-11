@@ -52,6 +52,7 @@
 // Every route that names a company resolves it from the URL and refuses it
 // (as "no such company") when it is outside what the session may open.
 
+import { today as bizToday } from "../packages/core/clock.ts";
 import http from "node:http";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -75,7 +76,10 @@ import { ActionError, rolesOf, type Actor } from "./actions.ts";
 import * as P from "./platform.ts";
 import { PlatformError } from "./platform.ts";
 import { resetDemo, DemoResetError } from "../packages/core/platform_demo.ts";
-import { clientIp, describeClientIp, forwardingShape } from "./client_ip.ts";
+import { clientIp, describeClientIp } from "./client_ip.ts";
+import { recordError, installProcessHandlers, listErrors, errorByRef } from "./errors.ts";
+import { startScheduler, runDue, jobById, jobsView, runsView, runDetail } from "./scheduler.ts";
+import { PeriodError } from "../packages/core/periods.ts";
 import { loadSampleActivity } from "./sample.ts";
 import { MODULES } from "./modules/index.ts";
 import { ModuleError, PublicPage, PublicAsset, markLookOnly } from "./modules/kit.ts";
@@ -684,8 +688,6 @@ function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body:
 }
 
 const param = (url: URL, k: string) => url.searchParams.get(k) ?? "";
-const monthStart = () => new Date().toISOString().slice(0, 8) + "01";
-const todayStr = () => new Date().toISOString().slice(0, 10);
 
 // --------------------------------------------------------- retail modules
 // Each module registers through the same coGet/coPost doors, so every rule
@@ -760,12 +762,8 @@ async function signedIn(c: Client, l: P.Login): Promise<Reply> {
 
 // One page signs in both kinds: a customer's email and password (or an emailed
 // code), or an operator's name and password.
-// Temporary: the first sign-in after boot logs how the request was forwarded
-// (hop counts only, never addresses), to confirm ERP_TRUSTED_PROXY_HOPS on live.
-let forwardingLogged = false;
 route("POST", /^\/session$/, "none", async (req) => {
   requirePageHeader(req);
-  if (!forwardingLogged) { forwardingLogged = true; console.log(`first sign-in: ${forwardingShape(req)}`); }
   const ip = clientIp(req);
   const body = await readJson(req);
   if (typeof body.email === "string" && body.email.trim()) {
@@ -1039,6 +1037,40 @@ route("POST", /^\/api\/platform\/support\/end$/, "token", async (_req, _u, _m, w
   if (who.support) await tx({ kind: "user", label: `${who.name} (operator)` }, (c) => P.endSupport(c, who.name, who.support!.id));
   return [200, { ok: true }, { "set-cookie": sessionCookie({ n: who.name, e: who.exp, k: "o", t: who.tk }) }];
 });
+// Server errors by reference, and the scheduler's jobs and runs (all companies).
+route("GET", /^\/api\/platform\/errors$/, "token", async (_req, url, _m, who) => {
+  operator(who);
+  const ref = (url.searchParams.get("ref") ?? "").trim();
+  if (ref) { const e = await errorByRef(ref); return [200, e ? [e] : []]; }
+  return [200, await listErrors(Number(url.searchParams.get("limit") ?? 100))];
+});
+route("GET", /^\/api\/platform\/errors\/([A-Za-z0-9]{6})$/, "token", async (_req, _u, m, who) => {
+  operator(who);
+  const e = await errorByRef(m[1]);
+  if (!e) throw new HttpError(404, `no error with reference ${m[1].toUpperCase()}`);
+  return [200, e];
+});
+route("GET", /^\/api\/platform\/jobs$/, "token", async (_req, url, _m, who) => {
+  operator(who);
+  const job = url.searchParams.get("job");
+  return [200, await read(async (c) => ({ jobs: await jobsView(c, null), runs: await runsView(c, null, job && jobById(job) ? job : null, 50) }))];
+});
+route("GET", /^\/api\/platform\/jobs\/runs\/([0-9a-fA-F-]{36})$/, "token", async (_req, _u, m, who) => {
+  operator(who);
+  const r = await read((c) => runDetail(c, m[1], null));
+  if (!r) throw new HttpError(404, "no such run");
+  return [200, r];
+});
+route("POST", /^\/api\/platform\/jobs\/([a-z_]{2,40})\/run$/, "token", async (req, _u, m, who) => {
+  const by = operator(who);
+  const job = jobById(m[1]);
+  if (!job) throw new HttpError(404, "no such job");
+  await readJson(req);
+  // through the scheduler's lock, so it never runs beside the server's own tick
+  const r = await runDue({ trigger: "manual", only: [job.id], force: true, runner: `operator ${by.actor}` });
+  if (r.skipped) throw new HttpError(409, "the scheduler is running jobs right now; try again in a minute");
+  return [200, r.runs[0]];
+});
 route("GET", /^\/api\/platform\/audit$/, "token", async (_req, url, _m, who) => {
   operator(who);
   const t = url.searchParams.get("tenant");
@@ -1157,20 +1189,20 @@ coPost("/setup/banks", (c, co, a, b) => act.addBankAccount(c, co, a, b));
 coPost("/setup/people", (c, co, a, b) => act.addPerson(c, co, a, b));
 coPost("/setup/people/([0-9a-fA-F-]{36})/roles", (c, co, a, b, m) => act.setRoles(c, co, a, { ...b, personId: m[2] }));
 
-coGet("/books/pnl", (c, co, url) => {
-  const from = DAY.test(param(url, "from")) ? param(url, "from") : monthStart();
-  const to = DAY.test(param(url, "to")) ? param(url, "to") : todayStr();
+coGet("/books/pnl", async (c, co, url) => {
+  const to = DAY.test(param(url, "to")) ? param(url, "to") : await bizToday(c, co.id);
+  const from = DAY.test(param(url, "from")) ? param(url, "from") : (await bizToday(c, co.id)).slice(0, 8) + "01";
   return views.pnl(c, co, from, to);
 });
-coGet("/books/account/([0-9A-Za-z.-]{1,20})", (c, co, url, m) => {
-  const from = DAY.test(param(url, "from")) ? param(url, "from") : monthStart();
-  const to = DAY.test(param(url, "to")) ? param(url, "to") : todayStr();
+coGet("/books/account/([0-9A-Za-z.-]{1,20})", async (c, co, url, m) => {
+  const to = DAY.test(param(url, "to")) ? param(url, "to") : await bizToday(c, co.id);
+  const from = DAY.test(param(url, "from")) ? param(url, "from") : (await bizToday(c, co.id)).slice(0, 8) + "01";
   const store = param(url, "store");
   return views.accountLines(c, co, m[2], from, to, store === "none" || UUID.test(store) ? store : null);
 });
 coGet("/books/entry/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.entry(c, co, m[2]));
-coGet("/books/trial-balance", (c, co, url) =>
-  views.trialBalance(c, co, DAY.test(param(url, "asOf")) ? param(url, "asOf") : todayStr()));
+coGet("/books/trial-balance", async (c, co, url) =>
+  views.trialBalance(c, co, DAY.test(param(url, "asOf")) ? param(url, "asOf") : await bizToday(c, co.id)));
 
 coGet("/cash", (c, co) => views.cash(c, co));
 coPost("/cash/plan", (c, co, a) => act.planTodaysSweeps(c, co, a));
@@ -1442,7 +1474,7 @@ route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
 // ------------------------------------------------------------------- server
 
 // The engine's refusals are written for people; pass them on as they are.
-const REFUSALS = [PlatformError, DemoResetError, ModuleError, TaxError, InventoryError, ArError, PostingError, PricingError, SetupError, PosError, WorkforceError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
+const REFUSALS = [PeriodError, PlatformError, DemoResetError, ModuleError, TaxError, InventoryError, ArError, PostingError, PricingError, SetupError, PosError, WorkforceError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
 
 function refusal(e: unknown): string | null {
   if (REFUSALS.some((K) => e instanceof K)) return (e as Error).message;
@@ -1510,8 +1542,9 @@ export function createServer(): http.Server {
       else if (why) { status = 409; json(res, 409, { error: why }); }
       else {
         status = 500;
-        console.error(`error on ${req.method} ${url.pathname}: ${describeError(e)}`);
-        json(res, 500, { error: "internal error; the detail is in the service log" });
+        // A short reference the person can read out; the ERP team finds the detail in the Operator console.
+        const ref = await recordError(e, { kind: "request", method: req.method, path: logPath(url.pathname), status: 500 });
+        if (!res.headersSent) json(res, 500, { error: `Something went wrong on our side (ref ${ref}). Nothing was changed; tell the ERP team the reference if it happens again.`, ref });
       }
     } finally {
       // method, path, status, time. Never bodies, never tokens.
@@ -1530,6 +1563,7 @@ export async function start(): Promise<http.Server> {
       "ERP-api -> Environment -> add DATABASE_URL with the database's Internal Database URL.");
   }
   if (!APP || !APP_JS || !APP_CSS) console.warn("the app files are not all in server/; the root address will say so");
+  installProcessHandlers();
   console.log(describeClientIp());
   const applied = await migrate({ seed: TRIAL });
   console.log(applied.length ? `migrations: applied ${applied.length}` : "migrations: up to date");
@@ -1550,7 +1584,9 @@ export async function start(): Promise<http.Server> {
       .catch((e) => console.error(`outbox: ${describeError(e)}`));
   }, 60_000);
   outbox.unref();
-  const stop = () => { clearInterval(outbox); server.close(() => pool.end().then(() => process.exit(0))); };
+  // Due jobs run here, one runner across instances (server/scheduler.ts); render.yaml's cron service stays off.
+  const stopScheduler = startScheduler((s) => console.log(s));
+  const stop = () => { clearInterval(outbox); stopScheduler(); server.close(() => pool.end().then(() => process.exit(0))); };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
   return server;

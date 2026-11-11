@@ -31,12 +31,12 @@
 // Receiving posts nothing: inventory reaches the ledger when the vendor's
 // merchandise invoice posts in payables (Dr 1300 Cr 2010), as it already does.
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor } from "./posting.ts";
 
 export class InventoryError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new InventoryError(msg); };
-const today = () => new Date().toISOString().slice(0, 10);
 
 /** Statuses in which a unit counts toward on_hand at its location. */
 export const ON_HAND = ["in_stock", "reserved", "picked", "loaded", "damaged", "in_repair", "vendor_claim", "as_is", "returned"];
@@ -555,8 +555,9 @@ async function level(c: Client, entityId: string, productId: string, locationId:
 
 /** Post a stock value change: positive = inventory up. Returns the journal entry, or null for zero. */
 async function postValue(c: Client, scope: Scope, locationId: string, valueMinor: bigint, sourceId: string, description: string,
-  other = "5040", date: string = today()): Promise<string | null> {
+  other = "5040", date?: string): Promise<string | null> {
   if (valueMinor === 0n) return null;
+  date ??= await bizToday(c, scope, locationId);   // the store's own day
   const po = await profitObjectFor(c, scope.entityId, locationId);
   const abs = valueMinor < 0n ? -valueMinor : valueMinor;
   const lines = valueMinor > 0n
@@ -675,7 +676,7 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
   const cols = await columnsOf(c, "purchase_order_line");
   need(cols.has("product_id"), "purchase order lines do not name products yet, so nothing can be received into stock");
   const gr = await one<{ id: string }>(c, `insert into goods_receipt (purchase_order_id, received_on, received_by, note) values ($1,$2,$3,$4) returning id`,
-    [po[0].id, today(), by, e.note ?? null]);
+    [po[0].id, (await bizToday(c, scope)), by, e.note ?? null]);
   const out: { poLineId: string; sku: string; qty: number; labels: string[]; unitCostMinor: bigint; reservedFor: string[]; serials: string[]; lots: string[] }[] = [];
   const seen = new Set<string>();
   const received = new Set<string>(), linked = new Set<string>();
@@ -749,7 +750,7 @@ export async function receivePurchaseOrder(c: Client, scope: Scope, e: { purchas
   // Received, not yet invoiced: the vendor's bill clears 2050.
   if (total > 0n) {
     const pobj = await profitObjectFor(c, entityId, e.locationId);
-    await post(c, scope, { date: today(), sourceType: "inventory", sourceId: gr.id, description: `Received on ${po[0].number}`,
+    await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "inventory", sourceId: gr.id, description: `Received on ${po[0].number}`,
       lines: [{ code: "1300", debit: total, profitObjectId: pobj }, { code: "2050", credit: total, profitObjectId: pobj, memo: "received not invoiced" }] });
   }
   // Closed when every line is in.
@@ -822,7 +823,7 @@ export async function recheckBackorders(c: Client, entityId: string, f: { produc
 export async function bookReceiving(c: Client, scope: Scope, e: { locationId: string; day: string; window?: string; vendorId?: string | null;
   purchaseOrderId?: string | null; carrier?: string; expectedPieces: number; note?: string }) {
   need(/^\d{4}-\d{2}-\d{2}$/.test(e.day), "pick a day");
-  need(e.day >= today(), "that day has passed");
+  need(e.day >= (await bizToday(c, scope)), "that day has passed");
   need(Number.isInteger(e.expectedPieces) && e.expectedPieces > 0, "how many pieces are coming?");
   const loc = await q(c, `select id from location where id = $1 and entity_id = $2`, [e.locationId, scope.entityId]);
   need(loc.length, "no such location");
@@ -933,7 +934,7 @@ export async function createTransfer(c: Client, scope: Scope, e: { fromId: strin
 export async function shipTransfer(c: Client, scope: Scope, id: string, opts: { expectedOn?: string | null } = {}) {
   const t = await transferOf(c, scope.entityId, id);
   need(t.status === "draft", `transfer ${t.number} is ${t.status.replace("_", " ")}, so it cannot ship`);
-  if (opts.expectedOn) need(/^\d{4}-\d{2}-\d{2}$/.test(opts.expectedOn) && opts.expectedOn >= today(), "the arrival day is a day from today on");
+  if (opts.expectedOn) need(/^\d{4}-\d{2}-\d{2}$/.test(opts.expectedOn) && opts.expectedOn >= (await bizToday(c, scope)), "the arrival day is a day from today on");
   // To another of the client's companies: the goods leave this company's books (sold to the sibling at transfer price).
   const across = !!t.to_entity_id;
   if (across) await groupRole(c, scope, t.to_entity_id!, "shipping to another of the client's companies");
@@ -1008,12 +1009,12 @@ export async function shipTransfer(c: Client, scope: Scope, id: string, opts: { 
     const docs = await group.completeAcross(c, scope, id);
     return { number: t.number, valueMinor: value, ...docs };
   }
-  const arrive = opts.expectedOn || addDaysIso(today(), ts.transitDays);
+  const arrive = opts.expectedOn || addDaysIso((await bizToday(c, scope)), ts.transitDays);
   await c.query(`update inv_transfer set status = 'in_transit', shipped_by = $3, shipped_at = now(), transit_gl = $4, expected_on = $5 where id = $1 and entity_id = $2`,
     [id, scope.entityId, by, gl, arrive]);
   if (value > 0n && gl === "1310") {
     const po = await profitObjectFor(c, scope.entityId, t.from_location_id);
-    await post(c, scope, { date: today(), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} shipped`,
+    await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} shipped`,
       lines: [{ code: "1310", debit: value, profitObjectId: po }, { code: "1300", credit: value, profitObjectId: po }] });
   }
   if (!ts.twoStep) {
@@ -1070,11 +1071,11 @@ export async function receiveTransfer(c: Client, scope: Scope, id: string, e: { 
     const po = await profitObjectFor(c, scope.entityId, t.to_location_id);
     // Shipped before the account was chosen per transfer: it went through 1310.
     if ((t.transit_gl ?? "1310") === "1310") {
-      await post(c, scope, { date: today(), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} received`,
+      await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} received`,
         lines: [{ code: "1300", debit: value, profitObjectId: po }, { code: "1310", credit: value, profitObjectId: po }] });
     } else {
       const from = await profitObjectFor(c, scope.entityId, t.from_location_id);
-      if (from !== po) await post(c, scope, { date: today(), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} received`,
+      if (from !== po) await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "inventory", sourceId: id, description: `Transfer ${t.number} received`,
         lines: [{ code: "1300", debit: value, profitObjectId: po }, { code: "1300", credit: value, profitObjectId: from }] });
     }
   }
@@ -1737,7 +1738,7 @@ export async function adjust(c: Client, scope: Scope, e: { locationId: string; p
   }
   // stock that was there before the books (an opening balance) is equity, not shrink
   const je = await postValue(c, scope, e.locationId, value, adjId, `Adjustment ${number}: ${e.reasonCode.replace(/_/g, " ")}`,
-    e.reasonCode === "opening_balance" ? "3000" : "5040", e.postOn || today());
+    e.reasonCode === "opening_balance" ? "3000" : "5040", e.postOn || (await bizToday(c, scope)));
   await c.query(`insert into inv_adjustment (id, entity_id, number, location_id, bin_id, product_id, qty, reason_code, note, labels, value_minor, journal_entry_id, by_user)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, [adjId, scope.entityId, number, e.locationId, bin, p.id, qty, e.reasonCode, e.note ?? null, labels,
     value.toString(), je, by]);
@@ -1816,7 +1817,7 @@ export async function revalue(c: Client, scope: Scope, e: { productId: string; l
   const side = (code: string, v: bigint, memo?: string) => (v > 0n ? { code, debit: v, profitObjectId: po, memo } : { code, credit: -v, profitObjectId: po, memo });
   const lines = [side("1300", e.onHandMinor), side("5000", e.goneMinor, "landed cost on goods already sold"), side("2050", -total, "received not invoiced")]
     .filter((l) => (l.debit ?? l.credit ?? 0n) !== 0n);
-  return post(c, scope, { date: today(), sourceType: "inventory", sourceId: e.sourceId, description: e.description.slice(0, 300), lines });
+  return post(c, scope, { date: (await bizToday(c, scope)), sourceType: "inventory", sourceId: e.sourceId, description: e.description.slice(0, 300), lines });
 }
 
 /** Goods on the road for a product: shipped on a PO (an 856 or a container that left) or on a transfer, and where each is going. */

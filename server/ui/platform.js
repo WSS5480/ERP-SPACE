@@ -52,7 +52,7 @@ const statusChip = (t) => (t.kind === 'demo' ? chip('neutral', 'info', 'Demo') :
 
 // ========================================================= operator console
 async function screenOperator() {
-  const [list, prospects] = await Promise.all([api('/api/platform/customers'), api('/api/platform/prospects')]);
+  const [list, prospects, jobs, errors] = await Promise.all([api('/api/platform/customers'), api('/api/platform/prospects'), api('/api/platform/jobs'), api('/api/platform/errors?limit=20')]);
   const customers = list.filter((t) => t.kind !== 'demo');
   const demo = list.filter((t) => t.kind === 'demo');
   const sup = E.S.me.viewer.support;
@@ -87,7 +87,50 @@ async function screenOperator() {
         el('button', { class: 'btn', type: 'button', onclick: newProspect }, icon('plus'), 'Demo sign-in for a prospect'),
         el('button', { class: 'btn', type: 'button', onclick: resetDemo }, icon('refresh'), 'Reset demo')),
       demoCards.length ? el('div', { class: 'cards' }, demoCards) : empty('No demo loaded', 'Reset demo loads it from the sample data.', true),
-    prospectCards.length ? el('div', { class: 'cards' }, prospectCards) : null));
+    prospectCards.length ? el('div', { class: 'cards' }, prospectCards) : null),
+    jobsSection(jobs), errorsSection(errors));
+}
+
+// ------------------------------------------------- scheduled jobs, errors
+const JOB_TONE = { ok: ['good', 'ok', 'OK'], partial: ['warning', 'warn', 'Partly'], failed: ['critical', 'fail', 'Failed'], running: ['neutral', 'clock', 'Running'], never: ['neutral', 'pending', 'Not run yet'] };
+const jobChip = (s) => chip(...(JOB_TONE[s] || JOB_TONE.never));
+function jobsSection(d) {
+  return section('Scheduled jobs', 'Run inside the server, one runner at a time', null, el('div', { class: 'cards' }, d.jobs.map((j) => card({
+    title: j.label, badge: jobChip(j.status), onClick: j.lastRunId ? () => runDialog(j.lastRunId) : null,
+    rows: [['Last run', when(j.lastRunAt), j.lastRunId ? () => runDialog(j.lastRunId) : null], ['Next run', j.nextRunAt ? new Date(j.nextRunAt).toLocaleString() : 'within a minute'],
+      j.error ? ['Error', j.error] : null, j.note ? ['Result', j.note] : null],
+    acts: [el('button', { class: 'btn', type: 'button', onclick: (e) => E.act(e.currentTarget, () => api(`/api/platform/jobs/${j.id}/run`, { method: 'POST', body: {} }), (r) => `${j.label}: ${r.status}`).then(() => E.render()) }, icon('refresh'), 'Run now')],
+  }))));
+}
+async function runDialog(id) {
+  const d = openDialog('Job run', null);
+  fillDialog(d, async () => {
+    const r = await api(`/api/platform/jobs/runs/${id}`);
+    return E.frag(card({ title: r.label, badge: jobChip(r.status), rows: [['Started', new Date(r.started_at).toLocaleString()], ['Finished', r.finished_at ? new Date(r.finished_at).toLocaleString() : 'still running'],
+      ['How', `${r.trigger} · ${r.runner}`], r.summary ? ['Summary', r.summary] : null, r.error ? ['Error', r.error] : null] }),
+      r.items.length ? el('div', { class: 'cards' }, r.items.map((x) => card({ title: x.company || x.tenant || 'The install', badge: x.ok ? chip('good', 'ok', 'OK') : chip('critical', 'fail', 'Failed'), rows: [['Note', x.note]] })))
+        : empty('Nothing per company in this run', null, true),
+      el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: () => d.close() }, icon('chev', 'back'), 'Back')));
+  });
+}
+function errorsSection(list) {
+  const ref = input({ maxlength: '6', placeholder: 'ABC123', autocapitalize: 'characters' });
+  const find = el('button', { class: 'btn', type: 'button', onclick: () => { if (ref.value.trim()) errorDialog(ref.value.trim()); } }, 'Look up');
+  return section('Server errors', list.length ? `latest ${list.length}` : 'none', null,
+    el('div', { class: 'row-acts' }, field('Reference a person read out', ref), find),
+    list.length ? el('div', { class: 'cards' }, list.map((x) => card({ title: `ref ${x.ref}`, badge: chip(x.kind === 'request' ? 'warning' : 'critical', 'warn', x.kind.replace(/_/g, ' ')), onClick: () => errorDialog(x.ref),
+      rows: [['When', new Date(x.at).toLocaleString()], ['Where', [x.method, x.path].filter(Boolean).join(' ') || '—'], ['Customer', x.tenant || '—'], ['Message', x.message]] })))
+      : empty('No server errors', 'Errors a person sees as "ref ABC123" land here.', true));
+}
+function errorDialog(ref) {
+  const d = openDialog(`Error ref ${ref.toUpperCase()}`, null);
+  fillDialog(d, async () => {
+    const x = await api(`/api/platform/errors/${encodeURIComponent(ref)}`);
+    return E.frag(card({ title: x.message, rows: [['When', new Date(x.at).toLocaleString()], ['Kind', x.kind.replace(/_/g, ' ')], ['Where', [x.method, x.path].filter(Boolean).join(' ') || '—'],
+      ['Customer', x.tenant || '—'], ['Company', x.company || '—'], ['Who', x.who || '—'], ['Alert sent', x.alerted ? 'yes' : 'no']] }),
+      x.stack ? el('pre', { class: 'stack', text: x.stack }) : null,
+      el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: () => d.close() }, icon('chev', 'back'), 'Back')));
+  });
 }
 
 async function newCustomer() {

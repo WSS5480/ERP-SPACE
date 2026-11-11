@@ -810,6 +810,11 @@ async function sendClaimed(m: Claimed, env: MsgEnv): Promise<boolean> {
     await c.query(`update outbound_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end where id = $1 and entity_id = $2`,
       [m.id, m.entity_id, ok ? "sent" : "failed", ref, error?.slice(0, 500) ?? null]);
     if (row) await mark(c, row, ok, error);
+    // a campaign message handed to the outbox reads 'sent'; if the provider refused it, it says so
+    if (m.source_table === "crm_message" && m.source_id && !ok) {
+      await c.query(`update crm_message set status = 'failed', reason = $3 where id = $1 and entity_id = $2 and status = 'sent'`,
+        [m.source_id, m.entity_id, (error ?? "the provider refused it").slice(0, 200)]);
+    }
     if (m.source_table === "customer_message" && m.source_id) {
       await c.query(`update customer_message set status = $3, provider_ref = $4, error = $5, sent_at = case when $3 = 'sent' then now() end where id = $1 and entity_id = $2`,
         [m.source_id, m.entity_id, ok ? "sent" : "failed", ref, error?.slice(0, 300) ?? null]);

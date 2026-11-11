@@ -43,7 +43,7 @@ async function overview(c: Client, co: Company) {
   const dmg = await q<{ n: string }>(c, `select count(*) n from inv_damage where entity_id = $1 and status <> 'resolved'`, [co.id]);
   const counts = await q<{ n: string }>(c, `select count(*) n from inv_count where entity_id = $1 and status = 'submitted'`, [co.id]);
   const transfers = await q<{ n: string }>(c, `select count(*) n from inv_transfer where entity_id = $1 and status = 'in_transit'`, [co.id]);
-  const appts = await q<{ n: string }>(c, `select count(*) n from inv_receiving_appt where entity_id = $1 and status = 'booked' and day between current_date and current_date + 7`, [co.id]);
+  const appts = await q<{ n: string }>(c, `select count(*) n from inv_receiving_appt where entity_id = $1 and status = 'booked' and day between business_today($1) and business_today($1) + 7`, [co.id]);
   const pieces = await q<{ status: string; n: string }>(c, `select status, count(*) n from inv_piece where entity_id = $1 group by status`, [co.id]);
   return { locations: locs, valueMinor: val.totalMinor, inTransitMinor: val.inTransitMinor, openDamage: Number(dmg[0].n),
     countsToApprove: Number(counts[0].n), transfersInTransit: Number(transfers[0].n), receivingThisWeek: Number(appts[0].n),
@@ -85,7 +85,7 @@ async function receiving(c: Client, co: Company) {
            a.carrier, a.expected_pieces, a.status, a.note
       from inv_receiving_appt a join location l on l.id = a.location_id
       left join vendor v on v.id = a.vendor_id left join purchase_order po on po.id = a.purchase_order_id
-     where a.entity_id = $1 and a.day >= current_date - 1 and a.status <> 'cancelled' order by a.day, a.window_label`, [co.id]);
+     where a.entity_id = $1 and a.day >= business_today($1) - 1 and a.status <> 'cancelled' order by a.day, a.window_label`, [co.id]);
   const docks = await q(c, `select d.location_id, l.name location, d.daily_piece_limit from inv_dock d join location l on l.id = d.location_id
      where d.entity_id = $1`, [co.id]);
   const recent = await q(c, `select gr.id, po.number, gr.received_on::text, u.name received_by, count(gl.id)::int lines, coalesce(sum(gl.quantity),0)::text qty

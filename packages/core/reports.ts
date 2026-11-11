@@ -537,8 +537,9 @@ export type RunResult = {
 
 type RunOpts = { offset?: number; size?: number; params?: unknown; extraFilters?: Filter[]; cap?: number; withChart?: boolean; preview?: boolean };
 
-async function today(c: Client): Promise<string> {
-  return (await q<{ d: string }>(c, `select current_date::text d /* unscoped: the clock */`))[0].d;
+/** The company's business date: a report's "as of" and a schedule's next day are the company's, not UTC's. */
+async function today(c: Client, entityId: string): Promise<string> {
+  return (await q<{ d: string }>(c, `select business_today($1)::text d /* unscoped: keyed by the entity argument */`, [entityId]))[0].d;
 }
 
 /** Filters with any asked-at-run values put in: params is { [filterIndex]: { value, value2, op } }. */
@@ -562,7 +563,7 @@ export async function run(c: Client, entityId: string, roles: Set<string>, raw: 
   const ds = DATASET.get(def.dataset)!;
   requireDataset(ds, roles);
   await c.query(`select set_config('statement_timeout', $1, true)`, [String(LIMITS.timeoutMs)]);
-  const asOf = await today(c);
+  const asOf = await today(c, entityId);
   const filters = [...applyParams(def, o.params), ...(o.extraFilters ?? [])];
   const unfilled = (f: Filter) => f.value === undefined && !["blank", "not_blank", "is_true", "is_false"].includes(f.op);
   // A preview leaves out a prompt nobody has answered yet; a real run asks for it.
@@ -997,7 +998,7 @@ export async function setSchedule(c: Client, scope: Scope, id: string, personId:
     if (sched.every === "weekly") { const w = Number(b.weekday ?? 1); need(Number.isInteger(w) && w >= 0 && w <= 6, "pick a day of the week"); sched.weekday = w; }
     if (sched.every === "monthly") { const m = Number(b.monthday ?? 1); need(Number.isInteger(m) && m >= 1 && m <= 28, "pick a day of the month from 1 to 28"); sched.monthday = m; }
   }
-  const next = sched ? nextRun(sched, await today(c)) : null;
+  const next = sched ? nextRun(sched, await today(c, scope.entityId)) : null;
   await c.query(`update report set schedule = $3, next_run_on = $4, schedule_by = $5 where id = $1 and entity_id = $2`,
     [id, scope.entityId, sched ? JSON.stringify(sched) : null, next, sched ? personId : null]);
   await audit(c, scope, { table: "report", rowId: id, action: "update", before: { schedule: r.schedule }, after: { schedule: sched, nextRunOn: next } });
@@ -1083,10 +1084,10 @@ export async function runDueReports(pool: { connect: () => Promise<Client> }, tx
                          from report r join entity e on e.id = r.entity_id
                         where r.status = 'active' and r.schedule is not null and r.schedule_by is not null
                           and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active')
-                          and r.next_run_on <= coalesce($1::date, current_date) and ($2::uuid is null or r.entity_id = $2)
+                          and r.next_run_on <= coalesce($1::date, business_today(r.entity_id)) and ($2::uuid is null or r.entity_id = $2)
                         order by r.next_run_on /* unscoped: the scheduler walks every company's reports */`, [asOf ?? null, only ?? null]);
   } finally { c0.release(); }
-  const out: { name: string; ok: boolean; note: string }[] = [];
+  const out: { name: string; ok: boolean; note: string; entityId: string; tenantId: string }[] = [];
   for (const r of due) {
     const actor = { kind: "system" as const, label: "report scheduler" };
     try {
@@ -1096,9 +1097,9 @@ export async function runDueReports(pool: { connect: () => Promise<Client> }, tx
         await c.query(`update report set next_run_on = $3 where id = $1 and entity_id = $2`, [r.id, r.entity_id, nextRun(r.schedule, asOf ?? r.next_run_on)]);
         return res;
       });
-      out.push({ name: r.name, ok: !s.problem, note: s.problem ?? `${s.rows} rows${s.delivery ? `, email prepared for ${s.delivery.to.length}` : ""}` });
+      out.push({ name: r.name, ok: !s.problem, note: s.problem ?? `${s.rows} rows${s.delivery ? `, email prepared for ${s.delivery.to.length}` : ""}`, entityId: r.entity_id, tenantId: r.tenant_id });
     } catch (e) {
-      out.push({ name: r.name, ok: false, note: (e as Error).message });
+      out.push({ name: r.name, ok: false, note: (e as Error).message, entityId: r.entity_id, tenantId: r.tenant_id });
     }
   }
   return { due: due.length, runs: out };

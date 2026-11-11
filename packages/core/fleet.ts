@@ -7,6 +7,7 @@
 // taken at the door goes through a customer_receipt and ar.postReceipt.
 // Routing maths is in routing.ts and has no database in it.
 
+import { timeZoneFor } from "./clock.ts";
 import { partialSetWarning } from "./configurator.ts";
 import { createHash, randomBytes } from "node:crypto";
 import * as messaging from "./messaging.ts";
@@ -48,10 +49,14 @@ export async function settings(c: Client, entityId: string): Promise<Settings> {
            booking_lead_days, link_valid_days
       from fleet_setting where entity_id = $1`, [entityId]);
   const x = r[0];
-  // no delivery settings yet: the time clock's zone if there is one
-  const wz = x ? null : (await q<{ tz: string }>(c, `select timezone tz from workforce_settings where entity_id = $1`, [entityId]))[0]?.tz;
-  if (!x) return { tz: wz ?? "America/Chicago", avgMph: 30, roadFactor: 1.3, startMin: 450, endMin: 1110, baseMin: 10,
-    perPieceMin: 4, perStairPieceMin: 3, laborHourMinor: 2200n, fuelPriceMinor: 389n, leadDays: 1, linkDays: 14 };
+  // no delivery settings yet: the company's business zone (clock.ts) and its pack's minutes per stop (fleet.service_minutes)
+  if (!x) {
+    const sm = (await q<{ value: { base?: number; per_piece?: number; per_stair_flight?: number } }>(c,
+      `select value from entity_setting where entity_id = $1 and key = 'fleet.service_minutes' and jsonb_typeof(value) = 'object'`, [entityId]))[0]?.value ?? {};
+    const mins = (v: unknown, d: number) => { const k = Number(v); return Number.isFinite(k) && k >= 0 ? Math.trunc(k) : d; };
+    return { tz: await timeZoneFor(c, entityId), avgMph: 30, roadFactor: 1.3, startMin: 450, endMin: 1110, baseMin: mins(sm.base, 10),
+    perPieceMin: mins(sm.per_piece, 4), perStairPieceMin: mins(sm.per_stair_flight, 3), laborHourMinor: 2200n, fuelPriceMinor: 389n, leadDays: 1, linkDays: 14 };
+  }
   return { tz: String(x.time_zone), avgMph: n(x.avg_mph), roadFactor: n(x.road_factor), startMin: n(x.start_min),
     endMin: n(x.end_min), baseMin: n(x.base_service_min), perPieceMin: n(x.per_piece_min),
     perStairPieceMin: n(x.per_stair_piece_min), laborHourMinor: BigInt(x.labor_cost_hour_minor),
@@ -144,8 +149,8 @@ export async function vehicle(c: Client, entityId: string, id: string) {
            order by read_at desc limit 20`, [entityId, id]),
   ]);
   const cost = await q<{ s: string }>(c, `
-    select (coalesce((select sum(cost_minor) from service_record where entity_id = $1 and vehicle_id = $2 and performed_on > current_date - 365),0)
-          + coalesce((select sum(cost_minor) from fuel_log where entity_id = $1 and vehicle_id = $2 and filled_on > current_date - 365),0))::text s`,
+    select (coalesce((select sum(cost_minor) from service_record where entity_id = $1 and vehicle_id = $2 and performed_on > business_today($1) - 365),0)
+          + coalesce((select sum(cost_minor) from fuel_log where entity_id = $1 and vehicle_id = $2 and filled_on > business_today($1) - 365),0))::text s`,
     [entityId, id]);
   return { ...v, schedules, services, fuel, dvirs, odometer: odo, costYearMinor: cost[0].s };
 }
@@ -207,7 +212,7 @@ export async function addSchedule(c: Client, scope: Scope, vehicleId: string, b:
   const v = await q<{ odometer_mi: number }>(c, `select odometer_mi from vehicle where entity_id = $1 and id = $2`, [scope.entityId, vehicleId]);
   need(v.length, "no such vehicle");
   return one(c, `insert into maintenance_schedule (entity_id, vehicle_id, task, every_miles, every_days, last_done_mi, last_done_on)
-                 values ($1,$2,$3,$4,$5,$6,coalesce($7::date, current_date)) returning id`,
+                 values ($1,$2,$3,$4,$5,$6,coalesce($7::date, business_today($1))) returning id`,
     [scope.entityId, vehicleId, task, mi, days, b.lastDoneMi != null ? n(b.lastDoneMi) : v[0].odometer_mi,
      DAY.test(String(b.lastDoneOn ?? "")) ? b.lastDoneOn : null]);
 }
@@ -230,7 +235,7 @@ export async function recordService(c: Client, scope: Scope, vehicleId: string, 
   if (odo != null && odo > v[0].odometer_mi) await recordOdometer(c, scope, vehicleId, odo, "service");
   const r = await one<{ id: string; performed_on: string }>(c, `
     insert into service_record (entity_id, vehicle_id, schedule_id, performed_on, odometer_mi, vendor_name, description, cost_minor, recorded_by)
-    values ($1,$2,$3,coalesce($4::date, current_date),$5,nullif($6,''),$7,$8,$9) returning id, performed_on::text`,
+    values ($1,$2,$3,coalesce($4::date, business_today($1)),$5,nullif($6,''),$7,$8,$9) returning id, performed_on::text`,
     [scope.entityId, vehicleId, sched, on, odo ?? v[0].odometer_mi, String(b.vendorName ?? "").trim(), desc, costMinor.toString(), scope.actor.id || null]);
   if (sched) await c.query(`update maintenance_schedule set last_done_mi = $3, last_done_on = $4 where entity_id = $1 and id = $2`,
     [scope.entityId, sched, odo ?? v[0].odometer_mi, r.performed_on]);
@@ -246,7 +251,7 @@ export async function logFuel(c: Client, scope: Scope, vehicleId: string, b: Rec
   const odo = b.odometerMi != null && b.odometerMi !== "" ? n(b.odometerMi) : null;
   if (odo != null) await recordOdometer(c, scope, vehicleId, odo, "fuel");
   return one(c, `insert into fuel_log (entity_id, vehicle_id, driver_id, filled_on, gallons, cost_minor, odometer_mi, station)
-                 values ($1,$2,$3,coalesce($4::date,current_date),$5,$6,$7,nullif($8,'')) returning id`,
+                 values ($1,$2,$3,coalesce($4::date,business_today($1)),$5,$6,$7,nullif($8,'')) returning id`,
     [scope.entityId, vehicleId, scope.actor.id || null, DAY.test(String(b.filledOn ?? "")) ? b.filledOn : null, gal,
      costMinor.toString(), odo, String(b.station ?? "").trim()]);
 }
@@ -257,7 +262,7 @@ export async function maintenanceDue(c: Client, entityId: string) {
     miles_left: number | null; days_left: number | null; due_on: string | null }>(c, `
     select m.id, m.vehicle_id, v.unit_no, m.task, m.every_miles, m.every_days,
            case when m.every_miles is not null then m.last_done_mi + m.every_miles - v.odometer_mi end miles_left,
-           case when m.every_days is not null then (m.last_done_on + m.every_days) - current_date end days_left,
+           case when m.every_days is not null then (m.last_done_on + m.every_days) - business_today($1) end days_left,
            case when m.every_days is not null then (m.last_done_on + m.every_days)::text end due_on
       from maintenance_schedule m join vehicle v on v.id = m.vehicle_id
      where m.entity_id = $1 and m.active and v.status <> 'retired'
@@ -342,8 +347,8 @@ export async function drivers(c: Client, entityId: string, tenantId: string, onD
            p.license_expires::text license_expires, p.medical_expires::text medical_expires, p.phone,
            p.default_helper_id, hu.name default_helper, p.hourly_cost_minor, coalesce(p.active, false) active,
            p.app_user_id is not null set_up,
-           (p.kind = 'driver' and p.license_expires < coalesce($3::date, current_date)) license_expired,
-           (p.kind = 'driver' and p.license_expires between coalesce($3::date, current_date) and coalesce($3::date, current_date) + 30) license_expiring
+           (p.kind = 'driver' and p.license_expires < coalesce($3::date, business_today($1))) license_expired,
+           (p.kind = 'driver' and p.license_expires between coalesce($3::date, business_today($1)) and coalesce($3::date, business_today($1)) + 30) license_expiring
       from app_user u
       join role_grant g on g.app_user_id = u.id and g.role in ('driver','technician')
                        and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $2))
@@ -399,7 +404,7 @@ export async function zones(c: Client, entityId: string) {
            cube_cap::float cube_cap, weight_cap_lb::float weight_cap_lb, labor_min_cap, active
       from delivery_window where entity_id = $1 order by starts`, [entityId]);
   const blackouts = await q(c, `select b.id, b.zone_id, b.day::text as day, b.reason from delivery_blackout b
-                                 where b.entity_id = $1 and b.day >= current_date and b.released_at is null order by b.day`, [entityId]);
+                                 where b.entity_id = $1 and b.day >= business_today($1) and b.released_at is null order by b.day`, [entityId]);
   return { zones: z.map((x) => ({ ...x, windows: w.filter((y) => y.zone_id === x.id) })), blackouts };
 }
 
@@ -1717,7 +1722,7 @@ export async function dashboard(c: Client, entityId: string, day: string) {
     select coalesce(sum(extract(epoch from coalesce(finished_at, now()) - started_at)) / 3600, 0)::float h
       from delivery_route where entity_id = $1 and route_on = $2 and started_at is not null and status <> 'cancelled'`, [entityId, day]);
   const fuel = await q<{ ppg: number | null }>(c, `
-    select (sum(cost_minor)::float / nullif(sum(gallons),0))::float ppg from fuel_log where entity_id = $1 and filled_on > current_date - 60`, [entityId]);
+    select (sum(cost_minor)::float / nullif(sum(gallons),0))::float ppg from fuel_log where entity_id = $1 and filled_on > business_today($1) - 60`, [entityId]);
   const ppg = fuel[0]?.ppg ?? Number(s.fuelPriceMinor);
   const mpg = await q<{ id: string; mpg: number; crew: number }>(c, `
     select r.id, coalesce(v.mpg, 9)::float mpg, (1 + (r.helper_id is not null)::int) crew

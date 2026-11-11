@@ -39,8 +39,8 @@ export async function run(t: T) {
 
   const csv = [
     "number,name,email,phone,address,city,state,zip,credit_limit,terms_days",
-    "C-000001,Alicia Gomez-Ruiz,alicia@example.com,717-555-0101,12 Oak Ln,Camp Hill,PA,17011,500,0",
-    "LEG-1001,Frank Ortiz,frank@example.com,717-555-0199,5 Pine St,Enola,PA,17025,\"1,250.00\",30",
+    "C-000001,Alicia Gomez-Ruiz,alicia@example.com,555-555-0101,12 Oak Ln,Maple Grove,PA,00111,500,0",
+    "LEG-1001,Frank Ortiz,frank@example.com,555-555-0199,5 Pine St,Riverside,PA,00125,\"1,250.00\",30",
     ",Nameless No Number,not-an-email,,,,,,,",
     "LEG-1002,,x@example.com,,,,,,,",
   ].join("\n");
@@ -51,7 +51,7 @@ export async function run(t: T) {
   const frank = await t.as(PEOPLE.STEVE, async (c) => (await c.query(
     `select c.credit_limit_minor, c.terms_days, a.city from customer c left join customer_address a on a.customer_id = c.id
       where c.entity_id = $1 and c.number = 'LEG-1001'`, [ENTITY])).rows[0]);
-  t.ok("imported money is exact cents and the address came with it", frank && frank.credit_limit_minor === "125000" && frank.city === "Enola");
+  t.ok("imported money is exact cents and the address came with it", frank && frank.credit_limit_minor === "125000" && frank.city === "Riverside");
 
   const ar = [
     "customer_number,reference,as_of,due_on,balance",
@@ -72,7 +72,7 @@ export async function run(t: T) {
   t.ok("open A/R ties to the ledger: 1100 carries $292.45", tb === "29245", tb);
 
   const dc2 = await t.as(PEOPLE.STEVE, (c, co, a) => saveLocation(c, scopeOf(co, a), {
-    code: "dc2", name: "South DC", kind: "warehouse", taxRateBps: 0, address: { line1: "9 Dock Rd", city: "El Paso", state: "TX", postal: "79901" }, lng: -106.44, lat: 31.76 }));
+    code: "dc2", name: "South DC", kind: "warehouse", taxRateBps: 0, address: { line1: "9 Dock Rd", city: "Sun Valley", state: "TX", postal: "79901" }, lng: -106.44, lat: 31.76 }));
   t.ok("a warehouse is added with a map point", !!dc2);
   const outlet = await t.as(PEOPLE.STEVE, (c, co, a) => saveLocation(c, scopeOf(co, a), { code: "OUT1", name: "Clearance outlet", kind: "outlet", taxRateBps: 825 }));
   const po = await t.as(PEOPLE.STEVE, async (c) => (await c.query(`select count(*)::int n from profit_object where entity_id = $1 and location_id = $2`, [ENTITY, outlet])).rows[0].n);

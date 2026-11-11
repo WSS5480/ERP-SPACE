@@ -7,6 +7,7 @@
 // on_order moves only through inventory.ts addOnOrder. Receiving (on hand,
 // on_order down) is the inventory module's.
 
+import { today as bizToday } from "./clock.ts";
 import * as messaging from "./messaging.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { addOnOrder } from "./inventory.ts";
@@ -37,14 +38,15 @@ const money = (m: bigint) => {
 };
 const addDays = (iso: string, n: number) => { const d = new Date(iso + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
 const monthOf = (iso: string) => iso.slice(0, 8) + "01";
-const today = () => new Date().toISOString().slice(0, 10);
 
 type Vendor = { id: string; name: string; gl: string | null; lead_days: number; freight_min_minor: string; freight_min_qty: number; order_email: string | null; account_no: string | null };
 
 async function vendorFor(c: Client, s: Scope, vendorId: string): Promise<Vendor> {
   const v = (await q<Vendor>(c, `
     select v.id, coalesce(v.dba, v.legal_name) as name, ve.default_gl_account_id gl,
-           coalesce(vp.lead_days, 30) lead_days, coalesce(vp.freight_min_minor, 0) freight_min_minor,
+           -- a vendor with no lead time of its own: the company's special-order lead days (its pack's catalog.special_order_lead_days), else 30
+           coalesce(vp.lead_days, (select (value #>> '{}')::int from entity_setting es where es.entity_id = ve.entity_id and es.key = 'catalog.special_order_lead_days'
+                                    and jsonb_typeof(value) = 'number'), 30) lead_days, coalesce(vp.freight_min_minor, 0) freight_min_minor,
            coalesce(vp.freight_min_qty, 0) freight_min_qty, vp.order_email, vp.account_no
       from vendor_entity ve join vendor v on v.id = ve.vendor_id
       left join vendor_profile vp on vp.vendor_id = v.id and vp.entity_id = ve.entity_id
@@ -111,7 +113,7 @@ export async function createPO(c: Client, s: Scope, po: PoIn, mayOverride: boole
   const loc = await locationFor(c, s.entityId, po.shipToId);
   need(Array.isArray(po.lines) && po.lines.length, "a purchase order needs at least one line");
   need(po.lines.length <= 500, "500 lines at most on one purchase order");
-  const ordered = today();
+  const ordered = (await bizToday(c, s));
   if (po.expectedOn) need(DAY.test(po.expectedOn) && po.expectedOn >= ordered, "the expected date is a day from today on");
 
   type Built = { productId: string; sku: string; vendorSku: string | null; category: string | null; desc: string; qty: number;
@@ -410,7 +412,7 @@ export async function acknowledgePO(c: Client, s: Scope, poId: string, a: { vend
     select sum(quantity - cancelled_qty) open, max(expected_on) filter (where ack_status <> 'rejected')::text latest
       from purchase_order_line where entity_id = $1 and purchase_order_id = $2`, [s.entityId, poId]);
   const allGone = Number(after[0].open) <= 0;
-  await c.query(`update purchase_order set acknowledged_on = current_date, vendor_ref = coalesce($3, vendor_ref),
+  await c.query(`update purchase_order set acknowledged_on = business_today($2), vendor_ref = coalesce($3, vendor_ref),
                         expected_on = coalesce($4::date, expected_on),
                         status = case when $5 then 'cancelled' else status end,
                         cancel_reason = case when $5 then 'the vendor rejected every line' else cancel_reason end
@@ -643,7 +645,7 @@ export async function exportForVendor(c: Client, s: Scope, vendorId: string, opt
   const ids = [...new Set(rows.map((r) => r.po_id))];
   if (ids.length) await c.query(`update purchase_order set exported_at = now() where entity_id = $1 and id = any($2)`, [s.entityId, ids]);
   const slug = v.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-  return { filename: `po-${slug}-${today()}.csv`, csv: lines.join("\r\n") + "\r\n", orders: ids.length, lines: rows.length, orderEmail: v.order_email };
+  return { filename: `po-${slug}-${(await bizToday(c, s))}.csv`, csv: lines.join("\r\n") + "\r\n", orders: ids.length, lines: rows.length, orderEmail: v.order_email };
 }
 
 // ---------------------------------------------------------- transmission --
@@ -806,7 +808,7 @@ export async function recordShipment(c: Client, s: Scope, poId: string, n: ShipN
     await c.query(`update po_line_sales_line k set expected_on = pol.expected_on from purchase_order_line pol
                     where k.entity_id = $1 and k.purchase_order_line_id = $2 and k.active and pol.id = k.purchase_order_line_id`, [s.entityId, p.l.id]);
   }
-  await c.query(`update purchase_order set acknowledged_on = coalesce(acknowledged_on, current_date),
+  await c.query(`update purchase_order set acknowledged_on = coalesce(acknowledged_on, business_today($2)),
                         expected_on = coalesce((select max(expected_on) from purchase_order_line where entity_id = $2 and purchase_order_id = $1 and ack_status <> 'rejected'), expected_on)
                   where id = $1 and entity_id = $2`, [poId, s.entityId]);
   await audit(c, s, { table: "po_shipment", rowId: sh.id, action: "insert", after: { po: po.number, asn: n.asn, lines: picked.length, carrier: n.carrier ?? null, tracking: n.tracking ?? null, arrive } });
@@ -834,7 +836,7 @@ export async function recordShipmentsFromRows(c: Client, s: Scope, vendorId: str
     const po = (await q<{ id: string }>(c, `select id from purchase_order where entity_id = $1 and vendor_id = $2 and number = $3`, [s.entityId, vendorId, num]))[0];
     if (!po) { problems.push(`no purchase order ${num || "(blank)"} from this vendor`); continue; }
     const first = rs[0];
-    const asn = (first.vendor_ref || first.tracking || `${num}-${usDay(first.ship_date) ?? today()}`).trim();
+    const asn = (first.vendor_ref || first.tracking || `${num}-${usDay(first.ship_date) ?? (await bizToday(c, s))}`).trim();
     if ((await q(c, `select 1 from po_shipment where entity_id = $1 and purchase_order_id = $2 and asn_number = $3`, [s.entityId, po.id, asn])).length) continue;   // already have it
     await c.query("savepoint ship_rows");
     try {

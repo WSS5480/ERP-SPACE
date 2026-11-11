@@ -17,6 +17,7 @@
 //   other costs, paid elsewhere           record only; a chargeback  Dr 1150 Cr 6150
 //   billable service charges              the sale posts 4030; moved  Dr 4030  Cr 4050 service revenue
 
+import { today as bizToday } from "./clock.ts";
 import { createHash } from "node:crypto";
 import * as tax from "./tax.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
@@ -50,7 +51,6 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const words = (s: string) => s.replace(/_/g, " ");
 const usd = (m: bigint) => `$${(Number(m) / 100).toFixed(2)}`;
 const bps = (m: bigint, rate: number) => (m * BigInt(rate) + 5000n) / 10000n;
-const today = () => new Date().toISOString().slice(0, 10);
 
 // ------------------------------------------------------------- settings --
 
@@ -216,7 +216,8 @@ export type Coverage = { suggested: string; reason: string; deliveredOn: string 
 const addMonths = (d: string, m: number) => { const x = new Date(d + "T12:00:00Z"); x.setUTCMonth(x.getUTCMonth() + m); return x.toISOString().slice(0, 10); };
 
 /** Who should pay, from the dates and the rules: our delivery damage, the maker's warranty, the protection plan, or the customer. */
-export async function coverageFor(c: Client, entityId: string, ticketId: string, asOf = today()): Promise<Coverage> {
+export async function coverageFor(c: Client, entityId: string, ticketId: string, asOf?: string): Promise<Coverage> {
+  asOf ??= await bizToday(c, entityId);
   const t = await ticketOf(c, entityId, ticketId, false);
   const out: Coverage = { suggested: "billable", reason: "", deliveredOn: null, warrantyEnds: null, planEnds: null, planLineId: null, planName: null };
   if (t.issue_type === "damage_delivery") {
@@ -226,11 +227,11 @@ export async function coverageFor(c: Client, entityId: string, ticketId: string,
     const d = await q<{ d: string | null }>(c, `
       select coalesce((select min(i.invoice_date)::text from customer_invoice_line il join customer_invoice i on i.id = il.invoice_id
                         where il.entity_id = $1 and il.sales_order_line_id = l.id),
-                      (select so.ordered_at::date::text from sales_order so where so.id = l.sales_order_id)) d
+                      (select (so.ordered_at at time zone business_tz(so.entity_id, so.location_id))::date::text from sales_order so where so.id = l.sales_order_id)) d
         from sales_order_line l where l.entity_id = $1 and l.id = $2`, [entityId, t.sales_order_line_id]);
     out.deliveredOn = d[0]?.d ?? null;
   } else if (t.sales_order_id) {
-    out.deliveredOn = (await q<{ d: string }>(c, `select ordered_at::date::text d from sales_order where entity_id = $1 and id = $2`, [entityId, t.sales_order_id]))[0]?.d ?? null;
+    out.deliveredOn = (await q<{ d: string }>(c, `select (ordered_at at time zone business_tz(entity_id, location_id))::date::text d from sales_order where entity_id = $1 and id = $2`, [entityId, t.sales_order_id]))[0]?.d ?? null;
   }
   if (!out.deliveredOn) return { ...out, reason: "no sale is linked, so nothing shows it is covered" };
   // manufacturer warranty: the most specific rule
@@ -521,7 +522,7 @@ async function postCost(c: Client, scope: Scope, t: TicketRow, e: { kind: string
   const id = (await one<{ id: string }>(c, `select gen_random_uuid()::text id /* unscoped: no table */`)).id;
   // "other" costs are paid elsewhere (a card, a bill coded to 6150), which already books the expense:
   // the ticket keeps the record, and only a chargeback to the vendor moves money in the books.
-  const je = debit === e.credit ? null : await post(c, scope, { date: today(), sourceType: "service" as never, sourceId: id,
+  const je = debit === e.credit ? null : await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "service" as never, sourceId: id,
     description: `${t.number}: ${e.kind.replace("_", " ")}${e.note ? ` — ${e.note}` : ""}`.slice(0, 300),
     lines: [{ code: debit, debit: e.amountMinor, profitObjectId: po }, { code: e.credit, credit: e.amountMinor, profitObjectId: po }] });
   await c.query(`insert into service_cost (id, entity_id, ticket_id, visit_id, kind, amount_minor, charge_to, note, journal_entry_id, created_by)
@@ -592,7 +593,7 @@ async function invoiceBillable(c: Client, scope: Scope, t: TicketRow, lineIds: s
   if (svc > 0n) {
     const loc = await serviceLocation(c, scope.entityId, t);
     const po = await profitObjectFor(c, scope.entityId, loc);
-    await post(c, scope, { date: today(), sourceType: "service" as never, sourceId: t.id, description: `${t.number}: service charges to service revenue`,
+    await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "service" as never, sourceId: t.id, description: `${t.number}: service charges to service revenue`,
       lines: [{ code: "4030", debit: svc, profitObjectId: po }, { code: "4050", credit: svc, profitObjectId: po }] });
   }
   await settleOrderStatus(c, scope.entityId, t.billing_order_id);
@@ -921,7 +922,7 @@ export async function customerLookup(c: Client, entityId: string, term: string) 
      order by cu.name limit 15`, [entityId, s]);
   if (!cu.length) return [];
   const lines = await q<{ customer_id: string; order_id: string; number: string; ordered_at: string; line_id: string; description: string; kind: string | null; line_status: string }>(c, `
-    select so.customer_id, so.id order_id, so.number, so.ordered_at::date::text ordered_at, l.id line_id, l.description, p.kind, l.line_status
+    select so.customer_id, so.id order_id, so.number, (so.ordered_at at time zone business_tz(so.entity_id, so.location_id))::date::text ordered_at, l.id line_id, l.description, p.kind, l.line_status
       from sales_order so join sales_order_line l on l.sales_order_id = so.id and l.entity_id = so.entity_id left join product p on p.id = l.product_id
      where so.entity_id = $1 and so.customer_id = any($2) and so.status not in ('draft','cancelled') and l.qty > 0
        and coalesce(p.kind,'') in ('stock','configurable','special_order') and coalesce(so.external_ref,'') not like 'SV-%'

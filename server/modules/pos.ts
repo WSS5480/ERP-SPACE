@@ -83,7 +83,7 @@ async function setup(c: Client, co: Company, personId: string | null) {
     pos.settings(c, co.id),
   ]);
   const roles = personId ? [...await rolesOf(c, co, personId)] : [];
-  return { registers, stores, people, settings: set, roles, tenders: pos.TENDERS, returnReasons: pos.RETURN_REASONS, denominations: pos.DENOMS };
+  return { registers, stores, people, settings: set, roles, tenders: set.tenders, returnReasons: pos.RETURN_REASONS, denominations: pos.DENOMS };
 }
 
 async function customers(c: Client, co: Company, url: URL) {
@@ -92,7 +92,7 @@ async function customers(c: Client, co: Company, url: URL) {
   return q(c, `select cu.id, cu.number, cu.name, cu.phone, cu.email, cu.kind, cu.tax_exempt_ref, cu.status,
       (select json_agg(json_build_object('id', x.id, 'number', x.number, 'state', x.state, 'reason', x.reason, 'expiresOn', x.expires_on) order by x.expires_on desc nulls first)
          from tax_exemption_certificate x where x.entity_id = cu.entity_id and x.customer_id = cu.id and x.status = 'active'
-          and (x.expires_on is null or x.expires_on >= current_date)) certificates,
+          and (x.expires_on is null or x.expires_on >= business_today($1))) certificates,
       (select json_agg(json_build_object('id', a.id, 'label', a.label, 'line1', a.line1, 'city', a.city, 'state', a.state, 'postal', a.postal, 'isDefault', a.is_default)
                order by a.is_default desc) from customer_address a where a.customer_id = cu.id and a.entity_id = cu.entity_id) addresses
     from customer cu where cu.entity_id = $1 and cu.status <> 'inactive'
@@ -300,9 +300,12 @@ export const module: ErpModule = {
     coPost("/pos/settings", safe(async (c, co, a, b) => {
       await requireRole(c, co, a, ["store_manager", "controller"], "changing the selling rules");
       const pctIn = (v: unknown) => (v === undefined || v === null || v === "" ? undefined : Math.round(Number(v) * 100));
+      const intIn = (v: unknown) => (v === undefined || v === null || v === "" ? undefined : int(v));
       return pos.saveSettings(c, sc(co, a), { specialOrderDepositBps: pctIn(b.specialOrderDepositPct), stockedDepositBps: pctIn(b.stockedDepositPct),
         quoteHoldsAllowed: typeof b.quoteHoldsAllowed === "boolean" ? b.quoteHoldsAllowed : undefined,
-        quoteHoldMaxDays: b.quoteHoldMaxDays === undefined ? undefined : int(b.quoteHoldMaxDays) });
+        quoteHoldMaxDays: intIn(b.quoteHoldMaxDays), discountLimitBps: pctIn(b.discountLimitPct), quoteValidDays: intIn(b.quoteValidDays),
+        layawayMinDepositBps: pctIn(b.layawayDepositPct), layawayMaxDays: intIn(b.layawayDays), layawayInstallments: intIn(b.layawayPayments),
+        tenders: Array.isArray(b.tenders) ? b.tenders.map((x) => str(x, 20)) : undefined });
     }));
     coGet(`/pos/orders/${ID}/deposit`, safe((c, co, _u, m) => pos.depositRequirement(c, co.id, m[2])));
 

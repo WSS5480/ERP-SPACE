@@ -12,6 +12,7 @@
 // This file reads and writes only its own tables, the GL through post(), and
 // a vendor bill through the payables gates (runGates, postToLedger).
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor, type PostLine } from "./posting.ts";
 import { mulBps } from "./money.ts";
@@ -21,7 +22,6 @@ export class TradeCommissionError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new TradeCommissionError(msg); };
 const U = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const B = (v: string | number | bigint | null | undefined) => BigInt(v ?? 0);
-const today = () => new Date().toISOString().slice(0, 10);
 const pct = (b: number) => `${(b / 100).toFixed(b % 100 ? 2 : 0)}%`;
 
 /** The line a return line gives back (itself, if it is not a return). */
@@ -82,7 +82,7 @@ export async function setLineCommission(c: Client, scope: Scope, lineId: string,
       need(isDesigner.length, "the designer named has no designer or sales role here");
       // A share with no plan to earn it would be lost at hand-over: refuse it now instead.
       const plan = await q<{ id: string }>(c, `select a.app_user_id id from commission_assignment a join commission_plan p on p.id = a.plan_id and p.active
-          where a.entity_id = $1 and a.app_user_id = any($2::uuid[]) and a.effective_from <= current_date and (a.effective_to is null or a.effective_to >= current_date)`,
+          where a.entity_id = $1 and a.app_user_id = any($2::uuid[]) and a.effective_from <= business_today($1) and (a.effective_to is null or a.effective_to >= business_today($1))`,
         [scope.entityId, [primary, designer]]);
       for (const [who, label] of [[designer, "the designer"], [primary!, "the primary rep"]] as const)
         need(plan.some((x) => x.id === who), `${label} has no commission plan, so their share would be lost; assign one in Time and commissions first`);
@@ -133,7 +133,7 @@ export async function accrueReferrals(c: Client, scope: Scope, opts: { orderId?:
   const onPaid = (await referralTrigger(c, scope.entityId)) === "paid";
   const lines = await q<{ line_id: string; order_id: string; location_id: string; earned_on: string; net_minor: string; qty: string; cost_minor: string | null;
     trade_account_id: string; vendor_id: string | null; rate_bps: number; basis: string }>(c, `
-    select l.id line_id, so.id order_id, so.location_id, coalesce(i.invoice_date, current_date)::text earned_on,
+    select l.id line_id, so.id order_id, so.location_id, coalesce(i.invoice_date, business_today($1))::text earned_on,
            coalesce(il.net_minor, round(l.qty * l.unit_price_minor)::bigint - l.discount_minor)::text net_minor, l.qty::text,
            -- the cost recorded on the line when it was sold (the configurator's, or the register's), not today's product cost
            coalesce((ol.config->'cfg'->>'unitCostMinor')::bigint, opl.unit_cost_minor, (l.config->'cfg'->>'unitCostMinor')::bigint, pl.unit_cost_minor, p.cost_minor)::text cost_minor,
@@ -188,7 +188,7 @@ export async function accrueReferrals(c: Client, scope: Scope, opts: { orderId?:
     const ev = await one<{ id: string }>(c, `insert into trade_referral_event (entity_id, trade_account_id, vendor_id, sales_order_id, sales_order_line_id, kind,
         sale_minor, cost_minor, basis_minor, rate_bps, amount_minor, earned_on) values ($1,$2,$3,$4,$5,'clawback',$6,$7,$8,$9,$10,$11) returning id`,
       [scope.entityId, g.trade_account_id, g.vendor_id, g.sales_order_id, g.sales_order_line_id, (-B(g.sale_minor)).toString(), (-B(g.cost_minor)).toString(),
-       (-B(g.basis_minor)).toString(), g.rate_bps, (-B(g.amount_minor)).toString(), today()]);
+       (-B(g.basis_minor)).toString(), g.rate_bps, (-B(g.amount_minor)).toString(), (await bizToday(c, scope))]);
     fresh.push({ amount: -B(g.amount_minor), location: g.location_id, id: ev.id });
     clawedBack++;
   }
@@ -203,7 +203,7 @@ export async function accrueReferrals(c: Client, scope: Scope, opts: { orderId?:
   }
   let je: string | null = null;
   if (pl.length) {
-    je = await post(c, scope, { date: today(), sourceType: "commission", sourceId: opts.orderId ?? null,
+    je = await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "commission", sourceId: opts.orderId ?? null,
       description: `Trade referral commission: ${earned} earned, ${clawedBack} given back`, lines: pl });
     await c.query(`update trade_referral_event set journal_entry_id = $2 where entity_id = $3 and id = any($1)`, [fresh.map((f) => f.id), je, scope.entityId]);
   }
@@ -242,7 +242,7 @@ export async function billReferrals(c: Client, scope: Scope, tradeAccountId: str
   const reference = `${seq}-${ta!.number}`.slice(0, 60);
   const inv = await one<{ id: string }>(c, `
     insert into invoice (tenant_id, entity_id, vendor_id, kind, reference, invoice_date, due_date, total_minor, confidence_bps, created_by)
-    values ($1,$2,$3,'operating',$4,current_date,current_date + $5::int,$6,10000,$7) returning id`,
+    values ($1,$2,$3,'operating',$4,business_today($2),business_today($2) + $5::int,$6,10000,$7) returning id`,
     [scope.tenantId, scope.entityId, ta!.vendor_id, reference, ve!.terms_days, total.toString(), makerId]);
   await c.query(`insert into invoice_line (invoice_id, seq, gl_account_id, description, amount_minor)
                  select $1, 1, $2, $3, $4 where exists (select 1 from invoice where id = $1 and entity_id = $5)`,

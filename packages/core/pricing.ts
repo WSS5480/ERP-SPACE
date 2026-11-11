@@ -103,7 +103,7 @@ export function promoPrice(p: Promo, configured: bigint, baseTicket: bigint, map
 export async function listPrice(c: Client, entityId: string, priceList: string, e: { productId: string; category: string | null; ticketMinor: bigint;
   costMinor: bigint; optionsDeltaMinor?: bigint; on?: string | null }): Promise<{ priceMinor: bigint; code: string } | null> {
   const code = String(priceList).toUpperCase();
-  const live = `l.entity_id = $1 and l.code = $2 and l.active and coalesce($3::date, current_date) between coalesce(l.starts_on, '-infinity') and coalesce(l.ends_on, 'infinity')`;
+  const live = `l.entity_id = $1 and l.code = $2 and l.active and coalesce($3::date, business_today($1)) between coalesce(l.starts_on, '-infinity') and coalesce(l.ends_on, 'infinity')`;
   const li = (await q<{ price_minor: string; code: string }>(c, `select i.price_minor, l.code from price_list l join price_list_item i on i.price_list_id = l.id
      where ${live} and i.product_id = $4`, [entityId, code, e.on ?? null, e.productId]))[0];
   if (li) return { priceMinor: BigInt(li.price_minor) + (e.optionsDeltaMinor ?? 0n), code: li.code };
@@ -195,7 +195,7 @@ export async function priceConfigured(c: Client, entityId: string, productId: st
   const mapMinor = p.map_minor == null ? null : BigInt(p.map_minor);
   const promos = await q<Promo>(c, `
     select id, name, kind, pct_bps, amount_minor, respect_map from promotion
-     where entity_id = $1 and active and coalesce($2::date, current_date) between starts_on and ends_on
+     where entity_id = $1 and active and coalesce($2::date, business_today($1)) between starts_on and ends_on
        and (product_id = $3 or (product_id is null
             and (vendor_id is null or vendor_id = $4) and (category is null or category = $5)))`,
     [entityId, on, productId, p.vendor_id, p.category]);

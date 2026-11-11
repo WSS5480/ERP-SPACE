@@ -11,6 +11,7 @@
 // What a shopper sees is built field by field (pub* functions below). Cost,
 // vendor, vendor codes and margin never leave this file on a public path.
 
+import { today as bizToday } from "./clock.ts";
 import * as messaging from "./messaging.ts";
 import { q, one, type Client, type Scope } from "./db.ts";
 import { priceConfigured, PricingError, type Choice } from "./pricing.ts";
@@ -92,7 +93,8 @@ export async function pubSite(c: Client, site: Site) {
 // ----------------------------------------------------------------- dates --
 
 const DAYMS = 86_400_000;
-const utcToday = () => { const d = new Date(); return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())); };
+/** Midnight UTC of the web store's business date (dates are calendar days; the zone is the company's, clock.ts). */
+const storeToday = async (c: Client, entityId: string) => new Date(`${await bizToday(c, entityId)}T00:00:00Z`);
 export function addBusinessDays(from: Date, n: number): Date {
   const d = new Date(from.getTime());
   let left = n;
@@ -124,7 +126,7 @@ async function stockRows(c: Client, entityId: string, productId: string) {
 /** Where a product can come from, and when -- for a shopper. leadDays is the configured options' longest lead time. */
 export async function availabilityFor(c: Client, site: Site, p: ProdLite, leadDays = 0, locs?: Map<string, Loc>): Promise<Availability> {
   locs = locs ?? await locationsOf(c, site.entity_id);
-  const today = utcToday();
+  const today = await storeToday(c, site.entity_id);
   if (["service", "warranty", "fee", "gift_card"].includes(p.kind)) {
     return { state: "service", lines: [{ kind: "service", text: "Added to your order. Nothing to deliver." }], pickupStoreIds: [], deliverBy: null, leadWeeks: null };
   }
@@ -680,7 +682,7 @@ async function buildOrder(c: Client, site: Site, inp: CheckoutIn, write = false)
     need(!bulky, `${bulky?.name ?? "An item"} is too large to ship by parcel. Choose delivery or pickup.`);
   }
 
-  const today = utcToday();
+  const today = await storeToday(c, site.entity_id);
   const lines: Built["lines"] = [];
   let promised: Date | null = null;
   const later = (d: Date) => { if (!promised || d > promised) promised = d; };

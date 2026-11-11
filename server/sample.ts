@@ -16,6 +16,7 @@
 // two bills held at the gates, a possible duplicate, this week's timecards,
 // Friday's sweeps to confirm and two bank lines nobody can explain.
 
+import { periodFor as openPeriodFor } from "../packages/core/periods.ts";
 import { tx, q, one, type Client } from "../packages/core/db.ts";
 import { planSweeps, confirmTransfer } from "../packages/core/banking.ts";
 import { autoMatch } from "../packages/core/reconcile.ts";
@@ -122,8 +123,7 @@ async function build(c: Client, co: Company, log: (s: string) => void): Promise<
   await q(c, `update bank_account set fee_gl_account_id = $2
                where entity_id = $1 and purpose = 'deposit' and fee_gl_account_id is null`, [co.id, gl["6350"]]);
 
-  const periodFor = async (day: string) => (await one<{ id: string }>(c, `
-    select id from fiscal_period where entity_id = $1 and $2::date between starts_on and ends_on`, [co.id, day])).id;
+  const periodFor = (day: string) => openPeriodFor(c, { entityId: co.id }, day);
 
   const post = async (day: string, source: string, description: string,
                       lines: { gl: string; debit?: bigint; credit?: bigint; store?: string | null; bank?: string | null; memo?: string }[]) => {

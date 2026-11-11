@@ -20,7 +20,7 @@ const CENSUS_HIT = {"result":{"input":{"address":{"address":"4600 Silver Hill Rd
   "addressMatches":[{"tigerLine":{"side":"L","tigerLineId":"76355984"},"coordinates":{"x":-76.92748724230096,"y":38.84601622386617},
     "addressComponents":{"zip":"20233","streetName":"SILVER HILL","preType":"","city":"WASHINGTON","preDirection":"","suffixDirection":"","fromAddress":"4600","state":"DC","suffixType":"RD","toAddress":"4700","suffixQualifier":"","preQualifier":""},
     "matchedAddress":"4600 SILVER HILL RD, WASHINGTON, DC, 20233"}]}};
-const CENSUS_MISS = {"result":{"input":{"address":{"address":"77 Unknown Rd, Lemoyne, PA 17043"},"benchmark":{"isDefault":true,"benchmarkDescription":"Public Address Ranges - Current Benchmark","id":"4","benchmarkName":"Public_AR_Current"}},"addressMatches":[]}};
+const CENSUS_MISS = {"result":{"input":{"address":{"address":"77 Unknown Rd, Brookside, PA 00143"},"benchmark":{"isDefault":true,"benchmarkDescription":"Public Address Ranges - Current Benchmark","id":"4","benchmarkName":"Public_AR_Current"}},"addressMatches":[]}};
 const reply = (status: number, body: unknown) => Promise.resolve({ ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body) });
 
 const DC = "33333333-0000-0000-0000-0000000000dc";
@@ -70,7 +70,7 @@ export async function run(t0: T) {
   // ===================================================== pure routing
   const enola = { lng: -76.9336, lat: 40.2601 }, hbg = { lng: -76.8867, lat: 40.2589 };
   const d1 = R.haversineMiles(enola, hbg);
-  t.ok("haversine: Enola to Harrisburg is about 2.5 miles as the crow flies", d1 > 2.3 && d1 < 2.7, d1.toFixed(2));
+  t.ok("haversine: Riverside to Hillcrest is about 2.5 miles as the crow flies", d1 > 2.3 && d1 < 2.7, d1.toFixed(2));
   const nyla = R.haversineMiles({ lng: -74.006, lat: 40.7128 }, { lng: -118.2437, lat: 34.0522 });
   t.ok("haversine: New York to Los Angeles is about 2,445 miles", Math.abs(nyla - 2445) < 15, nyla.toFixed(0));
   t.ok("service time is base + per piece + stairs per piece", R.serviceMinutes({ id: "x", at: enola, pieces: 3, stairs: 2 }) === 10 + 12 + 18);
@@ -505,10 +505,10 @@ export async function run(t0: T) {
   setGeocoder(censusGeocoder(((url: string) => {
     if (failNext) return Promise.reject(new TypeError("fetch failed"));
     if (decodeURIComponent(url).includes("Unknown Rd")) return reply(200, CENSUS_MISS);
-    // a Census answer for the newcomer's street in Camp Hill
+    // a Census answer for the newcomer's street in Maple Grove
     const h = structuredClone(CENSUS_HIT);
     h.result.addressMatches[0].coordinates = { x: -76.9195, y: 40.2422 };
-    h.result.addressMatches[0].matchedAddress = "5 MARKET ST, CAMP HILL, PA, 17011";
+    h.result.addressMatches[0].matchedAddress = "5 MARKET ST, CAMP HILL, PA, 00111";
     return reply(200, h);
   }) as FetchLike));
   try {
@@ -517,8 +517,8 @@ export async function run(t0: T) {
     while (![3, 6].includes(new Date(D2 + "T12:00:00Z").getUTCDay()));
     const newbies = await t.as(P.STEVE, async (c) => {
       const out: Record<string, { order: string; address: string }> = {};
-      for (const [key, name, line1, city, postal] of [["nina", "Nina Newcomer", "5 Market St", "Camp Hill", "17011"], ["oscar", "Oscar Nowhere", "77 Unknown Rd", "Lemoyne", "17043"]]) {
-        const cu = (await t.q<{ id: string }>(c, `insert into customer (entity_id, number, name, phone) values ($1, $2, $3, '717-555-0190') returning id`,
+      for (const [key, name, line1, city, postal] of [["nina", "Nina Newcomer", "5 Market St", "Maple Grove", "00111"], ["oscar", "Oscar Nowhere", "77 Unknown Rd", "Brookside", "00143"]]) {
+        const cu = (await t.q<{ id: string }>(c, `insert into customer (entity_id, number, name, phone) values ($1, $2, $3, '555-555-0190') returning id`,
           [ENTITY, "C-G" + key.toUpperCase(), name]))[0].id;
         const ad = (await t.q<{ id: string }>(c, `insert into customer_address (entity_id, customer_id, line1, city, state, postal, is_default)
           values ($1,$2,$3,$4,'PA',$5,true) returning id`, [ENTITY, cu, line1, city, postal]))[0].id;
@@ -545,15 +545,15 @@ export async function run(t0: T) {
     const left = b2.unassigned.find((u: any) => u.id === os.id);
     t.ok("the builder routes the new customer and leaves the unplaced one over, naming customer and address",
       b2.routes.length === 1 && b2.routes[0].stops === 1 && b2.routes[0].miles < 40 && left?.noMapPoint && left.addressId === newbies.oscar.address
-      && /Oscar Nowhere at 77 Unknown Rd, Lemoyne has no map point/.test(left.reason), `${b2.routes[0]?.miles} mi · ${left?.reason}`);
+      && /Oscar Nowhere at 77 Unknown Rd, Brookside has no map point/.test(left.reason), `${b2.routes[0]?.miles} mi · ${left?.reason}`);
     await t.throws("a stop with no map point cannot be put on a route by hand either", () => post(P.RAY, `/fleet/stops/${os.id}/assign`, { routeId: b2.routes[0].routeId }),
-      /stop D-\d+ for Oscar Nowhere at 77 Unknown Rd, Lemoyne has no map point/);
+      /stop D-\d+ for Oscar Nowhere at 77 Unknown Rd, Brookside has no map point/);
     await t.throws("the database refuses 0,0 as a point", () => t.as(P.RAY, async (c) => {
       await c.query(`update customer_address set geo = point(0,0) where entity_id = $1 and id = $2`, [ENTITY, newbies.oscar.address]);
     }), /customer_address_geo_range/);
     failNext = true;
     await t.throws("Find on map with the service down says so and offers the manual way", () => post(P.RAY, `/fleet/addresses/${newbies.oscar.address}/locate`),
-      /could not place Oscar Nowhere at 77 Unknown Rd, Lemoyne on the map: the map service could not be reached .*Enter its latitude and longitude/);
+      /could not place Oscar Nowhere at 77 Unknown Rd, Brookside on the map: the map service could not be reached .*Enter its latitude and longitude/);
     failNext = false;
     await t.throws("a manual point must be a real place", () => post(P.RAY, `/fleet/addresses/${newbies.oscar.address}/place`, { lat: "0", lng: "0" }), /real latitude and longitude/);
     await t.throws("a manual point must be two numbers", () => post(P.RAY, `/fleet/addresses/${newbies.oscar.address}/place`, { lat: "abc", lng: "" }), /real latitude and longitude/);

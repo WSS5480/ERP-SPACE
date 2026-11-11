@@ -285,7 +285,7 @@ export async function run(t: T) {
   await t.throws("opening stock: a file without a qty column is refused", () => r.post("/onboarding/opening-stock/preview", owner, { csv: "sku,location\nCHAIR-1,DC1", filename: "x.csv", asOf: AS_OF }), /qty column/);
   const gl = async (code: string) => BigInt((await inTx((c) => q<{ b: string }>(c, `select coalesce(sum(jl.debit_minor - jl.credit_minor), 0)::text b from journal_line jl
       join journal_entry je on je.id = jl.journal_entry_id join gl_account g on g.id = jl.gl_account_id where je.entity_id = $1 and g.code = $2`, [E1, code])))[0].b);
-  await t.throws("opening stock: the as-of day must be in a fiscal period", () => r.post("/onboarding/opening-stock/preview", owner, { csv, filename: "stock.csv", asOf: "1990-01-01" }), /no fiscal period holding 1990-01-01/);
+  await t.throws("opening stock: the as-of day must be in a fiscal period", () => r.post("/onboarding/opening-stock/preview", owner, { csv, filename: "stock.csv", asOf: "1990-01-01" }), /no period for 1990-01-01.*before this fiscal year/);
   await t.throws("opening stock: an as-of day is required", () => r.post("/onboarding/opening-stock/preview", owner, { csv, filename: "stock.csv" }), /give the day/);
   const pv = await r.post("/onboarding/opening-stock/preview", owner, { csv, filename: "stock.csv", asOf: AS_OF });
   const msg = (row: number) => pv.rows.find((x: any) => x.row === row)?.message ?? "";
@@ -400,7 +400,7 @@ export async function run(t: T) {
   const hits = uiFiles.filter((f) => sample.test(readFileSync(ROOT + f, "utf8")));
   t.ok("sample names: no screen assumes a sample business, town or state", !hits.length, hits.join(", "));
   const core = ["packages/core/haulaway.ts", "packages/core/tax.ts", "packages/core/setup.ts", "server/actions.ts", "packages/core/geocode.ts"];
-  const coreHits = core.filter((f) => /\?\? "PA"|like TX|like ENL|TX-PALESTINE|Enola|Palestine/.test(readFileSync(ROOT + f, "utf8")));
+  const coreHits = core.filter((f) => /\?\? "PA"|like TX|like ENL|TX-MESAVERDE|Riverside|Mesa Verde/.test(readFileSync(ROOT + f, "utf8")));
   t.ok("sample names: no core rule falls back to a sample state or names one", !coreHits.length, coreHits.join(", "));
   t.ok("new company: the add-a-company form starts as general retail", /select\(Object\.entries\(KIND\), 'retail'\)/.test(readFileSync(ROOT + "server/app.js", "utf8")));
   void store;

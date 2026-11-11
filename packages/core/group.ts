@@ -28,6 +28,7 @@
 // has left the group (sold outside, written off) comes out of the buyers' cost
 // of goods (ic_markup_move, released by inventory as the stock leaves).
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor, type PostLine } from "./posting.ts";
 import { invoiceSibling, settleSiblingInvoices } from "./ar.ts";
@@ -38,7 +39,6 @@ import { format } from "./money.ts";
 
 export class GroupError extends Error {}
 const need = (cond: unknown, msg: string): asserts cond => { if (!cond) throw new GroupError(msg); };
-const today = () => new Date().toISOString().slice(0, 10);
 const B = (v: unknown) => BigInt(String(v ?? "0"));
 const $ = (m: bigint) => format(m);
 const T = "/* unscoped: the client's own companies, by tenant */";
@@ -265,7 +265,7 @@ async function recordPair(c: Client, s: Scope, x: { kind: "goods" | "service"; f
   need(amount > 0n, "an inter-company document is for more than zero");
   const fs = scopeFor(s, from.id), ts = scopeFor(s, to.id);
   const link = await linkFor(c, s, from.id, to.id);
-  const date = today();
+  const date = (await bizToday(c, s));
   const number = (await one<{ n: string }>(c, `select next_doc_no($1, 'ic_document', 'IC-') n /* unscoped: numbering keyed by entity argument */`, [from.id])).n;
   const doc = await one<{ id: string }>(c, `
     insert into ic_document (tenant_id, number, kind, from_entity_id, to_entity_id, description, amount_minor, cost_minor, basis, markup_bps,
@@ -394,7 +394,7 @@ export async function adjust(c: Client, s: Scope, x: { counterpartyId: string; k
   if (code === DIFFERENCE) await requireWriteOff(c, s, x.amountMinor);
   const acct = await q<{ is_postable: boolean; active: boolean }>(c, `select is_postable, active from gl_account where tenant_id = $1 and code = $2 ${T}`, [s.tenantId, code]);
   need(acct.length && acct[0].is_postable && acct[0].active, `there is no postable account ${code} in the chart`);
-  const date = today();
+  const date = (await bizToday(c, s));
   const lines: PostLine[] = x.kind === "charge"
     ? [{ code: IC.DUE_FROM, debit: x.amountMinor, memo: `due from ${other.name}` }, { code, credit: x.amountMinor }]
     : [{ code, debit: x.amountMinor }, { code: IC.DUE_TO, credit: x.amountMinor, memo: `due to ${other.name}` }];
@@ -527,7 +527,7 @@ export async function settle(c: Client, s: Scope, x: { aId: string; bId: string;
     need(x.amountMinor == null || x.amountMinor === cash, `the two books differ, so the payment is what ${payer.name}'s own books say it owes (${$(cash)}); book the missing side first to settle another amount`);
     need(reason.length >= 3, `the two companies' books differ (${payer.name} says it owes ${$(cash)}, ${payee.name} says it is owed ${$(owed > 0n ? owed : 0n)}); say why before settling, and the difference is written off to ${DIFFERENCE}`);
   }
-  const date = today();
+  const date = (await bizToday(c, s));
   const id = (await one<{ id: string }>(c, `select gen_random_uuid()::text id /* unscoped: no table */`)).id;
   const number = (await one<{ n: string }>(c, `select next_doc_no($1, 'ic_settlement', 'ICS-') n /* unscoped: numbering keyed by entity argument */`, [payer.id])).n;
 

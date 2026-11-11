@@ -372,7 +372,7 @@ export async function run(t: T) {
       t.ok("a feed connection with no company is refused, not filed into the first company", h.status === 409 && /not attached to a company/.test(hb.error), hb.error);
     }
     t.ok("the request log hides link tokens", logPath("/sheet/AbCdEf0123456789xyzQ_k") === "/sheet/[token]" && logPath("/crm/u/Zx9_-abcdefghijklmnopq") === "/crm/u/[token]"
-      && logPath("/delivery/schedule/abcDEF1234567890ghijKL") === "/delivery/schedule/[token]" && logPath(`/api/c/${ENTITY}/bills`) === `/api/c/${ENTITY}/bills` && logPath("/trade/buddys/api/orders") === "/trade/buddys/api/orders"
+      && logPath("/delivery/schedule/abcDEF1234567890ghijKL") === "/delivery/schedule/[token]" && logPath(`/api/c/${ENTITY}/bills`) === `/api/c/${ENTITY}/bills` && logPath("/trade/riverside-home/api/orders") === "/trade/riverside-home/api/orders"
       && logPath("/sheet/abcdefghijklmnopqrstuvwx") === "/sheet/[token]" && logPath("/x/AbCdEfGhIjKlMnOpQrSt") === "/x/[token]"
       && logPath(`/api/c/${ENTITY}/payroll/periods/${ENTITY}/approve-timecards`) === `/api/c/${ENTITY}/payroll/periods/${ENTITY}/approve-timecards`);
     const lines: string[] = [];

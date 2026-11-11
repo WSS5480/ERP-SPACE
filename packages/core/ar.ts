@@ -19,6 +19,7 @@
 // and on the same date, so balances, statements and the aging are sums of
 // that table and tie to the general ledger by construction.
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { postLines as postTaxLines } from "./tax.ts";
 import { post, profitObjectFor, type PostLine } from "./posting.ts";
@@ -27,7 +28,6 @@ import { recordFinancingRefund } from "./ar_settlement.ts";
 
 export class ArError extends Error {}
 
-const today = () => new Date().toISOString().slice(0, 10);
 const need = (cond: unknown, msg: string): asserts cond => { if (!cond) throw new ArError(msg); };
 const B = (v: string | number | bigint | null | undefined) => BigInt(v ?? 0);
 const $ = (m: bigint) => format(m);
@@ -54,7 +54,7 @@ export function cashCodeFor(method: string): string {
 /** Post a customer receipt (or refund, if negative) to the ledger. */
 export async function postReceipt(c: Client, scope: Scope, receiptId: string): Promise<string> {
   const r = await one<{ amount_minor: string; method: string; number: string; location_id: string; received_at: string; voided_at: string | null }>(c,
-    `select amount_minor, method, number, location_id, received_at::date::text received_at, voided_at
+    `select amount_minor, method, number, location_id, (received_at at time zone business_tz(entity_id, location_id))::date::text received_at, voided_at
        from customer_receipt where id = $1 and entity_id = $2`, [receiptId, scope.entityId]);
   if (r.voided_at) throw new ArError("a voided receipt does not post");
   const amt = BigInt(r.amount_minor);
@@ -146,7 +146,7 @@ export async function invoiceFulfilment(c: Client, scope: Scope, orderId: string
     { code: "5000", debit: costMinor, profitObjectId: po },
     { code: "1300", credit: costMinor, profitObjectId: po },
   ];
-  const date = today();
+  const date = await bizToday(c, scope, so.location_id);   // the selling store's own day, not UTC's
   const je = await post(c, scope, { date, sourceType: "sale", sourceId: orderId,
     description: `Sale ${so.number}, ${lines.length} line${lines.length === 1 ? "" : "s"} handed over`, lines: out });
   // The tax just credited to 2100 is the lines' tax by jurisdiction, now posted on this day.
@@ -231,7 +231,8 @@ async function takeReceipt(c: Client, scope: Scope, r: {
   return { id: x.id, number };
 }
 
-export async function glBalance(c: Client, entityId: string, code: string, asOf = today()): Promise<bigint> {
+export async function glBalance(c: Client, entityId: string, code: string, asOf?: string): Promise<bigint> {
+  asOf ??= await bizToday(c, entityId);
   const r = await one<{ b: string }>(c, `
     select coalesce(sum(jl.debit_minor - jl.credit_minor), 0) b
       from journal_line jl
@@ -246,7 +247,13 @@ export async function settings(c: Client, entityId: string) {
     late_fee_max_minor: string | null; default_terms_days: number; writeoff_method: "allowance" | "direct"; call_after_days: number }>(c,
     `select late_fee_enabled, late_fee_bps, late_fee_grace_days, late_fee_min_minor, late_fee_max_minor, default_terms_days,
             writeoff_method, call_after_days from ar_settings where entity_id = $1`, [entityId]);
-  return r[0] ?? { late_fee_enabled: false, late_fee_bps: 0, late_fee_grace_days: 10, late_fee_min_minor: "0", late_fee_max_minor: null,
+  if (r[0]) return r[0];
+  // No A/R settings saved yet: the late fee the company's setup pack set (ar.late_fee), else none.
+  const pack = (await q<{ value: { rate_bps?: number; min_minor?: number; grace_days?: number } }>(c,
+    `select value from entity_setting where entity_id = $1 and key = 'ar.late_fee' and jsonb_typeof(value) = 'object'`, [entityId]))[0]?.value;
+  const rate = Math.max(0, Math.trunc(Number(pack?.rate_bps ?? 0))) || 0;
+  return { late_fee_enabled: rate > 0, late_fee_bps: rate, late_fee_grace_days: Math.max(0, Math.trunc(Number(pack?.grace_days ?? 10))) || 0,
+    late_fee_min_minor: String(Math.max(0, Math.trunc(Number(pack?.min_minor ?? 0))) || 0), late_fee_max_minor: null,
     default_terms_days: 30, writeoff_method: "allowance" as const, call_after_days: 1 };
 }
 
@@ -262,7 +269,8 @@ async function customerOf(c: Client, entityId: string, customerId: string, lock 
 // ================================================================ balances
 
 /** What the customer owes on account (negative = a credit balance). */
-export async function customerBalance(c: Client, entityId: string, customerId: string, asOf = today()): Promise<bigint> {
+export async function customerBalance(c: Client, entityId: string, customerId: string, asOf?: string): Promise<bigint> {
+  asOf ??= await bizToday(c, entityId);
   const r = await one<{ b: string }>(c, `select coalesce(sum(amount_minor),0) b from ar_ledger
                                           where entity_id = $1 and customer_id = $2 and occurred_on <= $3::date`, [entityId, customerId, asOf]);
   return B(r.b);
@@ -468,7 +476,7 @@ export async function receivePayment(c: Client, scope: Scope, p: {
   }
   need(p.method !== "financing", "a finance company pays for a sale, not an account; take it on the order");
 
-  const date = p.date ?? today();
+  const date = p.date ?? (await bizToday(c, scope, p.locationId));
   const r = await takeReceipt(c, scope, { ...p, channel: p.channel ?? "pos" });
   const plan = await planApplications(c, scope.entityId, p.customerId, p.amountMinor, p.apply ?? "oldest");
   const applied = plan.reduce((a, x) => a + x.amountMinor, 0n);
@@ -540,7 +548,7 @@ export async function applyCredits(c: Client, scope: Scope, customerId: string, 
   need(available > 0n, "there is no unapplied cash or credit on this account");
   const plan = await planApplications(c, scope.entityId, customerId, available, apply);
   need(plan.length, "there is no open invoice to apply it to");
-  const date = today();
+  const date = (await bizToday(c, scope));
   let fromCash = unapplied;
   const memoLeft = memos.map((m) => ({ id: m.id, number: m.number, left: -B(m.open_minor) }));
   let total = 0n;
@@ -574,9 +582,9 @@ export async function creditToStoreCredit(c: Client, scope: Scope, customerId: s
   need(amountMinor <= unapplied, `${cu.name} has ${$(unapplied)} unapplied on account`);
   need(reason.trim(), "say why");
   const po = await profitObjectFor(c, scope.entityId, cu.home_location_id);
-  const je = await post(c, scope, { date: today(), sourceType: "ar", sourceId: customerId, description: `Credit balance to store credit, ${cu.name}`,
+  const je = await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "ar", sourceId: customerId, description: `Credit balance to store credit, ${cu.name}`,
     lines: [{ code: "1100", debit: amountMinor, profitObjectId: po }, { code: "2320", credit: amountMinor, profitObjectId: po }] });
-  await ledger(c, scope, { customerId, date: today(), kind: "to_store_credit", amount: amountMinor, memo: reason.trim(), journalEntryId: je });
+  await ledger(c, scope, { customerId, date: (await bizToday(c, scope)), kind: "to_store_credit", amount: amountMinor, memo: reason.trim(), journalEntryId: je });
   await c.query(`insert into store_credit_ledger (entity_id, customer_id, amount_minor, source, journal_entry_id, reason, created_by)
                  values ($1,$2,$3,'credit_balance',$4,$5,$6)`, [scope.entityId, customerId, amountMinor.toString(), je, reason.trim(), scope.actor.id || null]);
   return je;
@@ -643,7 +651,8 @@ const blank = (key: string, name: string): AgingRow =>
  * installment it belongs to; unapplied cash is its own column. The total
  * is compared with GL 1100 on the same day.
  */
-export async function aging(c: Client, entityId: string, asOf = today(), onlyCustomer: string | null = null) {
+export async function aging(c: Client, entityId: string, asOf?: string, onlyCustomer: string | null = null) {
+  asOf ??= await bizToday(c, entityId);
   const inv = await q<{ customer_id: string | null; cname: string | null; location_id: string | null; lname: string | null; due_date: string; open: string }>(c, `
     select i.customer_id, cu.name cname, i.location_id, lo.name lname, i.due_date::text, sum(l.amount_minor)::text open
       from ar_ledger l join customer_invoice i on i.id = l.invoice_id
@@ -708,8 +717,9 @@ export async function aging(c: Client, entityId: string, asOf = today(), onlyCus
  * grace days, the larger of the minimum and the rate on what is overdue
  * (capped at the maximum, if set). Fees do not earn fees. Dr 1100, Cr 4020.
  */
-export async function assessLateFees(c: Client, scope: Scope, asOf = today()) {
-  need(isDay(asOf) && asOf <= today(), "late fees are charged as of today or an earlier day");
+export async function assessLateFees(c: Client, scope: Scope, asOf?: string) {
+  asOf ??= await bizToday(c, scope);
+  need(isDay(asOf) && asOf <= (await bizToday(c, scope)), "late fees are charged as of today or an earlier day");
   const s = await settings(c, scope.entityId);
   need(s.late_fee_enabled, "late fees are turned off in the A/R settings");
   const month = asOf.slice(0, 7);
@@ -763,7 +773,8 @@ export class RecordOnlyProvider implements MessageProvider {
 }
 
 /** Promises whose day has passed are kept if that much came in since, broken if not. */
-export async function refreshPromises(c: Client, scope: Scope, asOf = today()) {
+export async function refreshPromises(c: Client, scope: Scope, asOf?: string) {
+  asOf ??= await bizToday(c, scope);
   const r = await q<{ id: string; status: string }>(c, `
     update ar_promise p set status = case when coalesce((
              select sum(r.amount_minor) from customer_receipt r
@@ -784,7 +795,8 @@ export async function refreshPromises(c: Client, scope: Scope, asOf = today()) {
  * Someone with a promise not yet due waits; someone already reached today
  * waits unless a callback is due.
  */
-export async function callList(c: Client, entityId: string, asOf = today()) {
+export async function callList(c: Client, entityId: string, asOf?: string) {
+  asOf ??= await bizToday(c, entityId);
   const s = await settings(c, entityId);
   const ag = await aging(c, entityId, asOf);
   const rows = ag.customers.filter((r) => r.key !== "none" && r.total - r.current - r.unapplied > 0n && r.maxDays >= s.call_after_days);
@@ -853,7 +865,7 @@ export async function logAction(c: Client, scope: Scope, a: {
     [scope.entityId, a.customerId, a.kind, a.outcome ?? null, a.notes?.trim() || null, a.callbackAt || null, scope.actor.id || null]);
   let promiseId: string | null = null;
   if (a.promise) {
-    need(isDay(a.promise.on) && a.promise.on >= today(), "a promise is for today or a day to come");
+    need(isDay(a.promise.on) && a.promise.on >= (await bizToday(c, scope)), "a promise is for today or a day to come");
     need(a.promise.amountMinor > 0n, "a promise needs an amount");
     await c.query(`update ar_promise set status = 'cancelled', resolved_at = now()
                     where entity_id = $1 and customer_id = $2 and status = 'open'`, [scope.entityId, a.customerId]);
@@ -873,7 +885,7 @@ export async function renderTemplate(c: Client, entityId: string, customerId: st
     `select id, channel, subject, body, name from ar_template where entity_id = $1 and code = $2 and active`, [entityId, code]);
   need(t.length, "no such template");
   const cu = await customerOf(c, entityId, customerId);
-  const ag = await aging(c, entityId, today(), customerId);
+  const ag = await aging(c, entityId, (await bizToday(c, entityId)), customerId);
   const co = await one<{ name: string }>(c, `select name from entity where id = $1 /* unscoped: the company's own name */`, [entityId]);
   const vars: Record<string, string> = {
     name: cu.name, number: cu.number, company: co.name, balance: $(ag.totals.total),
@@ -953,7 +965,7 @@ export async function decideWriteoff(c: Client, scope: Scope, id: string, d: { d
     : await one<{ location_id: string | null; number: string }>(c, `select location_id, number from ar_contract where id = $1 and entity_id = $2`, [x.contract_id, scope.entityId]);
   const po = await profitObjectFor(c, scope.entityId, loc.location_id);
   const code = x.method === "direct" ? "6900" : "1190";
-  const date = today();
+  const date = (await bizToday(c, scope));
   const je = await post(c, scope, { date, sourceType: "ar", sourceId: id, description: `Write-off ${loc.number}: ${x.reason}`.slice(0, 300),
     lines: [{ code, debit: amt, profitObjectId: po }, { code: "1100", credit: amt, profitObjectId: po }] });
   await c.query(`update ar_writeoff set status = 'posted', decided_by = $2, decided_at = now(), decision_note = $3, journal_entry_id = $4
@@ -986,7 +998,7 @@ export async function recordRecovery(c: Client, scope: Scope, writeoffId: string
     reference: r.reference, channel: "pos" });
   const po = await profitObjectFor(c, scope.entityId, r.locationId);
   const code = x.method === "direct" ? "6900" : "1190";
-  const date = today();
+  const date = (await bizToday(c, scope));
   const je = await post(c, scope, { date, sourceType: "ar", sourceId: rc.id, description: `Recovery on a written-off balance, ${rc.number}`,
     lines: [{ code: "1100", debit: r.amountMinor, profitObjectId: po, memo: "reinstated" }, { code, credit: r.amountMinor, profitObjectId: po },
             { code: cashCodeFor(r.method), debit: r.amountMinor, profitObjectId: po }, { code: "1100", credit: r.amountMinor, profitObjectId: po, memo: "collected" }] });
@@ -1066,8 +1078,8 @@ export async function openContract(c: Client, scope: Scope, k: {
   const principal = k.principalMinor ?? open;
   need(principal > 0n, `${inv[0].number} has nothing open to finance`);
   need(principal <= open, `${inv[0].number} has ${$(open)} open; a contract cannot finance more than that`);
-  const first = k.firstDueOn ?? addMonths(today(), 1);
-  need(isDay(first) && first > today(), "the first payment is due after today");
+  const first = k.firstDueOn ?? addMonths((await bizToday(c, scope)), 1);
+  need(isDay(first) && first > (await bizToday(c, scope)), "the first payment is due after today");
   const sch = amortize(principal, k.aprBps, k.termMonths, first);
   const number = await nextNo(c, scope.entityId, "contract", "IC-");
   const r = await one<{ id: string }>(c, `
@@ -1076,7 +1088,7 @@ export async function openContract(c: Client, scope: Scope, k: {
     [scope.entityId, number, inv[0].customer_id, k.invoiceId, inv[0].location_id, principal.toString(), k.aprBps, k.termMonths,
      sch.paymentMinor.toString(), first, scope.actor.id || null]);
   await writeSchedule(c, scope, r.id, 1, sch.rows);
-  const date = today();
+  const date = (await bizToday(c, scope));
   await ledger(c, scope, { customerId: inv[0].customer_id, invoiceId: k.invoiceId, locationId: inv[0].location_id, date, kind: "contract",
     amount: -principal, memo: `financed on ${number}` });
   await ledger(c, scope, { customerId: inv[0].customer_id, contractId: r.id, locationId: inv[0].location_id, date, kind: "contract",
@@ -1102,7 +1114,8 @@ async function dueRows(c: Client, entityId: string, contractId: string, version:
 }
 
 /** What it takes to close the contract today: principal left, interest due, and interest since the last due day. */
-export async function payoffQuote(c: Client, entityId: string, contractId: string, asOf = today()) {
+export async function payoffQuote(c: Client, entityId: string, contractId: string, asOf?: string) {
+  asOf ??= await bizToday(c, entityId);
   const k = await contractOf(c, entityId, contractId);
   const principal = await openOf(c, entityId, { contractId });
   const rows = await dueRows(c, entityId, contractId, k.version);
@@ -1110,8 +1123,8 @@ export async function payoffQuote(c: Client, entityId: string, contractId: strin
   for (const r of rows) if (r.due_on <= asOf) interestDue += B(r.interest_minor) - B(r.paid_interest_minor);
   // Interest runs from the last due day passed (or the opening), on the principal still owed.
   const f = await one<{ d: string }>(c, `
-    select greatest(k.opened_at::date, coalesce((select max(i.due_on) from ar_contract_installment i
-             where i.entity_id = $1 and i.contract_id = k.id and i.status <> 'superseded' and i.due_on <= $3::date), k.opened_at::date))::text d
+    select greatest((k.opened_at at time zone business_tz(k.entity_id))::date, coalesce((select max(i.due_on) from ar_contract_installment i
+             where i.entity_id = $1 and i.contract_id = k.id and i.status <> 'superseded' and i.due_on <= $3::date), (k.opened_at at time zone business_tz(k.entity_id))::date))::text d
       from ar_contract k where k.id = $2 and k.entity_id = $1`, [entityId, contractId, asOf]);
   const from = f.d;
   const days = Math.max(0, daysBetween(from, asOf));
@@ -1134,7 +1147,7 @@ export async function payContract(c: Client, scope: Scope, contractId: string, p
   const quote = await payoffQuote(c, scope.entityId, contractId);
   need(p.amountMinor > 0n, "the amount has to be more than zero");
   need(p.amountMinor <= quote.payoffMinor, `that is more than the payoff of ${$(quote.payoffMinor)}`);
-  const date = today();
+  const date = (await bizToday(c, scope));
   const rows = await dueRows(c, scope.entityId, contractId, k.version);
   let left = p.amountMinor, interest = 0n, principal = 0n;
   const payoff = p.amountMinor === quote.payoffMinor;
@@ -1206,7 +1219,7 @@ export async function restructure(c: Client, scope: Scope, contractId: string, r
   }
   const principal = await openOf(c, scope.entityId, { contractId });
   need(principal > 0n, "no principal is left");
-  const t = today();
+  const t = (await bizToday(c, scope));
   const carried = rows.filter((x) => x.due_on <= t).reduce((a, x) => a + B(x.interest_minor) - B(x.paid_interest_minor), 0n);
   const apr = r.kind === "refinance" ? (r.aprBps ?? -1) : k.apr_bps;
   need(r.kind !== "refinance" || (apr >= 0 && apr <= 9999), "a refinance needs the new APR");
@@ -1338,8 +1351,8 @@ export async function settleFinanceBatch(c: Client, scope: Scope, s: {
 }) {
   need(s.saleIds.length, "pick the sales this deposit pays for");
   need(s.reference.trim(), "put the lender's batch or deposit reference in");
-  const on = s.fundedOn ?? today();
-  need(isDay(on) && on <= today(), "the funding date is today or earlier");
+  const on = s.fundedOn ?? (await bizToday(c, scope));
+  need(isDay(on) && on <= (await bizToday(c, scope)), "the funding date is today or earlier");
   const sales = await q<{ id: string; amount_minor: string; expected_fee_minor: string; status: string; company_id: string }>(c,
     `select id, amount_minor, expected_fee_minor, status, company_id from financed_sale where entity_id = $1 and id = any($2) for update`,
     [scope.entityId, s.saleIds]);
@@ -1389,12 +1402,12 @@ export async function depositLiability(c: Client, entityId: string) {
      where x.paid_minor - x.applied + x.returned <> 0
      order by x.ordered_at`, [entityId]);
   const loose = await q<{ id: string; number: string; customer: string | null; amount_minor: string; received_at: string }>(c, `
-    select r.id, r.number, cu.name customer, r.amount_minor, r.received_at::date::text received_at
+    select r.id, r.number, cu.name customer, r.amount_minor, (r.received_at at time zone business_tz(r.entity_id, r.location_id))::date::text received_at
       from customer_receipt r left join customer cu on cu.id = r.customer_id
      where r.entity_id = $1 and r.sales_order_id is null and r.voided_at is null
        and not exists (select 1 from ar_payment p where p.receipt_id = r.id)`, [entityId]);
   const unposted = await q<{ id: string; number: string; amount_minor: string; received_at: string }>(c, `
-    select r.id, r.number, r.amount_minor, r.received_at::date::text received_at
+    select r.id, r.number, r.amount_minor, (r.received_at at time zone business_tz(r.entity_id, r.location_id))::date::text received_at
       from customer_receipt r
      where r.entity_id = $1 and r.voided_at is null
        and not exists (select 1 from ar_payment p where p.receipt_id = r.id)
