@@ -1082,6 +1082,7 @@ export async function runDueReports(pool: { connect: () => Promise<Client> }, tx
     due = await q(c0, `select r.id, r.entity_id, e.tenant_id, r.schedule, r.schedule_by, r.next_run_on::text, r.name
                          from report r join entity e on e.id = r.entity_id
                         where r.status = 'active' and r.schedule is not null and r.schedule_by is not null
+                          and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active')
                           and r.next_run_on <= coalesce($1::date, current_date) and ($2::uuid is null or r.entity_id = $2)
                         order by r.next_run_on /* unscoped: the scheduler walks every company's reports */`, [asOf ?? null, only ?? null]);
   } finally { c0.release(); }

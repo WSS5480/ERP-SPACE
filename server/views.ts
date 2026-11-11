@@ -53,8 +53,11 @@ export async function loadCompany(c: Client, entityId: string): Promise<Company 
   } : null;
 }
 
-/** The people who can act for this company: its own, plus anyone granted it by name. */
-export async function people(c: Client, co: Company) {
+/**
+ * The people who can act for this company: its own, plus anyone granted it by name.
+ * Sales prospects' demo sign-ins are left out, except the one asking (viewerId).
+ */
+export async function people(c: Client, co: Company, viewerId: string | null = null) {
   return await q<{ id: string; name: string; email: string; roles: string[] }>(c, `
     select u.id, u.name, u.email,
            coalesce(array_agg(distinct g.role order by g.role) filter (where g.role is not null), '{}') as roles
@@ -62,14 +65,15 @@ export async function people(c: Client, co: Company) {
       left join role_grant g on g.app_user_id = u.id
                             and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $2))
      where u.status = 'active'
+       and (u.id = $3 or not exists (select 1 from platform_login pl where pl.app_user_id = u.id and pl.kind = 'prospect'))
        and (u.tenant_id = $2 or exists (select 1 from role_grant g2
                                           where g2.app_user_id = u.id and g2.entity_id = $1))
      group by u.id, u.name, u.email
-     order by u.name`, [co.id, co.tenantId]);
+     order by u.name`, [co.id, co.tenantId, viewerId]);
 }
 
-export async function person(c: Client, co: Company, personId: string) {
-  const all = await people(c, co);
+export async function person(c: Client, co: Company, personId: string, viewerId: string | null = personId) {
+  const all = await people(c, co, viewerId);
   return all.find((p) => p.id === personId) ?? null;
 }
 

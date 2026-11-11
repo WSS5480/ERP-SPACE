@@ -75,10 +75,10 @@ import { ActionError, rolesOf, type Actor } from "./actions.ts";
 import * as P from "./platform.ts";
 import { PlatformError } from "./platform.ts";
 import { resetDemo, DemoResetError } from "../packages/core/platform_demo.ts";
-import { clientIp } from "./modules/trade.ts";
+import { clientIp, describeClientIp, forwardingShape } from "./client_ip.ts";
 import { loadSampleActivity } from "./sample.ts";
 import { MODULES } from "./modules/index.ts";
-import { ModuleError, PublicPage, PublicAsset } from "./modules/kit.ts";
+import { ModuleError, PublicPage, PublicAsset, markLookOnly } from "./modules/kit.ts";
 import { InventoryError } from "../packages/core/inventory.ts";
 import { ArError } from "../packages/core/ar.ts";
 import { PostingError } from "../packages/core/posting.ts";
@@ -341,40 +341,44 @@ const auditActor = (who: Who | null): P.AuditActor =>
 // an address that keeps failing waits longer each time (up to 8 seconds) and
 // is refused for 15 minutes after 40. Nothing counted against one address
 // ever stops a correct password from another, and there is no install-wide
-// lock any more: made-up names cannot lock out the real ones.
-const FAIL_MS = 15 * 60_000;
-const fails = new Map<string, { n: number; since: number }>();
-function failsOf(key: string) {
-  const f = fails.get(key);
-  if (!f || Date.now() - f.since >= FAIL_MS) return 0;
-  return f.n;
+// lock: made-up names cannot lock out the real ones. The counts live in
+// platform_signin_attempt (hashed keys), so a restart does not reset them.
+const FAIL_MIN = 15;
+const keyHash = (key: string) => createHash("sha256").update(`erp/brake/${key}`).digest("hex");
+async function failsOf(key: string, windowMin = FAIL_MIN): Promise<number> {
+  const r = await pool.query<{ n: number }>(`select n from platform_signin_attempt where key_hash = $1 and since > now() - make_interval(mins => $2)
+     /* unscoped: sign-in brakes are install-wide */`, [keyHash(key), windowMin]);
+  return r.rows[0]?.n ?? 0;
 }
-function noteFail(key: string) {
-  const f = fails.get(key);
-  if (!f || Date.now() - f.since >= FAIL_MS) fails.set(key, { n: 1, since: Date.now() });
-  else f.n++;
-  if (fails.size > 50_000) for (const [k, v] of fails) if (Date.now() - v.since >= FAIL_MS) fails.delete(k);
+async function noteFail(key: string, windowMin = FAIL_MIN): Promise<void> {
+  await pool.query(`insert into platform_signin_attempt (key_hash, n, since) values ($1, 1, now())
+     on conflict (key_hash) do update set
+       n = case when platform_signin_attempt.since > now() - make_interval(mins => $2) then platform_signin_attempt.n + 1 else 1 end,
+       since = case when platform_signin_attempt.since > now() - make_interval(mins => $2) then platform_signin_attempt.since else now() end`,
+    [keyHash(key), windowMin]);
+  // old rows go now and then
+  if (Math.random() < 0.02) await pool.query(`delete from platform_signin_attempt where since < now() - interval '2 days' /* unscoped: housekeeping */`);
 }
 const userKey = (name: string, ip: string) => `u:${name.toLowerCase()}|${ip}`;
 const ipKey = (ip: string) => `ip:${ip}`;
 const USER_LIMIT = 5, IP_LIMIT = 40;
-function signInGate(name: string, ip: string): void {
-  if (failsOf(ipKey(ip)) >= IP_LIMIT) throw new HttpError(429, "too many wrong sign-ins from this address; wait 15 minutes and try again");
-  if (failsOf(userKey(name, ip)) >= USER_LIMIT) throw new HttpError(429, "too many wrong tries for that sign-in; wait 15 minutes and try again");
+async function signInGate(name: string, ip: string): Promise<void> {
+  if (await failsOf(ipKey(ip)) >= IP_LIMIT) throw new HttpError(429, "too many wrong sign-ins from this address; wait 15 minutes and try again");
+  if (await failsOf(userKey(name, ip)) >= USER_LIMIT) throw new HttpError(429, "too many wrong tries for that sign-in; wait 15 minutes and try again");
 }
 async function signInFailed(name: string, ip: string, what: string): Promise<never> {
-  noteFail(userKey(name, ip));
-  noteFail(ipKey(ip));
-  const n = failsOf(ipKey(ip));
+  await noteFail(userKey(name, ip));
+  await noteFail(ipKey(ip));
+  const n = await failsOf(ipKey(ip));
   await sleep(Math.min(8000, 700 * 2 ** Math.max(0, Math.floor(n / 5) - 1)));
   console.log(`sign-in refused (${what})`);
   throw new HttpError(401, what === "customer" ? "that email and password did not match" : "that access key did not match");
 }
-const signInOk = (name: string, ip: string) => fails.delete(userKey(name, ip));
-/** A plain rate limit (codes, reset emails): true when over. */
-function overRate(key: string, max: number): boolean {
-  if (failsOf(`r:${key}`) >= max) return true;
-  noteFail(`r:${key}`);
+const signInOk = (name: string, ip: string) => pool.query(`delete from platform_signin_attempt where key_hash = $1 /* unscoped: sign-in brakes */`, [keyHash(userKey(name, ip))]);
+/** A plain rate limit (codes, reset emails): true when over. windowMin defaults to 15 minutes. */
+async function overRate(key: string, max: number, windowMin = FAIL_MIN): Promise<boolean> {
+  if (await failsOf(`r:${key}`, windowMin) >= max) return true;
+  await noteFail(`r:${key}`, windowMin);
   return false;
 }
 
@@ -529,8 +533,10 @@ async function personOfTenant(c: Client, co: views.Company, id: string, tenantId
 
 type Acting = { personId: string; personName: string; label: string; preview: boolean } | null;
 
-/** A write outside coPost: refused while a tenant owner previews someone else's view. */
+const PROSPECT_READ_ONLY = "a demo sign-in can look at everything but not change it; ask the ERP team for a walk-through of making changes";
+/** A write outside coPost: refused while a tenant owner previews someone else's view, and for a demo prospect. */
 function refusePreview(req: http.IncomingMessage, who: Who | null): void {
+  if (who?.kind === "customer" && who.prospect) throw new HttpError(403, PROSPECT_READ_ONLY);
   if (who?.kind === "customer" && namedSomeone(req) && actingId(req) !== who.userId) {
     throw new HttpError(403, "previewing someone's view is read-only; switch back to yourself to make changes");
   }
@@ -550,11 +556,14 @@ async function acting(c: Client, co: views.Company, req: http.IncomingMessage, w
   const id = actingId(req);
   if (who.kind === "customer") {
     if (namedSomeone(req) && !id) throw new HttpError(403, "you can only act as yourself");
+    // A sales prospect's demo sign-in looks around but changes nothing, so prospects never see each other's work.
+    if (who.prospect && write) throw new HttpError(403, PROSPECT_READ_ONLY);
     if (!id || id === who.userId) {
-      const me = await views.person(c, co, who.userId);
+      const me = await views.person(c, co, who.userId, who.userId);
       if (!me) throw new HttpError(403, "you hold no role in this company");
       return { personId: me.id, personName: me.name, label: `${who.name} (web)`, preview: false };
     }
+    if (who.prospect) throw new HttpError(403, "you can only act as yourself");
     const mine = await rolesOf(c, co, who.userId);
     if (!mine.has("owner")) throw new HttpError(403, "you can only act as yourself");
     const p = await personOfTenant(c, co, id, who.tenantId);
@@ -631,12 +640,14 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
     try {
       const co = await companyFor(c, who, m[1]);
       const a = await acting(c, co, req, who!, false);
+      markLookOnly(c, !!a?.preview || (who?.kind === "customer" && who.prospect));
       const out = await fn(c, co, url, m, a?.personId ?? null);
       if (out === null) throw new HttpError(404, "not found");
       // A printable page (a tear sheet) goes out with every header and the CSP, like any page.
       if (out instanceof PublicPage) return [200, new Html(out.text)];
       return [200, out];
     } finally {
+      markLookOnly(c, false);
       c.release();
     }
   });
@@ -746,16 +757,24 @@ async function signedIn(c: Client, l: P.Login): Promise<Reply> {
 
 // One page signs in both kinds: a customer's email and password (or an emailed
 // code), or an operator's name and password.
+// Temporary: the first sign-in after boot logs how the request was forwarded
+// (hop counts only, never addresses), to confirm ERP_TRUSTED_PROXY_HOPS on live.
+let forwardingLogged = false;
 route("POST", /^\/session$/, "none", async (req) => {
   requirePageHeader(req);
+  if (!forwardingLogged) { forwardingLogged = true; console.log(`first sign-in: ${forwardingShape(req)}`); }
   const ip = clientIp(req);
   const body = await readJson(req);
   if (typeof body.email === "string" && body.email.trim()) {
     const email = P.cleanEmail(body.email);
-    signInGate(email, ip);
+    await signInGate(email, ip);
     const password = typeof body.password === "string" ? body.password : "";
     const code = typeof body.code === "string" ? body.code.trim() : "";
     if (!password && !code) throw new HttpError(400, "put your password in");
+    // A login takes at most CODE_WRONG_PER_DAY wrong codes a day, from anywhere (counted in the database).
+    if (code && await failsOf(`code-wrong:${email}`, DAY_MIN) >= CODE_WRONG_PER_DAY) {
+      throw new HttpError(429, "too many wrong codes for this sign-in today; use your password, or try again tomorrow");
+    }
     return tx({ kind: "system", label: "sign-in" }, async (c) => {
       const l = await P.loginByEmail(c, email);
       const ok = code ? !!l && l.status === "active" && await P.useCode(c, l, code)
@@ -763,11 +782,12 @@ route("POST", /^\/session$/, "none", async (req) => {
       if (!ok || !l) {
         // the wrong code's try is counted in the database; keep it when we refuse
         await c.query("commit"); await c.query("begin");
+        if (code) await noteFail(`code-wrong:${email}`, DAY_MIN);
         return signInFailed(email, ip, "customer");
       }
       const why = P.blocked(l);
       if (why) throw new HttpError(403, why);
-      signInOk(email, ip);
+      await signInOk(email, ip);
       return signedIn(c, l);
     });
   }
@@ -775,7 +795,7 @@ route("POST", /^\/session$/, "none", async (req) => {
   const name = cleanName(body.name);
   if (!name) throw new HttpError(400, "put your name in, so what you do here is recorded against it");
   const login = name.toLowerCase();
-  signInGate(login, ip);
+  await signInGate(login, ip);
   const logins = operatorLogins();
   const viaToken = !logins.has(login);
   if (logins.has(login)) {
@@ -785,7 +805,7 @@ route("POST", /^\/session$/, "none", async (req) => {
   } else if (!key || !safeEqual(key, TOKEN())) {
     return signInFailed(login, ip, "operator");
   }
-  signInOk(login, ip);
+  await signInOk(login, ip);
   const exp = Math.floor(Date.now() / 1000) + SESSION_HOURS * 3600;
   console.log(`signed in: operator ${name}`);
   return [200, { name, kind: "operator", until: new Date(exp * 1000).toISOString() }, { "set-cookie": sessionCookie({ n: name, e: exp, k: "o", ...(viaToken ? { t: 1 as const } : {}) }) }];
@@ -801,6 +821,9 @@ route("POST", /^\/session\/end$/, "none", async (req) => {
   return [200, { ok: true }, { "set-cookie": CLEAR_COOKIE }];
 });
 
+// An emailed six-digit code instead of the password: at most CODES_PER_DAY codes and
+// CODE_WRONG_PER_DAY wrong codes per sign-in per day, on top of 5 tries per code.
+const DAY_MIN = 24 * 60, CODES_PER_DAY = 5, CODE_WRONG_PER_DAY = 10;
 // An emailed six-digit code instead of the password. The answer is the same whether or not the email has an account.
 route("POST", /^\/session\/code$/, "none", async (req) => {
   requirePageHeader(req);
@@ -808,7 +831,8 @@ route("POST", /^\/session\/code$/, "none", async (req) => {
   const email = P.cleanEmail(body.email);
   if (!P.EMAIL.test(email)) throw new HttpError(400, "enter your email address");
   const ip = clientIp(req);
-  if (overRate(`code-ip:${ip}`, 10) || overRate(`code:${email}`, 3)) throw new HttpError(429, "too many codes asked for; wait 15 minutes and try again");
+  if (await overRate(`code-ip:${ip}`, 10) || await overRate(`code:${email}`, 3)) throw new HttpError(429, "too many codes asked for; wait 15 minutes and try again");
+  if (await overRate(`code-day:${email}`, CODES_PER_DAY, DAY_MIN)) throw new HttpError(429, "that is as many sign-in codes as one sign-in gets in a day; use your password");
   await tx({ kind: "system", label: "sign-in code" }, async (c) => {
     const l = await P.loginByEmail(c, email);
     if (!l || l.status !== "active" || P.blocked(l)) return;
@@ -825,7 +849,7 @@ route("POST", /^\/account\/forgot$/, "none", async (req) => {
   const email = P.cleanEmail(body.email);
   if (!P.EMAIL.test(email)) throw new HttpError(400, "enter your email address");
   const ip = clientIp(req);
-  if (overRate(`forgot-ip:${ip}`, 10) || overRate(`forgot:${email}`, 3)) throw new HttpError(429, "too many reset emails asked for; wait 15 minutes and try again");
+  if (await overRate(`forgot-ip:${ip}`, 10) || await overRate(`forgot:${email}`, 3)) throw new HttpError(429, "too many reset emails asked for; wait 15 minutes and try again");
   await tx({ kind: "system", label: "password reset" }, async (c) => {
     const l = await P.loginByEmail(c, email);
     if (!l || l.status === "disabled" || P.blocked(l) || l.kind === "prospect") return;
@@ -849,11 +873,11 @@ route("GET", /^\/account\/token$/, "none", async (_req, url) => {
 route("POST", /^\/account\/(?:accept|reset)$/, "none", async (req) => {
   requirePageHeader(req);
   const ip = clientIp(req);
-  if (overRate(`token-ip:${ip}`, 30)) throw new HttpError(429, "too many tries from this address; wait 15 minutes");
+  if (await overRate(`token-ip:${ip}`, 30)) throw new HttpError(429, "too many tries from this address; wait 15 minutes");
   const body = await readJson(req);
   return tx({ kind: "system", label: "account link" }, async (c) => {
     const l = await P.usePasswordToken(c, String(body.token ?? ""), body.password, body.name);
-    fails.delete(userKey(l.email, ip));
+    await signInOk(l.email, ip);
     return signedIn(c, l);
   });
 });
@@ -901,13 +925,14 @@ route("POST", /^\/api\/me\/company$/, "token", async (req, _url, _m, who) => {
 // A customer changes their own password.
 route("POST", /^\/api\/account\/password$/, "token", async (req, _url, _m, who) => {
   if (who?.kind !== "customer") throw new HttpError(403, "only a customer sign-in has a password here");
+  if (who.prospect) throw new HttpError(403, PROSPECT_READ_ONLY);
   const body = await readJson(req);
   const ip = clientIp(req);
-  signInGate(who.email, ip);
+  await signInGate(who.email, ip);
   return tx({ kind: "user", id: who.userId, label: `${who.name} (web)` }, async (c) => {
     const l = await P.loginById(c, who.loginId);
     if (!l || !P.verifyPassword(String(body.current ?? ""), l.pw_hash)) {
-      noteFail(userKey(who.email, ip));
+      await noteFail(userKey(who.email, ip));
       throw new HttpError(401, "your current password did not match");
     }
     const pw = P.checkPassword(body.next, l.email);
@@ -993,11 +1018,11 @@ route("POST", new RegExp(`^/api/platform/customers/${TID}/(suspend|reactivate)$`
 route("POST", new RegExp(`^/api/platform/customers/${TID}/users$`), "token", async (req, _u, m, who) => {
   const by = operator(who);
   const body = await readJson(req);
-  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.inviteUser(c, by, tenantParam(m), body, publicBase()))];
+  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.inviteUser(c, by, tenantParam(m), body, publicBase(), { reveal: true }))];
 });
 route("POST", new RegExp(`^/api/platform/customers/${TID}/logins/${TID}/invite$`), "token", async (_req, _u, m, who) => {
   const by = operator(who);
-  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.reinvite(c, by, tenantParam(m), m[2], publicBase()))];
+  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.reinvite(c, by, tenantParam(m), m[2], publicBase(), { reveal: true }))];
 });
 // Support mode: the cookie now names a support session, recorded on the customer's log.
 route("POST", new RegExp(`^/api/platform/customers/${TID}/support$`), "token", async (req, _u, m, who) => {
@@ -1042,12 +1067,12 @@ route("POST", /^\/api\/platform\/demo\/reset$/, "token", async (req, _u, _m, who
 // ------------------------------------------- a tenant's own users and tokens
 
 /** The tenant an account-owner route acts on: a customer's own (owner only), or the one an operator is supporting. */
-async function ownerTenant(who: Who | null): Promise<{ tenantId: string; by: P.AuditActor; selfUserId: string | null }> {
-  if (who?.kind === "operator" && who.support) return { tenantId: who.support.tenantId, by: auditActor(who), selfUserId: null };
+async function ownerTenant(who: Who | null): Promise<{ tenantId: string; by: P.AuditActor; selfUserId: string | null; reveal: boolean }> {
+  if (who?.kind === "operator" && who.support) return { tenantId: who.support.tenantId, by: auditActor(who), selfUserId: null, reveal: true };
   if (who?.kind === "customer") {
     const owner = !who.prospect && await read((c) => P.isTenantOwner(c, who.userId, who.tenantId));
     if (!owner) throw new HttpError(403, "managing sign-ins and API tokens is for the account owner");
-    return { tenantId: who.tenantId, by: auditActor(who), selfUserId: who.userId };
+    return { tenantId: who.tenantId, by: auditActor(who), selfUserId: who.userId, reveal: false };
   }
   throw new HttpError(403, "managing sign-ins and API tokens is for the account owner");
 }
@@ -1060,11 +1085,11 @@ route("GET", /^\/api\/tenant\/users$/, "token", async (_r, _u, _m, who) => {
 route("POST", /^\/api\/tenant\/users$/, "token", async (req, _u, _m, who) => {
   const o = await ownerTenant(who);
   const body = await readJson(req);
-  return [200, await ownerTx(o, (c) => P.inviteUser(c, o.by, o.tenantId, body, publicBase()))];
+  return [200, await ownerTx(o, (c) => P.inviteUser(c, o.by, o.tenantId, body, publicBase(), { reveal: o.reveal }))];
 });
 route("POST", new RegExp(`^/api/tenant/users/${TID}/(invite|disable|enable)$`), "token", async (_req, _u, m, who) => {
   const o = await ownerTenant(who);
-  return [200, await ownerTx(o, (c) => m[2] === "invite" ? P.reinvite(c, o.by, o.tenantId, m[1], publicBase())
+  return [200, await ownerTx(o, (c) => m[2] === "invite" ? P.reinvite(c, o.by, o.tenantId, m[1], publicBase(), { reveal: o.reveal })
     : P.setLoginStatus(c, o.by, o.tenantId, m[1], m[2] === "enable", o.selfUserId))];
 });
 route("GET", /^\/api\/tenant\/tokens$/, "token", async (_r, _u, _m, who) => {
@@ -1081,7 +1106,7 @@ route("POST", new RegExp(`^/api/tenant/tokens/${TID}/(rotate|revoke)$`), "token"
   return [200, await ownerTx(o, (c) => m[2] === "rotate" ? P.rotateApiToken(c, o.by, o.tenantId, m[1]) : P.revokeApiToken(c, o.by, o.tenantId, m[1]))];
 });
 
-coGet("/people", (c, co) => views.people(c, co));
+coGet("/people", (c, co, _u, _m, p) => views.people(c, co, p));
 coGet("/home", (c, co, _u, _m, p) => views.home(c, co, p));
 coGet("/options", (c, co) => views.formOptions(c, co));
 
@@ -1434,8 +1459,12 @@ function refusal(e: unknown): string | null {
  * tear sheet, unsubscribe or self-schedule link, any long random token -- is
  * shown as [token]; ids (uuids) and ordinary words stay.
  */
+const SECRET_AFTER = /^(\/sheet|\/crm\/u|\/delivery\/schedule)\/[^/]+/;
 export function logPath(path: string): string {
-  return path.split("/").map((seg) => (/^[A-Za-z0-9_-]{16,}$/.test(seg) && !UUID.test(seg) && /[0-9_-]/.test(seg) ? "[token]" : seg)).join("/");
+  // the link routes whose next segment is always a secret, whatever it looks like
+  const p = path.replace(SECRET_AFTER, "$1/[token]");
+  // anything else that looks random: 16+ token characters, not an id, not a lower-case slug (approve-timecards)
+  return p.split("/").map((seg) => (/^[A-Za-z0-9_-]{16,}$/.test(seg) && !UUID.test(seg) && !/^[a-z]+(-[a-z]+)*$/.test(seg) ? "[token]" : seg)).join("/");
 }
 
 export function createServer(): http.Server {
@@ -1498,6 +1527,7 @@ export async function start(): Promise<http.Server> {
       "ERP-api -> Environment -> add DATABASE_URL with the database's Internal Database URL.");
   }
   if (!APP || !APP_JS || !APP_CSS) console.warn("the app files are not all in server/; the root address will say so");
+  console.log(describeClientIp());
   const applied = await migrate({ seed: TRIAL });
   console.log(applied.length ? `migrations: applied ${applied.length}` : "migrations: up to date");
   if (TRIAL) {

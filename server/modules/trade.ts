@@ -75,16 +75,8 @@ async function viewGuard(c: Client, co: Company, personId: string | null) {
 const hits = new Map<string, number[]>();
 export const LIMITS = { apply: { max: 5, ms: 60 * 60_000 }, code: { max: 6, ms: 15 * 60_000 }, verify: { max: 20, ms: 15 * 60_000 }, portal: { max: 600, ms: 10 * 60_000 },
   applyEmail: { max: 3, ms: 60 * 60_000 }, codeEmail: { max: 5, ms: 15 * 60_000 }, verifyEmail: { max: 10, ms: 15 * 60_000 } };
-export function proxyHops(): number {
-  const n = Number(process.env.ERP_TRUSTED_PROXY_HOPS ?? "1");
-  return Number.isInteger(n) && n >= 0 && n <= 5 ? n : 1;
-}
-export function clientIp(req: http.IncomingMessage, hops = proxyHops()): string {
-  const sock = req.socket?.remoteAddress ?? "?";
-  if (hops === 0) return sock;
-  const xf = String(req.headers["x-forwarded-for"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  return xf.length >= hops ? xf[xf.length - hops] : sock;
-}
+export { proxyHops, clientIp } from "../client_ip.ts";
+import { clientIp } from "../client_ip.ts";
 function hit(key: string, bucket: keyof typeof LIMITS): boolean {
   const { max, ms } = LIMITS[bucket];
   const now = Date.now(), k = `${bucket}:${key}`;

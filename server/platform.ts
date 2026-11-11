@@ -277,8 +277,16 @@ export async function createCustomer(c: Client, who: AuditActor, input: Record<s
   return { tenantId: made.tenantId, entityId: made.id, ownerId: owner.id, loginId: login.id, pack: pack.id, inviteLink: link, emailed: mail.sent };
 }
 
-/** A tenant owner (or an operator) adds someone: a person with roles in one company, and an invite. */
-export async function inviteUser(c: Client, who: AuditActor, tenantId: string, input: Record<string, unknown>, base: string) {
+/**
+ * A tenant owner (or an operator) adds someone: a person with roles in one company, and an invite.
+ *
+ * An email can sign in to one tenant only. A tenant owner is never told that an
+ * address belongs to another customer: the answer is the same either way, no
+ * link is shown (it goes by email, or the ERP team hands it over), and the
+ * person and their roles are kept here; the clash is on the platform log for
+ * the ERP team. An operator (reveal) gets the link and is told plainly.
+ */
+export async function inviteUser(c: Client, who: AuditActor, tenantId: string, input: Record<string, unknown>, base: string, opts: { reveal?: boolean } = {}) {
   const email = cleanEmail(input.email), name = text(input.name, 80);
   need(EMAIL.test(email), "enter their email address; the invite goes there");
   need(name.length >= 2, "enter their name");
@@ -289,30 +297,61 @@ export async function inviteUser(c: Client, who: AuditActor, tenantId: string, i
   const allowed = ["owner", "controller", "approver", "ap_clerk", "viewer", "store_manager", "sales", "cashier", "buyer", "warehouse", "dispatcher", "driver", "ar_clerk", "hr", "web_admin", "marketing", "technician", "designer"];
   const roles = [...new Set((Array.isArray(input.roles) ? input.roles : []).map(String).filter((r) => allowed.includes(r)))];
   need(roles.length, "give them at least one role");
+  if (opts.reveal) {
+    const elsewhere = await q(c, `select 1 from platform_login where email = $1 and tenant_id <> $2 /* unscoped: one email, one sign-in */`, [email, tenantId]);
+    need(!elsewhere.length, `${email} already signs in to another customer's account; use another address`);
+  }
   const found = await q<{ id: string }>(c, `select id from app_user where tenant_id = $1 and lower(email) = $2 /* unscoped: people belong to the client */`, [tenantId, email]);
   const userId = found[0]?.id ?? (await one<{ id: string }>(c, `insert into app_user (tenant_id, email, name) values ($1,$2,$3) returning id`, [tenantId, email, name])).id;
   for (const r of roles) await c.query(`insert into role_grant (app_user_id, entity_id, role) values ($1,$2,$3) on conflict do nothing`, [userId, entityId, r]);
-  const existing = await q<{ id: string; tenant_id: string; email: string; status: string }>(c, `select id, tenant_id, email, status from platform_login where app_user_id = $1 /* unscoped: the person's sign-in */`, [userId]);
-  const login = existing[0] ?? await newLogin(c, tenantId, userId, email, "customer", who.actor);
+  const existing = await q<{ status: string }>(c, `select status from platform_login where app_user_id = $1 /* unscoped: the person's sign-in */`, [userId]);
   need(!existing[0] || existing[0].status !== "active", `${email} already signs in here; their new roles are in place`);
-  const t = await one<{ name: string }>(c, `select name from tenant where id = $1 /* unscoped: the client */`, [tenantId]);
-  const { token } = await issueToken(c, login, "invite", who.actor);
-  const link = `${base}/#invite=${token}`;
-  const mail = await sendAccountEmail(c, { ...login, name, tenant_name: t.name }, "invite", token, link, who.actor);
-  await audit(c, who, "user.invite", tenantId, { email, roles, entityId, emailed: mail.sent }, entityId);
-  return { userId, loginId: login.id, inviteLink: link, emailed: mail.sent };
+  const sent = await inviteFor(c, who, tenantId, userId, base, "user.invite", { roles, entityId }, entityId);
+  return opts.reveal ? { userId, ...sent } : { userId, ...neutral(sent) };
 }
 
-/** A fresh invite link for someone who has not set a password yet. */
-export async function reinvite(c: Client, who: AuditActor, tenantId: string, loginId: string, base: string) {
-  const l = await loginById(c, loginId);
-  need(l && l.tenant_id === tenantId, "no such sign-in");
-  need(l.status === "invited", "they have already set a password; they can reset it from the sign-in page");
-  const { token } = await issueToken(c, l, "invite", who.actor);
+/** What a tenant owner is told about an invite: the same whatever became of it. */
+function neutral(r: { emailed: boolean; connected: boolean }) {
+  return { ok: true, note: r.connected ? "The invite is on its way by email. It works once, for 7 days."
+    : "Email is not connected yet, so the invite was not sent. Connect email under Connections, or ask the ERP team for the link." };
+}
+
+/** An invite for a person of this tenant: their sign-in (made if they have none) and a fresh link. */
+async function inviteFor(c: Client, who: AuditActor, tenantId: string, userId: string, base: string, action: string, detail: Record<string, unknown>, entityId: string | null) {
+  const u = await one<{ email: string; name: string; tenant_name: string }>(c, `select u.email, u.name, t.name as tenant_name from app_user u join tenant t on t.id = u.tenant_id
+     where u.id = $1 and u.tenant_id = $2 /* unscoped: the client's person */`, [userId, tenantId]);
+  const email = cleanEmail(u.email);
+  const co = entityId ?? await firstCompany(c, tenantId);
+  const connected = !!(co && await mailVia(c, co));
+  const existing = await q<{ id: string; tenant_id: string; email: string; status: string }>(c, `select id, tenant_id, email, status from platform_login where app_user_id = $1 /* unscoped: the person's sign-in */`, [userId]);
+  if (!existing[0]) {
+    const elsewhere = await q(c, `select 1 from platform_login where email = $1 /* unscoped: one email, one sign-in */`, [email]);
+    if (elsewhere.length) {
+      await audit(c, who, "user.invite_conflict", tenantId, { email, ...detail }, entityId);
+      return { loginId: null, inviteLink: null, emailed: false, connected };
+    }
+  }
+  const login = existing[0] ?? await newLogin(c, tenantId, userId, email, "customer", who.actor);
+  need(login.status !== "active", "they have already set a password; they can reset it from the sign-in page");
+  const { token } = await issueToken(c, login, "invite", who.actor);
   const link = `${base}/#invite=${token}`;
-  const mail = await sendAccountEmail(c, { ...l }, "invite", token, link, who.actor);
-  await audit(c, who, "user.reinvite", tenantId, { email: l.email, emailed: mail.sent });
-  return { inviteLink: link, emailed: mail.sent };
+  const mail = await sendAccountEmail(c, { ...login, name: u.name, tenant_name: u.tenant_name, last_entity_id: entityId }, "invite", token, link, who.actor);
+  await audit(c, who, action, tenantId, { email, emailed: mail.sent, ...detail }, entityId);
+  return { loginId: login.id, inviteLink: link, emailed: mail.sent, connected };
+}
+
+/** A fresh invite for someone who has not set a password yet (id: their sign-in, or the person when they have none). */
+export async function reinvite(c: Client, who: AuditActor, tenantId: string, id: string, base: string, opts: { reveal?: boolean } = {}) {
+  need(UUID.test(id), "no such person");
+  const r = await q<{ user_id: string }>(c, `select u.id as user_id from app_user u left join platform_login l on l.app_user_id = u.id
+     where u.tenant_id = $1 and (l.id = $2 or u.id = $2) /* unscoped: the client's person or sign-in */`, [tenantId, id]);
+  need(r.length, "no such person");
+  const sent = await inviteFor(c, who, tenantId, r[0].user_id, base, "user.reinvite", {}, null);
+  if (opts.reveal) {
+    need(sent.inviteLink, "that email already signs in to another customer's account; change their email first");
+    return sent;
+  }
+  return neutral(sent);
 }
 
 export async function setLoginStatus(c: Client, who: AuditActor, tenantId: string, loginId: string, on: boolean, selfUserId: string | null) {
@@ -325,13 +364,16 @@ export async function setLoginStatus(c: Client, who: AuditActor, tenantId: strin
   return { ok: true };
 }
 
+/** Everyone in the tenant with their sign-in; someone with none yet reads as invited (id is then the person's). */
 export async function users(c: Client, tenantId: string) {
   return q(c, `
-    select l.id, l.email, l.kind, l.status, l.last_sign_in_at, l.expires_at, u.id as person_id, u.name,
+    select coalesce(l.id, u.id) as id, coalesce(l.email, lower(u.email)) as email, coalesce(l.kind, 'customer') as kind,
+           coalesce(l.status, 'invited') as status, l.last_sign_in_at, l.expires_at, u.id as person_id, u.name,
            coalesce((select json_agg(json_build_object('company', coalesce(e.name, 'Every company'), 'role', g.role) order by e.name, g.role)
                        from role_grant g left join entity e on e.id = g.entity_id where g.app_user_id = u.id), '[]') as roles
-      from platform_login l join app_user u on u.id = l.app_user_id
-     where l.tenant_id = $1 order by u.name /* unscoped: the client's sign-ins */`, [tenantId]);
+      from app_user u left join platform_login l on l.app_user_id = u.id
+     where u.tenant_id = $1 and u.status = 'active' and coalesce(l.kind, 'customer') <> 'prospect'
+     order by u.name /* unscoped: the client's people and sign-ins */`, [tenantId]);
 }
 
 export async function setTenantStatus(c: Client, who: AuditActor, tenantId: string, status: "active" | "suspended", reason: unknown) {
@@ -369,8 +411,10 @@ export async function customerDetail(c: Client, tenantId: string) {
       (select string_agg(distinct p.pack, ', ') from pack_application p where p.entity_id = e.id) as packs
       from entity e where e.tenant_id = $1 order by e.name /* unscoped: the client's companies */`, [tenantId]);
   const recent = await q(c, `select at, actor, actor_kind, action, detail from platform_audit where tenant_id = $1 order by at desc limit 30 /* unscoped: the client's platform log */`, [tenantId]);
+  const stores = await q(c, `select lo.id, lo.code, lo.name, lo.state, lo.kind, e.name as company from location lo join entity e on e.id = lo.entity_id
+      where e.tenant_id = $1 and lo.status = 'active' order by e.name, lo.name /* unscoped: the client's stores */`, [tenantId]);
   const tokens = await q(c, `select count(*)::int as n from platform_api_token where tenant_id = $1 and status = 'active' /* unscoped: the client's tokens */`, [tenantId]);
-  return { ...t, companiesList: companies, users: await users(c, tenantId), activeTokens: tokens[0].n, recent };
+  return { ...t, companiesList: companies, storesList: stores, users: await users(c, tenantId), activeTokens: tokens[0].n, recent };
 }
 
 // ------------------------------------------------------------- support mode

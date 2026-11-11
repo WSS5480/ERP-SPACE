@@ -418,3 +418,5 @@ dialog.sheet{margin:auto auto 0;width:100%;max-width:520px;border-radius:16px 16
 .field.roles legend{font-size:13px;color:var(--muted);margin-bottom:4px;padding:0}
 .check{display:flex;gap:8px;align-items:center;font-size:14px;min-height:32px}
 .row-acts{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
+.btn svg.back{transform:rotate(90deg)}
+.facts dd .linkbtn{font-variant-numeric:tabular-nums}

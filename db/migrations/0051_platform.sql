@@ -145,3 +145,21 @@ end $$;
 create trigger platform_audit_no_change
   before update or delete on platform_audit
   for each row execute function platform_audit_is_append_only();
+
+-- ------------------------------------------------------- sign-in brakes --
+
+-- Wrong passwords and codes, counted per name+address, per address and per
+-- login, kept here so a restart does not reset them. Keys are sha256 hashes:
+-- no email or address is stored.
+create table platform_signin_attempt (
+  key_hash  text primary key,
+  n         integer not null default 0,
+  since     timestamptz not null default now()
+);
+
+-- ------------------------------------------------- inbound email mailboxes --
+
+-- Mail is routed to a connection by the address it was sent to, before any
+-- company is known: one address, one live connection.
+create unique index connection_email_mailbox_key on connection (lower(config->>'mailbox'))
+  where channel = 'email' and status <> 'retired';

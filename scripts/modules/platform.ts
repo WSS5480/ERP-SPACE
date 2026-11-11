@@ -60,6 +60,34 @@ export async function run(t: T) {
     await Promise.all(Array.from({ length: 32 }, (_, i) => call("POST", "/session", { body: { name: `madeup${i}`, key: "whatever-123" }, ip: `192.0.2.${i + 10}` })));
     const afterFlood = await call("POST", "/session", { body: { name: "opsy", key: OP_PASS }, ip: "198.51.100.3" });
     t.ok("32 wrong tries under made-up names lock out nobody real", afterFlood.status === 200);
+    t.ok("wrong tries are counted in the database (a restart keeps them), by hashed key only",
+      (await db<{ n: number }>(`select count(*)::int n from platform_signin_attempt`))[0].n > 30
+      && (await db(`select 1 from platform_signin_attempt where key_hash like '%opsy%' or key_hash like '%203.0.113%'`)).length === 0);
+    // Behind Cloudflare and Render: x-forwarded-for is "client, edge", the edge shared by many clients.
+    process.env.ERP_TRUSTED_PROXY_HOPS = "2";
+    try {
+      const EDGE = "104.16.0.1";
+      for (let i = 0; i < 5; i++) await call("POST", "/session", { body: { name: "opsy", key: `nope-edge-${i}` }, ip: `198.51.100.71, ${EDGE}` });
+      const a1 = await call("POST", "/session", { body: { name: "opsy", key: OP_PASS }, ip: `198.51.100.71, ${EDGE}` });
+      const a2 = await call("POST", "/session", { body: { name: "opsy", key: OP_PASS }, ip: `198.51.100.72, ${EDGE}` });
+      t.ok("two clients behind the same edge do not lock each other out", a1.status === 429 && a2.status === 200, `${a1.status} ${a2.status}`);
+      const spoof = await call("POST", "/session", { body: { name: "opsy", key: OP_PASS }, ip: `1.2.3.4, 198.51.100.71, ${EDGE}` });
+      t.ok("and a client cannot dodge its lock by writing its own x-forwarded-for entry", spoof.status === 429);
+    } finally { process.env.ERP_TRUSTED_PROXY_HOPS = "1"; }
+    const { clientIp } = await import("../../server/client_ip.ts");
+    const fake = (h: Record<string, string>) => ({ headers: h, socket: { remoteAddress: "10.0.0.9" } }) as unknown as import("node:http").IncomingMessage;
+    process.env.ERP_CLIENT_IP_HEADER = "cf-connecting-ip";
+    t.ok("cf-connecting-ip is used when ERP_CLIENT_IP_HEADER says so", clientIp(fake({ "cf-connecting-ip": "203.0.113.9", "x-forwarded-for": "5.5.5.5, 104.16.0.1" }), 2) === "203.0.113.9"
+      && clientIp(fake({ "x-forwarded-for": "203.0.113.8, 104.16.0.1" }), 2) === "203.0.113.8" && clientIp(fake({ "x-forwarded-for": "203.0.113.7" }), 2) === "203.0.113.7");
+    delete process.env.ERP_CLIENT_IP_HEADER;
+    const savedRender = process.env.RENDER, savedHops = process.env.ERP_TRUSTED_PROXY_HOPS;
+    delete process.env.ERP_TRUSTED_PROXY_HOPS; process.env.RENDER = "true";
+    const onRender = clientIp(fake({ "x-forwarded-for": "203.0.113.6, 104.16.0.1" }));
+    delete process.env.RENDER;
+    const offRender = clientIp(fake({ "x-forwarded-for": "203.0.113.6, 104.16.0.1" }));
+    if (savedRender !== undefined) process.env.RENDER = savedRender;
+    process.env.ERP_TRUSTED_PROXY_HOPS = savedHops;
+    t.ok("defaults: two hops on Render, the socket elsewhere", onRender === "203.0.113.6" && offRender === "10.0.0.9", `${onRender} ${offRender}`);
 
     // ------------------------------------------------------------ customers
     const before = await db<{ n: number }>(`select count(*)::int n from tenant`);
@@ -111,13 +139,30 @@ export async function run(t: T) {
 
     // A second person in Alpha, invited by the owner.
     const inv = await call("POST", "/api/tenant/users", { cookie: aOwner, body: { name: "Sam Sales", email: "sam@alpha.example", entityId: aE, roles: ["sales"] } });
-    t.ok("the owner invites someone with a role", inv.status === 200 && !!inv.data.inviteLink, inv.data.error);
-    const samIn = await call("POST", "/account/accept", { body: { token: tokenOf(inv.data.inviteLink as string), password: "sam-sales-pass" } });
+    t.ok("the owner invites someone with a role; with no email connected the link is not shown to the owner",
+      inv.status === 200 && !inv.data.inviteLink && /not connected/.test(String(inv.data.note)), inv.data.error);
+    const tokenFor = (email: string, purpose: "invite" | "reset" | "code") => t.pool.connect().then(async (c) => {
+      try { const l = (await P.loginByEmail(c, email))!; return (await P.issueToken(c, l, purpose, "check")).token; } finally { c.release(); }
+    });
+    const samIn = await call("POST", "/account/accept", { body: { token: await tokenFor("sam@alpha.example", "invite"), password: "sam-sales-pass" } });
     const sam = samIn.cookie!;
     const samId = inv.data.userId as string;
     const ownerId = (aMe.data.viewer as { personId: string }).personId;
     const inviteOther = await call("POST", "/api/tenant/users", { cookie: aOwner, body: { name: "X", email: "x@x.example", entityId: bE, roles: ["sales"] } });
     t.ok("an owner cannot invite someone into another tenant's company", inviteOther.status === 409);
+    // An address that signs in to another customer: the owner's answer is the same as for a new address.
+    const fresh = await call("POST", "/api/tenant/users", { cookie: aOwner, body: { name: "Nina New", email: "nina@alpha.example", entityId: aE, roles: ["viewer"] } });
+    const clash = await call("POST", "/api/tenant/users", { cookie: aOwner, body: { name: "Bob Bravo", email: "owner@bravo.example", entityId: aE, roles: ["viewer"] } });
+    const keys = (r: Res) => Object.keys(r.data).filter((k) => k !== "userId").sort().join(",") + "|" + String(r.data.note);
+    t.ok("inviting another customer's email reveals nothing: same answer as a new address", clash.status === 200 && keys(clash) === keys(fresh), `${keys(clash)} vs ${keys(fresh)}`);
+    t.ok("no sign-in is made for it, and the clash is on the platform log for the ERP team",
+      (await db(`select 1 from platform_login where email = 'owner@bravo.example' and tenant_id = $1`, [aT])).length === 0
+      && (await db(`select 1 from platform_audit where tenant_id = $1 and action = 'user.invite_conflict'`, [aT])).length === 1);
+    const listed = (await call("GET", "/api/tenant/users", { cookie: aOwner })).data as unknown as { email: string; status: string }[];
+    t.ok("both read as invited in the owner's list", listed.filter((u) => ["nina@alpha.example", "owner@bravo.example"].includes(u.email)).every((u) => u.status === "invited")
+      && listed.filter((u) => ["nina@alpha.example", "owner@bravo.example"].includes(u.email)).length === 2);
+    const opClash = await call("POST", `/api/platform/customers/${aT}/users`, { cookie: op, body: { name: "Bob Bravo", email: "owner@bravo.example", entityId: aE, roles: ["viewer"] } });
+    t.ok("the ERP team is told plainly", opClash.status === 409 && /another customer/.test(opClash.data.error ?? ""));
     t.ok("a non-owner cannot manage sign-ins", (await call("GET", "/api/tenant/users", { cookie: sam })).status === 403);
 
     // --------------------------------------------------------------- lockout
@@ -146,11 +191,28 @@ export async function run(t: T) {
     // An emailed sign-in code.
     const codeReq = await call("POST", "/session/code", { body: { email: "sam@alpha.example" }, ip: "10.9.9.7" });
     t.ok("a sign-in code can be asked for", codeReq.status === 200);
-    const code = await t.pool.connect().then(async (c) => {
-      try { const l = (await P.loginByEmail(c, "sam@alpha.example"))!; return (await P.issueToken(c, l, "code", "check")).token; } finally { c.release(); }
-    });
+    const code = await tokenFor("sam@alpha.example", "code");
     t.ok("a wrong code is refused", (await call("POST", "/session", { body: { email: "sam@alpha.example", code: "000000" === code ? "111111" : "000000" }, ip: "10.9.9.6" })).status === 401);
     t.ok("the emailed code signs in", (await call("POST", "/session", { body: { email: "sam@alpha.example", code }, ip: "10.9.9.6" })).status === 200);
+    // A day's cap per sign-in, whatever address the tries come from.
+    for (let i = 0; i < 10; i++) {
+      await tokenFor("sam@alpha.example", "code");
+      await call("POST", "/session", { body: { email: "sam@alpha.example", code: "000001" }, ip: `10.8.${i}.1` });
+    }
+    const cap = await tokenFor("sam@alpha.example", "code");
+    const capped = await call("POST", "/session", { body: { email: "sam@alpha.example", code: cap }, ip: "10.8.99.1" });
+    t.ok("after 10 wrong codes in a day, codes stop working for that sign-in (the password still does)", capped.status === 429
+      && (await call("POST", "/session", { body: { email: "sam@alpha.example", password: "sam-new-pass-22" }, ip: "10.8.99.2" })).status === 200, capped.data.error);
+    // 3 codes per 15 minutes, 5 a day. The quarter-hour brake is cleared here to reach the day's cap.
+    const { createHash } = await import("node:crypto");
+    const brake = (k: string) => createHash("sha256").update(`erp/brake/${k}`).digest("hex");
+    let asked = 0, why = "";
+    for (let i = 0; i < 6; i++) {
+      const r = await call("POST", "/session/code", { body: { email: "nina@alpha.example" }, ip: `10.7.${i}.1` });
+      if (r.status === 200) asked++; else why = r.data.error ?? "";
+      await db(`delete from platform_signin_attempt where key_hash = $1`, [brake("r:code:nina@alpha.example")]);
+    }
+    t.ok("at most 5 codes a day are sent for one sign-in", asked === 5 && /in a day/.test(why), `${asked} ${why}`);
 
     // ----------------------------------------------------- tenant isolation
     const ROUTES = routeList().filter((r) => r.auth === "token" && r.path.source.startsWith("^\\/api\\/c\\/"));
@@ -279,6 +341,9 @@ export async function run(t: T) {
     t.ok("suspending needs a reason", (await call("POST", `/api/platform/customers/${aT}/suspend`, { cookie: op, body: {} })).status === 409);
     const susp = await call("POST", `/api/platform/customers/${aT}/suspend`, { cookie: op, body: { reason: "unpaid invoice" } });
     t.ok("an operator suspends a customer", susp.status === 200);
+    const RD = await import("../run-due.ts");
+    const crmRun = await RD.runDueCrm(new Date());
+    t.ok("the scheduler skips a suspended customer's companies", !crmRun.some((r) => r.entityId === aE) && crmRun.some((r) => r.entityId === bE));
     const susIn = await call("POST", "/session", { body: { email: "owner@alpha.example", password: "alpha-owner-pass" } });
     t.ok("a suspended customer cannot sign in, and is told why", susIn.status === 403 && /suspended/.test(susIn.data.error ?? ""));
     t.ok("their open sessions end", (await call("GET", "/api/me", { cookie: aOwner })).status === 401);
@@ -298,7 +363,9 @@ export async function run(t: T) {
       t.ok("a feed connection with no company is refused, not filed into the first company", h.status === 409 && /not attached to a company/.test(hb.error), hb.error);
     }
     t.ok("the request log hides link tokens", logPath("/sheet/AbCdEf0123456789xyzQ_k") === "/sheet/[token]" && logPath("/crm/u/Zx9_-abcdefghijklmnopq") === "/crm/u/[token]"
-      && logPath("/delivery/schedule/abcDEF1234567890ghijKL") === "/delivery/schedule/[token]" && logPath(`/api/c/${ENTITY}/bills`) === `/api/c/${ENTITY}/bills` && logPath("/trade/buddys/api/orders") === "/trade/buddys/api/orders");
+      && logPath("/delivery/schedule/abcDEF1234567890ghijKL") === "/delivery/schedule/[token]" && logPath(`/api/c/${ENTITY}/bills`) === `/api/c/${ENTITY}/bills` && logPath("/trade/buddys/api/orders") === "/trade/buddys/api/orders"
+      && logPath("/sheet/abcdefghijklmnopqrstuvwx") === "/sheet/[token]" && logPath("/x/AbCdEfGhIjKlMnOpQrSt") === "/x/[token]"
+      && logPath(`/api/c/${ENTITY}/payroll/periods/${ENTITY}/approve-timecards`) === `/api/c/${ENTITY}/payroll/periods/${ENTITY}/approve-timecards`);
     const lines: string[] = [];
     const orig = console.log;
     console.log = (...a: unknown[]) => { lines.push(a.join(" ")); };
@@ -313,6 +380,19 @@ export async function run(t: T) {
     t.ok("the prospect sees the demo and nothing else", prIn.status === 200 && (prMe.data.companies as { tenant_id: string }[]).every((x) => x.tenant_id === TENANT)
       && (prMe.data.companies as unknown[]).length > 0 && (await call("GET", `/api/c/${aE}/home`, { cookie: prIn.cookie })).status === 404);
     t.ok("a prospect cannot manage the demo's sign-ins", (await call("GET", "/api/tenant/users", { cookie: prIn.cookie })).status === 403);
+    const pr2 = await call("POST", "/api/platform/prospects", { cookie: op, body: { name: "Quinn Prospect", email: "quinn@prospect.example", days: 1 } });
+    const q2 = (await call("POST", "/session", { body: { email: "quinn@prospect.example", password: pr2.data.password } })).cookie;
+    const ppl = (await call("GET", `/api/c/${ENTITY}/people`, { cookie: q2 })).data as unknown as { name: string }[];
+    t.ok("a prospect sees themselves in the people list but not other prospects", ppl.some((p) => /Quinn/.test(p.name)) && !ppl.some((p) => /Pat Prospect/.test(p.name)));
+    const ro = await call("POST", `/api/c/${ENTITY}/setup/stores`, { cookie: q2, body: { code: "PRS1", name: "Prospect store" } });
+    t.ok("a prospect's demo sign-in is look-only", ro.status === 403 && /look at everything/.test(ro.data.error ?? ""), ro.data.error);
+    const patId = (await db<{ app_user_id: string }>(`select app_user_id from platform_login where email = 'pat@prospect.example'`))[0].app_user_id;
+    t.ok("and cannot act as another prospect", (await call("GET", `/api/c/${ENTITY}/home`, { cookie: q2, as: patId })).status === 403);
+    const jobs0 = (await db<{ n: number }>(`select count(*)::int n from label_print_job where entity_id = $1`, [ENTITY]))[0].n;
+    const sku = (await db<{ sku: string }>(`select sku from product where entity_id = $1 and status = 'active' order by sku limit 1`, [ENTITY]))[0]?.sku;
+    const lbl = await fetch(`${base}/api/c/${ENTITY}/labels/print?source=tags&skus=${encodeURIComponent(sku ?? "x")}`, { headers: { cookie: q2!, "x-erp-page": "1" } });
+    const jobs1 = (await db<{ n: number }>(`select count(*)::int n from label_print_job where entity_id = $1`, [ENTITY]))[0].n;
+    t.ok("a look-only label print page writes nothing", lbl.status === 200 && jobs1 === jobs0, `${lbl.status} ${jobs0}->${jobs1}`);
 
     // ------------------------------------------------------------ demo reset
     const scopedTables = await db<{ t: string; col: string }>(`select table_name t, column_name col from information_schema.columns
@@ -344,7 +424,12 @@ export async function run(t: T) {
     t.ok("Alpha's people still sign in after the reset", (await call("POST", "/session", { body: { email: "sam@alpha.example", password: "sam-new-pass-22" }, ip: "10.1.1.1" })).status === 200);
     const prAgain = await call("POST", "/session", { body: { email: "pat@prospect.example", password: pr.data.password } });
     t.ok("a prospect's demo sign-in is kept across the reset", prAgain.status === 200);
+    t.ok("the demo companies keep their setup checklist dismissed after a reset (a trading business)",
+      (await db(`select 1 from onboarding_dismissal where entity_id = $1 and withdrawn_at is null`, [ENTITY])).length === 1);
     t.ok("the reset is on the platform log", (await db(`select 1 from platform_audit where action = 'demo.reset' and actor = 'opsy'`)).length === 1);
+    const dupMail = await db(`insert into connection (tenant_id, entity_id, source_code, channel, name, config, allowed_senders, status)
+        select tenant_id, entity_id, source_code, channel, 'Duplicate mailbox', config, allowed_senders, 'active' from connection where channel = 'email' and status = 'active' limit 1`).then(() => false, (e) => /connection_email_mailbox_key/.test(e.message));
+    t.ok("two live email connections cannot share a mailbox address", dupMail);
     t.ok("a demo cannot be suspended", (await call("POST", `/api/platform/customers/${TENANT}/suspend`, { cookie: op, body: { reason: "testing it" } })).status === 409);
 
     // A prospect's sign-in ends on time.

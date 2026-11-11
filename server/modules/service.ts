@@ -59,10 +59,7 @@ async function techMaySee(c: Client, co: Company, v: { personId: string | null; 
   need(r.rowCount, "that ticket is not one of yours");
 }
 
-function clientIp(req: http.IncomingMessage): string {
-  const f = String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim();
-  return f || req.socket?.remoteAddress || "unknown";
-}
+import { clientIp } from "../client_ip.ts";
 
 const money = (v: unknown) => (v === undefined || v === null || v === "" ? null : minor(v));
 

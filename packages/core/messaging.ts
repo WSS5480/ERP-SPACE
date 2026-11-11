@@ -770,6 +770,9 @@ export async function drainQueued(opts: { ids?: string[]; entityId?: string; lim
                      where (status = 'queued' or (status = 'sending' and claimed_at < now() - interval '10 minutes'))
                        and ($1::uuid[] is null or id = any($1)) and ($2::uuid is null or entity_id = $2)
                        and ($4::int is null or created_at < now() - make_interval(secs => $4))
+                       -- a suspended customer's messages wait until they are reactivated
+                       and not exists (select 1 from entity e join tenant t on t.id = e.tenant_id
+                                        where e.id = outbound_message.entity_id and t.status = 'suspended')
                      order by created_at limit $3 for update skip locked)
       returning id, entity_id, channel, to_addr, subject, body, redacted, connection_id, source_table, source_id /* unscoped: the outbox, by id or all due */`,
       [opts.ids ?? null, opts.entityId ?? null, opts.limit ?? 200, opts.olderThanSec ?? null]));

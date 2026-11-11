@@ -1,5 +1,7 @@
 // Runs every retail module's checks. Prepare the database first:
 //   ./db/apply.sh --reset --seed && npm run smoke && npm run smoke:modules
+// The checks speak through one stand-in proxy: x-forwarded-for's last entry is the client.
+process.env.ERP_TRUSTED_PROXY_HOPS ??= "1";
 import { harness } from "./modules/harness.ts";
 import { pool } from "../packages/core/db.ts";
 

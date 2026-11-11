@@ -2293,7 +2293,7 @@ function platformBanners() {
       el('button', { type: 'button', class: 'linkbtn', onclick: () => { setPerson(S.people.find((p) => p.id === S.me.viewer.personId) || null); renderNav(); render(); } }, 'Back to me'))));
   }
   if (S.co && S.co.tenant_kind === 'demo') {
-    const exp = isCustomer() && S.me.viewer.prospect && S.me.viewer.expiresAt ? ` Your demo sign-in ends ${fmtDate.format(new Date(S.me.viewer.expiresAt))}.` : '';
+    const exp = isCustomer() && S.me.viewer.prospect ? ` Your demo sign-in is look-only${S.me.viewer.expiresAt ? ` and ends ${fmtDate.format(new Date(S.me.viewer.expiresAt))}` : ''}.` : '';
     out.push(el('div', { class: 'banner' }, icon('info'), el('span', { text: `Demo company with sample data; the ERP team resets it from time to time.${exp}` })));
   }
   return out;

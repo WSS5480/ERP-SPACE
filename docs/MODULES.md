@@ -198,10 +198,10 @@ Review fixes (migration 0047, Nov 10 2026). An on-account order locks the
 customer row before it sums what is on order, so two at once cannot both pass
 the limit. Apply, ask-for-a-code and check-a-code answer the same whether or
 not the email has an account (apply never shows a number; staff see it). Client
-addresses: `ERP_TRUSTED_PROXY_HOPS` (default 1) is how many proxies append to
-x-forwarded-for; Render's proxy appends the address it saw, so with 1 only the
-rightmost hop counts and anything a client wrote to its left is ignored; 0 uses
-the socket address. Codes, checks and applications are also limited per email.
+addresses: `ERP_TRUSTED_PROXY_HOPS` is how many proxies append to
+x-forwarded-for (see Platform, review fixes: default 2 on Render, 0 elsewhere);
+anything a client wrote to the left of those entries is ignored; 0 uses the
+socket address. Codes, checks and applications are also limited per email.
 Routes may take a bigger JSON body (`coPost`/`publicRoute` option `maxBody`);
 only the room photo routes do (3 MB), and both screens resize photos to 1600 px
 JPEG 0.8. A session ends after two idle hours. "Once paid" referral means the
@@ -508,6 +508,28 @@ books. `tenant.kind` is `customer` or `demo`, `tenant.status` is `active` or
   their people's view with `x-erp-as`: reads only; a change is refused.
   `session_version` ends every older session on a password change, reset,
   disable or suspension.
+
+**Review fixes (Nov 10 2026).** Brakes live in `platform_signin_attempt`
+(sha256 keys, no emails or addresses), so a restart keeps them. An emailed
+code: 5 tries per code, 3 codes per 15 minutes and 5 a day per sign-in, and
+10 wrong codes a day stop codes for that sign-in (the password still works).
+The client address comes from `server/client_ip.ts`: `ERP_TRUSTED_PROXY_HOPS`
+(default 2 on Render, where Cloudflare's edge and Render's proxy each append
+to x-forwarded-for; 0 elsewhere, the socket) picks the entry that many from
+the right; `ERP_CLIENT_IP_HEADER=cf-connecting-ip` prefers Cloudflare's header.
+The start-up log says which; the first sign-in after boot logs the hop count
+(never addresses). A demo prospect's sign-in is look-only and never sees other
+prospects (`views.people` leaves them out; acting as someone else is refused).
+A tenant owner's invite answers the same whether or not the email signs in to
+another customer (no link is shown to owners; the clash goes on the platform
+log; operators are told plainly); people with no sign-in yet read as invited.
+`scripts/run-due.ts`, scheduled reports and the outbox skip suspended
+customers. One live email connection per mailbox address (unique index).
+A preview or prospect read is marked look-only (`kit.lookOnly(c)`); the label
+print page then writes no log row. Removed operators' cookies stop at once;
+signing out ends a customer's session on the server. Customer cards' figures
+open what is behind them, with Back. The demo's companies keep the setup
+checklist dismissed across a reset (seed 0033).
 
 **Sessions** are the same signed cookie, now carrying the kind (`o`/`c`), the
 login and its version, or the support session. **Sign-in brakes** are per name

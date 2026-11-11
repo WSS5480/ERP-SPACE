@@ -21,8 +21,11 @@ function copyBox(value) {
   } }, 'Copy');
   return el('div', { class: 'copybox' }, code, btn);
 }
+/** Label/value rows; a row with a third part (a function) makes its figure a link to the detail behind it. */
 function facts(rows) {
-  return el('dl', { class: 'facts' }, rows.filter(Boolean).flatMap(([k, v]) => [el('dt', { text: k }), el('dd', { text: String(v) })]));
+  return el('dl', { class: 'facts' }, rows.filter(Boolean).flatMap(([k, v, go]) => [el('dt', { text: k }),
+    go ? el('dd', {}, el('button', { type: 'button', class: 'linkbtn', 'aria-label': `${k}: ${v}, show them`, onclick: (e) => { e.stopPropagation(); go(); } }, String(v)))
+       : el('dd', { text: String(v) })]));
 }
 function card({ title, badge, rows, acts, onClick }) {
   return el('div', { class: 'pcard' + (onClick ? ' click' : ''), onclick: onClick || null, role: onClick ? 'button' : null, tabindex: onClick ? '0' : null,
@@ -56,15 +59,18 @@ async function screenOperator() {
   const top = head('Operator console', [
     el('button', { class: 'btn primary', type: 'button', onclick: newCustomer }, icon('plus'), 'New customer'),
   ], 'The ERP team');
+  const open = (t, focus) => () => customerDialog(t.id, focus);
   const custCards = customers.map((t) => card({
-    title: t.name, badge: statusChip(t), onClick: () => customerDialog(t.id),
-    rows: [['Plan', t.plan], ['Companies', t.companies], ['Stores', t.stores], ['Sign-ins', `${t.users} (${plural(t.people, 'person', 'people')})`],
-      ['Services on', t.services.length], ['Last activity', when(t.last_activity)]],
+    title: t.name, badge: statusChip(t), onClick: open(t),
+    rows: [['Plan', t.plan], ['Companies', t.companies, open(t, 'companies')], ['Stores', t.stores, open(t, 'stores')],
+      ['Sign-ins', `${t.users} (${plural(t.people, 'person', 'people')})`, open(t, 'users')],
+      ['Services on', t.services.length, open(t, 'services')], ['Last activity', when(t.last_activity), open(t, 'log')]],
     acts: [el('button', { class: 'btn', type: 'button', onclick: () => enterSupport(t) }, icon('user'), 'Support')],
   }));
   const demoCards = demo.map((t) => card({
-    title: t.name, badge: statusChip(t), onClick: () => customerDialog(t.id),
-    rows: [['Companies', t.companies], ['Stores', t.stores], ['People', t.people], ['Last activity', when(t.last_activity)]],
+    title: t.name, badge: statusChip(t), onClick: open(t),
+    rows: [['Companies', t.companies, open(t, 'companies')], ['Stores', t.stores, open(t, 'stores')], ['People', t.people, open(t, 'users')],
+      ['Last activity', when(t.last_activity), open(t, 'log')]],
     acts: [el('button', { class: 'btn', type: 'button', onclick: () => enterSupport(t) }, icon('user'), 'Open in support mode')],
   }));
   const prospectCards = prospects.map((p) => card({
@@ -107,15 +113,42 @@ async function newCustomer() {
   });
 }
 function inviteResult(r, title) {
+  if (!r.inviteLink) return resultBox(r.note && /not connected/.test(r.note) ? 'warning' : 'good', r.note && /not connected/.test(r.note) ? 'warn' : 'ok', title, r.note || 'Done.');
   return E.frag(resultBox('good', 'ok', title, r.emailed ? 'The invite is on its way by email. The link below works too, once, for 7 days.'
     : 'No email is connected, so nothing was sent. Copy this link and send it to them yourself; it works once, for 7 days.'), copyBox(r.inviteLink));
 }
 
-function customerDialog(id) {
+const FOCUS = { companies: 'Companies', stores: 'Stores', users: 'Sign-ins', services: 'Services on', log: 'Platform log' };
+/** A customer's detail. A figure tapped on a card opens just what is behind it, with Back to the whole customer. */
+function customerDialog(id, focus) {
   const d = openDialog('Customer', null, { wide: true });
-  const load = () => fillDialog(d, async () => {
-    const t = await api(`/api/platform/customers/${id}`);
-    d.dlg.querySelector('h2').textContent = t.name;
+  let t = null;
+  let view = focus || null;
+  const show = (v) => { view = v; paint(); };
+  const back = () => el('button', { class: 'btn', type: 'button', onclick: () => show(null) }, icon('chev', 'back'), 'Back');
+  const sections = {
+    companies: () => section('Companies', null, null, el('div', { class: 'cards' }, t.companiesList.map((c) => card({ title: c.name, rows: [['Legal name', c.legal_name], ['Pack', c.packs || 'none'], ['Status', c.status]] })))),
+    stores: () => section('Stores', null, null, t.storesList.length ? el('div', { class: 'cards' }, t.storesList.map((x) => card({ title: x.name, rows: [['Code', x.code], ['Company', x.company], ['State', x.state || ''], ['Kind', x.kind || 'store']] })))
+      : empty('No stores', null, true)),
+    users: () => section('Sign-ins', null, null, t.users.length ? el('div', { class: 'cards' }, t.users.map(userCard)) : empty('No sign-ins', null, true)),
+    services: () => section('Services on', null, null, t.services.length ? el('div', { class: 'cards' }, t.services.map((x) => card({ title: x }))) : empty('No services on', null, true)),
+    log: () => section('Platform log', null, null, t.recent.length ? el('div', { class: 'cards' }, t.recent.map((a) => card({ title: a.action, rows: [['When', new Date(a.at).toLocaleString()], ['Who', a.actor]] })))
+      : empty('Nothing recorded yet', null, true)),
+  };
+  function userCard(u) {
+    return card({
+      title: u.name, badge: u.status === 'active' ? chip('good', 'ok', u.kind === 'prospect' ? 'Demo' : 'Active') : u.status === 'invited' ? chip('warning', 'clock', 'Invited') : chip('neutral', 'none', 'Off'),
+      rows: [['Email', u.email], ['Roles', u.roles.map((r) => `${r.role.replace(/_/g, ' ')} (${r.company})`).join(', ') || 'none'], ['Last sign-in', when(u.last_sign_in_at)]],
+      acts: u.status === 'invited' ? [el('button', { class: 'btn', type: 'button', onclick: async (e) => {
+        busy(e.currentTarget, true);
+        try { const r = await api(`/api/platform/customers/${id}/logins/${u.id}/invite`, { method: 'POST', body: {} }); d.body.prepend(inviteResult(r, 'New invite link')); }
+        catch (err) { toast(friendly(err), 'critical'); } finally { if (e.currentTarget) busy(e.currentTarget, false); }
+      } }, 'New invite link')] : [],
+    });
+  }
+  function paint() {
+    d.dlg.querySelector('h2').textContent = view ? `${t.name}: ${FOCUS[view]}` : t.name;
+    if (view) { d.body.replaceChildren(el('div', { class: 'dlg-acts' }, back()), sections[view]()); return; }
     const acts = [el('button', { class: 'btn primary', type: 'button', onclick: () => { d.close(); enterSupport(t); } }, icon('user'), 'Enter support mode')];
     if (t.kind !== 'demo') {
       acts.push(t.status === 'suspended'
@@ -126,24 +159,14 @@ function customerDialog(id) {
           try { await api(`/api/platform/customers/${id}/suspend`, { method: 'POST', body: { reason } }); toast('Suspended', 'good'); load(); E.render(); } catch (e) { toast(friendly(e), 'critical'); }
         } }, 'Suspend'));
     }
-    const users = t.users.map((u) => card({
-      title: u.name, badge: u.status === 'active' ? chip('good', 'ok', u.kind === 'prospect' ? 'Demo' : 'Active') : u.status === 'invited' ? chip('warning', 'clock', 'Invited') : chip('neutral', 'none', 'Off'),
-      rows: [['Email', u.email], ['Roles', u.roles.map((r) => `${r.role.replace(/_/g, ' ')} (${r.company})`).join(', ') || 'none'], ['Last sign-in', when(u.last_sign_in_at)]],
-      acts: u.status === 'invited' ? [el('button', { class: 'btn', type: 'button', onclick: async (e) => {
-        busy(e.currentTarget, true);
-        try { const r = await api(`/api/platform/customers/${id}/logins/${u.id}/invite`, { method: 'POST', body: {} }); d.body.prepend(inviteResult(r, 'New invite link')); }
-        catch (err) { toast(friendly(err), 'critical'); } finally { busy(e.currentTarget, false); }
-      } }, 'New invite link')] : [],
-    }));
-    return E.frag(
+    d.body.replaceChildren(
       facts([['Status', t.status === 'suspended' ? `Suspended: ${t.status_reason || ''}` : t.kind === 'demo' ? 'Demo' : 'Active'], ['Plan', t.plan],
-        ['Companies', t.companies], ['Stores', t.stores], ['Services on', t.services.join(', ') || 'none'], ['API tokens', t.activeTokens], ['Last activity', when(t.last_activity)]]),
+        ['Companies', t.companies, () => show('companies')], ['Stores', t.stores, () => show('stores')], ['Sign-ins', t.users.length, () => show('users')],
+        ['Services on', t.services.length, () => show('services')], ['API tokens', t.activeTokens], ['Last activity', when(t.last_activity), () => show('log')]]),
       el('div', { class: 'dlg-acts' }, acts),
-      section('Companies', null, null, el('div', { class: 'cards' }, t.companiesList.map((c) => card({ title: c.name, rows: [['Legal name', c.legal_name], ['Pack', c.packs || 'none'], ['Status', c.status]] })))),
-      section('Sign-ins', null, null, users.length ? el('div', { class: 'cards' }, users) : empty('No sign-ins', null, true)),
-      section('Platform log', null, null, t.recent.length ? el('div', { class: 'cards' }, t.recent.map((a) => card({ title: a.action, rows: [['When', new Date(a.at).toLocaleString()], ['Who', a.actor]] })))
-        : empty('Nothing recorded yet', null, true)));
-  });
+      sections.companies(), sections.users(), sections.log());
+  }
+  const load = () => fillDialog(d, async () => { t = await api(`/api/platform/customers/${id}`); paint(); return d.body.firstChild ? E.frag(...d.body.childNodes) : el('div'); });
   load();
 }
 

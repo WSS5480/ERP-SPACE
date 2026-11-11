@@ -62,6 +62,12 @@ services:
       # Where links in invite and reset emails point (else RENDER_EXTERNAL_URL).
       # - key: ERP_PUBLIC_URL
       #   value: https://your-erp.example.com
+      # Client address behind Cloudflare + Render: 2 proxies append to
+      # x-forwarded-for (the default on Render). Or prefer Cloudflare's header:
+      # - key: ERP_CLIENT_IP_HEADER
+      #   value: cf-connecting-ip
+      # - key: ERP_TRUSTED_PROXY_HOPS
+      #   value: "2"
       # Operator (ERP team) sign-ins: name:password (10+ characters) or
       # name:scrypt$... from scripts/hash-password.ts, comma-separated.
       # - key: ERP_LOGINS
