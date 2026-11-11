@@ -15,11 +15,13 @@
 // acknowledged (or rejected, with the partner's reasons).
 //
 // Transports: manual (upload in, download out), a drop folder on the
-// server (ERP_EDI_DROP_DIR), and a VAN or EDI service over HTTPS (SPS
-// Commerce and the like) through the same SSRF-checked caller the vendor
-// feeds use. SFTP and AS2 keep their settings and secrets but refuse to run,
-// in words: this build has no SSH or AS2 library (package.json carries only
-// pg), and adding one is a decision for the owner, not a side effect.
+// server (ERP_EDI_DROP_DIR), a VAN or EDI service over HTTPS (SPS Commerce
+// and the like) through the same SSRF-checked caller the vendor feeds use,
+// and SFTP (ssh2, packages/core/transports.ts): we read the partner's outbox
+// folder and write to its inbox folder (name.part, then renamed), with the
+// server's key pinned on the first Test SFTP. AS2 keeps its settings and
+// refuses to run, in words: it needs S/MIME signing, encryption and MDN
+// receipts, which this build does not have.
 
 import { applyVendorExtras, pieceTypeFrom, type VendorExtra } from "./configurator.ts";
 import { readdir, readFile, writeFile, mkdir, rename, stat } from "node:fs/promises";
@@ -73,7 +75,7 @@ export async function defaultDocuments(c: Client, entityId: string, vendorId: st
 }
 
 export const TRANSPORTS = ["manual", "dropfolder", "van", "sftp", "as2"] as const;
-export const PARTNER_SECRETS = ["sftpPassword", "sftpKey", "vanApiKey", "vanToken", "vanPassword", "as2Password"] as const;
+export const PARTNER_SECRETS = ["sftpPassword", "sftpKey", "sftpPassphrase", "vanApiKey", "vanToken", "vanPassword", "as2Password"] as const;
 const SECRET_SET = new Set<string>(PARTNER_SECRETS);
 const SECRETY = /(password|passwd|secret|private_?key|api_?key|token|credential|passphrase)/i;
 
@@ -193,7 +195,8 @@ export async function savePartner(c: Client, s: Scope, env: EdiEnv, d: PartnerDr
   if (p.transport === "dropfolder") need(/^[A-Za-z0-9_-]{1,60}$/.test(String(tc.folder ?? "")), "name the partner's drop folder: letters, digits, - or _ (it sits under the server's EDI drop directory)");
   if (p.transport === "sftp") {
     need(String(tc.host ?? "").trim() && String(tc.user ?? "").trim(), "SFTP needs the host and the user");
-    if (tc.port != null && tc.port !== "") need(Number.isInteger(Number(tc.port)) && Number(tc.port) > 0 && Number(tc.port) < 65536, "the SFTP port is a number, usually 22");
+    if (tc.port != null && tc.port !== "") need(Number.isInteger(Number(tc.port)) && (Number(tc.port) === 22 || (Number(tc.port) >= 1024 && Number(tc.port) < 65536)), "the SFTP port is 22 or the partner's own port (1024 or above)");
+    if (tc.archiveFolder) need(String(tc.archiveFolder) !== String(tc.inFolder ?? ""), "the archive folder is not the folder read from");
   }
   if (p.transport === "van") {
     for (const k of ["sendUrl", "listUrl", "ackUrl"]) if (tc[k]) need(/^https:\/\/[^\s/]+/i.test(String(tc[k])), `the ${k} is an https:// address`);
@@ -292,8 +295,8 @@ export async function listPartners(c: Client, entityId: string) {
 }
 
 export function transportNote(p: Pick<Partner, "transport">): string | null {
-  if (p.transport === "sftp") return "SFTP is not built into this version (the server has no SSH library). The settings and password are kept; use the drop folder, a VAN, or download and upload by hand until it is.";
-  if (p.transport === "as2") return "AS2 is not built into this version. The settings are kept; use a VAN or EDI service, or download and upload by hand until it is.";
+  if (p.transport === "sftp") return "SFTP: we read their outbox folder and write to their inbox folder. Press Test SFTP once to see and record the server's key; a different key is refused.";
+  if (p.transport === "as2") return "AS2 is not built into this version (it needs S/MIME signing, encryption and MDN receipts). The settings are kept; use SFTP, a VAN or EDI service, or download and upload by hand.";
   if (p.transport === "manual") return "Files come in by Upload EDI file and go out by download from the outbox.";
   return null;
 }
@@ -433,6 +436,7 @@ async function setDoc(c: Client, s: Scope, id: string, f: { status: string; reas
 export type Arrival = { name: string; text: string; ref: string };
 export interface EdiTransport {
   kind: string;
+  close?(): void;
   send(name: string, text: string): Promise<string>;          // where it went, in words
   poll(): Promise<Arrival[]>;
   done?(a: Arrival): Promise<void>;                             // archive or acknowledge one we have stored
@@ -520,6 +524,35 @@ export async function transportFor(c: Client, p: Partner, env: EdiEnv): Promise<
       },
     };
   }
+  if (p.transport === "sftp") {
+    const C = await import("./connections.ts");
+    const { openSftp, sftpPort } = await import("./transports.ts");
+    const host = String(tc.host ?? "").trim().toLowerCase();
+    const port = sftpPort(tc.port);
+    const sec = await partnerSecrets(c, p.entity_id, env, p.id);
+    const pinned = C.pinFor(await C.loadPin(c, { kind: "edi_partner", id: p.id, entityId: p.entity_id }), host, port);
+    const net = await C.netEnv();
+    let s0: Promise<import("./transports.ts").SftpSession> | null = null;
+    const session = () => (s0 ??= openSftp(net, { host, port, user: String(tc.user ?? ""), password: sec.sftpPassword, privateKey: sec.sftpKey, passphrase: sec.sftpPassphrase, pinned }, "require")
+      .catch((e: Error) => { s0 = null; throw new EdiError(`SFTP to ${host}: ${e.message}`); }));
+    const inDir = String(tc.inFolder ?? "").trim() || ".", outDir = String(tc.outFolder ?? "").trim() || ".";
+    const wrap = async <R>(fn: () => Promise<R>): Promise<R> => { try { return await fn(); } catch (e) { if (e instanceof EdiError) throw e; throw new EdiError(`SFTP to ${host}: ${(e as Error).message}`); } };
+    return {
+      kind: "sftp",
+      send: (name, text) => wrap(async () => { const safe = name.replace(/[^A-Za-z0-9._-]/g, "_"); await (await session()).put(outDir, safe, Buffer.from(text, "latin1")); return `${host}:${outDir.replace(/\/$/, "")}/${safe}`; }),
+      poll: () => wrap(async () => {
+        const sx = await session();
+        const out: Arrival[] = [];
+        for (const f of (await sx.list(inDir, tc.pattern ? [String(tc.pattern)] : [])).slice(0, 200)) {
+          if (f.size > MAX_FILE) continue;
+          out.push({ name: f.name, text: (await sx.get(inDir, f.name, MAX_FILE)).toString("latin1"), ref: f.name });
+        }
+        return out;
+      }),
+      async done(a) { if (tc.archiveFolder) await wrap(async () => { await (await session()).move(inDir, a.ref, String(tc.archiveFolder)); }); },
+      close() { if (s0) s0.then((x) => x.close(), () => {}); s0 = null; },
+    };
+  }
   const note = transportNote(p)!;
   const refuse = async (): Promise<never> => { throw new EdiError(note); };
   return { kind: p.transport, send: refuse, poll: refuse };
@@ -538,7 +571,8 @@ export async function dispatch(c: Client, s: Scope, env: EdiEnv, docId: string) 
   const p = await loadPartner(c, s.entityId, d.partner_id!);
   try {
     const t = await transportFor(c, p, env);
-    const where = await t.send(d.filename || fileName(p, d.doc_type, d.isa_control ?? d.id.slice(0, 8)), d.raw);
+    let where: string;
+    try { where = await t.send(d.filename || fileName(p, d.doc_type, d.isa_control ?? d.id.slice(0, 8)), d.raw); } finally { t.close?.(); }
     await setDoc(c, s, d.id, { status: "sent", reason: null, attempt: true });
     if (d.doc_type === "850" && d.purchase_order_id && !d.summary?.test) await pur.markSent(c, s, d.purchase_order_id, where, `EDI 850, interchange ${d.isa_control}`);
     return { id: d.id, status: "sent", detail: `sent to ${where}` };
@@ -1095,12 +1129,15 @@ export async function pollPartner(run: TxRun, s: Scope, env: EdiEnv, partnerId: 
   const docs: Received["documents"] = [];
   const problems: string[] = [];
   let p: Partner | null = null;
+  let tt: EdiTransport | null = null;
   try {
     const got0 = await run(async (c) => { const pp = await loadPartner(c, s.entityId, partnerId); need(pp.edi_enabled, `EDI is switched off for ${pp.vendor}`);
       return { pp, t: await transportFor(c, pp, env) }; });
     p = got0.pp;
     const t = got0.t;
-    const got = await t.poll();
+    tt = t;
+    let got: Arrival[];
+    try { got = await t.poll(); } catch (e) { t.close?.(); throw e; }
     for (const a of got) {
       let ix: x12.Interchange | null = null;
       try { ix = x12.parseInterchange(a.text); } catch { ix = null; }
@@ -1120,6 +1157,7 @@ export async function pollPartner(run: TxRun, s: Scope, env: EdiEnv, partnerId: 
         catch (e) { const why = refusal(e) ?? (e as NodeJS.ErrnoException).code ?? "it failed"; problems.push(`${a.name} is in, but could not be moved or acknowledged (${why}); it will not be taken in twice`); }
       }
     }
+    t.close?.();
     if (p.transport !== "manual") {
       const queued = await run((c) => q<{ id: string }>(c, `select id from edi_document where entity_id = $1 and partner_id = $2 and direction = 'out' and status = 'queued' order by created_at limit 100`,
         [s.entityId, p!.id]));
@@ -1132,6 +1170,7 @@ export async function pollPartner(run: TxRun, s: Scope, env: EdiEnv, partnerId: 
       + `${seen ? `, ${seen} already taken in` : ""}${left ? `, ${left} left for another company or sender` : ""}, ${sent} sent${failedSends ? `, ${failedSends} not sent` : ""}`
       + (problems.length ? `; ${problems.join("; ")}` : "");
   } catch (e) {
+    tt?.close?.();
     const why = refusal(e) ?? (e instanceof Error && (e as NodeJS.ErrnoException).code ? `the drop folder could not be read (${(e as NodeJS.ErrnoException).code})` : null);
     if (!why) throw e;
     ok = false; note = why;
@@ -1203,4 +1242,28 @@ export async function ediHome(c: Client, entityId: string) {
            count(*) filter (where status in ('failed','rejected')) failed,
            count(*) filter (where direction = 'in' and created_at > now() - interval '1 day') today_in
       from edi_document where entity_id = $1`, [entityId]))[0];
+}
+
+/** Test a partner's SFTP: connect, list their outbox folder, show the server's key (recorded on the first good Test). */
+export async function testPartnerSftp(c: Client, s: Scope, env: EdiEnv, partnerId: string, who: string) {
+  const p = await loadPartner(c, s.entityId, partnerId);
+  need(p.transport === "sftp", `${p.vendor}'s files travel by ${p.transport}, not SFTP`);
+  const tc = p.transport_config ?? {};
+  const sec = await partnerSecrets(c, p.entity_id, env, p.id);
+  const C = await import("./connections.ts");
+  return C.testSftp(c, s, { kind: "edi_partner", id: p.id, tenantId: s.tenantId, entityId: s.entityId },
+    { host: String(tc.host ?? ""), port: Number(tc.port || 22), user: String(tc.user ?? ""), password: sec.sftpPassword, privateKey: sec.sftpKey, passphrase: sec.sftpPassphrase },
+    String(tc.inFolder ?? "").trim() || ".", tc.pattern ? [String(tc.pattern)] : [], who);
+}
+
+/** The owner trusts the new key a Test SFTP was shown. */
+export async function trustPartnerKey(c: Client, s: Scope, partnerId: string, fingerprint: string, who: string) {
+  await loadPartner(c, s.entityId, partnerId);
+  const C = await import("./connections.ts");
+  return C.trustOfferedKey(c, s, { kind: "edi_partner", id: partnerId, entityId: s.entityId }, fingerprint, who);
+}
+
+export async function partnerPin(c: Client, entityId: string, partnerId: string) {
+  const C = await import("./connections.ts");
+  return C.loadPin(c, { kind: "edi_partner", id: partnerId, entityId });
 }

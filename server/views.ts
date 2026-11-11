@@ -899,12 +899,13 @@ type ConnRow = {
   consecutive_failures: number; last_error: string | null; last_success_at: string | null;
   last_attempt_at: string | null; credential_ref: string | null; format: string | null;
   mailbox: string | null; host: string | null; account_name: string | null; bank_name: string | null;
-  account_last4: string | null; files: number; last_file_at: string | null;
+  account_last4: string | null; files: number; last_file_at: string | null; secrets: number; pinned: boolean;
 };
 
-// Which network clients this build actually has. The pipeline is wired for
-// both; the clients themselves are the next thing to write.
-export const TRANSPORTS = { sftp: false, http: false };
+// Which network clients this build has: SFTP (ssh2, key pinned on the first
+// Test) and HTTPS (the vendor feeds' checked caller), both in
+// packages/core/transports.ts.
+export const TRANSPORTS = { sftp: true, http: true };
 
 /** What stands between a connection and its first file: setup (arrange it) or build (code still to write). */
 function stepsFor(r: ConnRow): { kind: "setup" | "build"; text: string }[] {
@@ -915,10 +916,11 @@ function stepsFor(r: ConnRow): { kind: "setup" | "build"; text: string }[] {
     steps.push({ kind: "build", text: `${a} ${noun} ${r.direction === "outbound" ? "writer" : "reader"}` });
   }
   const from = r.bank_name ? ` from ${r.bank_name}` : r.host ? ` for ${r.host}` : "";
-  const credentialSet = !!(r.credential_ref && process.env[secretEnvName(r.credential_ref)]);
+  const credentialSet = r.credential_ref === "sealed" ? r.secrets > 0 || r.channel === "api" : !!(r.credential_ref && process.env[secretEnvName(r.credential_ref)]);
   switch (r.channel) {
     case "sftp":
       if (!credentialSet) steps.push({ kind: "setup", text: `SFTP login${from}` });
+      if (!r.pinned) steps.push({ kind: "setup", text: "A Test, to record the server's key" });
       if (!TRANSPORTS.sftp) steps.push({ kind: "build", text: "The SFTP connector" });
       break;
     case "api":
@@ -944,7 +946,9 @@ export async function connections(c: Client, co: Company) {
            c.credential_ref, c.config->>'format' as format, c.config->>'mailbox' as mailbox, c.config->>'host' as host,
            b.name as account_name, b.bank_name, b.account_last4,
            (select count(*) from inbound_file f where f.connection_id = c.id)::int as files,
-           (select max(f.received_at) from inbound_file f where f.connection_id = c.id) as last_file_at
+           (select max(f.received_at) from inbound_file f where f.connection_id = c.id) as last_file_at,
+           (select count(*)::int from connection_secret x where x.connection_id = c.id) as secrets,
+           exists (select 1 from sftp_host_pin p where p.owner_kind = 'connection' and p.owner_id = c.id) as pinned
       from connection c
       join connection_health h on h.connection_id = c.id
       join ingest_source s on s.code = c.source_code

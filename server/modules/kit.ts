@@ -50,6 +50,14 @@ export class PublicAsset {
   constructor(text: string, type: PublicAsset["type"]) { this.text = text; this.type = type; }
 }
 
+/** A file a company route hands back to save (an import template), rather than JSON. */
+export class Download {
+  bytes: Buffer;
+  type: string;
+  filename: string;
+  constructor(bytes: Buffer, type: string, filename: string) { this.bytes = bytes; this.type = type; this.filename = filename; }
+}
+
 export type ModuleKit = {
   coGet: CoGet;
   coPost: CoPost;
