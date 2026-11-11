@@ -44,6 +44,15 @@ export async function run(t: T) {
     t.ok("an operator's wrong password is refused", bad.status === 401);
     const shorty = await call("POST", "/session", { body: { name: "shorty", key: "5480" }, ip: "198.51.100.9" });
     t.ok("an old 4-digit operator key is refused, saying what to set", shorty.status === 403 && /at least 10 characters/.test(shorty.data.error ?? ""), shorty.data.error);
+    {
+      const was = process.env.ERP_SEED; process.env.ERP_SEED = "placeholder";
+      try {
+        const dev = await call("POST", "/session", { body: { name: "shorty", key: "5480" }, ip: "198.51.100.10" });
+        t.ok("in development (ERP_SEED=placeholder) a 4-digit operator key still signs in", dev.status === 200, dev.data.error);
+        const devBad = await call("POST", "/session", { body: { name: "shorty", key: "0000" }, ip: "198.51.100.10" });
+        t.ok("in development a wrong 4-digit key is still refused", devBad.status !== 200, devBad.status);
+      } finally { if (was === undefined) delete process.env.ERP_SEED; else process.env.ERP_SEED = was; }
+    }
     const opIn = await call("POST", "/session", { body: { name: "opsy", key: OP_PASS }, ip: "198.51.100.2" });
     t.ok("an operator signs in with name and password", opIn.status === 200 && !!opIn.cookie && opIn.data.kind === "operator");
     let op = opIn.cookie!;

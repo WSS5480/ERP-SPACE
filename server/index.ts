@@ -311,7 +311,7 @@ async function authenticate(req: http.IncomingMessage): Promise<Who | null> {
   // 12 hours later; a sign-in made with the install token (t) lasts until that token rotates.
   if (s.t !== 1) {
     const stored = operatorLogins().get(s.name.toLowerCase());
-    if (!stored || (!stored.startsWith("scrypt$") && stored.length < P.MIN_PASSWORD)) return null;
+    if (!stored || (!stored.startsWith("scrypt$") && stored.length < P.MIN_PASSWORD && !devShortKeys())) return null;
   }
   let support: Support | null = null;
   if (s.s) {
@@ -393,6 +393,9 @@ function operatorLogins(): Map<string, string> {
       return [x.slice(0, i).trim().toLowerCase(), x.slice(i + 1).trim()] as [string, string];
     }).filter(([n, k]) => n && k));
 }
+// Development only: while ERP_SEED=placeholder (the trial environment, with its yellow banner)
+// operator logins may keep short access keys. Removing ERP_SEED for go-live turns this off.
+const devShortKeys = () => process.env.ERP_SEED === "placeholder";
 function operatorKeyMatches(key: string, stored: string): "ok" | "short" | "no" {
   if (stored.startsWith("scrypt$")) return P.verifyPassword(key, stored) ? "ok" : "no";
   if (!key || !safeEqual(key, stored)) return "no";
@@ -801,7 +804,7 @@ route("POST", /^\/session$/, "none", async (req) => {
   if (logins.has(login)) {
     const m = operatorKeyMatches(key, logins.get(login)!);
     if (m === "no") return signInFailed(login, ip, "operator");
-    if (m === "short") throw new HttpError(403, `the operator login ${login} still uses a short key; set a password of at least ${P.MIN_PASSWORD} characters (or a hash from scripts/hash-password.ts) for it in ERP_LOGINS`);
+    if (m === "short" && !devShortKeys()) throw new HttpError(403, `the operator login ${login} still uses a short key; set a password of at least ${P.MIN_PASSWORD} characters (or a hash from scripts/hash-password.ts) for it in ERP_LOGINS`);
   } else if (!key || !safeEqual(key, TOKEN())) {
     return signInFailed(login, ip, "operator");
   }
@@ -1539,6 +1542,7 @@ export async function start(): Promise<http.Server> {
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(PORT, "0.0.0.0", resolve));
   console.log(`erp-api ${VERSION} listening on ${PORT}`);
+  if (devShortKeys()) console.log("development: ERP_SEED=placeholder, so operator logins may use short access keys; remove ERP_SEED before go-live");
   // The outbox: email and texts a restart left queued go out within a minute. A message only just
   // queued is left to the request that queued it (a sign-in code lives only in that request's memory).
   const outbox = setInterval(() => {
