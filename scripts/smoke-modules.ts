@@ -12,7 +12,9 @@ const { t, counts } = harness();
 for (const id of ORDER) {
   let mod: { run?: (t: unknown) => Promise<void> };
   try { mod = await import(`./modules/${id}.ts`); } catch (e) {
-    if ((e as { code?: string }).code === "ERR_MODULE_NOT_FOUND") continue;
+    // Skip only a module that has no check file; a check file whose own import is missing
+    // (an uninstalled package, say) must fail loudly, not vanish from the count.
+    if ((e as { code?: string }).code === "ERR_MODULE_NOT_FOUND" && String((e as Error).message).includes(`modules/${id}.ts'`)) continue;
     throw e;
   }
   if (!mod.run) continue;
