@@ -47,11 +47,38 @@ export async function run(t: T) {
   const nonEmpty = ["gl_lines", "pnl_lines", "sales_lines", "sales_posted", "orders", "receipts", "ar_open", "customers", "products_stock",
     "inventory_value", "po_lines", "vendor_spend", "payroll", "commissions", "deliveries", "routes", "web_carts", "trial_balance"];
   const counts: string[] = [];
+  // Every dataset's rows come from the module checks that run before this one, except vendor bills: the demo's seeds
+  // carry none, and the only ones were the finance smoke's (scripts/smoke.ts), left behind in the database. So
+  // vendor_spend had rows only when the smoke had run on this database since its last reset -- never after
+  // `apply.sh --reset --seed && smoke:modules`, nor on a second modules run (platform's demo reset clears them).
+  // The check now brings its own bill, through the payables tables, and rolls it back: the same answer every time,
+  // whatever ran before, whatever the clock says (the dataset has no date window).
+  const ROLLBACK = new Error("rollback: the check's own bill is not kept");
+  const withOwnBill = async <R>(fn: (c: Client, roles: Set<string>) => Promise<R>): Promise<R> => {
+    let out: R | undefined;
+    await tx({ kind: "user", id: PEOPLE.STEVE, label: "check" }, async (c) => {
+      const v = await q<{ vendor_id: string }>(c, `select vendor_id from vendor_entity where entity_id = $1 and status = 'active' order by vendor_id limit 1`, [ENTITY]);
+      const g = await q<{ id: string }>(c, `select g.id from gl_account g join entity e on e.tenant_id = g.tenant_id and e.id = $1
+                                              where g.is_postable and g.account_type = 'expense' order by g.code limit 1 /* unscoped: the company's chart */`, [ENTITY]);
+      const b = await q<{ id: string }>(c, `insert into invoice (tenant_id, entity_id, vendor_id, kind, reference, invoice_date, due_date, total_minor, confidence_bps, created_by)
+          select e.tenant_id, e.id, $2, 'operating', 'REPORTS-CHECK-1', business_today(e.id), business_today(e.id) + 30, 12345, 10000, $3
+            from entity e where e.id = $1 returning id /* unscoped: the company row itself */`, [ENTITY, v[0].vendor_id, PEOPLE.CLERK]);
+      await c.query(`insert into invoice_line (invoice_id, seq, gl_account_id, amount_minor) values ($1, 1, $2, 12345)`, [b[0].id, g[0].id]);
+      out = await fn(c, await rep.rolesFor(c, ENTITY, PEOPLE.STEVE));
+      throw ROLLBACK;
+    }).catch((e) => { if (e !== ROLLBACK) throw e; });
+    return out!;
+  };
   for (const id of nonEmpty) {
     const ds = rep.DATASET.get(id)!;
-    const res = await runAs(t, PEOPLE.STEVE, (c, roles) => rep.run(c, ENTITY, roles, { dataset: id, columns: [{ id: "a", field: ds.fields[0].id }] }, { size: 1 }));
+    const def = { dataset: id, columns: [{ id: "a", field: ds.fields[0].id }] };
+    const res = id === "vendor_spend"
+      ? await withOwnBill((c, roles) => rep.run(c, ENTITY, roles, def, { size: 1 }))
+      : await runAs(t, PEOPLE.STEVE, (c, roles) => rep.run(c, ENTITY, roles, def, { size: 1 }));
     if (!res.count) counts.push(id);
   }
+  const leftBehind = await read(t, (c) => q(c, `select 1 from invoice where entity_id = $1 and reference = 'REPORTS-CHECK-1'`, [ENTITY]));
+  t.ok("vendor spend: the check's own bill is rolled back, never left in the demo", !leftBehind.length);
   t.ok("the demo has rows in every dataset", !counts.length, counts.join(", "));
 
   // ------------------------------------------------------------ starters
