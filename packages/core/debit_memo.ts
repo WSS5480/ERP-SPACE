@@ -12,6 +12,7 @@
 // credit on the vendor's statement until it is. The bill itself -- its
 // lines, its PO and receipt, the three-way match -- is never changed.
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post } from "./posting.ts";
 import { transition } from "./invoice.ts";
@@ -22,7 +23,6 @@ function need(cond: unknown, message: string): asserts cond {
 }
 const UUIDRX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (v: unknown): v is string => typeof v === "string" && UUIDRX.test(v);
-const today = () => new Date().toISOString().slice(0, 10);
 const usd = (m: bigint) => `$${(Number(m) / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 export const SOURCES = ["service_chargeback", "damaged_on_receipt", "price_difference", "short_shipped", "other"];
@@ -105,7 +105,7 @@ export async function fromChargeback(c: Client, scope: Scope, x: { vendorId: str
                                    service_cost_id, service_ticket_id, journal_entry_id, created_by, auto_approved)
     values ($1,$2,$3,$4,'service_chargeback',$5,$6,$7,$8,$13,$9,$10,$11,$12,$14) returning id`,
     [scope.tenantId, scope.entityId, x.vendorId, number, `Service ${x.ticketNumber}: ${x.what}`.slice(0, 300), x.amountMinor.toString(), x.offsetCode,
-     today(), x.serviceCostId, x.ticketId, x.journalEntryId, scope.actor.id || null, auto ? "open" : "pending_approval", auto]);
+     (await bizToday(c, scope)), x.serviceCostId, x.ticketId, x.journalEntryId, scope.actor.id || null, auto ? "open" : "pending_approval", auto]);
   await audit(c, scope, { table: "vendor_debit_memo", rowId: r.id, action: "insert",
     after: { number, source: "service_chargeback", amount: x.amountMinor.toString(), status: auto ? "open (under the auto-approve amount)" : "pending_approval" } });
   return { id: r.id, number, status: auto ? "open" : "pending_approval" };
@@ -134,7 +134,7 @@ export async function createMemo(c: Client, scope: Scope, b: { vendorId: string;
     const p = await q<{ vendor_id: string }>(c, `select vendor_id from purchase_order where entity_id = $1 and id = $2`, [scope.entityId, b.purchaseOrderId]);
     need(p.length && p[0].vendor_id === b.vendorId, "that purchase order is not this vendor's");
   }
-  const date = b.memoDate && /^\d{4}-\d{2}-\d{2}$/.test(b.memoDate) ? b.memoDate : today();
+  const date = b.memoDate && /^\d{4}-\d{2}-\d{2}$/.test(b.memoDate) ? b.memoDate : (await bizToday(c, scope));
   const number = await nextNo(c, scope.entityId);
   const r = await one<{ id: string }>(c, `
     insert into vendor_debit_memo (tenant_id, entity_id, vendor_id, number, source, reason, amount_minor, offset_code, memo_date, invoice_id,
@@ -179,7 +179,7 @@ export async function rejectMemo(c: Client, scope: Scope, id: string, note: stri
   // a chargeback was already moved to 1150 by the service cost: turned down, the company carries it (Dr 6150 Cr 1150)
   let rev: string | null = null;
   if (m.source === "service_chargeback" && m.journal_entry_id) {
-    rev = await post(c, scope, { date: today(), sourceType: "invoice", sourceId: m.id, description: `Debit memo ${m.number} turned down: ${note.trim()}`.slice(0, 300),
+    rev = await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "invoice", sourceId: m.id, description: `Debit memo ${m.number} turned down: ${note.trim()}`.slice(0, 300),
       lines: [{ code: SERVICE_EXPENSE, debit: BigInt(m.amount_minor), memo: m.number }, { code: "1150", credit: BigInt(m.amount_minor), memo: m.number }] });
   }
   await c.query(`update vendor_debit_memo set status = 'rejected', decided_by = $3, decided_at = now(), decision_note = $4, reversal_entry_id = $5 where entity_id = $1 and id = $2`,
@@ -200,7 +200,7 @@ export async function voidMemo(c: Client, scope: Scope, id: string, reason: stri
   const left = await memoLeft(c, scope.entityId, id);
   need(left === BigInt(m.amount_minor), `debit memo ${m.number} has already been applied to a bill; it cannot be voided`);
   const back = m.source === "service_chargeback" ? SERVICE_EXPENSE : m.offset_code;
-  const je = await post(c, scope, { date: today(), sourceType: "invoice", sourceId: m.id, description: `Void debit memo ${m.number}: ${reason.trim()}`.slice(0, 300),
+  const je = await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "invoice", sourceId: m.id, description: `Void debit memo ${m.number}: ${reason.trim()}`.slice(0, 300),
     lines: [{ code: back, debit: left, memo: m.number }, { code: "1150", credit: left, memo: m.number }] });
   await c.query(`update vendor_debit_memo set status = 'void', void_reason = $3, reversal_entry_id = $4 where entity_id = $1 and id = $2`, [scope.entityId, id, reason.trim().slice(0, 300), je]);
   await audit(c, scope, { table: "vendor_debit_memo", rowId: id, action: "transition", before: { status: "open" }, after: { status: "void", journalEntryId: je }, reason });
@@ -232,7 +232,7 @@ export async function applyMemo(c: Client, scope: Scope, id: string, invoiceId: 
   need(amt > 0n, open <= 0n ? "that bill has nothing left to pay" : `debit memo ${m.number} has nothing left to apply`);
   need(amt <= left, `debit memo ${m.number} has ${usd(left)} left, not ${usd(amt)}`);
   need(amt <= open, `that bill has ${usd(open)} left to pay, not ${usd(amt)}`);
-  const je = await post(c, scope, { date: today(), sourceType: "invoice", sourceId: invoiceId,
+  const je = await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "invoice", sourceId: invoiceId,
     description: `Debit memo ${m.number} applied to bill ${i.reference ?? invoiceId.slice(0, 8)}`.slice(0, 300),
     lines: [{ code: "2010", debit: amt, memo: m.number }, { code: "1150", credit: amt, memo: m.number }] });
   await c.query(`insert into vendor_memo_application (entity_id, memo_id, invoice_id, amount_minor, journal_entry_id, applied_by) values ($1,$2,$3,$4,$5,$6)`,

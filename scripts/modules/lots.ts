@@ -367,7 +367,7 @@ export async function run(t: T) {
     const exc2 = (await read<{ id: string }>(`select id from finance_remit_line where import_id = $1 and status = 'exception' /* unscoped: test lookup */`, [im2.importId]))[0].id;
     await t.throws("exceptions: setting a row aside needs a reason", () => R.post(t, JEN, `/settlements/lines/${exc2}/resolve`, { dismissReason: "" }), /pick the financed sale this row pays, or set it aside|say why/);
     const sus0 = { f2195: await gl("2195"), bank: await gl(bankCode) };
-    const dis = await R.post(t, JEN, `/settlements/lines/${exc2}/resolve`, { dismissReason: "belongs to the Palestine store's merchant number" }) as { status: string };
+    const dis = await R.post(t, JEN, `/settlements/lines/${exc2}/resolve`, { dismissReason: "belongs to the Mesa Verde store's merchant number" }) as { status: string };
     const sus1 = { f2195: await gl("2195"), bank: await gl(bankCode) };
     t.ok("exceptions: a paid row set aside still puts its cash in the bank, held in 2195, and leaves the exception list",
       dis.status === "suspense" && sus0.f2195 - sus1.f2195 === 84600n && sus1.bank - sus0.bank === 84600n

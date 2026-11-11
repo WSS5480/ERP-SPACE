@@ -1,0 +1,75 @@
+# Checks on every push and pull request: the database built from scratch with
+# the demo seeds, then the finance core smoke and every retail module's checks.
+# Nothing here deploys: Render deploys from the branch on its own.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: erp
+          POSTGRES_PASSWORD: erp
+          POSTGRES_DB: erp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U erp -d erp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: erp
+      PGPASSWORD: erp
+      PGDATABASE: erp
+      # the checks pin their own clock where a time zone matters; the runner's zone is UTC like Render's
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Postgres client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+      - name: Build the database (migrations and demo seeds)
+        run: bash db/apply.sh --reset --seed
+      - name: Smoke (finance core)
+        run: npm run -s smoke
+      - name: Smoke (retail modules)
+        run: npm run -s smoke:modules
+
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Not blocking yet: the code base had 406 type errors when this was added
+    # (172 after the first pass, Nov 2026). Make it blocking once it is clean.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npm run -s typecheck

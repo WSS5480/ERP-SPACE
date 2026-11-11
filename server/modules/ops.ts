@@ -15,6 +15,7 @@
 //   hr, store_manager                      approve or decline time off (never their own); the absent-today card
 //   hr, controller                         leave types, balances, accrual, holidays
 
+import { today as bizToday } from "../../packages/core/clock.ts";
 import * as L from "../../packages/core/loading.ts";
 import * as HA from "../../packages/core/haulaway.ts";
 import * as DM from "../../packages/core/debit_memo.ts";
@@ -44,7 +45,6 @@ const LEAVE_MANAGE = ["hr", "store_manager"];
 const LEAVE_SETUP = ["hr", "controller"];
 
 const scopeOf = (co: Company, a: Actor): Scope => ({ tenantId: co.tenantId, entityId: co.id, actor: { kind: "user", id: a.personId, label: a.label } });
-const today = () => new Date().toISOString().slice(0, 10);
 const dayOr = (v: unknown, d: string) => { const s = str(v, 10); return DAY.test(s) ? s : d; };
 const isoYear = (y: number) => ({ from: `${y}-01-01`, to: `${y}-12-31` });
 
@@ -89,7 +89,7 @@ export const module: ErpModule = {
     // ================================================================ loading
     coGet("/fleet/loading", async (c, co, url, _m, p) => {
       await canRead(c, co, p, [...LOAD], "the loading dock");
-      const day = dayOr(url.searchParams.get("day"), today());
+      const day = dayOr(url.searchParams.get("day"), await bizToday(c, co.id));
       const dc = uuid(url.searchParams.get("dc"));
       return plain(async () => {
         const routes = await c.query(`
@@ -135,7 +135,8 @@ export const module: ErpModule = {
     });
     coGet("/fleet/lanes", async (c, co, url, _m, p) => {
       await canRead(c, co, p, [...LOAD], "the dock lanes");
-      return plain(() => L.lanes(c, co.id, uuid(url.searchParams.get("dc")), dayOr(url.searchParams.get("day"), today())));
+      const t = await bizToday(c, co.id);
+      return plain(() => L.lanes(c, co.id, uuid(url.searchParams.get("dc")), dayOr(url.searchParams.get("day"), t)));
     });
     coPost("/fleet/lanes", async (c, co, a, b) => {
       await requireRole(c, co, a, DISPATCH, "setting up dock lanes");
@@ -193,13 +194,14 @@ export const module: ErpModule = {
     });
     coGet("/fleet/haul-away/disposals", async (c, co, url, _m, p) => {
       await canRead(c, co, p, [...LOAD, "controller"], "the disposal log");
-      const y = new Date().getUTCFullYear();
+      const y = Number((await bizToday(c, co.id)).slice(0, 4));
       return plain(() => HA.disposals(c, co.id, dayOr(url.searchParams.get("from"), `${y}-01-01`), dayOr(url.searchParams.get("to"), `${y}-12-31`)));
     });
     coGet("/fleet/haul-away/report", async (c, co, url, _m, p) => {
       await canRead(c, co, p, [...DISPATCH, "controller"], "the recycling program report");
-      const y = new Date().getUTCFullYear();
-      return plain(() => HA.programReport(c, co.id, str(url.searchParams.get("state"), 2), dayOr(url.searchParams.get("from"), `${y}-01-01`), dayOr(url.searchParams.get("to"), today())));
+      const y = Number((await bizToday(c, co.id)).slice(0, 4));
+      const t = await bizToday(c, co.id);
+      return plain(() => HA.programReport(c, co.id, str(url.searchParams.get("state"), 2), dayOr(url.searchParams.get("from"), `${y}-01-01`), dayOr(url.searchParams.get("to"), t)));
     });
 
     // ========================================================== debit memos
@@ -338,7 +340,7 @@ export const module: ErpModule = {
     });
     coGet("/workforce/holidays", async (c, co, url, _m, p) => {
       await held(c, co, p);
-      const y = int(url.searchParams.get("year"), new Date().getUTCFullYear());
+      const y = int(url.searchParams.get("year"), Number((await bizToday(c, co.id)).slice(0, 4)));
       const r = isoYear(Math.min(2100, Math.max(2000, y)));
       return plain(() => LV.holidays(c, co.id, r.from, r.to));
     });

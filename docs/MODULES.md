@@ -105,6 +105,9 @@ Data is placed with textContent only, never innerHTML.
 | admin (service switches and presets, single-store rule, connections, outbound message log) | 0049 | none | Setup (Services, Connections) |
 | platform (customers, sign-in, support mode, tenant API tokens, the demo) | 0051 | 0032 (marks the demo) | Platform (Operator console), Account |
 | onboarding (setup checklist, opening stock import, bank opening balance, tax rates checked) | 0052 | none | Setup (Setup checklist), a Home card |
+| periods (periods that open on their own, month-end and year-end close), store-local dates | 0053 | 0034 | Back office (Books → Periods) |
+| scheduler and server errors (in-server jobs, run log, error references) | 0054 | none | Setup (Scheduled jobs), Operator console |
+| selling rules (discount limit, quote life, layaway terms, tenders); demo made up | 0055 | 0035 | Setup (Sales tax → Selling rules) |
 | vendor_files (SFTP and HTTPS transports, vendor file connections, vendor email, SFTP/email-in vendor feeds, EDI over SFTP) | 0057 | none | Setup (Connections → Vendor files), Retail (Catalog → Vendors → Catalog connections) |
 | drill (the rows behind every tile; read-only lists) | none | none | no screen of its own |
 
@@ -553,8 +556,8 @@ The client address comes from `server/client_ip.ts`: `ERP_TRUSTED_PROXY_HOPS`
 (default 2 on Render, where Cloudflare's edge and Render's proxy each append
 to x-forwarded-for; 0 elsewhere, the socket) picks the entry that many from
 the right; `ERP_CLIENT_IP_HEADER=cf-connecting-ip` prefers Cloudflare's header.
-The start-up log says which; the first sign-in after boot logs the hop count
-(never addresses). A demo prospect's sign-in is look-only and never sees other
+The start-up log says which (the temporary first-sign-in hop-count line was
+removed, Nov 11 2026). A demo prospect's sign-in is look-only and never sees other
 prospects (`views.people` leaves them out; acting as someone else is refused).
 A tenant owner's invite answers the same whether or not the email signs in to
 another customer (no link is shown to owners; the clash goes on the platform
@@ -669,6 +672,132 @@ The Home card counts without the tie-outs, and runs them before it would hide.
 Time zones: the time clock falls back to the delivery settings' zone and
 delivery to the time clock's, before the built-in defaults.
 
+## Periods, business dates, the scheduler and server errors (migrations 0053–0055)
+
+**Business dates** (`packages/core/clock.ts`). Every business date -- a posting,
+a document, a due date, aging, a report's "as of" -- is the store's local day:
+`today(c, scope or entityId, locationId?)`. Never `new Date().toISOString()`
+or SQL `current_date` for one; SQL uses `business_today(entity, location)`.
+Timestamps stay UTC. The zone is `location.time_zone`, else the time clock's
+zone for that store, else `entity.time_zone`, else the time clock's or the
+delivery settings' company zone, else the store's (or company's) state
+(`state_time_zone`, all 50 states and DC; `STATE_TZ` in code), else New York
+(`business_tz()` in SQL is the one definition). A check may pin the clock
+(`pinClock`); `db.tx` then sets `erp.now`, which `erp_now()` reads. Company
+details and each store's form set the zones. Text quiet hours use the
+customer's state, else the company's zone.
+
+Behaviour change (kept on purpose, Nov 11 2026): with no zone set anywhere
+for a store -- not on the store, the company, the time clock or the delivery
+settings -- the time clock and delivery now use the zone of the store's (or
+company's) state before New York. Before 0053 they fell back to New York (time
+clock) or Chicago (delivery) whatever the state. A company in Texas with no
+zone set therefore now clocks and routes in Central time.
+
+**Periods** (`packages/core/periods.ts`). `post()` finds the period through
+`periodFor`: a month with no period opens on its own when the date is this
+month or up to two months ahead of the company's business date, or an earlier
+month of its current fiscal year (a `period_event` row says so); a month
+further ahead never opens on its own, even inside the fiscal year; anything else is refused with a sentence
+saying what to do (an owner or controller opens a month by hand in Books,
+Periods, with a reason). The daily period job keeps three months ahead open for
+every company of a customer that is not suspended. Every other writer of
+`journal_entry` (bills, payroll, transfers, bank fees, booked bank lines, the
+sample data) also goes through `periodFor`.
+
+Month-end close (owner or controller): the checklist lists bills and payroll
+dated in the month and not yet in the books, drawer sessions still open, bank
+lines not matched to its end, and the 1300 / 2100 / 1110 / inter-company
+tie-outs (`onboarding.tieOuts`); each item carries its rows and the screen that
+fixes it. A month with items still open closes only with `override` and a
+reason. A closed month refuses postings, in code and by the database trigger,
+in a sentence. Reopening is the owner's, with a reason (audit and period log).
+`period_event` is append-only.
+
+Year-end close (owner or controller): one `closing` journal on the year's last
+day moves every revenue and expense balance (by profit object) to retained
+earnings -- 3900, or the equity account named in `books.retained_earnings_code`
+-- and closes the year's months. A second close of the same year returns the
+first (`fiscal_year_close`, one live row per year). Reopening any month of a
+closed year, or the year, reverses the closing journal; closing again makes a
+new one. Packs carry 3900.
+
+**Scheduler** (`server/scheduler.ts`). The web server runs due jobs every
+minute (`ERP_SCHEDULER_TICK_SEC`; `ERP_SCHEDULER=off` stops it): each tick takes
+`pg_try_advisory_lock(7406312)` on its own connection or skips, so two
+instances never run a job twice. Jobs: periods (daily), connections, vendor
+feeds, marketing, EDI (15 minutes), quote holds, scheduled reports (hourly),
+outbox sweep (15 minutes). Each run is a `job_run` with its outcome (ok,
+partial, failed), its error, and what it did per company (`job_run_item`); a
+run that throws is also a server error. Suspended customers are skipped by each
+job's own query. `scripts/run-due.ts` runs what is due through the same code
+(`--all` runs everything). Owners see Setup, Scheduled jobs (their company's
+part of each run only); operators see every company's in the Operator console
+and can run a job now.
+
+**Server errors** (`server/errors.ts`). A failure that is not a refusal is
+answered "Something went wrong on our side (ref ABC123)" and kept in
+`server_error` under that reference, redacted (tokens, secrets, emails, card
+and account numbers; ids kept). Unhandled rejections are recorded and the
+service carries on; an uncaught exception is recorded and the process exits
+for Render to restart. `ERP_ALERT_WEBHOOK` (optional) gets one redacted line
+per error, at most one a minute and twenty an hour. Operators look a reference
+up in the Operator console.
+
+**Selling rules** (Setup, Sales tax, Selling rules; store manager or
+controller): deposits, quote holds, the discount limit, how long a quote is
+good for, the layaway deposit, length and number of payments, and the tenders
+the registers take (`pos_setting`). POS, quotes and layaway read them. A
+company with no row yet takes its pack's values. Pack settings now read when a
+company has none of its own: `pos.*`, `ar.late_fee` (A/R settings),
+`fleet.service_minutes` (delivery settings), `catalog.special_order_lead_days`
+(a vendor with no lead time). Not wired (they are rows a person sets up):
+`fleet.windows` (windows belong to zones), `workforce.commission` (plans are
+rows), `ar.aging_buckets` (the aging keeps its fixed 30/60/90 columns).
+
+**Campaigns** go through the outbox: the message and its `outbound_message`
+row commit together and the outbox sends it once after the commit; a provider
+refusal marks the campaign message failed.
+
+**The demo is made up.** Seed 0035 renames the earlier seeds' real towns,
+businesses, ZIP codes (to 001xx) and area codes (to 555) in the demo tenants
+only (Riverside, Mesa Verde, Canyon Ridge, Oak Hollow, Hillcrest, Maple Grove;
+the web store is `riverside-home`). Audit rows and journal entries keep what
+they were written with; furniture makers' names on vendors stay (their
+connections are built for them).
+
+**CI** (`.github/workflows/ci.yml`): Postgres 16, `apply.sh --reset --seed`,
+smoke and smoke:modules on every push and pull request; `npm run typecheck`
+runs alongside, not blocking until it is clean. CI never deploys.
+
+### Review fixes (Nov 11 2026, migrations 0056, 0058, 0059; seed 0036)
+
+- The year-end closing entry (`source_type = 'closing'`) is left out of the
+  P&L: Books, Home, Group consolidation and the `pnl_lines` dataset.
+- 0056: a posting reads its period row FOR SHARE, so it cannot pass a
+  month-end close (which takes it FOR UPDATE); an entry's period must be its
+  company's and hold its date; lines cannot be added to an entry in a closed
+  month; a closed month changes status only with a 'reopened' log row in the
+  same transaction (periods.ts writes the log row first).
+- Two year closes of the same company at once: one waits for the other
+  (advisory lock) and returns its close; a clash says so in a sentence.
+- Reopening a month of a closed year says first that the year's closing entry
+  is reversed and the year's last month stays open until the year closes again.
+- A failing pull connection's failure is recorded outside the rolled-back
+  transaction, so it backs off and stops after five failures. The job log keeps
+  90 days. Operator "Run now" queues the job and answers at once; the console
+  watches the job log for the result.
+- 0058: date columns that defaulted to the UTC day (customer_invoice,
+  ar_ledger, maintenance_schedule, fuel_log, ic_document, ic_settlement,
+  ic_markup_move) take the company's business date by trigger; the views
+  ap_aging, sweep_status, connection_health and statement_gaps count from it.
+- The demo never calls a real outside system on a schedule: 0059 (live) and
+  seed 0036 (every reset) set its vendor feeds to on demand, turn its EDI off
+  and pause its pull connections, and the scheduler skips the demo's feeds, EDI
+  and pulls ("demo: skipped"). A person can still run one by hand.
+- Error log redaction also covers phone numbers, passwords in URLs and
+  `api_key=`. After an uncaught exception the server stops taking requests
+  (`server.close()`) and the process exits within 10 seconds.
 ## Vendor files: SFTP, HTTPS and email transports (migration 0057)
 
 Vendors deliver catalogs, prices, inventory and EDI documents three ways

@@ -34,8 +34,8 @@ const RC = routesOf(catalogModule as never);
 const OWNER = PEOPLE.STEVE;
 const MARIA = "55555555-0000-0000-0000-000000000011";    // sales
 const MGR = "55555555-0000-0000-0000-000000000018";      // store manager + sales
-const TABLET = "9a9a0000-0000-0000-0000-000000000002";   // Enola sales tablet
-const PAL_REG = "9a9a0000-0000-0000-0000-000000000003";  // Palestine counter
+const TABLET = "9a9a0000-0000-0000-0000-000000000002";   // Riverside sales tablet
+const PAL_REG = "9a9a0000-0000-0000-0000-000000000003";  // Mesa Verde counter
 const CUST = { ALICIA: "88888888-0000-0000-0000-000000000001", BRIAN: "88888888-0000-0000-0000-000000000002", DANA: "88888888-0000-0000-0000-000000000004",
   RIVERSIDE: "88888888-0000-0000-0000-000000000005" };
 const P = { SOFA: "77777777-0000-0000-0000-000000000001", LAMP: "77777777-0000-0000-0000-000000000009", HUDSON: "77777777-0000-0000-0000-000000000010" };
@@ -68,11 +68,11 @@ export async function run(t: T) {
     const ps = await order(OWNER, { kind: "sale", locationId: LOC.PALESTINE, sessionId: pal.id, lines: [{ productId: P.LAMP, qty: 2, fulfillment: "carry" }] });
     const psRows = await rowsOf(ps.id);
     const psTax = BigInt((await view(ps.id)).tax_minor as string);
-    t.ok("stacked: a Palestine sale is taxed by Texas, the city and the county", psRows.map((r) => r.code).sort().join(",") === "TX,TX-ANDERSON,TX-PALESTINE");
+    t.ok("stacked: a Mesa Verde sale is taxed by Texas, the city and the county", psRows.map((r) => r.code).sort().join(",") === "TX,TX-JUNIPER,TX-MESAVERDE");
     t.ok("stacked: together they charge exactly the old 8.25% store rate", psTax === half(11998n, 825), `${psTax}`);
     t.ok("stacked: the line's tax is split over them by rate and adds up", psRows.reduce((a, r) => a + BigInt(r.tax_minor), 0n) === psTax
-      && BigInt(psRows.find((r) => r.code === "TX")!.tax_minor) === 750n && BigInt(psRows.find((r) => r.code === "TX-PALESTINE")!.tax_minor) === 180n
-      && BigInt(psRows.find((r) => r.code === "TX-ANDERSON")!.tax_minor) === 60n, psRows.map((r) => `${r.code} ${r.tax_minor}`).join(" "));
+      && BigInt(psRows.find((r) => r.code === "TX")!.tax_minor) === 750n && BigInt(psRows.find((r) => r.code === "TX-MESAVERDE")!.tax_minor) === 180n
+      && BigInt(psRows.find((r) => r.code === "TX-JUNIPER")!.tax_minor) === 60n, psRows.map((r) => `${r.code} ${r.tax_minor}`).join(" "));
     const psOut = await R.post(t, OWNER, `/pos/orders/${ps.id}/checkout`, { sessionId: pal.id, tenders: [{ method: "cash", amount: "200.00" }] }) as { status: string };
     const psPosted = await rowsOf(ps.id);
     t.ok("stacked: handed over, each jurisdiction's tax is posted the day it reached 2100", psOut.status === "fulfilled" && psPosted.every((r) => !!r.posted_on));
@@ -82,7 +82,7 @@ export async function run(t: T) {
     // ------------------------------------- one jurisdiction = the old single rate
     const es = await order(OWNER, { kind: "sale", locationId: LOC.ENOLA, lines: [{ productId: P.LAMP, qty: 3, fulfillment: "carry" }] });
     const esRows = await rowsOf(es.id);
-    t.ok("one jurisdiction: Enola is Pennsylvania alone, at 6%, as before", esRows.length === 1 && esRows[0].code === "PA" && BigInt(esRows[0].tax_minor) === half(17997n, 600));
+    t.ok("one jurisdiction: Riverside is Pennsylvania alone, at 6%, as before", esRows.length === 1 && esRows[0].code === "PA" && BigInt(esRows[0].tax_minor) === half(17997n, 600));
     const ohio = await t.as(OWNER, (c, co, a) => saveLocation(c, scopeOf(co, a), { code: "OHX", name: "Columbus test store", kind: "store", taxRateBps: 725,
       address: { line1: "1 High St", city: "Columbus", state: "OH", postal: "43215" } }));
     const oh = await order(OWNER, { kind: "sale", locationId: ohio, lines: [{ productId: P.LAMP, qty: 1, fulfillment: "pickup" }] });
@@ -94,7 +94,7 @@ export async function run(t: T) {
     const oh2 = await order(OWNER, { kind: "sale", locationId: ohio, lines: [{ productId: P.LAMP, qty: 1, fulfillment: "pickup" }] });
     t.ok("single rate: changing the store's rate in setup changes it from today", BigInt((await rowsOf(oh2.id))[0].tax_minor) === half(5999n, 750));
     await t.throws("a stacked store's rate is not typed over in setup", () => t.as(OWNER, (c, co, a) => saveLocation(c, scopeOf(co, a), { id: LOC.PALESTINE, code: "PAL",
-      name: "Palestine", kind: "store", taxRateBps: 700, address: { line1: "200 Spring St", city: "Palestine", state: "TX", postal: "75801" } })), /comes from its tax jurisdictions/);
+      name: "Mesa Verde", kind: "store", taxRateBps: 700, address: { line1: "200 Spring St", city: "Mesa Verde", state: "TX", postal: "00181" } })), /comes from its tax jurisdictions/);
 
     // ---------------------------------------------- destination vs origin
     const danaAddr = (await read<{ id: string }>(`select id from customer_address where entity_id = $1 and customer_id = $2 and is_default`, [ENTITY, CUST.DANA]))[0].id;
@@ -103,10 +103,10 @@ export async function run(t: T) {
     const dRows = await rowsOf(dest.id);
     const dLines = (await view(dest.id)).lines;
     const sofaLine = dLines.find((l) => l.sku === "ASH-2930338")!, lampLine = dLines.find((l) => l.sku === "ACC-LAMP-01")!;
-    t.ok("destination: a sofa sold at Enola and delivered to Palestine, TX is taxed at the Texas address (8.25%)", BigInt(sofaLine.tax_minor) === half(79999n, 825)
-      && dRows.filter((r) => r.line_id === sofaLine.id).map((r) => `${r.code}:${r.sourced}`).sort().join(",") === "TX-ANDERSON:destination,TX-PALESTINE:destination,TX:destination",
+    t.ok("destination: a sofa sold at Riverside and delivered to Mesa Verde, TX is taxed at the Texas address (8.25%)", BigInt(sofaLine.tax_minor) === half(79999n, 825)
+      && dRows.filter((r) => r.line_id === sofaLine.id).map((r) => `${r.code}:${r.sourced}`).sort().join(",") === "TX-JUNIPER:destination,TX-MESAVERDE:destination,TX:destination",
       `${sofaLine.tax_minor}`);
-    t.ok("destination: the lamp taken out of the Enola store is taxed at Enola (6%)", BigInt(lampLine.tax_minor) === half(5999n, 600)
+    t.ok("destination: the lamp taken out of the Riverside store is taxed at Riverside (6%)", BigInt(lampLine.tax_minor) === half(5999n, 600)
       && dRows.some((r) => r.code === "PA" && r.sourced === "origin"));
     await RS.post(t, OWNER, "/setup/tax/sourcing", { sourcing: "origin" });
     const orig = await order(OWNER, { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.DANA, shipAddressId: danaAddr, promisedOn: plus(9),
@@ -174,9 +174,9 @@ export async function run(t: T) {
     const ret = await R.post(t, OWNER, `/pos/orders/${ps.id}/return`, { sessionId: pal.id, lines: [{ lineId: pv.lines[0].id, qty: 1, reason: "changed_mind", disposition: "restock" }],
       tenders: [{ method: "cash", amount: String((5999 + Number(half(5999n, 825))) / 100) }] }) as { id: string; taxMinor: bigint; journalEntryId: string };
     const rRows = (await rowsOf(ret.id)).filter((r) => r.kind === "return");
-    t.ok("return: the tax comes back from the same three jurisdictions", rRows.map((r) => r.code).sort().join(",") === "TX,TX-ANDERSON,TX-PALESTINE" && rRows.every((r) => !!r.posted_on));
-    t.ok("return: each gives back its share for one of the two lamps", rRows.find((r) => r.code === "TX")!.tax_minor === "-375" && rRows.find((r) => r.code === "TX-PALESTINE")!.tax_minor === "-90"
-      && rRows.find((r) => r.code === "TX-ANDERSON")!.tax_minor === "-30" && rRows.every((r) => r.taxable_minor === "-5999"), rRows.map((r) => `${r.code} ${r.tax_minor}`).join(" "));
+    t.ok("return: the tax comes back from the same three jurisdictions", rRows.map((r) => r.code).sort().join(",") === "TX,TX-JUNIPER,TX-MESAVERDE" && rRows.every((r) => !!r.posted_on));
+    t.ok("return: each gives back its share for one of the two lamps", rRows.find((r) => r.code === "TX")!.tax_minor === "-375" && rRows.find((r) => r.code === "TX-MESAVERDE")!.tax_minor === "-90"
+      && rRows.find((r) => r.code === "TX-JUNIPER")!.tax_minor === "-30" && rRows.every((r) => r.taxable_minor === "-5999"), rRows.map((r) => `${r.code} ${r.tax_minor}`).join(" "));
     const r2100 = await read<{ d: string }>(`select coalesce(sum(jl.debit_minor - jl.credit_minor),0)::text d from journal_line jl join gl_account g on g.id = jl.gl_account_id
       join journal_entry je on je.id = jl.journal_entry_id where je.entity_id = $2 and jl.journal_entry_id = $1 and g.code = '2100'`, [ret.journalEntryId, ENTITY]);
     t.ok("return: 2100 is debited exactly what the jurisdictions give back", BigInt(r2100[0].d) === -rRows.reduce((a, r) => a + BigInt(r.tax_minor), 0n) && BigInt(ret.taxMinor) === 495n);
@@ -255,7 +255,7 @@ export async function run(t: T) {
       `${all.tie.note} gl ${all.tie.glSalesMinor} rows ${all.tie.collectedMinor}`);
     const month = new Date().toISOString().slice(0, 8) + "01";
     const fl = await tax.filing(c0, ENTITY, month, plus(0));
-    const pa = fl.rows.find((r) => r.code === "TX-PALESTINE")!;
+    const pa = fl.rows.find((r) => r.code === "TX-MESAVERDE")!;
     t.ok("filing: per jurisdiction it shows gross, taxable, tax and the returns", !!pa && pa.taxMinor >= 180n && pa.returnsTaxMinor <= -90n && pa.grossMinor >= pa.taxableMinor
       && pa.netTaxMinor === pa.taxMinor + pa.returnsTaxMinor);
     const paRow = fl.rows.find((r) => r.code === "PA")!;
@@ -264,7 +264,7 @@ export async function run(t: T) {
     t.ok("filing: this month ties to 2100 too", fl.tie.ties, fl.tie.note);
     const csv = await RR.post(t, OWNER, "/reports/tax-filing/export", { from: month, to: plus(0) }) as { filename: string; csv: string; note: string | null };
     t.ok("filing: the CSV has a row per jurisdiction and says it ties", csv.filename.endsWith(".csv") && csv.csv.startsWith("Jurisdiction code,Jurisdiction,Level,State")
-      && csv.csv.includes("TX-PALESTINE,City of Palestine,city,TX") && /Difference,0\.00,ties/.test(csv.csv) && csv.note === null);
+      && csv.csv.includes("TX-MESAVERDE,City of Mesa Verde,city,TX") && /Difference,0\.00,ties/.test(csv.csv) && csv.note === null);
     await t.throws("filing: sales cannot pull the filing", () => RR.post(t, MARIA, "/reports/tax-filing/export", { from: month, to: plus(0) }), /needs one of: owner, controller, viewer/);
     // A stray 2100 posting that no sale explains is flagged, not hidden.
     const stray = await sys(async (c) => {
@@ -353,23 +353,23 @@ export async function run(t: T) {
     const lineRows = (lineId: string) => read<{ code: string; tax_minor: string; owed_minor: string; sourced: string; exempt_reason: string | null; note: string | null }>(`
       select j.code, t.tax_minor::text, t.owed_minor::text, t.sourced, t.exempt_reason, t.note from sales_order_line_tax t join tax_jurisdiction j on j.id = t.jurisdiction_id
        where t.entity_id = $1 and t.sales_order_line_id = $2 and t.kind = 'sale' order by j.code`, [ENTITY, lineId]);
-    const SOC = { line1: "9 Mesa Rd", city: "Socorro", state: "TX", postal: "79927" };
-    const site = (await sys((c) => shop.siteBySlug(c, "buddys")))!;
+    const SOC = { line1: "9 Mesa Rd", city: "Canyon Ridge", state: "TX", postal: "00127" };
+    const site = (await sys((c) => shop.siteBySlug(c, "riverside-home")))!;
     const ck = (over: Record<string, unknown>) => shop.parseCheckout({ cartId: `tax-${Math.random().toString(36).slice(2, 12)}`, email: "taxweb@example.com", name: "Tax Web",
-      phone: "915-555-0177", fulfillment: "delivery", address: SOC, paymentToken: "tok_test_visa_4242", lines: [{ productId: P.LAMP, qty: 1 }], ...over });
+      phone: "555-555-0177", fulfillment: "delivery", address: SOC, paymentToken: "tok_test_visa_4242", lines: [{ productId: P.LAMP, qty: 1 }], ...over });
     const prev = await sys((c) => shop.quote(c, site, ck({})));
-    t.ok("web: the checkout preview for a Socorro delivery shows Socorro's 8.25%, not the shop's own rate", prev.taxRateBps === 825
+    t.ok("web: the checkout preview for a Canyon Ridge delivery shows Canyon Ridge's 8.25%, not the shop's own rate", prev.taxRateBps === 825
       && prev.lines[0].taxMinor === half(5999n, 825).toString(), `${prev.taxRateBps} ${prev.lines[0].taxMinor}`);
     const web = await sys((c) => shop.placeWebOrder(c, site, ck({}), SCOPE));
     const webLine = (await read<{ id: string; tax_minor: string }>(`select l.id, l.tax_minor::text from sales_order_line l join sales_order so on so.id = l.sales_order_id
       where so.entity_id = $1 and so.number = $2 and l.sku = 'ACC-LAMP-01'`, [ENTITY, web.order.number]))[0];
     const webRows = await lineRows(webLine.id);
-    t.ok("web: a delivery to another county is taxed at the address: Texas, El Paso County and Socorro", webLine.tax_minor === half(5999n, 825).toString()
-      && webRows.map((r) => r.code).join(",") === "TX,TX-ELPASO,TX-SOCORRO" && webRows.every((r) => r.sourced === "destination" && r.owed_minor === r.tax_minor), JSON.stringify(webRows));
+    t.ok("web: a delivery to another county is taxed at the address: Texas, Sun Valley County and Canyon Ridge", webLine.tax_minor === half(5999n, 825).toString()
+      && webRows.map((r) => r.code).join(",") === "TX,TX-CANYONRIDGE,TX-SUNVALLEY" && webRows.every((r) => r.sourced === "destination" && r.owed_minor === r.tax_minor), JSON.stringify(webRows));
     const pk = await sys((c) => shop.placeWebOrder(c, site, ck({ fulfillment: "pickup", pickupLocationId: LOC.PALESTINE, address: undefined }), SCOPE));
     const pkLine = (await read<{ id: string; tax_minor: string }>(`select l.id, l.tax_minor::text from sales_order_line l join sales_order so on so.id = l.sales_order_id
       where so.entity_id = $1 and so.number = $2 and l.sku = 'ACC-LAMP-01'`, [ENTITY, pk.order.number]))[0];
-    t.ok("web: a pickup is taxed at the pickup store's jurisdictions", (await lineRows(pkLine.id)).map((r) => r.code).join(",") === "TX,TX-ANDERSON,TX-PALESTINE");
+    t.ok("web: a pickup is taxed at the pickup store's jurisdictions", (await lineRows(pkLine.id)).map((r) => r.code).join(",") === "TX,TX-JUNIPER,TX-MESAVERDE");
 
     const svc = await sys(async (c) => {
       const tk = await service.openTicket(c, SCOPE, { source: "phone", customerId: CUST.DANA, issueType: "other", description: "Recliner squeaks when it reclines" });
@@ -402,7 +402,7 @@ export async function run(t: T) {
       await c.query("rollback to savepoint mis");
       return { rows: rows[0], f, before: f0.collection.underCollectedMinor };
     });
-    t.ok("mismatch: an imported line charged 6% for a Socorro delivery keeps what was charged and what is owed (8.25%)", mis.rows.tax === "180" && mis.rows.owed === half(3000n, 825).toString());
+    t.ok("mismatch: an imported line charged 6% for a Canyon Ridge delivery keeps what was charged and what is owed (8.25%)", mis.rows.tax === "180" && mis.rows.owed === half(3000n, 825).toString());
     t.ok("mismatch: the filing still ties to 2100 and flags the tax under-collected, line by line", mis.f.tie.ties && mis.f.collection.underCollectedMinor - mis.before === half(3000n, 825) - 180n
       && /under-collected/.test(mis.f.collection.note ?? "") && mis.f.collection.lines.some((x) => x.order_number === "IMPORT-TAX-1"), mis.f.collection.note ?? "");
 
@@ -412,7 +412,7 @@ export async function run(t: T) {
       lines: [{ productId: P.SOFA, qty: 1, fulfillment: "delivery" }] }) as { id: string; taxNotes: string[] };
     const gpSofa = (await view(gapPal.id)).lines.find((l) => l.sku === "ASH-2930338")!;
     const gpRows = await lineRows(gpSofa.id);
-    t.ok("ZIP gap: McAllen has no local tax set up, so a Palestine sale is taxed at the Palestine store's stack, and says so",
+    t.ok("ZIP gap: McAllen has no local tax set up, so a Mesa Verde sale is taxed at the Mesa Verde store's stack, and says so",
       gpSofa.tax_minor === half(79999n, 825).toString() && gpRows.every((r) => r.sourced === "origin" && /ZIP 78501 has no local tax/.test(r.note ?? ""))
       && gapPal.taxNotes.some((n) => /78501/.test(n)), JSON.stringify(gpRows));
     const gapEn = await order(OWNER, { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.DANA, shipAddressId: mca.id, promisedOn: plus(9),
@@ -434,7 +434,7 @@ export async function run(t: T) {
     // ------------------------------- a store that was there before the migration
     const pre = await sys(async (c) => {
       const mk = async (code: string) => (await t.q<{ id: string }>(c, `insert into location (entity_id, code, name, kind, state, tax_rate_bps, address)
-        values ($1,$2,$3,'store','TX',825,'{"line1":"1 Tyler Ave","city":"Harlingen","state":"TX","postal":"78550"}') returning id`, [ENTITY, code, `Harlingen ${code}`]))[0].id;
+        values ($1,$2,$3,'store','TX',825,'{"line1":"1 Oak Hollow Ave","city":"Harlingen","state":"TX","postal":"78550"}') returning id`, [ENTITY, code, `Harlingen ${code}`]))[0].id;
       const a = await mk("PRE1");
       const made = (await t.q<{ n: number }>(c, `select tax_make_standins($1, $2) n /* unscoped: the migration's own rule, for this one store */`, [ENTITY, a]))[0].n;
       const b = await mk("PRE2");   // as if added after the migration by a script, with no stand-in

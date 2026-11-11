@@ -94,7 +94,7 @@ export const DATASETS: Dataset[] = [
                  jl.credit_minor - jl.debit_minor as net_income,
                  je.id::text as entry_id
             from journal_line jl
-            join journal_entry je on je.id = jl.journal_entry_id and je.entity_id = $1
+            join journal_entry je on je.id = jl.journal_entry_id and je.entity_id = $1 and je.source_type <> 'closing'  -- the year-end closing entry is not the year's P&L
             join gl_account ga on ga.id = jl.gl_account_id and ga.account_type in ('revenue', 'expense')
             left join profit_object po on po.id = jl.profit_object_id and po.entity_id = $1`,
   },
@@ -159,7 +159,7 @@ export const DATASETS: Dataset[] = [
       F("margin", "Margin", "money"), F("fulfillment", "Fulfillment", "text"), F("line_status", "Line status", "text"),
       F("order_status", "Order status", "text"),
     ],
-    sql: `select so.ordered_at::date as ordered_on, so.number as order_number, so.channel,
+    sql: `select (so.ordered_at at time zone business_tz(so.entity_id, so.location_id))::date as ordered_on, so.number as order_number, so.channel,
                  lo.name as store, su.name as salesperson, cu.name as customer, l.sku, l.description as product,
                  p.category, ${VENDOR} as vendor, p.brand, l.qty,
                  l.unit_price_minor as unit_price, round(l.qty * l.unit_price_minor)::bigint as gross, l.discount_minor as discount,
@@ -244,7 +244,7 @@ export const DATASETS: Dataset[] = [
       F("discount", "Discount", "money"), F("tax", "Tax", "money"), F("fees", "Fees", "money"), F("total", "Total", "money"),
       F("paid", "Paid", "money"), F("balance", "Balance owed", "money"),
     ],
-    sql: `select so.ordered_at::date as ordered_on, so.number as order_number, so.channel,
+    sql: `select (so.ordered_at at time zone business_tz(so.entity_id, so.location_id))::date as ordered_on, so.number as order_number, so.channel,
                  case when so.channel = 'web' then 'Web' else 'Store' end as channel_group,
                  lo.name as store, su.name as salesperson, cu.name as customer, so.status, so.fulfillment, so.promised_on,
                  (select count(*) from sales_order_line x where x.sales_order_id = so.id and x.entity_id = $1)::int as lines,
@@ -267,7 +267,7 @@ export const DATASETS: Dataset[] = [
       F("order_number", "Order", "text"), F("reference", "Reference", "text"), F("received_by", "Taken by", "text"),
       F("voided", "Voided", "bool"), F("amount", "Amount", "money"),
     ],
-    sql: `select r.received_at::date as received_on, r.number, lo.name as store, r.channel, r.method as tender,
+    sql: `select (r.received_at at time zone business_tz(r.entity_id, r.location_id))::date as received_on, r.number, lo.name as store, r.channel, r.method as tender,
                  cu.name as customer, so.number as order_number, r.reference, u.name as received_by,
                  r.voided_at is not null as voided, r.amount_minor as amount
             from customer_receipt r
@@ -294,35 +294,35 @@ export const DATASETS: Dataset[] = [
               from ar_ledger l join customer_invoice i on i.id = l.invoice_id and i.entity_id = $1
               left join customer cu on cu.id = i.customer_id and cu.entity_id = $1
               left join location lo on lo.id = i.location_id and lo.entity_id = $1
-             where l.entity_id = $1 and l.occurred_on <= current_date
+             where l.entity_id = $1 and l.occurred_on <= business_today($1)
              group by i.id, cu.name, lo.name having sum(l.amount_minor) <> 0
             union all
-            select cu.name, 'contract', k.number, lo.name, k.opened_at::date,
+            select cu.name, 'contract', k.number, lo.name, (k.opened_at at time zone business_tz(k.entity_id))::date,
                    (select min(x.due_on) from ar_contract_installment x where x.contract_id = k.id and x.entity_id = $1
                        and x.status = 'due' and x.principal_minor > x.paid_principal_minor),
                    k.principal_minor, sum(l.amount_minor)
               from ar_ledger l join ar_contract k on k.id = l.contract_id and k.entity_id = $1
               join customer cu on cu.id = k.customer_id and cu.entity_id = $1
               left join location lo on lo.id = k.location_id and lo.entity_id = $1
-             where l.entity_id = $1 and l.occurred_on <= current_date
+             where l.entity_id = $1 and l.occurred_on <= business_today($1)
              group by k.id, cu.name, lo.name having sum(l.amount_minor) <> 0
             union all
             select coalesce(cu.name, 'Cash sales (no customer)'), 'unapplied', null, lo.name, null, null, null, sum(l.amount_minor)
               from ar_ledger l
               left join customer cu on cu.id = l.customer_id and cu.entity_id = $1
               left join location lo on lo.id = l.location_id and lo.entity_id = $1
-             where l.entity_id = $1 and l.occurred_on <= current_date and l.invoice_id is null and l.contract_id is null
+             where l.entity_id = $1 and l.occurred_on <= business_today($1) and l.invoice_id is null and l.contract_id is null
              group by l.customer_id, cu.name, l.location_id, lo.name having sum(l.amount_minor) <> 0)
           select customer, kind, document, store, invoice_date, due_on,
-                 case when kind = 'unapplied' or due_on is null then 0 else greatest(0, current_date - due_on) end as days_past_due,
+                 case when kind = 'unapplied' or due_on is null then 0 else greatest(0, business_today($1) - due_on) end as days_past_due,
                  case when kind = 'unapplied' then 'Unapplied'
-                      when due_on is null or current_date - due_on <= 0 then 'Current'
-                      when current_date - due_on <= 30 then '1–30'
-                      when current_date - due_on <= 60 then '31–60'
-                      when current_date - due_on <= 90 then '61–90' else 'Over 90' end as bucket,
-                 case when kind = 'unapplied' then 6 when due_on is null or current_date - due_on <= 0 then 1
-                      when current_date - due_on <= 30 then 2 when current_date - due_on <= 60 then 3
-                      when current_date - due_on <= 90 then 4 else 5 end as bucket_order,
+                      when due_on is null or business_today($1) - due_on <= 0 then 'Current'
+                      when business_today($1) - due_on <= 30 then '1–30'
+                      when business_today($1) - due_on <= 60 then '31–60'
+                      when business_today($1) - due_on <= 90 then '61–90' else 'Over 90' end as bucket,
+                 case when kind = 'unapplied' then 6 when due_on is null or business_today($1) - due_on <= 0 then 1
+                      when business_today($1) - due_on <= 30 then 2 when business_today($1) - due_on <= 60 then 3
+                      when business_today($1) - due_on <= 90 then 4 else 5 end as bucket_order,
                  original, open
             from items /* entity_id = $1 inside every branch */`,
   },
@@ -338,7 +338,7 @@ export const DATASETS: Dataset[] = [
       F("balance", "Owes now", "money"),
     ],
     sql: `select cu.number, cu.name as customer, cu.kind, cu.status, lo.name as home_store, cu.email, cu.phone, cu.marketing_ok,
-                 cu.created_at::date as created_on,
+                 (cu.created_at at time zone business_tz(cu.entity_id))::date as created_on,
                  (select max(so.ordered_at)::date from sales_order so where so.entity_id = $1 and so.customer_id = cu.id) as last_order_on,
                  (select count(*) from sales_order so where so.entity_id = $1 and so.customer_id = cu.id and so.status not in ('draft', 'cancelled'))::int as orders,
                  coalesce((select sum(ci.subtotal_minor) from customer_invoice ci where ci.entity_id = $1 and ci.customer_id = cu.id and ci.kind = 'sale'), 0)::bigint as lifetime_sales,
@@ -371,7 +371,7 @@ export const DATASETS: Dataset[] = [
                  round(coalesce(a.on_hand, 0) * coalesce(case when ic.qty > 0 then ic.value_minor / ic.qty end, p.cost_minor, 0))::bigint as stock_value,
                  round(coalesce(a.on_hand, 0) * p.price_minor)::bigint as retail_value,
                  ls.last_sold_on,
-                 (current_date - coalesce(ls.last_sold_on, p.created_at::date))::int as idle_days
+                 (business_today($1) - coalesce(ls.last_sold_on, (p.created_at at time zone business_tz($1))::date))::int as idle_days
             from product p
             left join product_availability a on a.product_id = p.id and a.entity_id = $1
             left join location lo on lo.id = a.location_id and lo.entity_id = $1
@@ -413,8 +413,8 @@ export const DATASETS: Dataset[] = [
       F("retail", "Retail", "money"), F("price", "Tag price", "money"), F("markdown", "Markdown", "money"),
     ],
     sql: `select x.label, p.sku, p.name as product, l.name as location, coalesce(ic.grade, 'ungraded') as grade, coalesce(ic.source, 'as_is') as source,
-                 ic.graded_at::date as graded_on,
-                 (current_date - coalesce((select min(h.graded_at) from inv_condition h where h.entity_id = $1 and h.unit_id = x.unit_id), x.created_at)::date)::int as age_days,
+                 (ic.graded_at at time zone business_tz(ic.entity_id))::date as graded_on,
+                 (business_today($1) - coalesce((select min(h.graded_at) from inv_condition h where h.entity_id = $1 and h.unit_id = x.unit_id), x.created_at)::date)::int as age_days,
                  p.price_minor as retail, coalesce(ic.price_minor, x.as_is_price_minor) as price,
                  p.price_minor - coalesce(ic.price_minor, x.as_is_price_minor, p.price_minor) as markdown
             from inv_piece x
@@ -545,7 +545,7 @@ export const DATASETS: Dataset[] = [
                       else greatest(0, extract(epoch from ((s.arrived_at at time zone tz.tz)::time - w.ends)) / 60)::int end as late_minutes,
                  coalesce(s.exception_reason, s.exception) as exception
             from delivery_stop s
-            cross join (select coalesce((select time_zone from fleet_setting where entity_id = $1), (select timezone from workforce_settings where entity_id = $1), 'America/Chicago') as tz) tz
+            cross join (select coalesce((select time_zone from fleet_setting where entity_id = $1), business_tz($1)) as tz) tz
             left join delivery_window w on w.id = s.window_id and w.entity_id = $1
             left join delivery_zone z on z.id = s.zone_id and z.entity_id = $1
             left join delivery_route r on r.id = s.route_id and r.entity_id = $1
@@ -613,7 +613,7 @@ export const DATASETS: Dataset[] = [
       F("has_email", "Left an email", "bool"), F("items", "Items", "number"), F("subtotal", "Cart subtotal", "money"),
       F("converted", "Became an order", "bool"), F("order_number", "Order", "text"), F("order_total", "Order total", "money"),
     ],
-    sql: `select c.created_at::date as started_on, c.updated_at::date as updated_on,
+    sql: `select (c.created_at at time zone business_tz($1))::date as started_on, (c.updated_at at time zone business_tz($1))::date as updated_on,
                  s.display_name as site, c.email is not null and c.email <> '' as has_email, c.item_count as items,
                  c.subtotal_minor as subtotal, c.sales_order_id is not null as converted, so.number as order_number,
                  so.total_minor as order_total

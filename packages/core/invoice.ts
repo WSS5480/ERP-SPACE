@@ -4,6 +4,7 @@
 // are where people enter, which is why the exception count matters more
 // than the touchless rate on its own.
 
+import { periodFor } from "./periods.ts";
 import { type Client, type Scope, audit, one, q } from "./db.ts";
 import { openRequest } from "./approvals.ts";
 import { withinTolerance } from "./money.ts";
@@ -293,12 +294,7 @@ export async function postToLedger(c: Client, scope: Scope, invoiceId: string): 
   if (!["approved", "scheduled", "paid"].includes(inv.status))
     throw new TransitionError(`invoice is ${inv.status}; nothing posts before approval`);
 
-  const period = await one<{ id: string }>(
-    c,
-    `select id from fiscal_period
-      where entity_id = $1 and $2::date between starts_on and ends_on`,
-    [scope.entityId, inv.invoice_date]
-  );
+  const period = { id: await periodFor(c, scope, inv.invoice_date) };
 
   const lines = await q<{ gl_account_id: string; profit_object_id: string | null; department_id: string | null; amount_minor: string }>(
     c,

@@ -3,9 +3,10 @@
 // Accounts are named by code from the tenant's chart ('4000', '2300'), never
 // by id, so the same posting works for every company on its own chart. The
 // entry must balance (the database checks it too), lands in the open period
-// that holds its date, and names the thing that caused it.
+// that holds its date (opened on its own when the month is near, see periods.ts), and names the thing that caused it.
 
 import { q, one, type Client, type Scope } from "./db.ts";
+import { periodFor, PeriodError } from "./periods.ts";
 
 export type PostLine = {
   code: string;                 // GL account code in the tenant's chart
@@ -18,7 +19,7 @@ export type PostLine = {
 
 export class PostingError extends Error {}
 
-export type SourceType = "invoice" | "sale" | "receipt" | "refund" | "inventory" | "commission" | "ar" | "fleet" | "finance" | "manual" | "opening" | "intercompany";
+export type SourceType = "invoice" | "sale" | "receipt" | "refund" | "inventory" | "commission" | "ar" | "fleet" | "finance" | "manual" | "opening" | "intercompany" | "closing";
 
 /** The store's profit object, so revenue and cost land on the right P&L column. */
 export async function profitObjectFor(c: Client, entityId: string, locationId: string | null): Promise<string | null> {
@@ -55,16 +56,15 @@ export async function post(c: Client, scope: Scope, e: {
   const missing = codes.filter((x) => !byCode.has(x));
   if (missing.length) throw new PostingError(`the chart of accounts has no account ${missing.join(", ")}; add it in Setup`);
 
-  const period = await q<{ id: string; status: string }>(c,
-    `select id, status from fiscal_period where entity_id = $1 and $2::date between starts_on and ends_on`,
-    [scope.entityId, e.date]);
-  if (!period.length) throw new PostingError(`there is no fiscal period for ${e.date}; open one in Books`);
-  if (period[0].status === "closed") throw new PostingError(`the period holding ${e.date} is closed`);
+  // The open period holding the date; a month with none opens on its own when it is near (periods.ts says when).
+  let periodId: string;
+  try { periodId = await periodFor(c, scope, e.date); }
+  catch (x) { if (x instanceof PeriodError) throw new PostingError(x.message); throw x; }
 
   const je = await one<{ id: string }>(c,
     `insert into journal_entry (tenant_id, entity_id, period_id, posting_date, source_type, source_id, description, posted_by, actor_kind)
      values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning id`,
-    [scope.tenantId, scope.entityId, period[0].id, e.date, e.sourceType, e.sourceId, e.description.slice(0, 300),
+    [scope.tenantId, scope.entityId, periodId, e.date, e.sourceType, e.sourceId, e.description.slice(0, 300),
      scope.actor.id || null, scope.actor.kind]);
   let seq = 1;
   for (const l of lines) {

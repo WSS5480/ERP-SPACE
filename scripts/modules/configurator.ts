@@ -227,7 +227,7 @@ export async function run(t: T) {
     t.ok("return by piece: the set still shows all three pieces, each with its own story", pkSet.lines.length === 3 && pkSet.lines.filter((l) => l.line_status === "fulfilled").length >= 2);
 
     // ------------------------------------------------------------ the web customizer
-    const site = await tx(sys, async (c) => (await shop.siteBySlug(c, "buddys"))!);
+    const site = await tx(sys, async (c) => (await shop.siteBySlug(c, "riverside-home"))!);
     const pub = await tx(sys, (c) => shop.pubProduct(c, site, FAM));
     t.ok("web: the sectional page carries the builder: pieces, popular layouts, covers and rules, and no cost or vendor codes", !!pub?.sectional && pub.sectional.layouts.length >= 3
       && pub.sectional.covers.length >= 4 && !js(pub.sectional).includes("costMinor") && !js(pub.sectional).includes("vendorCode")
@@ -238,8 +238,8 @@ export async function run(t: T) {
     await t.throws("web: a sectional in the cart needs its pieces", () => tx(sys, (c) => shop.saveCart(c, site, "cfg-cart-nopieces", [{ productId: FAM, qty: 1 }]).then((r) => { if (r.problems.length) throw new Error(r.problems[0].error); return r; })), /Choose the pieces/);
     const cart = await tx(sys, (c) => shop.saveCart(c, site, "cfg-cart-0001", [{ productId: FAM, qty: 1, sectional: { ...layout3, cover: "navy-velvet" } }]));
     t.ok("web: the cart holds the sectional as one line, with its plan", cart.lines.length === 1 && cart.lines[0].unitPriceMinor === nv.totalMinor && (cart.lines[0] as { plan?: { seats: number } }).plan?.seats === 6);
-    const placedWeb = await tx(sys, (c) => shop.placeWebOrder(c, site, shop.parseCheckout({ cartId: "cfg-web-0001", email: "cfg@example.com", name: "Sectional Buyer", phone: "717-555-0199",
-      fulfillment: "delivery", address: { line1: "9 Elm St", city: "Camp Hill", state: "PA", postal: "17011" }, paymentToken: "tok_test_visa_4242",
+    const placedWeb = await tx(sys, (c) => shop.placeWebOrder(c, site, shop.parseCheckout({ cartId: "cfg-web-0001", email: "cfg@example.com", name: "Sectional Buyer", phone: "555-555-0199",
+      fulfillment: "delivery", address: { line1: "9 Elm St", city: "Maple Grove", state: "PA", postal: "00111" }, paymentToken: "tok_test_visa_4242",
       lines: [{ productId: FAM, qty: 1, sectional: { ...layout3, cover: "navy-velvet" } }] }), { tenantId: TENANT, entityId: ENTITY, actor: sys }));
     const webId = (await read<{ id: string }>(`select id from sales_order where entity_id = $1 and channel = 'web' and external_ref = 'cfg-web-0001'`, [ENTITY]))[0]?.id;
     t.ok("web: the sectional order is placed and paid", !!webId && !placedWeb.duplicate);
@@ -310,7 +310,7 @@ export async function run(t: T) {
     // ---- trade pricing: the list prices each piece, the grade % goes on the list price, the bundle after
     const tradeList = (await read<{ id: string }>(`select id from price_list where entity_id = $1 and code = 'TRADE'`, [ENTITY]))[0].id;
     const tcust = (await read<{ id: string }>(`insert into customer (entity_id, number, name, email, kind) values ($1, 'C-CFG-TRADE', 'Cfg Design Studio', 'cfg-trade@example.com', 'business') returning id /* unscoped: test set-up insert */`, [ENTITY]))[0].id;
-    await read(`insert into customer_address (entity_id, customer_id, label, line1, city, state, postal, is_default) values ($1,$2,'Studio','5 Market St','Camp Hill','PA','17011',true) /* unscoped: test set-up insert */`, [ENTITY, tcust]);
+    await read(`insert into customer_address (entity_id, customer_id, label, line1, city, state, postal, is_default) values ($1,$2,'Studio','5 Market St','Maple Grove','PA','00111',true) /* unscoped: test set-up insert */`, [ENTITY, tcust]);
     const tacct = (await read<{ id: string }>(`insert into trade_account (entity_id, number, customer_id, company_name, kind, contact_name, email, price_list_id)
       values ($1, 'TA-CFG-1', $2, 'Cfg Design Studio', 'designer', 'Dana Cfg', 'cfg-trade@example.com', $3) returning id /* unscoped: test set-up insert */`, [ENTITY, tcust, tradeList]))[0].id;
     await read(`insert into price_list_item (entity_id, price_list_id, product_id, price_minor) values ($1,$2,$3,70000)
@@ -344,9 +344,9 @@ export async function run(t: T) {
     const pv2 = await tx(sys, (c) => projects.project(c, ENTITY, projId, {}, "TRADE"));
     t.ok("project: the sectional item keeps its build and is priced at the trade price", pv2!.items[0].sectional?.cover === "stone-boucle" && pv2!.items[0].unitPriceMinor === tp.totalMinor.toString());
     const session = { accountId: tacct, customerId: tcust, entityId: ENTITY, priceList: "TRADE", company: "Cfg Design Studio", email: "cfg-trade@example.com", contact: "Dana Cfg", repId: null };
-    const site2 = await tx(sys, async (c) => (await shop.siteBySlug(c, "buddys"))!);
+    const site2 = await tx(sys, async (c) => (await shop.siteBySlug(c, "riverside-home"))!);
     const pq2 = await tx(sys, (c) => trade.quoteOrder(c, site2, session, { projectId: projId, fulfillment: "delivery", shipTo: "address", payBy: "card", cartId: "cfg-proj-0001",
-      address: { line1: "5 Market St", city: "Camp Hill", state: "PA", postal: "17011" } }));
+      address: { line1: "5 Market St", city: "Maple Grove", state: "PA", postal: "00111" } }));
     const pieceLines = (pq2.lines as { productId: string; unitPriceMinor: string }[]).filter((l) => Object.values(PIECE).includes(l.productId));
     t.ok("project: checking out the project orders the sectional as its pieces, at the trade price", pieceLines.length === 3
       && pieceLines.reduce((a, l) => a + BigInt(l.unitPriceMinor), 0n) === tp.totalMinor, js(pq2.lines).slice(0, 200));

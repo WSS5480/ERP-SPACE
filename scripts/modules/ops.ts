@@ -7,6 +7,7 @@
 // balances, the clock and the schedule, holidays as delivery blackouts and
 // holiday pay -- with the refusals that matter.
 
+import { today as bizToday } from "../../packages/core/clock.ts";
 import { type T, ENTITY, RIO_ENTITY, PEOPLE, LOC } from "./harness.ts";
 import { tx, type Client, type Scope } from "../../packages/core/db.ts";
 import * as F from "../../packages/core/fleet.ts";
@@ -96,7 +97,8 @@ export async function run(t0: T) {
     try { return (await t.q(c, sql, params)) as X[]; } finally { c.release(); }
   };
 
-  const today = (await one<{ d: string }>(`select (now() at time zone 'America/New_York')::date::text d /* unscoped: clock */`)).d;
+  // the company's business date, from the same helper the code uses (clock.ts), not a zone written here
+  const today = await (async () => { const c = await t.pool.connect(); try { return await bizToday(c, ENTITY); } finally { c.release(); } })();
   // the second Monday, Tuesday, Thursday or Friday from today: the fleet and service checks use the days before it
   let D = today, seen = 0;
   while (seen < 2) { D = addDays(D, 1); if ([1, 2, 4, 5].includes(new Date(D + "T12:00:00Z").getUTCDay())) seen++; }
@@ -288,10 +290,10 @@ export async function run(t0: T) {
   t.ok("the old mattress waits at the warehouse for disposal", waiting.some((x: any) => x.id === hMatt.id));
   await t.throws("a driver cannot log a disposal", () => post(P.TONY, "/fleet/haul-away/disposals", { dcLocationId: DC, disposedOn: today, method: "recycler", facility: "x", haulIds: [hMatt.id] }), /needs one of/);
   await t.throws("a recycler's drop needs its certificate number", () => post(P.DEE, "/fleet/haul-away/disposals",
-    { dcLocationId: DC, disposedOn: today, method: "recycler", facility: "Keystone Mattress Recycling", haulIds: [hMatt.id] }), /certificate number/);
+    { dcLocationId: DC, disposedOn: today, method: "recycler", facility: "Hearthstone Mattress Recycling", haulIds: [hMatt.id] }), /certificate number/);
   await t.throws("only what was taken is disposed of", () => post(P.DEE, "/fleet/haul-away/disposals",
     { dcLocationId: DC, disposedOn: today, method: "landfill", facility: "Cumberland landfill", haulIds: [hSofa.id] }), /only what was taken/);
-  const disp = await post(P.DEE, "/fleet/haul-away/disposals", { dcLocationId: DC, disposedOn: today, method: "recycler", facility: "Keystone Mattress Recycling",
+  const disp = await post(P.DEE, "/fleet/haul-away/disposals", { dcLocationId: DC, disposedOn: today, method: "recycler", facility: "Hearthstone Mattress Recycling",
     certificateNo: "KMR-2026-0441", haulIds: [hMatt.id] });
   t.ok("the disposal is logged with its number, weight and certificate", /^HD-/.test(disp.number) && disp.weightLb === 62, `${disp.number} ${disp.weightLb} lb`);
   await t.throws("a piece is disposed of once", () => post(P.DEE, "/fleet/haul-away/disposals", { dcLocationId: DC, disposedOn: today, method: "landfill", facility: "x", haulIds: [hMatt.id] }),

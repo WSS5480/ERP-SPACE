@@ -25,7 +25,7 @@ const WEBADMIN = "55555555-0000-0000-0000-000000000019";
 const SALES = "55555555-0000-0000-0000-000000000011";
 const sys = { kind: "system" as const, label: "shop checks" };
 const scope = { tenantId: TENANT, entityId: ENTITY, actor: sys };
-const ADDR = { line1: "12 Oak Ln", city: "Camp Hill", state: "PA", postal: "17011" };
+const ADDR = { line1: "12 Oak Ln", city: "Maple Grove", state: "PA", postal: "00111" };
 const cfg = (size: string, fabric: string, legs: string) =>
   [{ group: "size", option: size }, { group: "fabric", option: fabric }, { group: "legs", option: legs }];
 
@@ -41,11 +41,11 @@ function leaks(v: unknown, path = "$"): string[] {
 const json = (v: unknown) => JSON.parse(JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x)));
 
 export async function run(t: T) {
-  const site = await tx(sys, async (c) => (await shop.siteBySlug(c, "buddys"))!);
-  t.ok("seeded storefront is live at /shop/buddys/", !!site && site.entity_id === ENTITY && site.status === "live");
+  const site = await tx(sys, async (c) => (await shop.siteBySlug(c, "riverside-home"))!);
+  t.ok("seeded storefront is live at /shop/riverside-home/", !!site && site.entity_id === ENTITY && site.status === "live");
   const inTx = <R>(fn: (c: Client) => Promise<R>) => tx(sys, fn);
   const checkout = (over: Record<string, unknown>) => shop.parseCheckout({
-    cartId: `chk-${Math.random().toString(36).slice(2, 12)}`, email: "checks@example.com", name: "Check Buyer", phone: "717-555-0142",
+    cartId: `chk-${Math.random().toString(36).slice(2, 12)}`, email: "checks@example.com", name: "Check Buyer", phone: "555-555-0142",
     fulfillment: "delivery", address: ADDR, paymentToken: "tok_test_visa_4242",
     lines: [{ productId: LAMP, qty: 1 }], ...over });
 
@@ -79,7 +79,7 @@ export async function run(t: T) {
     return r.products.length === 2 && r.products.every((p) => p.brand === "Ashley" && p.color === "Cobblestone");
   }));
   const lampView = views.details.find((d) => d && d.id === LAMP)!;
-  t.ok("availability says in stock for pickup at a store and ships from the DC", lampView.availability.lines.some((l) => l.kind === "pickup" && /Enola/.test(l.text))
+  t.ok("availability says in stock for pickup at a store and ships from the DC", lampView.availability.lines.some((l) => l.kind === "pickup" && /Riverside/.test(l.text))
     && lampView.availability.lines.some((l) => l.kind === "parcel" || l.kind === "delivery"));
   t.ok("product page carries the site's financing link", lampView.financingUrl === site.financing_url && !!site.financing_url);
   t.ok("unpublished product has no public page", (await inTx((c) => shop.pubProduct(c, site, NIGHTSTAND))) === null);
@@ -162,7 +162,7 @@ export async function run(t: T) {
   }), /no longer sold online/);
   await t.throws("a card number pasted into checkout notes is refused", async () => shop.parseCheckout({ ...checkout({}), cartId: "x-card-0001", lines: [{ productId: LAMP, qty: 1 }], notes: "my card 4111 1111 1111 1111" } as never), /Card numbers are never sent/);
   for (const [label, body] of [
-    ["a card number in the street address", { address: { line1: "4242-4242-4242-4242", city: "Camp Hill" } }],
+    ["a card number in the street address", { address: { line1: "4242-4242-4242-4242", city: "Maple Grove" } }],
     ["a card number in the name", { name: "Pat 5555555555554444" }],
     ["an Amex number in the notes", { notes: "use 3782 822463 10005" }],
   ] as const) {
@@ -293,7 +293,7 @@ export async function run(t: T) {
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   try {
     _resetLimits();
-    const page = await fetch(`${base}/shop/buddys/`);
+    const page = await fetch(`${base}/shop/riverside-home/`);
     const html = await page.text();
     const csp = page.headers.get("content-security-policy") ?? "";
     const nonce = /'nonce-([^']+)'/.exec(csp)?.[1];
@@ -303,24 +303,24 @@ export async function run(t: T) {
     const js = await fetch(`${base}/shop/assets/store.js`);
     t.ok("the store script is served as JavaScript", js.status === 200 && /javascript/.test(js.headers.get("content-type") ?? ""));
     t.ok("an unknown store is a 404", (await fetch(`${base}/shop/nobody-here/`)).status === 404 && (await fetch(`${base}/shop/nobody-here/api/site`)).status === 404);
-    const api = await (await fetch(`${base}/shop/buddys/api/products/${HUDSON}`)).json();
+    const api = await (await fetch(`${base}/shop/riverside-home/api/products/${HUDSON}`)).json();
     t.ok("public API responses carry no cost or vendor fields", leaks(api).length === 0 && api.priceMinor === "129900");
-    const noHeader = await fetch(`${base}/shop/buddys/api/price`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ productId: HUDSON }) });
+    const noHeader = await fetch(`${base}/shop/riverside-home/api/price`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ productId: HUDSON }) });
     t.ok("a public POST without the store header is refused", noHeader.status === 403);
     const H = { "content-type": "application/json", "x-erp-shop": "1" };
-    const viaHttp = await fetch(`${base}/shop/buddys/api/checkout`, { method: "POST", headers: H, body: JSON.stringify({ cartId: "http-cart-0001", email: "http@example.com", name: "Http Buyer",
+    const viaHttp = await fetch(`${base}/shop/riverside-home/api/checkout`, { method: "POST", headers: H, body: JSON.stringify({ cartId: "http-cart-0001", email: "http@example.com", name: "Http Buyer",
       fulfillment: "pickup", pickupLocationId: LOC.ENOLA, paymentToken: "tok_test_visa_4242", lines: [{ productId: LAMP, qty: 1, unitPriceMinor: "1" }] }) });
     const vj = await viaHttp.json();
     t.ok("a full checkout works over HTTP and ignores the posted price", viaHttp.status === 200 && vj.order?.lines?.[0]?.unitPriceMinor === "5999" && leaks(vj).length === 0, JSON.stringify(vj).slice(0, 80));
-    const bad = await fetch(`${base}/shop/buddys/api/checkout`, { method: "POST", headers: H, body: JSON.stringify({ cartId: "http-cart-0002", lines: [] }) });
+    const bad = await fetch(`${base}/shop/riverside-home/api/checkout`, { method: "POST", headers: H, body: JSON.stringify({ cartId: "http-cart-0002", lines: [] }) });
     t.ok("a refused checkout is a plain sentence", bad.status === 422 && typeof (await bad.json()).error === "string");
     let status = 0;
     for (let i = 0; i <= LIMITS.lookup.max; i++) {
-      status = (await fetch(`${base}/shop/buddys/api/order-status`, { method: "POST", headers: H, body: JSON.stringify({ number: "SO-999999", email: "x@example.com" }) })).status;
+      status = (await fetch(`${base}/shop/riverside-home/api/order-status`, { method: "POST", headers: H, body: JSON.stringify({ number: "SO-999999", email: "x@example.com" }) })).status;
     }
     t.ok("order lookup is rate limited per address", status === 429);
     await inTx((c) => shop.setSiteStatus(c, ENTITY, site.id, "draft"));
-    t.ok("a draft storefront is not public", (await fetch(`${base}/shop/buddys/api/site`)).status === 404);
+    t.ok("a draft storefront is not public", (await fetch(`${base}/shop/riverside-home/api/site`)).status === 404);
     await inTx((c) => shop.setSiteStatus(c, ENTITY, site.id, "live"));
   } finally {
     _resetLimits();

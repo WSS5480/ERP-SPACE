@@ -153,17 +153,17 @@ async function main() {
       return decide(c, scope(STEVE, "Steve"), { requestId: r.id, actorId: STEVE, decision: "approved" });
     }), /does not hold the role/i);
 
-  await tx(scope(MANAGER, "Palestine manager"), async (c) => {
+  await tx(scope(MANAGER, "Mesa Verde manager"), async (c) => {
     const r = await one<{ id: string }>(c,
       `select r.id from approval_request r where r.subject_id = $1 and r.entity_id = $2 and r.status='open'`,
       [bigId, ENTITY]);
-    const status = await decide(c, scope(MANAGER, "Palestine manager"), {
+    const status = await decide(c, scope(MANAGER, "Mesa Verde manager"), {
       requestId: r.id, actorId: MANAGER, decision: "approved", note: "checked against the meter",
     });
     ok("the approver clears it", status === "approved");
     const { transition } = await import("../packages/core/invoice.ts");
-    await transition(c, scope(MANAGER, "Palestine manager"), bigId, "approved", "approval complete");
-    await postToLedger(c, scope(MANAGER, "Palestine manager"), bigId);
+    await transition(c, scope(MANAGER, "Mesa Verde manager"), bigId, "approved", "approval complete");
+    await postToLedger(c, scope(MANAGER, "Mesa Verde manager"), bigId);
   });
 
   console.log("\nthe controls");
@@ -182,7 +182,7 @@ async function main() {
 
   await throws("an unbalanced journal entry is refused", () =>
     tx(scope(CONTROLLER, "Controller"), async (c) => {
-      const p = await c.query(`select id from fiscal_period where entity_id=$1 and status<>'closed' limit 1`, [ENTITY]);
+      const p = await c.query(`select id from fiscal_period where entity_id=$1 and status<>'closed' and current_date between starts_on and ends_on limit 1`, [ENTITY]);
       const a = await c.query(`select id from gl_account where tenant_id=$1 and code='6800'`, [TENANT]);
       const je = await c.query(
         `insert into journal_entry (tenant_id, entity_id, period_id, posting_date, source_type, description)
@@ -204,7 +204,7 @@ async function main() {
          values ($1,$2,$3,current_date,'manual','into a closed period') returning id`,
         [TENANT, ENTITY, p.rows[0].id]);
       return je.rows[0].id;
-    }), /is closed/i);
+    }), /books for .* are closed, so nothing can be posted/i);
 
   await throws("the audit log cannot be rewritten", () =>
     tx(scope(STEVE, "Steve"), (c) => c.query(`update audit_event set reason = 'nothing to see' where id > 0`)),
@@ -413,7 +413,8 @@ async function main() {
     const cash = await c.query(`select id from gl_account where tenant_id=$1 and code='1010'`, [TENANT]);
     const rev = await c.query(`select id from gl_account where tenant_id=$1 and code='4010'`, [TENANT]);
     const deps = await c.query(
-      `select id, name from bank_account where entity_id=$1 and purpose='deposit' order by name`, [ENTITY]);
+      `select id, name from bank_account where entity_id=$1 and purpose='deposit'
+        order by case when name like 'Riverside%' then 0 when name like 'Mesa Verde%' then 1 else 2 end, name`, [ENTITY]);
     for (const [i, amount] of [[0, 412060], [1, 268400]] as [number, number][]) {
       const je = await c.query(
         `insert into journal_entry (tenant_id, entity_id, period_id, posting_date, source_type, description)
@@ -451,7 +452,7 @@ async function main() {
        zba ? `${zba.fromAccount} at ${zba.bank}` : "missing");
 
     const mid = await positions(c, s);
-    const enolaMid = mid.find((x) => x.name === "Enola deposits")!;
+    const enolaMid = mid.find((x) => x.name === "Riverside deposits")!;
     ok("until it clears, the money is still shown at the branch",
        BigInt(enolaMid.ledger_balance_minor) === 412060n,
        money.format(BigInt(enolaMid.ledger_balance_minor)));
@@ -589,7 +590,7 @@ async function main() {
     ok("the payroll account carries the run on its own",
        payroll !== undefined && BigInt(payroll.ledger_balance_minor) < 0n,
        payroll ? money.format(BigInt(payroll.ledger_balance_minor)) : "missing");
-    const enola = pos.find((p) => p.name === "Enola deposits");
+    const enola = pos.find((p) => p.name === "Riverside deposits");
     ok("a store account that has seen nothing reads zero",
        enola !== undefined && BigInt(enola.ledger_balance_minor) === 0n);
   });
@@ -667,6 +668,10 @@ async function main() {
     }), /duplicate key|reconciliation_match_once/i);
 
   console.log("\nthe intake framework");
+  // The demo's pull connections are paused so the scheduler never fetches from them (seed 0036);
+  // these checks run them by hand with stand-in transports, so they are turned on for the run.
+  await tx(scope(CONTROLLER, "Controller"), (c) => c.query(
+    `update connection set status = 'active' where tenant_id = $1 and status = 'paused'`, [TENANT]));
   await tx(scope(CONTROLLER, "Controller"), async (c) => {
     const srcs = await q<{ n: string }>(c,
       `select count(*) as n from ingest_source /* unscoped: the catalogue is not per-entity */`);

@@ -11,10 +11,16 @@
     "db:apply": "./db/apply.sh",
     "db:reset": "./db/apply.sh --reset --seed",
     "smoke": "node --experimental-strip-types scripts/smoke.ts",
-    "smoke:modules": "node --experimental-strip-types scripts/smoke-modules.ts"
+    "smoke:modules": "node --experimental-strip-types scripts/smoke-modules.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "pg": "^8.13.1",
     "ssh2": "1.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/pg": "^8.23.1",
+    "typescript": "^5.9.3"
   }
 }

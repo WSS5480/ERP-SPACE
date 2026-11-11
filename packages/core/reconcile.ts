@@ -15,6 +15,7 @@
 //
 // Whatever is left is a question for a person, and the run reports it.
 
+import { periodFor } from "./periods.ts";
 import { type Client, type Scope, audit, one, q } from "./db.ts";
 
 /** How far either side of the expected date a match may sit. */
@@ -247,12 +248,7 @@ async function postFee(
   t: { onDate: string; feeMinor: bigint; feeAccount: string; cashAccount: string;
        bankAccountId: string; accountName: string }
 ): Promise<string> {
-  const period = await one<{ id: string }>(
-    c,
-    `select id from fiscal_period
-      where entity_id = $1 and $2::date between starts_on and ends_on`,
-    [scope.entityId, t.onDate]
-  );
+  const period = { id: await periodFor(c, scope, t.onDate) };
   const je = await one<{ id: string }>(
     c,
     `insert into journal_entry

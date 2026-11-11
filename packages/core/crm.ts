@@ -16,6 +16,8 @@
 //     through pos.createOrder); the merge is the one deliberate exception and
 //     only repoints customer references, inside one transaction, with a record.
 
+import { tzForState as stateZone, timeZoneFor, DEFAULT_TZ } from "./clock.ts";
+import { today as bizToday } from "./clock.ts";
 import * as messaging from "./messaging.ts";
 import { randomBytes } from "node:crypto";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
@@ -32,7 +34,6 @@ const U = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL = /^[^@\s<>"]{1,64}@[^@\s<>"]{1,180}\.[^@\s<>".]{2,24}$/;
 const clean = (v: unknown, max: number) => (typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f<>]/g, " ").replace(/\s+/g, " ").trim().slice(0, max) : "");
 const digits = (v: unknown) => String(v ?? "").replace(/[^0-9]/g, "");
-const today = () => new Date().toISOString().slice(0, 10);
 export const STAGES = ["new", "contacted", "appointment", "quoted", "won", "lost"] as const;
 export const SOURCES = ["walk_in", "phone", "web_form", "quote_request", "abandoned_cart", "referral", "campaign", "other"] as const;
 export const LOST_REASONS = ["price", "bought elsewhere", "no response", "timing", "out of stock / lead time", "financing declined", "other"];
@@ -85,9 +86,8 @@ export async function canMarket(c: Client, entityId: string, customerId: string,
 }
 
 // Quiet hours: no marketing texts before 8am or after 9pm where the customer lives.
-const TZ: Record<string, string> = { PA: "America/New_York", NY: "America/New_York", NJ: "America/New_York", OH: "America/New_York", FL: "America/New_York",
-  TX: "America/Chicago", IL: "America/Chicago", OK: "America/Chicago", LA: "America/Chicago", NM: "America/Denver", CO: "America/Denver", AZ: "America/Phoenix", CA: "America/Los_Angeles" };
-export const tzForState = (st: string | null | undefined) => TZ[String(st ?? "").toUpperCase()] ?? "America/New_York";
+// The zone comes from the customer's state (all 50 states and DC, clock.ts); a customer with no state on file is in the company's zone.
+export const tzForState = (st: string | null | undefined, fallback = DEFAULT_TZ) => stateZone(st) ?? fallback;
 function localHour(d: Date, tz: string): number {
   return Number(new Intl.DateTimeFormat("en-US", { hour: "numeric", hourCycle: "h23", timeZone: tz }).format(d));
 }
@@ -888,7 +888,7 @@ export async function launchCampaign(c: Client, entityId: string, campaignId: st
     const vars = { first_name: m.name.split(" ")[0], name: m.name, store: info?.store ?? "", coupon, unsubscribe: unsub };
     let body = renderTemplate(k.body, vars);
     body += k.channel === "email" ? `\n\nDon't want these emails? Unsubscribe: ${unsub}` : `\nReply STOP to opt out.`;
-    const after = k.channel === "sms" ? outsideQuietHours(sendAt, tzForState(info?.state), qh.start ?? 21, qh.end ?? 8) : sendAt;
+    const after = k.channel === "sms" ? outsideQuietHours(sendAt, tzForState(info?.state, await timeZoneFor(c, entityId)), qh.start ?? 21, qh.end ?? 8) : sendAt;
     await c.query(`insert into crm_message (entity_id, campaign_id, customer_id, channel, to_ref, subject, body, status, reason, send_after, unsub_token)
         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict do nothing`,
       [entityId, campaignId, m.id, k.channel, addr ? (k.channel === "email" ? maskEmail(addr) : maskPhone(addr)) : "(none)",
@@ -915,9 +915,11 @@ async function connectedSend(c: Client, entityId: string, m: { id: string; custo
   const cu = (await q<{ email: string | null; phone: string | null }>(c, `select email, phone from customer where id = $1 and entity_id = $2`, [m.customer_id, entityId]))[0];
   const to = m.channel === "email" ? cu?.email : cu?.phone;
   if (!to) return { ok: false, name: "none", error: `no ${m.channel === "email" ? "email address" : "mobile number"} on file` };
+  // Through the outbox: the message and its outbox row commit together and the outbox sends it once, after
+  // the commit (messaging.drainQueued). A crash between the two can no longer send it again on the next run.
   const o = { purpose: "campaign", sourceTable: "crm_message", sourceId: m.id };
-  const r = m.channel === "email" ? await messaging.sendEmail(c, entityId, { to: [to], subject: m.subject ?? "", text: m.body }, o) : await messaging.sendSms(c, entityId, to, m.body, o);
-  return { ok: r.status === "sent", name: r.provider, error: r.error ?? undefined };
+  const r = m.channel === "email" ? await messaging.queueEmail(c, entityId, { to: [to], subject: m.subject ?? "", text: m.body }, o) : await messaging.queueSms(c, entityId, to, m.body, o);
+  return { ok: r.status === "queued" || r.status === "sent", name: r.provider, error: r.error ?? undefined };
 }
 
 export async function processQueue(c: Client, entityId: string, provider?: CampaignProvider, at: Date = new Date()) {
@@ -1008,7 +1010,7 @@ export async function checkCoupon(c: Client, entityId: string, code: unknown, ct
   const k = (await q<CouponRow>(c, `select id, code, kind, pct_bps, amount_minor, min_spend_minor, starts_on::text, ends_on::text, max_uses, once_per_customer, channels, active, campaign_id
       from crm_coupon where entity_id = $1 and code = $2 ${ctx.lock ? "for update" : ""}`, [entityId, cd]))[0];
   need(k && k.active, `${cd} is not a valid coupon code.`);
-  const d = today();
+  const d = (await bizToday(c, entityId));
   need(d >= k!.starts_on, `${cd} starts on ${k!.starts_on}.`);
   need(d <= k!.ends_on, `${cd} expired on ${k!.ends_on}.`);
   need(k!.channels.includes(ctx.channel), `${cd} can't be used ${ctx.channel === "web" ? "online" : "in the store"}.`);

@@ -69,9 +69,9 @@ export const module: ErpModule = {
     // ---- company details
     coGet("/onboarding/company", async (c, co, _u, _m, p) => {
       await canSee(c, co, p);
-      const r = await c.query(`select name, legal_name, ein_last4, address, state, fiscal_year_end_month from entity where id = $1 and tenant_id = $2 /* unscoped: the company itself */`, [co.id, co.tenantId]);
+      const r = await c.query(`select name, legal_name, ein_last4, address, state, fiscal_year_end_month, time_zone, business_tz(id) zone_in_use from entity where id = $1 and tenant_id = $2 /* unscoped: the company itself */`, [co.id, co.tenantId]);
       const e = r.rows[0];
-      return { name: e.name, legalName: e.legal_name, einLast4: e.ein_last4, address: e.address, state: e.state, fiscalYearStartMonth: (e.fiscal_year_end_month % 12) + 1,
+      return { name: e.name, legalName: e.legal_name, einLast4: e.ein_last4, address: e.address, state: e.state, fiscalYearStartMonth: (e.fiscal_year_end_month % 12) + 1, timeZone: e.time_zone, zoneInUse: e.zone_in_use,
         canChangeYear: !(await c.query(`select 1 from journal_entry where entity_id = $1 limit 1`, [co.id])).rows.length };
     });
     coPost("/onboarding/company", async (c, co, a, b) => {
@@ -79,7 +79,8 @@ export const module: ErpModule = {
       const addr = (b.address && typeof b.address === "object" ? b.address : {}) as Record<string, unknown>;
       return plain(() => ob.saveCompanyDetails(c, scopeOf(co, a), { legalName: str(b.legalName, 120), einLast4: str(b.einLast4, 10) || null,
         address: { line1: str(addr.line1, 120), city: str(addr.city, 60), postal: str(addr.postal, 10) }, state: str(b.state, 20) || null,
-        fiscalYearStartMonth: b.fiscalYearStartMonth == null || b.fiscalYearStartMonth === "" ? null : Number(b.fiscalYearStartMonth) }));
+        fiscalYearStartMonth: b.fiscalYearStartMonth == null || b.fiscalYearStartMonth === "" ? null : Number(b.fiscalYearStartMonth),
+        timeZone: b.timeZone === undefined ? undefined : str(b.timeZone, 60) }));
     });
 
     // ---- opening balances

@@ -15,11 +15,14 @@
 #   - Render deletes a free database 30 days after creation, and free
 #     databases have no backups. Nothing real should live here.
 #   - The API sleeps after 15 idle minutes and takes about a minute to wake.
-#   - Render has no free cron, so scheduled SFTP and API pulls do not run on
-#     their own. POST /api/connections/{id}/run runs one on demand instead.
+#   - The scheduled jobs (statement and vendor pulls, marketing, EDI, quote
+#     holds, scheduled reports, the outbox, the daily period job) run inside
+#     the web service itself (server/scheduler.ts), one runner at a time even
+#     with several instances. A sleeping free service runs them when it wakes.
 #
-# To move to a real environment: change both `plan: free` lines, uncomment the
-# cron job. ERP_SEED is no longer needed: sample data is the demo tenant.
+# To move to a real environment: change both `plan: free` lines. ERP_SEED is no
+# longer needed: sample data is the demo tenant. The cron service below stays
+# commented out (see its note).
 
 databases:
   - name: erp-db
@@ -75,10 +78,26 @@ services:
       # Set when the ERP shares a database with another app.
       - key: ERP_DB_SCHEMA
         value: erp
+      # Optional: a webhook (Slack, Teams, Discord or any HTTPS endpoint) that
+      # gets one redacted line per server error, at most one a minute and twenty
+      # an hour. The person who hit the error sees its reference (ref ABC123);
+      # operators look it up in the Operator console.
+      # - key: ERP_ALERT_WEBHOOK
+      #   sync: false
+      # The scheduler runs inside this service. ERP_SCHEDULER=off stops it here
+      # (only if the cron service below is turned on instead);
+      # ERP_SCHEDULER_TICK_SEC (default 60) is how often it looks for due jobs.
+      # - key: ERP_SCHEDULER
+      #   value: "off"
       # Connection secrets go here as ERP_SECRET_<credential_ref>, e.g.
       #   secret://sftp/first-valley/demo -> ERP_SECRET_SFTP_FIRST_VALLEY_DEMO
 
-  # Paid plans only. Runs every active SFTP and API connection on its schedule.
+  # Not needed (Nov 2026): the web service runs the due jobs itself, behind a
+  # Postgres advisory lock, and records every run (Setup, Scheduled jobs; the
+  # Operator console). Left here commented out on purpose. Turning it on as
+  # well is safe -- the lock means a tick that finds the web service running
+  # jobs skips -- but it costs a paid cron service for nothing. Use it only if
+  # the web service runs with ERP_SCHEDULER=off.
   # - type: cron
   #   name: erp-intake
   #   runtime: node

@@ -47,9 +47,3 @@ export function describeClientIp(): string {
   return `client address: ${cfHeader() ? `cf-connecting-ip when present, else ${how}` : how}` +
     ` (ERP_TRUSTED_PROXY_HOPS=${process.env.ERP_TRUSTED_PROXY_HOPS ?? `unset, default ${hops}`})`;
 }
-
-/** What a request's forwarding looks like, with no addresses in it: for a one-time check on live. */
-export function forwardingShape(req: http.IncomingMessage): string {
-  const xf = String(req.headers["x-forwarded-for"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  return `x-forwarded-for has ${xf.length} hop(s); cf-connecting-ip ${req.headers["cf-connecting-ip"] ? "present" : "absent"}; using ${proxyHops()} trusted hop(s)`;
-}

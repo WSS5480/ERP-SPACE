@@ -6,6 +6,7 @@
 // three stores banking at three banks into one cash code cannot otherwise be
 // told apart at reconciliation time.
 
+import { periodFor } from "./periods.ts";
 import { type Client, type Scope, audit, one, q } from "./db.ts";
 
 export type Purpose =
@@ -144,12 +145,7 @@ async function postTransfer(
   scope: Scope,
   t: { fromId: string; toId: string; fromGl: string; toGl: string; fromName: string; amount: bigint; onDate: string }
 ): Promise<string> {
-  const period = await one<{ id: string }>(
-    c,
-    `select id from fiscal_period
-      where entity_id = $1 and $2::date between starts_on and ends_on`,
-    [scope.entityId, t.onDate]
-  );
+  const period = { id: await periodFor(c, scope, t.onDate) };
   const je = await one<{ id: string }>(
     c,
     `insert into journal_entry

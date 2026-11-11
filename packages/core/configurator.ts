@@ -9,6 +9,7 @@
 // POS returns piece by piece. Who may do what is decided in
 // server/modules/configurator.ts.
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { priceConfigured, listPrice, PricingError, checkOptionRules, optionRules, type Choice, type OptionRule } from "./pricing.ts";
 import { imageByUrl, code128, createProduct, updateProduct, CatalogError, type ImageFetch } from "./catalog.ts";
@@ -16,7 +17,6 @@ import { pieceAction, setAsIsPrice, setLotClass, InventoryError } from "./invent
 
 export class ConfigError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new ConfigError(msg); };
-const today = () => new Date().toISOString().slice(0, 10);
 const bps = (m: bigint, rate: number): bigint => { const neg = m < 0n; const a = neg ? -m : m; const r = (a * BigInt(rate) + 5000n) / 10000n; return neg ? -r : r; };
 const usd = (m: bigint) => `$${(m / 100n).toLocaleString("en-US")}.${String(m % 100n).padStart(2, "0")}`;
 const U = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -257,7 +257,7 @@ export async function priceBuild(c: Client, entityId: string, familyId: string, 
     const sw = await swatchOf(c, entityId, fam!.grade_table_id, code!);
     need(sw, `${code} is not a cover offered on the ${fam!.name}.`);
     need(sw!.active, `${sw!.cover_name} is not offered any more; pick another cover.`);
-    need(!sw!.discontinued_on || sw!.discontinued_on > today(), `${sw!.cover_name} was discontinued on ${sw!.discontinued_on}; pick another cover.`);
+    need(!sw!.discontinued_on || sw!.discontinued_on > (await bizToday(c, entityId)), `${sw!.cover_name} was discontinued on ${sw!.discontinued_on}; pick another cover.`);
     grade = (await q<typeof grade & object>(c, `select id, code, label, uplift_bps, cost_uplift_bps from fabric_grade where entity_id = $1 and table_id = $2 and code = $3`,
       [entityId, fam!.grade_table_id, sw!.grade_code]))[0] ?? null;
     need(grade, `${sw!.cover_name} is grade ${sw!.grade_code}, which the grade table does not price; ask the buyer to add it.`);
@@ -424,7 +424,7 @@ export async function swatches(c: Client, entityId: string, f: { tableId?: strin
     select id, code, cover_name, grade_code, material, color_family, color, content, cleaning_code, vendor_code, image_url, hex, discontinued_on::text, active, grade_table_id
       from swatch where entity_id = $1 and ($2::uuid is null or grade_table_id = $2) and ($3::text is null or grade_code = $3)
        and ($4::text is null or color_family = $4)
-       and ($5 or (active and (discontinued_on is null or discontinued_on > current_date)))
+       and ($5 or (active and (discontinued_on is null or discontinued_on > business_today($1))))
        and ($6::text is null or cover_name ilike '%' || $6 || '%' or code ilike '%' || $6 || '%' or color ilike '%' || $6 || '%')
      order by grade_code, cover_name limit 500`,
     [entityId, f.tableId && U.test(f.tableId) ? f.tableId : null, f.grade || null, f.colorFamily || null, f.includeRetired === true, f.q ? f.q.replace(/[%_\\]/g, "") : null]);
@@ -877,7 +877,7 @@ export async function asIsReport(c: Client, entityId: string, f: { locationId?: 
     retail_minor: string; price_minor: string | null; age_days: number }>(c, `
     select x.label, p.sku, p.name, l.name location, x.status, ic.grade, ic.source, p.price_minor retail_minor,
            coalesce(ic.price_minor, x.as_is_price_minor)::text price_minor,
-           (current_date - coalesce((select min(h.graded_at) from inv_condition h where h.entity_id = x.entity_id and h.unit_id = x.unit_id), x.created_at)::date)::int age_days
+           (business_today($1) - coalesce((select min(h.graded_at) from inv_condition h where h.entity_id = x.entity_id and h.unit_id = x.unit_id), x.created_at)::date)::int age_days
       from inv_piece x join product p on p.id = x.product_id join location l on l.id = x.location_id
       left join inv_condition ic on ic.entity_id = x.entity_id and ic.unit_id = x.unit_id and ic.superseded_at is null
      where x.entity_id = $1 and x.carton_seq = 1 and ($2::uuid is null or x.location_id = $2)

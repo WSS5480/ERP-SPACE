@@ -6,6 +6,7 @@
 // cents in strings, dates as YYYY-MM-DD, so nothing is rounded or shifted a
 // day on its way to a phone in another time zone.
 
+import { today as bizToday } from "../packages/core/clock.ts";
 import { type Client, q, one } from "../packages/core/db.ts";
 import { handlerFor } from "../packages/core/connections.ts";
 
@@ -351,7 +352,7 @@ export async function bills(c: Client, co: Company, tab: string) {
   const statuses = BILL_TABS[tab] ?? BILL_TABS.attention;
   const rows = await q(c, `
     select i.id, coalesce(v.dba, v.legal_name) as vendor, i.reference, i.kind, i.invoice_date::text, i.due_date::text,
-           i.total_minor, i.status, greatest(0, current_date - i.due_date)::int as days_past_due,
+           i.total_minor, i.status, greatest(0, business_today($1) - i.due_date)::int as days_past_due,
            (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as credited_minor,
            i.total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as net_minor,
            (select string_agg(distinct po.name, ', ') from invoice_line il
@@ -504,7 +505,7 @@ export async function paymentRuns(c: Client, co: Company) {
   const eligible = await q(c, `
     select i.id, coalesce(v.dba, v.legal_name) as vendor, i.reference, i.invoice_date::text, i.due_date::text,
            i.total_minor, (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as credited_minor, i.total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as net_minor,
-           greatest(0, current_date - i.due_date)::int as days_past_due
+           greatest(0, business_today($1) - i.due_date)::int as days_past_due
       from invoice i join vendor v on v.id = i.vendor_id
      where i.entity_id = $1 and i.status = 'approved' and i.ic_document_id is null
        and not exists (select 1 from payment p join payment_run pr on pr.id = p.payment_run_id
@@ -550,7 +551,7 @@ export async function payroll(c: Client, co: Company) {
      order by case pg.frequency when 'weekly' then 0 when 'biweekly' then 1 when 'semimonthly' then 2 else 3 end, pg.name`, [co.id]);
   const periods = await q<{ pay_group_id: string }>(c, `
     select pp.id, pp.pay_group_id, pg.name as pay_group, pg.frequency, pp.starts_on::text, pp.ends_on::text, pp.pay_date::text, pp.status,
-           (pp.ends_on <= current_date) as period_over,
+           (pp.ends_on <= business_today($1)) as period_over,
            (select count(*) from timecard t where t.pay_period_id = pp.id)::int as timecards,
            (select coalesce(sum(t.hours), 0) from timecard t where t.pay_period_id = pp.id) as hours,
            (select count(*) from timecard t where t.pay_period_id = pp.id and t.status = 'recorded')::int as to_approve,
@@ -588,11 +589,11 @@ export async function payroll(c: Client, co: Company) {
       left join profit_object po on po.id = e.profit_object_id
       left join pay_group pg on pg.id = e.pay_group_id
      where e.entity_id = $1
-       and (e.status <> 'terminated' or e.terminated_on >= current_date - 90)
+       and (e.status <> 'terminated' or e.terminated_on >= business_today($1) - 90)
      order by case e.status when 'applicant' then 0 when 'active' then 1 when 'leave' then 2 else 3 end, e.last_name`, [co.id]);
   const remittances = await q(c, `
     select dt.name, dr.due_on::text, dr.deducted_minor, dr.employer_match_minor, dr.remitted_minor, dr.status,
-           greatest(0, current_date - dr.due_on)::int as days_late
+           greatest(0, business_today($1) - dr.due_on)::int as days_late
       from deduction_remittance dr join deduction_type dt on dt.id = dr.deduction_type_id
      where dr.entity_id = $1 and dr.status <> 'remitted'
      order by dr.due_on limit 20`, [co.id]);
@@ -679,6 +680,7 @@ export async function pnl(c: Client, co: Company, from: string, to: string) {
       join gl_account ga on ga.id = jl.gl_account_id
      where je.entity_id = $1 and je.posting_date between $2::date and $3::date
        and ga.account_type in ('revenue', 'expense')
+       and je.source_type <> 'closing'   -- the year-end closing entry (periods.ts) is not part of the year's P&L
      group by ga.code, ga.name, ga.account_type, jl.profit_object_id
      order by ga.code`, [co.id, from, to]);
   const accounts = new Map<string, { code: string; name: string; type: string; byStore: Record<string, string>; total: bigint }>();
@@ -760,7 +762,7 @@ export async function trialBalance(c: Client, co: Company, asOf: string) {
      order by ga.code`, [co.id, asOf]);
   const periods = await q(c, `
     select starts_on::text, ends_on::text, status from fiscal_period
-     where entity_id = $1 and starts_on <= current_date + 31
+     where entity_id = $1 and starts_on <= business_today($1) + 31
      order by starts_on desc limit 4`, [co.id]);
   return { asOf, rows, periods };
 }
@@ -786,7 +788,7 @@ export async function cash(c: Client, co: Company) {
   const transfers = await q(c, `
     select bt.id, f.name as from_account, t.name as to_account, bt.amount_minor, bt.transfer_date::text, bt.method,
            bt.status, bt.due_on::text, au.name as assigned_to, cu.name as confirmed_by, bt.confirmed_at,
-           (bt.status in ('expected','planned') and bt.due_on < current_date) as overdue
+           (bt.status in ('expected','planned') and bt.due_on < business_today($1)) as overdue
       from bank_transfer bt
       join bank_account f on f.id = bt.from_bank_account_id
       join bank_account t on t.id = bt.to_bank_account_id
@@ -823,7 +825,7 @@ export async function recon(c: Client, co: Company) {
      order by ubl.posted_on desc limit 200`, [co.id]);
   const deposits = await q(c, `
     select pd.id, pd.bank_account_id, ba.name as account_name, l.name as location_name, pd.business_date::text,
-           pd.method, pd.amount_minor, pd.expected_on::text, greatest(0, current_date - pd.expected_on)::int as days_late
+           pd.method, pd.amount_minor, pd.expected_on::text, greatest(0, business_today($1) - pd.expected_on)::int as days_late
       from pos_deposit pd
       join location l on l.id = pd.location_id
       left join bank_account ba on ba.id = pd.bank_account_id
@@ -972,18 +974,18 @@ export async function gaps(c: Client, co: Company) {
   return await q<{ bank_account_id: string; account_name: string; bank_name: string; missing_on: string; days_ago: number }>(c, `
     with acct as (
       select b.id, b.name, b.bank_name,
-             greatest(current_date - 30, b.opened_on,
+             greatest(business_today($1) - 30, b.opened_on,
                       (select min(s.statement_date) from bank_statement s where s.bank_account_id = b.id)) as since
         from bank_account b
        where b.entity_id = $1 and b.status = 'active'
          and exists (select 1 from bank_statement s where s.bank_account_id = b.id)
     ), days as (
       select a.id, a.name, a.bank_name, d::date as d
-        from acct a, generate_series(a.since::timestamp, (current_date - 1)::timestamp, interval '1 day') d
+        from acct a, generate_series(a.since::timestamp, (business_today($1) - 1)::timestamp, interval '1 day') d
        where extract(isodow from d) between 1 and 5
     )
     select id as bank_account_id, name as account_name, bank_name,
-           d::text as missing_on, (current_date - d)::int as days_ago
+           d::text as missing_on, (business_today($1) - d)::int as days_ago
       from days
      where not exists (select 1 from bank_statement s where s.bank_account_id = days.id and s.statement_date = days.d)
      order by d desc, name`, [co.id]);
@@ -1030,10 +1032,10 @@ export async function home(c: Client, co: Company, personId: string | null) {
   const operating = cashRows.find((r) => r.purpose === "operating")?.total ?? "0";
 
   const billStats = await one<{ due7_n: number; due7: string; overdue_n: number; overdue: string; attention: number; pending: number }>(c, `
-    select count(*) filter (where status in ('approved','scheduled') and due_date <= current_date + 7)::int as due7_n,
-           coalesce(sum(total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id)) filter (where status in ('approved','scheduled') and due_date <= current_date + 7), 0) as due7,
-           count(*) filter (where status in ('approved','scheduled') and due_date < current_date)::int as overdue_n,
-           coalesce(sum(total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id)) filter (where status in ('approved','scheduled') and due_date < current_date), 0) as overdue,
+    select count(*) filter (where status in ('approved','scheduled') and due_date <= business_today($1) + 7)::int as due7_n,
+           coalesce(sum(total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id)) filter (where status in ('approved','scheduled') and due_date <= business_today($1) + 7), 0) as due7,
+           count(*) filter (where status in ('approved','scheduled') and due_date < business_today($1))::int as overdue_n,
+           coalesce(sum(total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id)) filter (where status in ('approved','scheduled') and due_date < business_today($1)), 0) as overdue,
            count(*) filter (where status in ('exception','held'))::int as attention,
            count(*) filter (where status = 'pending')::int as pending
       from invoice i where i.entity_id = $1 and i.ic_document_id is null`, [co.id]);
@@ -1049,7 +1051,7 @@ export async function home(c: Client, co: Company, personId: string | null) {
            (select count(*) from timecard t where t.pay_period_id = pp.id)::int as timecards,
            (select count(*) from timecard t where t.pay_period_id = pp.id and t.status = 'recorded')::int as to_approve,
            (select count(*) from employee e where e.pay_group_id = pg.id and e.status = 'active' and e.pay_type = 'salary')::int as salaried,
-           (pp.ends_on <= current_date) as period_over
+           (pp.ends_on <= business_today($1)) as period_over
       from pay_period pp join pay_group pg on pg.id = pp.pay_group_id
       left join lateral (select pr.id, pr.status, pr.net_minor from payroll_run pr
                           where pr.pay_period_id = pp.id and pr.status <> 'cancelled'
@@ -1064,29 +1066,28 @@ export async function home(c: Client, co: Company, personId: string | null) {
            (select coalesce(sum(u.amount_minor), 0) from unmatched_bank_lines u where u.entity_id = $1) as lines_minor,
            (select count(*) from pos_deposit pd where pd.entity_id = $1 and pd.status = 'open')::int as deposits,
            (select coalesce(sum(pd.amount_minor), 0) from pos_deposit pd where pd.entity_id = $1 and pd.status = 'open') as deposits_minor,
-           (select count(*) from pos_deposit pd where pd.entity_id = $1 and pd.status = 'open' and pd.expected_on < current_date - 2)::int as late`,
+           (select count(*) from pos_deposit pd where pd.entity_id = $1 and pd.status = 'open' and pd.expected_on < business_today($1) - 2)::int as late`,
     [co.id]);
 
   const sweepsOverdue = await q(c, `
     select bt.id, f.name as from_account, bt.amount_minor, bt.due_on::text, u.name as owner, bt.method
       from bank_transfer bt join bank_account f on f.id = bt.from_bank_account_id
       left join app_user u on u.id = bt.assigned_to
-     where bt.entity_id = $1 and bt.status in ('expected','planned') and bt.due_on < current_date
+     where bt.entity_id = $1 and bt.status in ('expected','planned') and bt.due_on < business_today($1)
      order by bt.due_on`, [co.id]);
 
   const conns = await connections(c, co);
   const quarantined = await q<{ n: number }>(c, `select count(*)::int as n from quarantined_files where entity_id = $1`, [co.id]);
 
-  const monthStart = new Date();
-  const from = `${monthStart.getUTCFullYear()}-${String(monthStart.getUTCMonth() + 1).padStart(2, "0")}-01`;
-  const to = new Date().toISOString().slice(0, 10);
+  const to = await bizToday(c, co.id);   // the company's business date, not UTC's
+  const from = to.slice(0, 8) + "01";
   const pl = await one<{ revenue: string; expenses: string }>(c, `
     select coalesce(sum(case when ga.account_type = 'revenue' then jl.credit_minor - jl.debit_minor else 0 end), 0) as revenue,
            coalesce(sum(case when ga.account_type = 'expense' then jl.debit_minor - jl.credit_minor else 0 end), 0) as expenses
       from journal_line jl
       join journal_entry je on je.id = jl.journal_entry_id
       join gl_account ga on ga.id = jl.gl_account_id
-     where je.entity_id = $1 and je.posting_date between $2::date and $3::date`, [co.id, from, to]);
+     where je.entity_id = $1 and je.posting_date between $2::date and $3::date and je.source_type <> 'closing'`, [co.id, from, to]);
 
   const attention = await q(c, `
     select i.id, coalesce(v.dba, v.legal_name) as vendor, i.reference, i.total_minor, i.status,

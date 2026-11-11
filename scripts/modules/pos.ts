@@ -23,7 +23,7 @@ const LUIS = "55555555-0000-0000-0000-000000000012";     // cashier
 const MARIA = "55555555-0000-0000-0000-000000000011";    // sales
 const MGR = "55555555-0000-0000-0000-000000000018";      // store manager + sales
 const DEE = "55555555-0000-0000-0000-000000000013";      // warehouse
-const REG = "9a9a0000-0000-0000-0000-000000000001";      // Enola front counter
+const REG = "9a9a0000-0000-0000-0000-000000000001";      // Riverside front counter
 const CUST = { ALICIA: "88888888-0000-0000-0000-000000000001", BRIAN: "88888888-0000-0000-0000-000000000002", RIVERSIDE: "88888888-0000-0000-0000-000000000005" };
 const P = { SOFA: "77777777-0000-0000-0000-000000000001", DRESSER: "77777777-0000-0000-0000-000000000004", RECLINER: "77777777-0000-0000-0000-000000000007",
   LAMP: "77777777-0000-0000-0000-000000000009", HUDSON: "77777777-0000-0000-0000-000000000010", DELIVERY: "77777777-0000-0000-0000-000000000011",
@@ -58,7 +58,7 @@ export async function run(t: T) {
     const cc = await R.post(t, LUIS, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, sessionId: ses.id,
       lines: [{ productId: P.LAMP, qty: 2, fulfillment: "carry" }], salespeople: [{ id: MARIA, splitPct: 100 }] }) as { id: string; number: string };
     const cco = await R.post(t, LUIS, `/pos/orders/${cc.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "cash", amount: "150.00" }] }) as Awaited<ReturnType<typeof pos.checkout>>;
-    t.ok("carry: total is two lamps plus 6% Enola tax", cco.totalMinor === 12718n, String(cco.totalMinor));
+    t.ok("carry: total is two lamps plus 6% Riverside tax", cco.totalMinor === 12718n, String(cco.totalMinor));
     t.ok("carry: cash over the total gives change", cco.changeMinor === 2282n && cco.paidMinor === 12718n);
     t.ok("carry: handed over on the spot, order fulfilled", cco.handedOver === 1 && cco.status === "fulfilled");
     const lamp1 = await level(P.LAMP, LOC.ENOLA);
@@ -152,7 +152,7 @@ export async function run(t: T) {
     await R.post(t, MGR, `/pos/orders/${ov.id}/override`, { lineId: ovLine, reason: "Matching competitor ad" });
     const ovv = await view(ov.id);
     const ovRow = (ovv.overrides as { approved_by: string; reason: string; requested_by: string }[])[0];
-    t.ok("override: who allowed it and why is recorded", ovRow.approved_by === "Enola manager" && ovRow.reason === "Matching competitor ad" && ovRow.requested_by === "Maria (sales)");
+    t.ok("override: who allowed it and why is recorded", ovRow.approved_by === "Riverside manager" && ovRow.reason === "Matching competitor ad" && ovRow.requested_by === "Maria (sales)");
     const ovo = await R.post(t, MARIA, `/pos/orders/${ov.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "card", amount: String(Number((ovv.total_minor as string)) / 100), reference: "1881" }] }) as { status: string };
     t.ok("override: once allowed the sale goes through", ovo.status === "fulfilled");
     const bc = await R.post(t, MGR, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.BRIAN, overrideReason: "Damaged box, manager call",
@@ -327,7 +327,7 @@ export async function run(t: T) {
     t.ok("special order: the receipt posts Dr 1300 Cr 2050 at the PO's cost", net(recvJe, "1300") === BigInt(rcv.valueMinor) && net(recvJe, "2050") === -BigInt(rcv.valueMinor)
       && BigInt(rcv.valueMinor) === BigInt(pol.unit) + BigInt(Math.round(Number(pol.landed ?? 0) / Number(pol.qty))));
     const soHand0 = await R.post(t, LUIS, `/pos/orders/${so.id}/fulfil`, { lineIds: [soLine.id] }).then(() => null, (e: Error) => e.message);
-    t.ok("special order: not handed over at Enola while it sits at the DC; the refusal says where it is", /reserved at Distribution center, not here at Enola/.test(soHand0 ?? ""), soHand0 ?? "handed over");
+    t.ok("special order: not handed over at Riverside while it sits at the DC; the refusal says where it is", /reserved at Distribution center, not here at Riverside/.test(soHand0 ?? ""), soHand0 ?? "handed over");
     const moveList = await RI.get(t, "/inventory/orders-to-move") as { line_id: string }[];
     t.ok("special order: it shows on the warehouse's list of customer orders to send to their store", moveList.some((x) => x.line_id === soLine.id));
     // Moved by scanning its labels: the pieces are the customer's, so the transfer carries the customer's line.
@@ -342,7 +342,7 @@ export async function run(t: T) {
     await RI.post(t, DEE, `/inventory/transfers/${tr.id}/receive`);
     const atStore = (await view(so.id)).lines as { line_status: string; fulfil_from: string }[];
     const enolaH = await level(P.HUDSON, LOC.ENOLA);
-    t.ok("special order: it lands at Enola still reserved for the customer", atStore[0].line_status === "reserved" && atStore[0].fulfil_from === "Enola" && enolaH.reserved === 1);
+    t.ok("special order: it lands at Riverside still reserved for the customer", atStore[0].line_status === "reserved" && atStore[0].fulfil_from === "Riverside" && enolaH.reserved === 1);
     const owed = (await view(so.id)).balance_minor as string;
     await R.post(t, LUIS, `/pos/orders/${so.id}/pay`, { sessionId: ses.id, tenders: [{ method: "card", amount: String(Number(owed) / 100), reference: "5151" }] });
     await R.post(t, LUIS, `/pos/orders/${so.id}/fulfil`, { lineIds: [soLine.id] });
@@ -354,7 +354,7 @@ export async function run(t: T) {
     const tie2 = await inv.tieOut(c0, ENTITY);
     t.ok("tie-out: after the special order's whole life, the books still tie", tie2.ties && tie2.quantityOutOfStep.length === 0, `diff ${tie2.differenceMinor}`);
 
-    // ------------- pickup sold at Enola but sourced from the DC: the review's repro (flow2t)
+    // ------------- pickup sold at Riverside but sourced from the DC: the review's repro (flow2t)
     const dp = await R.post(t, MARIA, "/pos/orders", { kind: "sale", locationId: LOC.ENOLA, customerId: CUST.BRIAN, promisedOn: plus(40),
       lines: [{ productId: P.HUDSON, qty: 1, fulfillment: "pickup", fulfilFromId: DC, choices: { size: "96", fabric: "velvet-navy", legs: "brass" } }] }) as { id: string; number: string };
     await R.post(t, MARIA, `/pos/orders/${dp.id}/checkout`, { sessionId: ses.id, tenders: [{ method: "cash", amount: "500.00" }, { method: "card", amount: "420.00", reference: "1111" }] });
@@ -369,10 +369,10 @@ export async function run(t: T) {
     const owedDp = BigInt((await view(dp.id)).balance_minor as string);
     await R.post(t, LUIS, `/pos/orders/${dp.id}/pay`, { sessionId: ses.id, tenders: [{ method: "card", amount: String(Number(owedDp) / 100), reference: "1111" }] });
     const early = await R.post(t, LUIS, `/pos/orders/${dp.id}/fulfil`, { lineIds: [dpLine], sessionId: ses.id }).then(() => "handed over", (e: Error) => e.message);
-    t.ok("DC pickup: paid in full but still at the DC, the Enola counter refuses and says to transfer it", /reserved at Distribution center, not here at Enola; send it over first/.test(early), early);
+    t.ok("DC pickup: paid in full but still at the DC, the Riverside counter refuses and says to transfer it", /reserved at Distribution center, not here at Riverside; send it over first/.test(early), early);
     const delivered = await read<{ n: string }>(`select count(*) n from inv_piece where entity_id = $1 and sales_order_line_id = $2 and status = 'delivered'`, [ENTITY, dpLine]);
     t.ok("DC pickup: no piece is marked delivered while it sits at the DC", delivered[0].n === "0");
-    // The warehouse moves it the plain way: product and quantity, DC → Enola.
+    // The warehouse moves it the plain way: product and quantity, DC → Riverside.
     const dpTr = await RI.post(t, DEE, "/inventory/transfers", { fromId: DC, toId: LOC.ENOLA, lines: [{ productId: P.HUDSON, qty: 1 }] }) as { id: string };
     const shipped = await RI.post(t, DEE, `/inventory/transfers/${dpTr.id}/ship`).then(() => "shipped", (e: Error) => e.message);
     t.ok("DC pickup: a transfer of the reserved sofa ships, carrying the customer's line", shipped === "shipped", shipped);
@@ -380,9 +380,9 @@ export async function run(t: T) {
     t.ok("DC pickup: not handed over while on the truck", /on a transfer to the store|not ready to hand over/.test(transitTry), transitTry);
     await RI.post(t, DEE, `/inventory/transfers/${dpTr.id}/receive`);
     const hEn = await level(P.HUDSON, LOC.ENOLA);
-    t.ok("DC pickup: it lands at Enola reserved for the customer", ((await view(dp.id)).lines as { line_status: string; fulfil_from: string }[])[0].fulfil_from === "Enola" && hEn.reserved >= 1);
+    t.ok("DC pickup: it lands at Riverside reserved for the customer", ((await view(dp.id)).lines as { line_status: string; fulfil_from: string }[])[0].fulfil_from === "Riverside" && hEn.reserved >= 1);
     await R.post(t, LUIS, `/pos/orders/${dp.id}/fulfil`, { lineIds: [dpLine], sessionId: ses.id });
-    t.ok("DC pickup: handed over at Enola once it is there", (await view(dp.id)).status === "fulfilled");
+    t.ok("DC pickup: handed over at Riverside once it is there", (await view(dp.id)).status === "fulfilled");
     const tie3 = await inv.tieOut(c0, ENTITY);
     t.ok("tie-out: after the DC-sourced pickup, the books still tie", tie3.ties && tie3.quantityOutOfStep.length === 0, `diff ${tie3.differenceMinor}`);
 

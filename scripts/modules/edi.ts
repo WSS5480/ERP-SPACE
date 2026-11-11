@@ -28,7 +28,7 @@ import { runDueEdi } from "../run-due.ts";
 
 const day = (n: number) => { const d = new Date(); d.setDate(d.getDate() + n); return d.toISOString().slice(0, 10); };
 const KEY = randomBytes(32);
-const APPROVER = PEOPLE.MANAGER;            // Palestine manager: approver
+const APPROVER = PEOPLE.MANAGER;            // Mesa Verde manager: approver
 const SALES = "55555555-0000-0000-0000-000000000011";
 const ENOLA = "33333333-0000-0000-0000-000000000001";
 const P = { TABLE: "77777777-0000-0000-0000-000000000005", CHAIRS: "77777777-0000-0000-0000-000000000006", LAMP: "77777777-0000-0000-0000-000000000009", GLB: "77777777-0000-0000-0000-000000000007" };
@@ -81,7 +81,7 @@ export async function run(t: T) {
   const env0: x12.Envelope = { sender: OURS, receiver: COASTER_ID, gsSender: OURS.id, gsReceiver: COASTER_ID.id, version: "004010", usage: "T", isaControl: 42, gsControl: 7,
     at: new Date("2026-11-10T15:04:00Z") };
   const po850: x12.Po850 = { poNumber: "PO-000123", date: "2026-11-10", purpose: "00", orderType: "SA", vendorAccount: "A-77", requestedOn: "2026-12-01",
-    shipTo: { code: "DC1", name: "Distribution center", address1: "1 Dock Rd", city: "Enola", state: "PA", postal: "17025" },
+    shipTo: { code: "DC1", name: "Distribution center", address1: "1 Dock Rd", city: "Riverside", state: "PA", postal: "00125" },
     lines: [{ line: 1, qty: 2, uom: "EA", unitMinor: 19000n, vendorSku: "121221", ourSku: "COA-121221", upc: "0123", description: "Dining table *oak~", options: ["FIN-OAK"], customerOrder: "SO-1" },
       { line: 2, qty: 4, unitMinor: 8250n, vendorSku: "121222", description: "Side chair" }] };
   const text850 = x12.writeInterchange(env0, [{ type: "850", control: 1, segments: x12.build850(po850) }]);
@@ -90,7 +90,7 @@ export async function run(t: T) {
   t.ok("X12: the ISA is the fixed 106 characters and the envelope carries the control numbers", text850.indexOf("~") === 105 && ix850.control === "000000042" && ix850.groups[0].control === "7"
     && ix850.errors.length === 0 && ix850.groups[0].errors.length === 0 && ix850.groups[0].sets[0].errors.length === 0, JSON.stringify(ix850.errors));
   t.ok("X12 850: round trip (number, ship-to, lines, ids, price, options, customer order) and separators inside values are cleaned",
-    back850.poNumber === "PO-000123" && back850.shipTo.code === "DC1" && back850.shipTo.postal === "17025" && back850.lines.length === 2 && back850.lines[0].vendorSku === "121221"
+    back850.poNumber === "PO-000123" && back850.shipTo.code === "DC1" && back850.shipTo.postal === "00125" && back850.lines.length === 2 && back850.lines[0].vendorSku === "121221"
     && back850.lines[0].ourSku === "COA-121221" && back850.lines[0].unitMinor === 19000n && back850.lines[1].unitMinor === 8250n && back850.lines[0].options?.[0] === "FIN-OAK"
     && back850.lines[0].customerOrder === "SO-1" && back850.lines[0].description === "Dining table oak" && back850.requestedOn === "2026-12-01" && !back850.errors.length, JSON.stringify(x12.summaryOf(back850.lines[0])));
   const rt = <V>(type: string, segs: x12.Segment[], parse: (s: x12.Segment[]) => V) => {
@@ -143,7 +143,7 @@ export async function run(t: T) {
 
   // Ashley already has API feeds for catalog, prices, quantities, freight, orders and status: a new partner defaults to the API for those.
   const ashley = await r.post<{ id: string }>("/edi/partners", BUYER, { partner: { vendor_id: V.ASHLEY, our_isa_id: OURS.id, their_isa_qual: "12", their_isa_id: "6162242000",
-    transport: "sftp", transport_config: { host: "sftp.ashleyfurniture.example", user: "buddys", port: "22", inFolder: "/out", outFolder: "/in" } }, secrets: { sftpPassword: "Sftp-Secret-4411" } });
+    transport: "sftp", transport_config: { host: "sftp.ashleyfurniture.example", user: "riverside", port: "22", inFolder: "/out", outFolder: "/in" } }, secrets: { sftpPassword: "Sftp-Secret-4411" } });
   const ashP = await read(t, (c) => edi.loadPartner(c, ENTITY, ashley.id));
   t.ok("partners: channels default to the vendor's API where a feed exists (orders, status, catalog/price, ATP, freight) and EDI for the invoice",
     ashP.documents["850"] === "api" && ashP.documents["855"] === "api" && ashP.documents["856"] === "api" && ashP.documents["832"] === "api" && ashP.documents["846"] === "api"
@@ -407,7 +407,7 @@ export async function run(t: T) {
     polled.ok && tStatus.status === "rejected" && /rejected it in their 997: one or more segments in error/.test(tStatus.reason) && net.state.acked.includes("m-1"), JSON.stringify({ polled, tStatus }));
 
   // ================================================================ the 850, laid out per partner
-  await r.post("/edi/partners", BUYER, { partner: { vendor_id: V.COASTER, options: { billTo: { name: "Demo Furniture AP", code: "BT-1", address1: "9 Main St", city: "Enola", state: "PA", postal: "17025" },
+  await r.post("/edi/partners", BUYER, { partner: { vendor_id: V.COASTER, options: { billTo: { name: "Demo Furniture AP", code: "BT-1", address1: "9 Main St", city: "Riverside", state: "PA", postal: "00125" },
     vendorN1: true, td5: { scac: "rlca", method: "M", routing: "R+L Carriers" }, fob: "PP", shipByDays: 14, cancelAfterDays: 45, itemIds: ["VN", "IN"], refs: [], contact: { name: "Ana", phone: "7175550100", email: "ana@example.com" } } } });
   await t.throws("850 layout: an item id the system does not send is refused", () => r.post("/edi/partners", BUYER, { partner: { vendor_id: V.COASTER, options: { itemIds: ["ZZ"] } } }), /not an item id/);
   const three = await asPerson(t, BUYER, (c, co, a) => pur.createPO(c, scopeOf(co, a), { vendorId: V.COASTER, shipToId: DC, lines: [{ productId: P.CHAIRS, qty: 2 }] }, false));
@@ -415,7 +415,7 @@ export async function run(t: T) {
   const raw3 = await read(t, async (c) => (await q<{ raw: string }>(c, `select raw from edi_document where id = $1 and entity_id = $2`, [s3.documentId, ENTITY]))[0].raw);
   const p3 = x12.parse850(x12.parseInterchange(raw3).groups[0].sets[0].segments);
   t.ok("850 layout: bill-to, vendor party, TD5 routing, FOB, ship-by and cancel-after, buyer contact and the partner's item ids, without the references it turned off",
-    p3.billTo?.name === "Demo Furniture AP" && p3.billTo?.postal === "17025" && !!p3.vendor && p3.td5?.scac === "RLCA" && p3.fob === "PP" && p3.shipBy === day(14) && p3.cancelAfter === day(45)
+    p3.billTo?.name === "Demo Furniture AP" && p3.billTo?.postal === "00125" && !!p3.vendor && p3.td5?.scac === "RLCA" && p3.fob === "PP" && p3.shipBy === day(14) && p3.cancelAfter === day(45)
     && p3.contact?.email === "ana@example.com" && /PO1\*1\*2\*EA\*[\d.]+\*PE\*VN\*121222\*IN\*COA-121222/.test(raw3) && !/\*BP\*/.test(raw3) && !/REF\*IA/.test(raw3), raw3.slice(0, 600));
 
   // ================================================================ VAN with no acknowledge address
@@ -474,7 +474,7 @@ export async function run(t: T) {
   await r.post("/edi/store-orders/:id/submit", STORE_MGR, {}, cart.id);
   await t.throws("store orders: a store manager cannot approve", () => r.post("/edi/store-orders/:id/approve", STORE_MGR, {}, cart.id), /needs one of: approver, buyer/);
   await t.throws("store orders: a sales associate cannot start one", () => r.post("/edi/store-orders", SALES, { locationId: ENOLA, vendorId: V.COASTER }), /needs one of: store manager, buyer/);
-  await t.throws("store orders: approving spends open-to-buy; over budget only the owner may place it", () => r.post("/edi/store-orders/:id/approve", APPROVER, { note: "district ok" }, cart.id), /over budget: Dining at Enola/);
+  await t.throws("store orders: approving spends open-to-buy; over budget only the owner may place it", () => r.post("/edi/store-orders/:id/approve", APPROVER, { note: "district ok" }, cart.id), /over budget: Dining at Riverside/);
   const approved = await r.post<{ po: { poId: string; number: string }; sent: { channel: string; status: string } | null }>("/edi/store-orders/:id/approve", PEOPLE.STEVE,
     { note: "holiday dining push", overBudgetReason: "holiday dining push" }, cart.id);
   const soRow = await r.get<{ order: { status: string; po_number: string }; lines: unknown[] }>("/edi/store-orders/:id", "", cart.id);

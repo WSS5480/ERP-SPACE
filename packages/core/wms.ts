@@ -13,6 +13,7 @@
 // "unloaded"; that is the day its PO lines, and the customers waiting on
 // them, are told.
 
+import { today as bizToday } from "./clock.ts";
 import { q, one, audit, tx, type Client, type Scope } from "./db.ts";
 import * as inv from "./inventory.ts";
 import * as pur from "./purchasing.ts";
@@ -20,7 +21,6 @@ import * as pur from "./purchasing.ts";
 export class WmsError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new WmsError(msg); };
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
-const today = () => new Date().toISOString().slice(0, 10);
 const words = (s: string) => s.replace(/_/g, " ");
 
 export const STAGES = ["booked", "departed", "at_port", "customs_cleared", "on_rail", "delivered_dc", "unloaded"] as const;
@@ -71,7 +71,7 @@ export async function createContainer(c: Client, s: Scope, e: ContainerIn) {
     need(v.length, "that vendor is not active for this company");
   }
   if (e.etaDc) need(DAY.test(e.etaDc), "the arrival day is a date, like 2026-12-01");
-  const bookedOn = e.bookedOn && DAY.test(e.bookedOn) && e.bookedOn <= today() ? e.bookedOn : today();
+  const bookedOn = e.bookedOn && DAY.test(e.bookedOn) && e.bookedOn <= (await bizToday(c, s)) ? e.bookedOn : (await bizToday(c, s));
   const number = await inv.nextNo(c, s.entityId, "container", "CT-");
   const ct = await one<{ id: string }>(c, `insert into wms_container (entity_id, number, container_no, carrier, vessel, voyage, bol, port_loading, port_discharge,
       dest_location_id, vendor_id, note, created_by) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) returning id`,
@@ -202,7 +202,7 @@ export async function setStage(c: Client, s: Scope, containerId: string, stage: 
   const ct = await containerOf(c, s.entityId, containerId);
   need((STAGES as readonly string[]).includes(stage), `a container stage is one of: ${STAGES.map((x) => STAGE_LABEL[x].toLowerCase()).join(", ")}`);
   for (const d of [e.expectedOn, e.actualOn]) if (d) need(DAY.test(d), "the stage dates are dates, like 2026-12-01");
-  if (e.actualOn) need(e.actualOn <= today(), `${STAGE_LABEL[stage as Stage]} cannot have happened on ${e.actualOn}; that is in the future. Put it as the expected day`);
+  if (e.actualOn) need(e.actualOn <= (await bizToday(c, s)), `${STAGE_LABEL[stage as Stage]} cannot have happened on ${e.actualOn}; that is in the future. Put it as the expected day`);
   const all = await q<{ stage: Stage; expected_on: string | null; actual_on: string | null }>(c, `select stage, expected_on::text, actual_on::text from wms_container_stage
      where entity_id = $1 and container_id = $2`, [s.entityId, containerId]);
   const idx = STAGES.indexOf(stage as Stage);
@@ -381,7 +381,7 @@ export async function receiveContainer(c: Client, s: Scope, containerId: string,
   for (const x of counted) await c.query(`update wms_container_line set received_qty = received_qty + $3, landed_applied_minor = landed_applied_minor + $4
       where id = $1 and entity_id = $2`, [x.id, s.entityId, x.qty, x.extra.toString()]);
   const at = await q<{ stage: Stage; actual_on: string | null }>(c, `select stage, actual_on::text from wms_container_stage where entity_id = $1 and container_id = $2`, [s.entityId, containerId]);
-  if (!at.find((x) => x.stage === "delivered_dc")?.actual_on) await setStage(c, s, containerId, "delivered_dc", { actualOn: today() });
+  if (!at.find((x) => x.stage === "delivered_dc")?.actual_on) await setStage(c, s, containerId, "delivered_dc", { actualOn: (await bizToday(c, s)) });
   const fin = await finishIfDone(c, s, containerId);
   return { number: ct.number, receipts, unloaded: fin.done, linesLeft: fin.left };
 }
@@ -391,7 +391,7 @@ async function finishIfDone(c: Client, s: Scope, containerId: string): Promise<{
   const rest = await q<{ n: string }>(c, `select count(*)::text n from wms_container_line where entity_id = $1 and container_id = $2 and received_qty < qty`, [s.entityId, containerId]);
   const left = Number(rest[0].n);
   const st = await q<{ stage: string }>(c, `select stage from wms_container where entity_id = $1 and id = $2`, [s.entityId, containerId]);
-  if (left === 0 && st[0]?.stage !== "unloaded") await setStage(c, s, containerId, "unloaded", { actualOn: today() });
+  if (left === 0 && st[0]?.stage !== "unloaded") await setStage(c, s, containerId, "unloaded", { actualOn: (await bizToday(c, s)) });
   return { done: left === 0, left };
 }
 
@@ -477,7 +477,7 @@ export async function attachShipment(c: Client, s: Scope, e: { equipment: string
   const st = await q<{ stage: Stage; actual_on: string | null }>(c, `select stage, actual_on::text from wms_container_stage where entity_id = $1 and container_id = $2`, [s.entityId, ct.id]);
   if (!st.find((x) => x.stage === "departed")?.actual_on) {
     const booked = st.find((x) => x.stage === "booked")?.actual_on ?? null;
-    let d = e.shippedOn && DAY.test(e.shippedOn) && e.shippedOn <= today() ? e.shippedOn : today();
+    let d = e.shippedOn && DAY.test(e.shippedOn) && e.shippedOn <= (await bizToday(c, s)) ? e.shippedOn : (await bizToday(c, s));
     if (booked && d < booked) d = booked;
     await setStage(c, s, ct.id, "departed", { actualOn: d });
   }

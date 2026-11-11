@@ -531,7 +531,7 @@ function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + 
  * the owner sees everything. The server still checks every action on its own.
  */
 const ROLE_SCREENS = {
-  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business', 'services', 'connections', 'checklist', 'salestax', 'wms', 'settlements', 'trade', 'asis'],
+  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'periods', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business', 'services', 'connections', 'checklist', 'salestax', 'wms', 'settlements', 'trade', 'asis'],
   approver: ['home', 'approvals', 'storeorders', 'payables', 'memos', 'reports'],
   ap_clerk: ['home', 'payables', 'memos', 'edi', 'reports', 'trade'],
   viewer: ['home', 'books', 'chart', 'reports'],
@@ -1421,6 +1421,15 @@ const lagText = (n) => (Number(n) === 0 ? 'pays on the last day' : `pays ${plura
 /** A labelled field; the label's first span is its name. */
 const field = (label, control, hint, wide) => el('label', { class: 'field' + (wide ? ' wide' : '') }, el('span', { text: label }), control, hint ? el('span', { class: 'hint', text: hint }) : null);
 const select = (options, value) => el('select', {}, options.map(([v, t]) => el('option', { value: v, text: t, selected: String(v) === String(value ?? '') || null })));
+/** The business time zones a US company or store keeps; '' is "the company's" (or the built-in fallbacks) */
+const ZONES = [['America/New_York', 'Eastern'], ['America/Detroit', 'Eastern (Michigan)'], ['America/Indiana/Indianapolis', 'Eastern (Indiana)'],
+  ['America/Chicago', 'Central'], ['America/Denver', 'Mountain'], ['America/Boise', 'Mountain (Idaho)'], ['America/Phoenix', 'Arizona (no daylight saving)'],
+  ['America/Los_Angeles', 'Pacific'], ['America/Anchorage', 'Alaska'], ['Pacific/Honolulu', 'Hawaii'], ['America/Puerto_Rico', 'Atlantic (Puerto Rico)']];
+const zonePicker = (value, emptyLabel) => {
+  const opts = [['', emptyLabel], ...ZONES.map(([z, t]) => [z, `${t} · ${z}`])];
+  if (value && !ZONES.some(([z]) => z === value)) opts.push([value, value]);
+  return select(opts, value || '');
+};
 const input = (props) => el('input', Object.assign({ type: 'text' }, props));
 
 function groupState(g, runs) {
@@ -1961,7 +1970,7 @@ function periodRange(key) {
 }
 async function screenBooks(sub) {
   const view = sub === 'tb' ? 'tb' : 'pnl';
-  const top = frag(head('Books'), el('div', { class: 'toolbar' }, seg([['pnl', 'Profit and loss'], ['tb', 'Trial balance'], ['coa', 'Chart of accounts']], view, (v) => (v === 'coa' ? go('chart') : go('books', v)))));
+  const top = frag(head('Books'), el('div', { class: 'toolbar' }, seg([['pnl', 'Profit and loss'], ['tb', 'Trial balance'], ['coa', 'Chart of accounts'], ...(canSee('periods') ? [['periods', 'Periods']] : [])], view, (v) => (v === 'coa' ? go('chart') : v === 'periods' ? go('periods') : go('books', v)))));
   return view === 'tb' ? frag(top, await trialBalanceView()) : frag(top, await pnlView());
 }
 const SECTIONS = [['Revenue', (c) => c.startsWith('4')], ['Cost of merchandise', (c) => c.startsWith('5')], ['Operating expenses', (c) => c.startsWith('6')], ['Other expenses', (c) => /^[789]/.test(c)]];
@@ -2406,7 +2415,7 @@ const RENDER = { home: screenHome, approvals: screenApprovals, payables: screenP
 window.ERP = {
   canSee, S, $, el, frag, icon, ICONS, chip, money, dayLabel, shortDay, plural, cap, sentence, human, ago, size, todayIso, isoDay,
   api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
-  head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input,
+  head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input, zonePicker, ZONES,
   drill, drillList, drillItems, drillNode, drillSum, drillRow, opener, openKind: (kind, id) => (OPENERS[kind] ? OPENERS[kind](id) : null),
   openEntry, NARROW, openAddVendor,
   // defined further down (sign-in and who you are); wrapped so they resolve when called

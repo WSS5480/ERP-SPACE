@@ -453,7 +453,7 @@ export async function runFeeds(t: T) {
 
   // ------------------------------------------------------ the feed screen data
   const sftp = await cr.post<{ id: string }>("/catalog/feeds", BUYER, { feed: { vendor_id: V.GLOBAL, purpose: "products", name: "Global SFTP drop", kind: "sftp", url: "",
-    options: { host: "sftp.global.example", port: 22, user: "buddys", path: "/outbound/", pattern: "*.csv" } } });
+    options: { host: "sftp.global.example", port: 22, user: "riverside", path: "/outbound/", pattern: "*.csv" } } });
   const gview = await cr.get<{ feeds: { id: string; transport_note: string | null }[] }>("/catalog/vendors/:id/feeds", "", V.GLOBAL);
   const sr = await cr.post<feeds.RunResult>("/catalog/feeds/:id/run", BUYER, {}, sftp.id).catch((e: Error) => ({ ok: false, note: e.message }) as feeds.RunResult);
   t.ok("SFTP: the feed is real now: no \"not built\" note, and a run before any Test refuses in words because no server key is recorded",

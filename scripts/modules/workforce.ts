@@ -42,7 +42,7 @@ async function as<R>(personId: string, fn: (c: Client, co: Company, a: Actor) =>
 }
 const scope = (person: string) => ({ tenantId: "11111111-1111-1111-1111-111111111111", entityId: ENTITY, actor: { kind: "user" as const, id: person, label: "check" } });
 
-/** A local time at Enola on a day, as an ISO instant. */
+/** A local time at Riverside on a day, as an ISO instant. */
 async function ny(c: Client, day: string, hm: string): Promise<string> {
   return (await one<{ t: string }>(c, `select to_char((($1::date + $2::time) at time zone 'America/New_York') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') t /* unscoped: arithmetic */`, [day, hm])).t;
 }

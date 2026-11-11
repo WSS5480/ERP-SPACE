@@ -99,7 +99,7 @@ export async function run(t: T) {
     for (const name of ["RR One", "RR Two", "RR Three", "RR Four"]) out.push(await crm.createLead(c, ENTITY, MARIA, { source: "walk_in", name, locationId: LOC.ENOLA, phone: `717555${String(out.length).padStart(4, "7")}` }));
     return q<{ number: string; assigned_to: string; next_follow_up_at: string | null }>(c, `select number, assigned_to, next_follow_up_at from crm_lead where entity_id = $1 and id = any($2::uuid[]) order by number`, [ENTITY, out.map((x) => x.id)]);
   });
-  t.ok("round-robin: Enola walk-ins alternate between the two salespeople", rr.map((x) => x.assigned_to).join(",") === [MARIA, ENOLA_MGR, MARIA, ENOLA_MGR].join(","),
+  t.ok("round-robin: Riverside walk-ins alternate between the two salespeople", rr.map((x) => x.assigned_to).join(",") === [MARIA, ENOLA_MGR, MARIA, ENOLA_MGR].join(","),
     rr.map((x) => x.assigned_to.slice(-2)).join(","));
   t.ok("every assigned lead gets a first-contact follow-up", rr.every((x) => !!x.next_follow_up_at)
     && (await n(`select count(*) n from crm_task where entity_id = $1 and auto and lead_id in (select id from crm_lead where entity_id = $1 and name like 'RR %') and done_at is null`, [ENTITY])) === 4);
@@ -154,9 +154,9 @@ export async function run(t: T) {
   t.ok("convert: a lead that matched a customer uses that customer, no duplicate made", conv2.customerId === ALICIA && !conv2.createdCustomer && !conv2.quote);
 
   // --------------------------------------------- coupons through the web store
-  const site = await inTx(async (c) => (await shop.siteBySlug(c, "buddys"))!);
+  const site = await inTx(async (c) => (await shop.siteBySlug(c, "riverside-home"))!);
   const webIn = (over: Record<string, unknown>) => shop.parseCheckout({ cartId: `crm-${Math.random().toString(36).slice(2, 12)}`, email: "coupon.buyer@example.com",
-    name: "Coupon Buyer", fulfillment: "delivery", address: { line1: "1 Elm St", city: "Camp Hill", state: "PA", postal: "17011" }, paymentToken: "tok_test_visa_4242",
+    name: "Coupon Buyer", fulfillment: "delivery", address: { line1: "1 Elm St", city: "Maple Grove", state: "PA", postal: "00111" }, paymentToken: "tok_test_visa_4242",
     lines: [{ productId: SOFA, qty: 1 }], couponCode: "FALL10", ...over });
   const webScope = { tenantId: TENANT, entityId: ENTITY, actor: sys };
   const w1in = webIn({ cartId: "crm-coupon-0001" });
@@ -212,7 +212,7 @@ export async function run(t: T) {
     lines: [{ productId: LAMP, qty: 1 }], phone: "7175550101" }), webScope));
   const dupId = (await inTx((c) => q<{ customer_id: string }>(c, `select customer_id from sales_order where entity_id = $1 and number = $2`, [ENTITY, dupOrder.order.number])))[0].customer_id;
   await inTx((c) => crm.recordConsent(c, ENTITY, dupId, "sms", "opt_out", "STOP reply", null));
-  const dups = await inTx((c) => crm.findDuplicates(c, ENTITY, { phone: "717-555-0101", exceptId: dupId }));
+  const dups = await inTx((c) => crm.findDuplicates(c, ENTITY, { phone: "555-555-0101", exceptId: dupId }));
   t.ok("duplicate customers are found by phone", dups.some((x) => x.id === ALICIA && x.why === "same phone"));
   const before = { orders: await n(`select count(*) n from sales_order where entity_id = $1 and customer_id = $2`, [ENTITY, ALICIA]) };
   const merged = await inTx((c) => crm.mergeCustomers(c, scopeAs(ENOLA_MGR), ALICIA, dupId, "Same phone; she used a second email online", ENOLA_MGR));
@@ -285,19 +285,19 @@ export async function run(t: T) {
   const H = { "content-type": "application/json", "x-erp-shop": "1" };
   try {
     _resetLimits();
-    const no = await fetch(`${base}/shop/buddys/api/lead`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const no = await fetch(`${base}/shop/riverside-home/api/lead`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     t.ok("public lead form: refused without the store header", no.status === 403);
-    const ok = await fetch(`${base}/shop/buddys/api/lead`, { method: "POST", headers: H, body: JSON.stringify({ kind: "quote", name: "Web Quote", email: "webquote@example.com",
+    const ok = await fetch(`${base}/shop/riverside-home/api/lead`, { method: "POST", headers: H, body: JSON.stringify({ kind: "quote", name: "Web Quote", email: "webquote@example.com",
       phone: "717 555 0188", message: "Price for the sofa in navy?", productId: SOFA, consentEmail: true, utmCampaign: "fall-living-room-event" }) });
     const okj = await ok.json();
     const wl = (await inTx((c) => q<{ source: string; items: unknown[]; consent: Record<string, string>; assigned_to: string | null; utm_campaign: string }>(c,
       `select source, items, consent, assigned_to, utm_campaign from crm_lead where entity_id = $1 and number = $2`, [ENTITY, okj.reference])))[0];
     t.ok("public lead form: a quote request becomes a lead with the product, consent and attribution", ok.status === 200 && wl?.source === "quote_request"
       && wl.items.length === 1 && wl.consent.email === "opt_in" && wl.utm_campaign === "fall-living-room-event", JSON.stringify(okj));
-    const bad = await fetch(`${base}/shop/buddys/api/lead`, { method: "POST", headers: H, body: JSON.stringify({ name: "No contact" }) });
+    const bad = await fetch(`${base}/shop/riverside-home/api/lead`, { method: "POST", headers: H, body: JSON.stringify({ name: "No contact" }) });
     t.ok("public lead form: a refusal is a plain sentence", bad.status === 422 && typeof (await bad.json()).error === "string");
     let status = 0;
-    for (let i = 0; i <= LIMITS.lead.max; i++) status = (await fetch(`${base}/shop/buddys/api/lead`, { method: "POST", headers: H, body: JSON.stringify({ name: "Spam", email: `s${i}@example.com` }) })).status;
+    for (let i = 0; i <= LIMITS.lead.max; i++) status = (await fetch(`${base}/shop/riverside-home/api/lead`, { method: "POST", headers: H, body: JSON.stringify({ name: "Spam", email: `s${i}@example.com` }) })).status;
     t.ok("public lead form: rate limited per address", status === 429);
     const tok = (await inTx((c) => q<{ unsub_token: string }>(c, `select unsub_token from crm_message where entity_id = $1 and customer_id = $2 and channel = 'sms' limit 1`, [ENTITY, ALICIA])))[0].unsub_token;
     const page = await fetch(`${base}/crm/u/${tok}`);

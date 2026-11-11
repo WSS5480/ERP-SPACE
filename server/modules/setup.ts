@@ -28,7 +28,7 @@ export const module: ErpModule = {
       const [applied, settings, locations, reasons, imports] = await (async (qs) => { const out = []; for (const f of qs) out.push(await f()); return out; })([
         () => q(c, `select pack, applied_at, applied_by, summary from pack_application where entity_id = $1 order by applied_at desc limit 10`, [co.id]),
         () => q(c, `select key, value, set_by, set_at, from_pack from entity_setting where entity_id = $1 order by key`, [co.id]),
-        () => q(c, `select id, code, name, kind, state, tax_rate_bps, address, geo[0] lng, geo[1] lat, status
+        () => q(c, `select id, code, name, kind, state, tax_rate_bps, address, geo[0] lng, geo[1] lat, status, time_zone, business_tz(entity_id, id) zone_in_use
                 from location where entity_id = $1 order by kind, code`, [co.id]),
         () => q(c, `select kind, code, label, restock, active from reason_code where entity_id = $1 order by kind, label`, [co.id]),
         () => q(c, `select kind, filename, rows_seen, rows_added, rows_updated, rows_refused, problems, run_by, run_at
@@ -79,7 +79,7 @@ export const module: ErpModule = {
         id: uuid(body.id), code: str(body.code, 10), name: str(body.name, 80), kind: str(body.kind, 20),
         taxRateBps: int(body.taxRateBps), state: str(addr.state, 2) || null,
         address: { line1: str(addr.line1, 120), city: str(addr.city, 60), state: str(addr.state, 2).toUpperCase(), postal: str(addr.postal, 10) },
-        lng, lat,
+        lng, lat, timeZone: body.timeZone === undefined ? undefined : str(body.timeZone, 60),
       });
       return { id };
     });
