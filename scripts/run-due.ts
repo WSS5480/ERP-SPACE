@@ -70,7 +70,7 @@ export async function runDueVendorFeeds(now: Date, env: FeedEnv = liveEnv(), onl
   const rows = await pool.query<{ id: string; name: string; entity_id: string; tenant_id: string; schedule_cron: string | null; every_hours: number | null; last_run_at: Date | null }>(
     `select f.id, f.name, f.entity_id, e.tenant_id, f.schedule_cron, f.every_hours, f.last_run_at
        from vendor_feed f join entity e on e.id = f.entity_id
-      where f.active and f.kind = 'api' and f.purpose <> 'orders' and (f.schedule_cron is not null or f.every_hours is not null)
+      where f.active and f.kind in ('api','sftp') and f.purpose <> 'orders' and (f.schedule_cron is not null or f.every_hours is not null)
         and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active')
         and ($1::uuid is null or f.entity_id = $1)
       order by f.entity_id, f.vendor_id, array_position(array['products','pricing','images','quantities','freight','acknowledgments'], f.purpose)

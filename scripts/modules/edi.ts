@@ -5,7 +5,7 @@
 // in transit, an 810 bill that three-way matches after receiving, an 832
 // repricing a product, an 846 refused while its channel is the API and
 // applied once it is EDI, quarantines with reasons, duplicates ignored,
-// test/production mismatch, a VAN with a token, the SFTP stub, API ordering
+// test/production mismatch, a VAN with a token, SFTP refusing before a Test, API ordering
 // and order-status polling through the vendor's orders and acknowledgments
 // feeds (mock network), store orders from cart to PO, roles, and no secret
 // in any GET. Runs last, so the products it reprices move no other check.
@@ -155,7 +155,7 @@ export async function run(t: T) {
   const buyerScope = await asPerson(t, BUYER, async (_c, co, a) => scopeOf(co, a));
   const runAs = (fn: (c: Client) => Promise<unknown>) => tx(buyerScope.actor, fn);
   const sftp = await edi.pollPartner(runAs as edi.TxRun, buyerScope, env, ashley.id);
-  t.ok("SFTP: settings and password are kept, and polling says plainly it is not built", !sftp.ok && /SFTP is not built into this version/.test(sftp.note), sftp.note);
+  t.ok("SFTP: settings and password are kept, and polling before any Test refuses in words: no server key recorded, nothing downloaded", !sftp.ok && /No server key is recorded/.test(sftp.note), sftp.note);
   await t.throws("partners: a secret in the transport settings is refused", () => r.post("/edi/partners", BUYER, { partner: { vendor_id: V.ASHLEY, transport_config: { host: "h", user: "u", password: "x" } } }), /may not hold password/);
   await t.throws("partners: a channel a document cannot use is refused", () => r.post("/edi/partners", BUYER, { partner: { vendor_id: V.ASHLEY, documents: { "810": "api" } } }), /goes by edi, email, file, off/);
   await t.throws("partners: EDI cannot be switched on without both ISA ids", () => r.post("/edi/partners", BUYER, { partner: { vendor_id: V.COASTER, edi_enabled: true } }), /give our ISA id and theirs/);

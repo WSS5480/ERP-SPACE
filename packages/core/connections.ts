@@ -797,7 +797,11 @@ function track(p: Promise<void>): Promise<void> {
   return p;
 }
 /** Checks wait here for the post-run moves and deletes to finish. */
-export async function postRunSettled(): Promise<void> { while (PENDING.size) await Promise.allSettled([...PENDING]); }
+export async function postRunSettled(): Promise<void> {
+  // The jobs start on the tick after the commit (db.tx), so let that tick pass first.
+  await new Promise((r) => setImmediate(r));
+  while (PENDING.size) await Promise.allSettled([...PENDING]);
+}
 
 /** Move or delete the files a committed run took. What failed is written on the run, in words; the files stay where they were. */
 async function postRun(conn: Connection, runId: string, names: string[]): Promise<void> {

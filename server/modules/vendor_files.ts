@@ -7,7 +7,7 @@
 // read says which are set, never what they are.
 
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
-import { ModuleError, need, requireRole, str, uuid } from "./kit.ts";
+import { ModuleError, need, requireRole, str, uuid, lookOnly } from "./kit.ts";
 import { rolesOf, scopeOf } from "../actions.ts";
 import * as vf from "../../packages/core/vendor_files.ts";
 import { TransportError, HostKeyError } from "../../packages/core/transports.ts";
@@ -36,13 +36,13 @@ const secretsOf = (b: Record<string, unknown>) => Object.fromEntries(Object.entr
 export const module: ErpModule = {
   id: "vendor_files",
   register({ coGet, coPost }) {
-    coGet("/vendor-files", async (c, co, _u, _m, p) => { await mayRead(c, co, p); return vf.overview(c, co); });
+    coGet("/vendor-files", async (c, co, _u, _m, p) => { await mayRead(c, co, p); return vf.overview(c, co, !lookOnly(c)); });
     coGet(`/vendor-files/${ID}`, async (c, co, url, m, p) => {
       await mayRead(c, co, p);
       const st = str(url.searchParams.get("status"), 20);
       return refuse(() => vf.detail(c, co.id, m[2], ["quarantined", "applied", "ignored", "parsed", "received"].includes(st) ? st : null));
     });
-    coGet(`/vendor-files/vendor/${ID}`, async (c, co, _u, m, p) => { await mayRead(c, co, p); return refuse(() => vf.vendorMail(c, co, m[2])); });
+    coGet(`/vendor-files/vendor/${ID}`, async (c, co, _u, m, p) => { await mayRead(c, co, p); return refuse(() => vf.vendorMail(c, co, m[2], !lookOnly(c))); });
 
     coPost("/vendor-files/save", async (c, co, a, b) => refuse(async () => {
       await requireRole(c, co, a, MANAGE, "setting up vendor files");

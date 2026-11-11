@@ -156,11 +156,11 @@ export async function openSftp(env: NetEnv, t: SftpTarget, mode: "require" | "le
   const port = sftpPort(t.port);
   const host = String(t.host ?? "").trim();
   const where = `the SFTP server ${host}${port === 22 ? "" : `:${port}`}`;
-  need(String(t.user ?? "").trim(), "SFTP needs the user name");
-  need(t.password || t.privateKey, "SFTP needs a password or a private key; type one in");
   if (mode === "require" && !t.pinned) {
     throw new HostKeyError("unpinned", `No server key is recorded for ${host}${port === 22 ? "" : `:${port}`} yet, so nothing was downloaded. Press Test to see the server's key and record it.`, null);
   }
+  need(String(t.user ?? "").trim(), "SFTP needs the user name");
+  need(t.password || t.privateKey, "SFTP needs a password or a private key; type one in");
   const addr = await sftpAddress(env, host, port);
   const ssh2 = (await import("ssh2")).default;
   const client = new ssh2.Client();

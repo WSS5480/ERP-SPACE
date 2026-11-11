@@ -105,6 +105,7 @@ Data is placed with textContent only, never innerHTML.
 | admin (service switches and presets, single-store rule, connections, outbound message log) | 0049 | none | Setup (Services, Connections) |
 | platform (customers, sign-in, support mode, tenant API tokens, the demo) | 0051 | 0032 (marks the demo) | Platform (Operator console), Account |
 | onboarding (setup checklist, opening stock import, bank opening balance, tax rates checked) | 0052 | none | Setup (Setup checklist), a Home card |
+| vendor_files (SFTP and HTTPS transports, vendor file connections, vendor email, SFTP/email-in vendor feeds, EDI over SFTP) | 0057 | none | Setup (Connections → Vendor files), Retail (Catalog → Vendors → Catalog connections) |
 | drill (the rows behind every tile; read-only lists) | none | none | no screen of its own |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
@@ -667,3 +668,93 @@ when 0052 runs get a dismissal, so trading customers do not see the Home card.
 The Home card counts without the tie-outs, and runs them before it would hide.
 Time zones: the time clock falls back to the delivery settings' zone and
 delivery to the time clock's, before the built-in defaults.
+
+## Vendor files: SFTP, HTTPS and email transports (migration 0057)
+
+Vendors deliver catalogs, prices, inventory and EDI documents three ways
+besides their APIs: an SFTP drop, a plain HTTPS address, and email. All three
+are real now.
+
+**Transports** (`packages/core/transports.ts`, behind the pipeline in
+`connections.ts`; `views.TRANSPORTS` is `{ sftp: true, http: true }`).
+SFTP is the `ssh2` package (pure JavaScript, the one dependency added).
+Password or private key (with passphrase); secrets are sealed in
+`connection_secret` (AES-256-GCM under `ERP_SECRET_KEY`, AAD
+`connection:<id>:<name>`, write-only; a read says which are set). The host is
+checked and resolved once and the checked address dialled: no private,
+loopback or link-local address unless it is on `ERP_SFTP_ALLOW_HOSTS`. Port
+22, or the connection's own port when it is 1024 or above. Timeouts to
+connect (`ERP_SFTP_CONNECT_TIMEOUT_MS`, 20 s) and per operation
+(`ERP_SFTP_OP_TIMEOUT_MS`, 60 s); a size cap per file (20 MB, at most 50).
+Listing is by pattern (`*` and `?`); a file already taken (same name, size,
+time) is not downloaded again, the same bytes are never applied twice
+(`inbound_file` sha256), and a file over the cap is quarantined by name and
+left on the server. After a run commits, files are left (default), moved to a
+folder (a clash gets a time stamp) or deleted (`connection.config.after`).
+Outbound puts write `name.part` and rename it, and never overwrite.
+HTTPS ("api" channel) is `vendor_feeds.call`: https only, every hop checked,
+redirects by hand, 10 MB, a timeout; auth none, basic, bearer or a key header.
+`ERP_FEEDS_ALLOW_HOSTS` lets listed hosts sit on a private network (still
+https); checks use it for a local test server.
+
+**Host keys** (`sftp_host_pin`, for a connection, an EDI partner or a vendor
+feed). The first good Test records the server's key (SHA256, as OpenSSH
+prints it) and who recorded it; a run with no recorded key is refused ("press
+Test"), and a different key is refused before any password is sent, in a
+sentence naming both keys. A Test that meets a new key records it as offered;
+only the owner may trust it, by the fingerprint the Test showed, and that is
+an audit row with both keys. A pin is for one host and port; changing either
+starts over with a new Test.
+
+**Vendor file connections** (`packages/core/vendor_files.ts`, source
+`vendor_files`, `server/modules/vendor_files.ts` at `/vendor-files/*`): one
+per vendor server (or address, or sender list), carrying catalog, prices,
+inventory and/or EDI documents, each picked out by a file pattern (an X12
+file is known by its content). A zip is opened and each file routed. Catalog
+goes through `applyCatalogRows` (cost into the price history), prices through
+`recordVendorPrices`, inventory through `recordAvailability`, EDI through
+`edi.receiveFile` for the vendor's trading partner (its inbox, 997s and
+quarantine). A file is applied whole or not at all (a savepoint); one that
+cannot be read is quarantined with the reason. Pulls run through the existing
+`ingest()` (the scheduler's run-due path and `POST /api/connections/:id/run`
+need nothing new). Owner, controller or buyer; trusting a key is the owner's.
+
+**Vendor feeds by SFTP and email** (`vendor_feeds.runFeed`, kinds `sftp` and
+`email`). Catalog → Vendors → Catalog connections offers API, SFTP, email-in
+and file import. An SFTP feed reads new files on its schedule
+(`runDueVendorFeeds` takes `api` and `sftp` feeds); an email-in feed is handed
+the attachment. Either way the file (CSV, TSV, XLSX, JSON, or a zip of them)
+runs through the feed's ETL and field mapping like an API answer;
+`vendor_feed_file` remembers each file by checksum so none is applied twice.
+
+**Inbound email.** Set `ERP_INBOUND_EMAIL_ADDRESS` to the mail service's
+inbound address (Postmark: `abc123@inbound.postmarkapp.com`) and point its
+inbound webhook at `POST /inbound/email?token=<ERP_EMAIL_INBOUND_TOKEN>`. Each
+company gets `local+<key>@domain` (shown in Admin → Connections → Vendor
+files) and each vendor its own (shown on its card and in Catalog connections);
+`inbound_mailbox` holds the keys. A customer points a vendor at it by asking
+the vendor to send there, or by a forwarding rule in their own mailbox (keep
+the vendor as the From; a forward that rewrites the sender needs the
+forwarding address on the sender list). A message is routed by mailbox key
+(the tenant and company, never anything the message claims) and then by sender
+to the one email connection or email-in feed that lists it (an exact address
+before an @domain; a feed may also require a subject or attachment pattern).
+Unknown senders, a sender two places list, and mail whose SPF or DMARC failed
+are held (`inbound_mail_held`, content kept) until a person assigns them
+(optionally adding the sender) or sets them aside with a reason. Data
+attachments only (CSV, TSV, TXT, XLSX, JSON, X12/EDI, zip); logos and PDFs are
+listed as left out. Mail to an address that is no company's falls through to
+the older `config.mailbox` routes (bank statements).
+
+**EDI over SFTP** (`edi.transportFor`): their outbox folder is read (optional
+pattern, optional archive folder), our documents are put in their inbox
+folder; Test SFTP and trust-key on the partner. AS2 is still not built (it
+needs S/MIME signing and encryption, MDN receipts and certificate management:
+a library such as `node-forge` plus an HTTP receiver with MDN replies). A VAN
+remains the way to reach AS2-only partners.
+
+**Catalog import template.** `GET /catalog/import/template.csv` (the
+`IMPORT_FIELDS` names in order) and `template.xlsx` (`server/static`, a
+Catalog sheet with an Instructions sheet; the checks hold its headings to
+`IMPORT_FIELDS`). The importer takes `.xlsx` (its Catalog sheet, else the
+first) as well as CSV, and leaves out the example row (model B1234-38).

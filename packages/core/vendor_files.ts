@@ -424,7 +424,7 @@ export async function dismissFile(c: Client, s: Scope, fileId: string, reason: s
 
 // --------------------------------------------------------------- views --
 
-export async function overview(c: Client, co: { id: string; tenantId: string }) {
+export async function overview(c: Client, co: { id: string; tenantId: string }, create = true) {
   const connections = await q(c, `
     select c.id, c.name, c.channel, c.status, c.vendor_id, coalesce(v.dba, v.legal_name) vendor, c.config, c.schedule_cron, c.allowed_senders,
            c.last_attempt_at, c.last_success_at, c.last_error, c.consecutive_failures, h.verdict,
@@ -442,8 +442,11 @@ export async function overview(c: Client, co: { id: string; tenantId: string }) 
   const held = await heldMail(c, co.id);
   const vendors = await q(c, `select v.id, coalesce(v.dba, v.legal_name) name from vendor_entity ve join vendor v on v.id = ve.vendor_id
      where ve.entity_id = $1 and ve.status = 'active' order by 2`, [co.id]);
-  const box = await mailboxOf(c, co.id, co.tenantId);
-  return { address: inboundAddress(box), emailReady: !!(process.env.ERP_INBOUND_EMAIL_ADDRESS && process.env.ERP_EMAIL_INBOUND_TOKEN), connections, held, vendors,
+  const emailFeeds = await q(c, `select f.id, f.name, f.vendor_id, coalesce(v.dba, v.legal_name) vendor, f.options->>'fromContains' senders
+     from vendor_feed f join vendor v on v.id = f.vendor_id where f.entity_id = $1 and f.kind = 'email' and f.active order by 4, 2`, [co.id]);
+  const box = create ? await mailboxOf(c, co.id, co.tenantId)
+    : (await q<{ mailbox_key: string }>(c, `select mailbox_key from inbound_mailbox where entity_id = $1 and vendor_id is null`, [co.id]))[0]?.mailbox_key ?? null;
+  return { address: box ? inboundAddress(box) : null, emailFeeds, emailReady: !!(process.env.ERP_INBOUND_EMAIL_ADDRESS && process.env.ERP_EMAIL_INBOUND_TOKEN), connections, held, vendors,
     kinds: KINDS.map((k) => ({ id: k, name: KIND_WORDS[k] })) };
 }
 
@@ -590,10 +593,12 @@ export async function heldMail(c: Client, entityId: string, vendorId: string | n
 }
 
 /** One vendor's own address, its email-in feeds' senders, and what is held for it: for the vendor card and the feed dialog. */
-export async function vendorMail(c: Client, co: { id: string; tenantId: string }, vendorId: string) {
+export async function vendorMail(c: Client, co: { id: string; tenantId: string }, vendorId: string, create = true) {
   const v = (await q(c, `select 1 from vendor_entity where entity_id = $1 and vendor_id = $2`, [co.id, vendorId]))[0];
   need(v, "that vendor is not set up for this company");
-  return { address: inboundAddress(await mailboxOf(c, co.id, co.tenantId, vendorId)), held: await heldMail(c, co.id, vendorId) };
+  const key = create ? await mailboxOf(c, co.id, co.tenantId, vendorId)
+    : (await q<{ mailbox_key: string }>(c, `select mailbox_key from inbound_mailbox where entity_id = $1 and vendor_id = $2`, [co.id, vendorId]))[0]?.mailbox_key ?? null;
+  return { address: key ? inboundAddress(key) : null, held: await heldMail(c, co.id, vendorId) };
 }
 
 /** A person says where held mail goes: a vendor connection or an email-in feed. The file goes through it; the sender may be added to its list. */

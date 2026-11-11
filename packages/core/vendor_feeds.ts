@@ -1081,8 +1081,9 @@ export async function recordVendorPrices(c: Client, s: Scope, vendorId: string, 
            and h.promo_cost_minor is not distinct from $7::bigint and h.effective_from is not distinct from $8::date and h.effective_to is not distinct from $9::date`,
         [s.entityId, vendorId, sku, ...vals]);
       if (same.length) continue;
-      await c.query(`insert into vendor_price_history (entity_id, vendor_id, vendor_sku, cost_minor, map_minor, msrp_minor, promo_cost_minor, effective_from, effective_to, feed_id)
-                     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [s.entityId, vendorId, sku, ...vals, feedId]);
+      // clock_timestamp, not now(): two price files in one transaction (an SFTP run) must keep their order, the later one winning.
+      await c.query(`insert into vendor_price_history (entity_id, vendor_id, vendor_sku, cost_minor, map_minor, msrp_minor, promo_cost_minor, effective_from, effective_to, feed_id, recorded_at)
+                     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, clock_timestamp())`, [s.entityId, vendorId, sku, ...vals, feedId]);
       recorded++;
     } catch (e) { if (e instanceof FeedError || e instanceof CatalogError) bad++; else throw e; }
   }

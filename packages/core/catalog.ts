@@ -80,6 +80,9 @@ export const csvCell = (v: unknown): string => {
 // ------------------------------------------------------- feed mapping --
 
 export type ImportField = { name: string; required: boolean; help: string };
+/** The example row of the downloadable import template; an import leaves it out. */
+export const TEMPLATE_EXAMPLE_SKU = "B1234-38";
+
 export const IMPORT_FIELDS: ImportField[] = [
   { name: "vendor_sku", required: true, help: "The vendor's model number; how a re-import finds the same product" },
   { name: "name", required: true, help: "Product name on the tag and the web" },
@@ -246,8 +249,11 @@ const skuPrefix = (v: { name: string; sku_prefix: string | null }) =>
 export async function previewImport(c: Client, s: Scope, a: { vendorId: string; csv: string; filename?: string; mapping: Record<string, string>;
   keep?: string[]; costOptional?: boolean }) {
   const vendor = await vendorOf(c, s.entityId, a.vendorId);
-  const rows = parseCsv(a.csv);
-  need(rows.length >= 2, "the file has no rows under its heading line");
+  const parsed = parseCsv(a.csv);
+  need(parsed.length >= 2, "the file has no rows under its heading line");
+  // The template's grey example row (model B1234-38) is not a product; it is left out before anything is counted.
+  const skuAt = parsed[0].map((h) => h.trim()).indexOf(String(a.mapping.vendor_sku ?? ""));
+  const rows = skuAt < 0 ? parsed : [parsed[0], ...parsed.slice(1).filter((r) => String(r[skuAt] ?? "").trim().toUpperCase() !== TEMPLATE_EXAMPLE_SKU)];
   need(rows.length <= 10001, "the file has more than 10,000 rows; split it");
   const headers = rows[0].map((h) => h.trim());
   const idx = new Map(headers.map((h, i) => [h, i] as [string, number]));

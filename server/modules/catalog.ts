@@ -3,7 +3,14 @@
 // images, price lists, promotions, margins, price tags with barcodes, vendor
 // ordering facts and freight, and the vendor feed import.
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
-import { ModuleError, PublicPage, need, requireRole, str, uuid, int, minor, seesCost, scrubCost } from "./kit.ts";
+import { ModuleError, PublicPage, Download, need, requireRole, str, uuid, int, minor, seesCost, scrubCost, lookOnly } from "./kit.ts";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { xlsxRows, isXlsx, FileError } from "../../packages/core/filekit.ts";
+import { loadPin } from "../../packages/core/connections.ts";
+import { TransportError } from "../../packages/core/transports.ts";
+import * as vfiles from "../../packages/core/vendor_files.ts";
 import { productSheet } from "./tearsheet.ts";
 import { q } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
@@ -23,13 +30,28 @@ export const currentImageFetch = () => imageFetch;
 
 const ID = "([0-9a-fA-F-]{36})";
 const EDIT = ["buyer"];
+
+// The catalog import template: the .xlsx (Catalog sheet: required headings dark, optional light, a grey example row 2,
+// status as a drop-down; an Instructions sheet) is a file kept beside the server; the checks hold its headings to IMPORT_FIELDS.
+const TEMPLATE_XLSX = join(dirname(fileURLToPath(import.meta.url)), "..", "static", "vendor-catalog-template.xlsx");
+export const templateCsv = () => cat.IMPORT_FIELDS.map((f) => f.name).join(",") + "\r\n";
+export const templateXlsx = () => readFileSync(TEMPLATE_XLSX);
+
+/** An uploaded workbook (base64) as CSV text: its Catalog sheet, else the first. */
+export function xlsxToCsv(b64: string): string {
+  const buf = Buffer.from(b64, "base64");
+  if (!isXlsx(buf)) throw new cat.CatalogError("that file is not an Excel workbook (.xlsx); save it as .xlsx or CSV");
+  const q_ = (v: string) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+  return xlsxRows(buf).filter((r) => r.some((v) => String(v ?? "").trim())).map((r) => r.map((v) => q_(String(v ?? ""))).join(",")).join("\r\n");
+}
+const uploadCsv = (b: Record<string, unknown>) => (typeof b.xlsx === "string" && b.xlsx ? xlsxToCsv(b.xlsx) : typeof b.csv === "string" ? b.csv : "");
 const FLOOR = ["buyer", "store_manager"];
 
 /** Core refusals are sentences already; hand them on as module refusals (422). */
 async function refuse<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn(); }
   catch (e) {
-    if (e instanceof cat.CatalogError || e instanceof PricingError || e instanceof feeds.FeedError) throw new ModuleError(e.message);
+    if (e instanceof cat.CatalogError || e instanceof PricingError || e instanceof feeds.FeedError || e instanceof FileError || e instanceof TransportError || e instanceof vfiles.VendorFilesError) throw new ModuleError(e.message);
     throw e;
   }
 }
@@ -271,13 +293,16 @@ async function vendors(c: Client, co: Company) {
            (select max(created_at) from catalog_import_run r where r.entity_id = ve.entity_id and r.vendor_id = v.id) last_import,
            (select count(*) from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id) feeds,
            (select count(*) from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id and f.active and f.last_ok = false) feeds_failing,
-           (select max(last_run_at) from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id) feeds_last_run
+           (select max(last_run_at) from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id) feeds_last_run,
+           (select mailbox_key from inbound_mailbox mb where mb.entity_id = ve.entity_id and mb.vendor_id = v.id) mailbox_key,
+           (select count(*) from connection cn where cn.entity_id = ve.entity_id and cn.vendor_id = v.id and cn.source_code = 'vendor_files' and cn.status <> 'retired') vendor_files,
+           (select count(*) from inbound_file x join connection cn on cn.id = x.connection_id where cn.entity_id = ve.entity_id and cn.vendor_id = v.id and x.status = 'quarantined') files_quarantined
       from vendor_entity ve join vendor v on v.id = ve.vendor_id
       left join vendor_profile vp on vp.entity_id = ve.entity_id and vp.vendor_id = v.id
      where ve.entity_id = $1 and ve.status = 'active' and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) order by 2`, [co.id]);
   const freight = await q(c, `select f.vendor_id, f.location_id, l.name location, f.freight_bps, f.per_unit_minor
                                 from vendor_freight f join location l on l.id = f.location_id where f.entity_id = $1 order by l.name`, [co.id]);
-  return { vendors: rows.map((v) => ({ ...v, freight: freight.filter((f) => f.vendor_id === v.id) })) };
+  return { vendors: rows.map(({ mailbox_key, ...v }) => ({ ...v, inbound_address: mailbox_key ? vfiles.inboundAddress(String(mailbox_key)) : null, freight: freight.filter((f) => f.vendor_id === v.id) })) };
 }
 
 // --------------------------------------------------------------- module
@@ -336,6 +361,8 @@ export const module: ErpModule = {
          where pr.entity_id = $1 order by pr.active desc, pr.ends_on >= current_date desc, pr.starts_on`, [co.id]),
     }));
     coGet("/catalog/import/fields", async () => ({ fields: cat.IMPORT_FIELDS }));
+    coGet("/catalog/import/template\\.csv", async () => new Download(Buffer.from(templateCsv(), "utf8"), "text/csv; charset=utf-8", "vendor-catalog-template.csv"));
+    coGet("/catalog/import/template\\.xlsx", async () => new Download(templateXlsx(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "vendor-catalog-template.xlsx"));
     coGet("/catalog/import/runs", async (c, co) => ({
       runs: await q(c, `select r.id, r.filename, r.status, r.rows, r.added, r.changed, r.unchanged, r.skipped, r.created_at, r.applied_at,
                                coalesce(v.dba, v.legal_name) vendor, u.name created_by
@@ -454,9 +481,16 @@ export const module: ErpModule = {
       credential_env: f.credential_ref ? feeds.secretEnvName(String(f.credential_ref)) : null,
       credential_set: !!(f.credential_ref && feedEnv().secret(String(f.credential_ref))),
       running: !!f.running,
-      transport_note: f.kind === "sftp" ? "SFTP pulls are not built in this version yet; these settings are kept for when they are."
-        : f.kind === "email" ? "Email-in is not built in this version yet; these settings are kept for when it is." : null,
+      transport_note: null,
+      pin: f.kind === "sftp" ? await loadPin(c, { kind: "vendor_feed", id: String(f.id), entityId: co.id }) : null,
+      files: f.kind === "sftp" || f.kind === "email" ? await feeds.feedFiles(c, co.id, String(f.id)) : [],
     });
+    /** The vendor's own inbound address (made on first look, never on a look-only read) and what is held for it. */
+    const vendorMail = async (c: Client, co: Company, vendorId: string) => {
+      const have = (await q<{ mailbox_key: string }>(c, `select mailbox_key from inbound_mailbox where entity_id = $1 and vendor_id = $2`, [co.id, vendorId]))[0];
+      const key = have?.mailbox_key ?? (lookOnly(c) ? null : await vfiles.mailboxOf(c, co.id, co.tenantId, vendorId));
+      return { address: key ? vfiles.inboundAddress(key) : null, emailReady: !!process.env.ERP_INBOUND_EMAIL_ADDRESS, held: await vfiles.heldMail(c, co.id, vendorId) };
+    };
     coGet(`/catalog/vendors/${ID}/feeds`, async (c, co, _u, m) => {
       const v = (await q<{ id: string; name: string }>(c, `select v.id, coalesce(v.dba, v.legal_name) as name from vendor_entity ve join vendor v on v.id = ve.vendor_id
                                                            where ve.entity_id = $1 and ve.vendor_id = $2 and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise)`, [co.id, m[2]]))[0];
@@ -466,7 +500,7 @@ export const module: ErpModule = {
       const out = [];
       for (const r of rows) out.push(await feedOut(c, co, r));
       const locations = await q(c, `select id, code, name, kind from location where entity_id = $1 and status = 'active' and kind not in ('in_transit','dropship') order by kind <> 'warehouse', name`, [co.id]);
-      return { vendor: v, feeds: out, locations, photos: await feeds.photoTally(c, co.id, m[2]), secretKeySet: !!feedEnv().secretKey,
+      return { vendor: v, feeds: out, locations, photos: await feeds.photoTally(c, co.id, m[2]), secretKeySet: !!feedEnv().secretKey, mail: await vendorMail(c, co, m[2]),
         purposes: feeds.PURPOSES, fields: feeds.PURPOSE_FIELDS, templates: [["ashley", "Ashley (products, prices, ATP quantities, freight, orders)"],
           ["generic_json", "Generic REST / JSON"], ["csv_https", "CSV over HTTPS"], ["blank", "Blank"]] };
     });
@@ -505,6 +539,10 @@ export const module: ErpModule = {
       await requireRole(c, co, a, EDIT, "running a vendor feed");
       return refuse(() => feeds.runFeed(c, sc(co, a), m[2], feedEnv(), "manual"));
     });
+    coPost(`/catalog/feeds/${ID}/trust-key`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, ["owner"], "trusting a changed SFTP server key");
+      return refuse(() => feeds.trustFeedKey(c, sc(co, a), m[2], str(b.fingerprint, 80), a.personName));
+    });
     coPost(`/catalog/feeds/${ID}/stop`, async (c, co, a, _b, m) => {
       await requireRole(c, co, a, EDIT, "stopping a vendor feed");
       return refuse(() => feeds.requestStop(c, sc(co, a), m[2]));
@@ -531,22 +569,23 @@ export const module: ErpModule = {
     // ---- vendor feed import: columns -> preview -> apply
     coPost("/catalog/import/columns", async (c, co, a, b) => {
       await requireRole(c, co, a, EDIT, "importing a vendor catalog");
-      const csv = typeof b.csv === "string" ? b.csv : "";
-      need(csv.trim(), "choose a CSV file first");
+      const csv = await refuse(async () => uploadCsv(b));
+      need(csv.trim(), "choose a CSV or Excel (.xlsx) file first");
       const rows = await refuse(async () => cat.parseCsv(csv.slice(0, 200000)));
       need(rows.length >= 1, "the file is empty");
       const headers = rows[0].map((h) => h.trim()).filter(Boolean);
       const mapping = cat.automap(headers);
       return { headers, mapping, missing: cat.missingRequired(mapping), sample: rows.slice(1, 4), fields: cat.IMPORT_FIELDS };
-    });
+    }, { maxBody: 12_000_000 });
     coPost("/catalog/import/preview", async (c, co, a, b) => {
       await requireRole(c, co, a, EDIT, "importing a vendor catalog");
       const v = uuid(b.vendorId); need(v, "pick the vendor this file is from");
       const mapping: Record<string, string> = {};
       for (const [k, val] of Object.entries((b.mapping ?? {}) as Record<string, unknown>)) if (typeof val === "string" && val) mapping[k] = val;
-      need(typeof b.csv === "string" && b.csv.length <= 8_000_000, "the file is larger than 8 MB; split it");
-      return refuse(() => cat.previewImport(c, sc(co, a), { vendorId: v!, csv: b.csv as string, filename: str(b.filename, 200), mapping }));
-    });
+      const csv = await refuse(async () => uploadCsv(b));
+      need(csv && csv.length <= 8_000_000, "the file is larger than 8 MB; split it");
+      return refuse(() => cat.previewImport(c, sc(co, a), { vendorId: v!, csv, filename: str(b.filename, 200), mapping }));
+    }, { maxBody: 12_000_000 });
     coPost(`/catalog/import/runs/${ID}/apply`, async (c, co, a, _b, m) => {
       await requireRole(c, co, a, EDIT, "importing a vendor catalog");
       return refuse(() => cat.applyImport(c, sc(co, a), m[2]));

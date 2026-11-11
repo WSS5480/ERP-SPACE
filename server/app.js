@@ -2408,7 +2408,7 @@ window.ERP = {
   api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
   head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input,
   drill, drillList, drillItems, drillNode, drillSum, drillRow, opener, openKind: (kind, id) => (OPENERS[kind] ? OPENERS[kind](id) : null),
-  openEntry, NARROW,
+  openEntry, NARROW, openAddVendor,
   // defined further down (sign-in and who you are); wrapped so they resolve when called
   isOperator: () => isOperator(), isCustomer: () => isCustomer(), inSupport: () => inSupport(), managesAccount: () => managesAccount(), boot: () => boot(),
   /** homeCard(async () => node | null): a card on Home, after the tiles */
