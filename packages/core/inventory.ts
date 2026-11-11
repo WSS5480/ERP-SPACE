@@ -34,6 +34,7 @@
 import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post, profitObjectFor } from "./posting.ts";
+import { selfApprovalFor, auditSelfApproval } from "./approvals.ts";
 
 export class InventoryError extends Error {}
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new InventoryError(msg); };
@@ -1582,6 +1583,9 @@ export async function submitCount(c: Client, scope: Scope, id: string, lines: { 
   return { number: ct.number, varianceMinor: BigInt(v[0].v) };
 }
 
+/** Who approves a count (besides the owner and a controller, who block a self-approval too). */
+export const COUNT_APPROVERS = ["store_manager"];
+
 /**
  * Approve or reject a submitted count. The person deciding must not be the
  * one who made or submitted it (role is checked by the caller). Approving
@@ -1591,11 +1595,14 @@ export async function decideCount(c: Client, scope: Scope, id: string, e: { appr
   const ct = await countOf(c, scope.entityId, id);
   need(ct.status === "submitted", `count ${ct.number} is ${ct.status}; only a submitted count is decided`);
   const me = scope.actor.id || "";
-  need(me !== ct.created_by && me !== ct.submitted_by, "the person who made or submitted a count cannot also approve it");
+  // The maker is never the checker -- unless they are the owner and nobody else here could approve a count (0063).
+  const selfApproved = await selfApprovalFor(c, scope.entityId, me, [ct.created_by, ct.submitted_by], COUNT_APPROVERS,
+    "the person who made or submitted a count cannot also approve it");
   if (!e.approve) {
     need(String(e.note ?? "").trim(), "say why the count is rejected");
-    await c.query(`update inv_count set status = 'rejected', decided_by = $3, decided_at = now(), decision_note = $4 where id = $1 and entity_id = $2`, [id, scope.entityId, me, e.note]);
-    return { number: ct.number, status: "rejected", varianceMinor: 0n, journalEntryId: null };
+    await c.query(`update inv_count set status = 'rejected', decided_by = $3, decided_at = now(), decision_note = $4, self_approved = $5 where id = $1 and entity_id = $2`, [id, scope.entityId, me, e.note, selfApproved]);
+    if (selfApproved) await auditSelfApproval(c, scope, "inv_count", id, { number: ct.number, decision: "rejected" });
+    return { number: ct.number, status: "rejected", varianceMinor: 0n, journalEntryId: null, selfApproved };
   }
   const lines = await q<{ product_id: string; serialized: boolean; expected_qty: string; counted_qty: string; expected_labels: string[]; scanned_labels: string[]; unit_cost_minor: string }>(c,
     `select product_id, serialized, expected_qty, counted_qty, expected_labels, scanned_labels, unit_cost_minor from inv_count_line where entity_id = $1 and count_id = $2`,
@@ -1658,9 +1665,10 @@ export async function decideCount(c: Client, scope: Scope, id: string, e: { appr
     }
   }
   const je = await postValue(c, scope, ct.location_id, value, id, `Cycle count ${ct.number} variance`);
-  await c.query(`update inv_count set status = 'approved', decided_by = $3, decided_at = now(), decision_note = $4, variance_minor = $5, journal_entry_id = $6
-    where id = $1 and entity_id = $2`, [id, scope.entityId, me, e.note ?? null, value.toString(), je]);
-  return { number: ct.number, status: "approved", varianceMinor: value, journalEntryId: je };
+  await c.query(`update inv_count set status = 'approved', decided_by = $3, decided_at = now(), decision_note = $4, variance_minor = $5, journal_entry_id = $6, self_approved = $7
+    where id = $1 and entity_id = $2`, [id, scope.entityId, me, e.note ?? null, value.toString(), je, selfApproved]);
+  if (selfApproved) await auditSelfApproval(c, scope, "inv_count", id, { number: ct.number, decision: "approved", variance: value.toString() });
+  return { number: ct.number, status: "approved", varianceMinor: value, journalEntryId: je, selfApproved };
 }
 
 // ============================================================== adjustments

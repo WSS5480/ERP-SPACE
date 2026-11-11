@@ -21,6 +21,7 @@ import { runDueReports } from "../packages/core/reports.ts";
 import { runDueConnections, runDueVendorFeeds, runDueCrm, runDueEdi, runDueHolds } from "../scripts/run-due.ts";
 import { recordError, redact } from "./errors.ts";
 import { purgeHeldContent } from "../packages/core/vendor_files.ts";
+import { makeDigest, digestCompanies } from "../packages/core/owner_digest.ts";
 
 export type JobItem = { tenantId?: string | null; entityId?: string | null; ok: boolean; note: string };
 export type JobOutcome = { items: JobItem[]; summary: string };
@@ -47,6 +48,26 @@ export async function rollPeriods(_now: Date): Promise<JobOutcome> {
   return { items, summary: `${plural(opened, "month")} opened across ${plural(cos.length, "company")}` };
 }
 
+/** The daily owner digest: every self-approval of the last 24 hours, per company of a customer (never the demo, never a suspended one). */
+export async function ownerDigests(now: Date): Promise<JobOutcome> {
+  const c0 = await pool.connect();
+  let cos: { id: string; tenant_id: string }[];
+  try { cos = await digestCompanies(c0); } finally { c0.release(); }
+  const items: JobItem[] = [];
+  let made = 0;
+  for (const co of cos) {
+    try {
+      const actor = { kind: "system" as const, label: "owner digest" };
+      const r = await tx(actor, (c) => makeDigest(c, { tenantId: co.tenant_id, entityId: co.id, actor }, now));
+      if (r.made) made++;
+      if (r.made || r.items) items.push({ tenantId: co.tenant_id, entityId: co.id, ok: true, note: r.note });
+    } catch (e) {
+      items.push({ tenantId: co.tenant_id, entityId: co.id, ok: false, note: (e as Error).message });
+    }
+  }
+  return { items, summary: `${plural(made, "digest")} made across ${plural(cos.length, "company")}` };
+}
+
 export const JOBS: JobDef[] = [
   { id: "periods", label: "Accounting periods", everyMin: 24 * 60, what: "Keeps the next three months open for posting in every company.", run: rollPeriods },
   { id: "connections", label: "Bank and statement pulls", everyMin: 15, what: "Pulls statements from connections that fetch on a schedule.",
@@ -61,6 +82,8 @@ export const JOBS: JobDef[] = [
     run: async (now) => { const r = await runDueHolds(now); return { items: r.map((x) => ({ tenantId: x.tenantId, entityId: x.entityId, ok: !x.note, note: `${x.holds} holds ran out, ${x.released} lines back${x.note ? ` — ${x.note}` : ""}` })), summary: `${plural(r.length, "company")} with holds ending` }; } },
   { id: "reports", label: "Scheduled reports", everyMin: 60, what: "Runs reports people scheduled and prepares their emails.",
     run: async () => { const r = await runDueReports(pool, tx); return { items: r.runs.map((x) => ({ tenantId: x.tenantId, entityId: x.entityId, ok: x.ok, note: `${x.name}: ${x.note}` })), summary: `${r.due} reports were due` }; } },
+  { id: "owner_digest", label: "Owner self-approval digest", everyMin: 24 * 60, what: "Tells each company's owners about every self-approval of the last day, and any role taken away just before one; emailed when email is connected.",
+    run: ownerDigests },
   { id: "held_mail", label: "Held vendor mail", everyMin: 24 * 60, what: "Drops the files of vendor mail held more than 60 days for review; the record of each message stays.",
     run: async (now) => { const r = await tx({ kind: "system", label: "scheduler" }, (c) => purgeHeldContent(c, now)); return { items: [], summary: `${plural(r.purged, "held file")} past 60 days dropped (records kept)` }; } },
   { id: "outbox", label: "Outbox sweep", everyMin: 15, what: "Sends email and texts a restart left queued (the server also drains it every minute).",

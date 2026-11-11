@@ -31,6 +31,10 @@ import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { WorkforceError, cancelShift } from "./workforce.ts";
 import { addBlackout } from "./fleet.ts";
+import { selfApprovalFor, auditSelfApproval } from "./approvals.ts";
+
+/** Who decides time off (besides the owner and a controller). */
+export const LEAVE_APPROVERS = ["hr", "store_manager"];
 
 function need(cond: unknown, msg: string): asserts cond { if (!cond) throw new WorkforceError(msg); }
 const UUIDRX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -248,13 +252,21 @@ async function payDay(c: Client, scope: Scope, p: { id: string; pay_type: string
 export async function decide(c: Client, scope: Scope, id: string, d: { approve: boolean; note?: string }) {
   const r = await reqOf(c, scope.entityId, id);
   need(r.status === "requested", `that request is already ${r.status}`);
-  need(!r.app_user_id || r.app_user_id !== scope.actor.id, "nobody approves or declines their own time off; another manager does");
-  need(!r.requested_by || r.requested_by !== scope.actor.id, "whoever entered a time-off request does not decide it; another manager does");
+  // Nobody decides their own time off, or what they entered -- unless they are the owner who entered it and
+  // nobody else here could decide it (0063): then it is the owner's self-approval.
+  const selfApproved = await selfApprovalFor(c, scope.entityId, scope.actor.id || "", [r.requested_by], LEAVE_APPROVERS,
+    r.app_user_id && r.app_user_id === scope.actor.id ? "nobody approves or declines their own time off; another manager does"
+      : "whoever entered a time-off request does not decide it; another manager does");
+  if (!selfApproved) {
+    need(!r.app_user_id || r.app_user_id !== scope.actor.id, "nobody approves or declines their own time off; another manager does");
+    need(!r.requested_by || r.requested_by !== scope.actor.id, "whoever entered a time-off request does not decide it; another manager does");
+  }
   if (!d.approve) {
     need(String(d.note ?? "").trim().length >= 3, "say why the time off is declined");
-    await c.query(`update leave_request set status = 'declined', decided_by = $3, decided_at = now(), decision_note = $4 where entity_id = $1 and id = $2`,
-      [scope.entityId, id, scope.actor.id || null, String(d.note).trim().slice(0, 300)]);
-    return { status: "declined" };
+    await c.query(`update leave_request set status = 'declined', decided_by = $3, decided_at = now(), decision_note = $4, self_approved = $5 where entity_id = $1 and id = $2`,
+      [scope.entityId, id, scope.actor.id || null, String(d.note).trim().slice(0, 300), selfApproved]);
+    if (selfApproved) await auditSelfApproval(c, scope, "leave_request", id, { decision: "declined" });
+    return { status: "declined", selfApproved };
   }
   const t = await typeOf(c, scope.entityId, r.leave_type_id);
   const p = await person(c, scope.entityId, r.employee_id);
@@ -279,8 +291,9 @@ export async function decide(c: Client, scope: Scope, id: string, d: { approve: 
             or exists (select 1 from time_punch tp where tp.entity_id = $1 and tp.employee_id = $2 and tp.work_day = d.day and tp.voided_at is null))
      order by d.day limit 1`, [scope.entityId, r.employee_id, id]);
   need(!worked.length, `${r.name} already has time worked on ${worked[0] ? dayWords(worked[0].day) : ""}${worked[0]?.hours ? ` (${n(worked[0].hours)} h)` : ""}; a day is paid once, so ask for the hours not worked that day instead`);
-  await c.query(`update leave_request set status = 'approved', decided_by = $3, decided_at = now(), decision_note = nullif($4,'') where entity_id = $1 and id = $2`,
-    [scope.entityId, id, scope.actor.id || null, String(d.note ?? "").trim().slice(0, 300)]);
+  await c.query(`update leave_request set status = 'approved', decided_by = $3, decided_at = now(), decision_note = nullif($4,''), self_approved = $5 where entity_id = $1 and id = $2`,
+    [scope.entityId, id, scope.actor.id || null, String(d.note ?? "").trim().slice(0, 300), selfApproved]);
+  if (selfApproved) await auditSelfApproval(c, scope, "leave_request", id, { decision: "approved", hours: r.total_hours });
   if (t.kind !== "unpaid") {
     await c.query(`insert into leave_ledger (entity_id, employee_id, leave_type_id, occurred_on, kind, hours, request_id, note, created_by)
                    values ($1,$2,$3,$4,'taken',$5,$6,$7,$8)`,
@@ -299,7 +312,7 @@ export async function decide(c: Client, scope: Scope, id: string, d: { approve: 
     for (const day of days) if (await payDay(c, scope, p, day, t.name, id, scope.actor.id || null)) paid++;
   }
   await audit(c, scope, { table: "leave_request", rowId: id, action: "transition", before: { status: "requested" }, after: { status: "approved", shiftsCancelled: shifts.length, daysPaid: paid } });
-  return { status: "approved", shiftsCancelled: shifts.length, daysPaid: paid };
+  return { status: "approved", shiftsCancelled: shifts.length, daysPaid: paid, selfApproved };
 }
 
 /** Withdraw a request, or take back approved leave that has not been paid in a payroll run. */
@@ -331,7 +344,7 @@ export async function requests(c: Client, entityId: string, f: { employeeId?: st
   return q(c, `
     select r.id, r.employee_id, e.first_name || ' ' || e.last_name employee, e.app_user_id, t.name type, t.kind, t.paid, r.starts_on::text starts_on,
            r.ends_on::text ends_on, r.hours_per_day::float hours_per_day, r.total_hours::float total_hours, r.note, r.status,
-           r.requested_at::text requested_at, du.name decided_by, r.decision_note, r.cancel_reason
+           r.requested_at::text requested_at, du.name decided_by, r.self_approved, r.decision_note, r.cancel_reason
       from leave_request r join employee e on e.id = r.employee_id join leave_type t on t.id = r.leave_type_id
       left join app_user du on du.id = r.decided_by
      where r.entity_id = $1 and ($2::uuid is null or r.employee_id = $2) and ($3::text is null or r.status = $3)

@@ -787,15 +787,34 @@ async function screenHome() {
 
   // Cards modules add to Home (pinned reports, ...). One that fails to load is left out, never breaks Home.
   const extras = (await Promise.all(cardsOn().map((f) => Promise.resolve().then(f).catch(() => null)))).filter(Boolean);
+  // The owner's daily digest of self-approvals: each opens the list behind it (with Back), each line opens its record.
+  const digests = d.selfDigests || [];
+  const digestCard = digests.length ? section('Self-approvals', `${digests.length} in 14 days`, null, el('div', { class: 'panel' }, digests.map((g) => item({
+    title: g.title, detail: [dayLabel(g.for_day), g.removals.length ? `${plural(g.removals.length, 'role')} taken away just before` : null, g.emailed ? 'emailed to the owners' : null].filter(Boolean).join(' · '),
+    badge: g.removals.length ? chip('serious', 'warn', 'Look at this') : chip('neutral', 'info', 'Digest'), onClick: () => openDigest(g) })))) : null;
   return frag(
     head('Home', canSee('payables') ? [el('button', { class: 'btn primary', type: 'button', onclick: () => openNewBill() }, icon('plus'), 'New bill')] : []),
-    trialBanner(), tiles, extras,
+    trialBanner(), tiles, digestCard, extras,
     el('div', { class: 'two', style: null },
       section('Needs a person', items.length ? `${items.length} open` : null, null,
         el('div', { class: 'panel' }, items.length ? items : empty('Nothing is waiting on a person.', 'Approvals, bills stopped at the gates, late sweeps and unmatched money show up here.'))),
       el('div', {},
         canSee('payroll') ? section('Payroll', null, null, el('div', { class: 'panel' }, payrollCard)) : null,
         canSee('feeds') ? section('Feeds', null, null, el('div', { class: 'panel' }, feedsCard)) : null)));
+}
+/** One day's self-approval digest: what was self-approved, and any role taken away in the 24 hours before one. */
+function openDigest(g) {
+  const removed = g.removals.length ? el('div', {}, resultBox('serious', 'warn', 'Roles taken away just before a self-approval',
+      'Taking away the only other approver is how self-approval is reached on purpose. If you did not mean these, put the roles back in Setup, People.'),
+    el('div', { class: 'panel' }, g.removals.map((r) => item({ title: `${r.person || 'Someone'} lost ${r.role.replace(/_/g, ' ')}${r.companyWide ? ' (every company)' : ''}`,
+      detail: [r.kind === 'person_inactive' ? 'no longer active' : null, r.by ? `by ${r.by}` : null, ago(r.at)].filter(Boolean).join(' · ') })))) : null;
+  return drillItems(g.title, g.items.map((x) => item({ title: x.title,
+    detail: [x.detail, `by ${x.by || 'someone'}`, ago(x.at)].filter(Boolean).join(' · '),
+    amount: x.amountMinor != null && x.flow !== 'count' ? money(x.amountMinor) : null,
+    badge: x.decision === 'rejected' || x.decision === 'declined' ? chip('critical', 'fail', cap(x.decision)) : chip('good', 'ok', 'Self-approved'),
+    onClick: x.link ? () => openSubject(x.link) : x.screen && canSee(x.screen) ? () => go(x.screen) : null })),
+  { noun: 'self-approval', before: removed, none: 'Nothing was self-approved that day.',
+    foot: 'A self-approval is the maker deciding their own request because nobody else in the company holds a role that could. It ends the moment a second owner, a controller or an approver for that kind of request is added.' });
 }
 /** Home for someone outside the back office: just the screens they work in. */
 async function screenRoleHome() {
@@ -915,10 +934,42 @@ async function decide(a, decision, btn, after) {
     if (note == null) return;
     callback = true;
   }
-  await act(btn, () => post(`/approvals/${a.id}`, { decision, note, callback }), (r) =>
+  // Approving your own bank change or run: type the payee or the total (the server checks it too).
+  let confirm;
+  if (decision === 'approved' && a.self && a.confirm) {
+    confirm = await askTypedConfirm(a);
+    if (confirm == null) return;
+  }
+  await act(btn, () => post(`/approvals/${a.id}`, { decision, note, callback, confirm }), (r) =>
     r.status === 'approved' ? (a.subject_type === 'invoice' ? 'Approved, and posted to the books.'
       : a.subject.kind === 'vendor_bank' ? 'Approved. The new details are in use; the first payment to them waits three days.' : 'Approved.')
     : r.status === 'rejected' ? 'Rejected, with your reason on record.' : 'Your step is done; it moves on to the next person.', { close: after });
+}
+/**
+ * The owner approving their own new bank details or run types what it is:
+ * the payee's name, or the total. Resolves to what was typed, or null.
+ */
+function askTypedConfirm(a) {
+  const cf = a.confirm;
+  return new Promise((resolve) => {
+    let answered = false;
+    const d = openDialog('Confirm your own approval', subjTitle(a.subject), { onClose: () => { if (!answered) resolve(null); } });
+    const input = el('input', { type: 'text', autocomplete: 'off', spellcheck: 'false', inputmode: cf.kind === 'amount' ? 'decimal' : null,
+      placeholder: cf.kind === 'amount' ? 'e.g. 1,284.55' : 'the payee’s name', 'aria-label': cf.prompt });
+    const err = el('div');
+    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => {
+      const v = input.value.trim();
+      if (!v) { err.replaceChildren(resultBox('warning', 'warn', 'Type it to go on', cf.prompt + '.')); input.focus(); return; }
+      answered = true; resolve(v); d.close();
+    } }, icon('check'), 'Approve');
+    d.body.append(
+      el('p', { class: 'lead', text: 'You made this, and nobody else here can approve it, so your approval is recorded as self-approved and listed in tomorrow’s owner digest. Money leaving the business on your word alone gets one more look.' }),
+      el('div', { class: 'panel' }, el('div', { class: 'facts' },
+        el('div', { class: 'wide2' }, el('span', { class: 'k', text: cf.kind === 'amount' ? 'The total' : 'The payee' }), el('div', { class: 'fv wrapany', text: cf.expect })))),
+      el('label', { class: 'field' }, el('span', { text: cf.prompt }), input),
+      el('div', { class: 'dlg-acts' }, go, el('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Cancel')), err);
+    setTimeout(() => input.focus(), 0);
+  });
 }
 /**
  * New bank details for a vendor are approved only after a call to the phone

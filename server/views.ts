@@ -9,6 +9,8 @@
 import { today as bizToday } from "../packages/core/clock.ts";
 import { type Client, q, one } from "../packages/core/db.ts";
 import { handlerFor } from "../packages/core/connections.ts";
+import { recentDigests } from "../packages/core/owner_digest.ts";
+import { selfApprovalRefusal, selfConfirmFor, SUPPORT_SELF_APPROVAL, type SelfConfirm } from "../packages/core/approvals.ts";
 
 export type Company = {
   id: string;
@@ -265,17 +267,22 @@ export async function approvals(c: Client, co: Company, personId: string | null)
     const waiting = who.length ? `waiting on ${either(who)}, the ${role}` : `nobody here holds the ${role} role yet; the owner can grant it`;
     let why = "";
     let canDecide = false;
+    let confirm: SelfConfirm | null = null;
     if (!personId) why = `Pick who you are acting as; ${waiting}`;
     else if (r.maker_id === personId) {
       // The owner of a company where nobody else could decide it approves it themselves (recorded as self-approved).
-      const anyoneElse = holders.some((h) => h.id !== personId && (h.role === r.step_role || h.role === "owner" || h.role === "controller"));
-      if (held.has("owner") && !anyoneElse) { canDecide = true; why = "You made it, and nobody else here can approve it, so you can (recorded as self-approved)"; }
+      // The same rule decide() applies (selfApprovalRefusal), so the screen never offers what the server refuses.
+      const refusal = await selfApprovalRefusal(c, co.id, personId, [r.step_role]);
+      if (refusal === null) { canDecide = true; why = "You made it, and nobody else here can approve it, so you can (recorded as self-approved)"; confirm = await selfConfirmFor(c, co.id, r.id); }
+      else if (refusal === SUPPORT_SELF_APPROVAL) why = "In support mode you cannot approve the owner's own request for them; the owner approves it signed in as themselves";
       else why = `You made it, so someone else approves it: ${waiting}`;
     }
     else if (already.has(personId)) why = `You decided an earlier step; the next is ${waiting}`;
     else if (!held.has(r.step_role)) why = cap(waiting);
     else canDecide = true;
-    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why, self: canDecide && r.maker_id === personId });
+    // a self-approval of new bank details or a run asks for the payee or the total to be typed (the server checks it)
+    const ask = confirm ? { kind: confirm.kind, prompt: confirm.prompt, expect: confirm.expect } : null;
+    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why, self: canDecide && r.maker_id === personId, confirm: ask });
   }
 
   const recent = await q(c, `
@@ -1107,6 +1114,10 @@ export async function home(c: Client, co: Company, personId: string | null) {
     cash: { total: cashTotal.toString(), operating, byPurpose: cashRows },
     bills: billStats,
     approvals: { mine: appr.mine, othersCount: appr.others.length },
+    selfDigests: personId && (await q(c, `
+      select 1 from role_grant g join app_user u on u.id = g.app_user_id
+       where g.app_user_id = $2 and g.role = 'owner' and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $3)) limit 1`, [co.id, personId, co.tenantId])).length
+      ? await recentDigests(c, co.id) : [],
     payroll: nextPay,
     payGroups: payGroups.n,
     hires: (await q<{ n: number }>(c, `select count(*)::int as n from employee where entity_id = $1 and status = 'applicant'`, [co.id]))[0].n,

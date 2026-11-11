@@ -13,6 +13,7 @@ import { scopeOf } from "../actions.ts";
 import { q, one } from "../../packages/core/db.ts";
 import { PostingError } from "../../packages/core/posting.ts";
 import * as ar from "../../packages/core/ar.ts";
+import { mayDecideOwn } from "../../packages/core/approvals.ts";
 
 const day = (v: unknown, dflt: string) => { const s = str(v, 10); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : dflt; };
 const B = (v: unknown) => BigInt(String(v ?? 0));
@@ -190,7 +191,7 @@ export const H = {
 
   writeoffs: wrap(async (c: Client, co: Company) => q(c, `
     select w.id, w.status, w.amount_minor, w.method, w.reason, w.requested_at::text, w.decided_at::text, w.decision_note, w.recovered_minor,
-           w.requested_by, ru.name requested_by_name, du.name decided_by_name, cu.name customer, w.customer_id,
+           w.requested_by, ru.name requested_by_name, du.name decided_by_name, w.self_approved, cu.name customer, w.customer_id,
            coalesce(i.number, k.number) target
       from ar_writeoff w join customer cu on cu.id = w.customer_id
       left join customer_invoice i on i.id = w.invoice_id left join ar_contract k on k.id = w.contract_id
@@ -494,7 +495,12 @@ export const module: ErpModule = {
     kit.coGet("/ar/aging", async (c, co, u) => H.aging(c, co, day(g(u, "asOf"), await bizToday(c, co.id))));
     kit.coGet("/ar/collections", async (c, co, u) => H.callList(c, co, day(g(u, "asOf"), await bizToday(c, co.id))));
     kit.coGet("/ar/templates", (c, co) => H.templates(c, co));
-    kit.coGet("/ar/writeoffs", (c, co) => H.writeoffs(c, co));
+    kit.coGet("/ar/writeoffs", async (c, co, _u, _m, p) => {
+      // a pending write-off the person asked for: may they approve it as the owner's self-approval (0063)?
+      const rows = await H.writeoffs(c, co) as { status: string; requested_by: string }[];
+      const selfOk = p && rows.some((r) => r.status === "pending" && r.requested_by === p) ? await mayDecideOwn(c, p, co.id, ar.WRITEOFF_APPROVERS) : false;
+      return rows.map((r) => ({ ...r, self_ok: selfOk && r.status === "pending" && r.requested_by === p }));
+    });
     kit.coGet("/ar/contracts", (c, co) => H.contracts(c, co));
     kit.coGet(`/ar/contracts/${ID}`, (c, co, _u, m) => H.contract(c, co, m[2]));
     kit.coGet(`/ar/contracts/${ID}/payoff`, async (c, co, u, m) => H.payoff(c, co, m[2], day(g(u, "asOf"), await bizToday(c, co.id))));

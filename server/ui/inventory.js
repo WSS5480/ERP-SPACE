@@ -465,8 +465,9 @@
       [el('button', { class: 'btn small primary', type: 'button', onclick: () => newCount(L) }, 'Count a bin')],
       el('div', { class: 'panel' }, list.length ? list.map((c) => item({ title: `${c.number} · ${c.location}${c.bin ? ' · ' + c.bin : ' · unbinned'}`,
         amount: c.variance_minor != null ? money(c.variance_minor) : null, badge: statusChip(c.status),
-        detail: [plural(c.lines, 'line'), `by ${c.created_by}`, c.submitted_by ? `submitted by ${c.submitted_by}` : null, c.decided_by ? `${words(c.status)} by ${c.decided_by}` : null, c.decision_note].filter(Boolean).join(' · '),
-        why: c.status === 'submitted' && me && (me === c.created_by_id || me === c.submitted_by_id) ? 'You counted this one, so someone else approves it.' : null,
+        detail: [plural(c.lines, 'line'), `by ${c.created_by}`, c.submitted_by ? `submitted by ${c.submitted_by}` : null, c.decided_by ? `${words(c.status)} by ${c.decided_by}${c.self_approved ? ' (self-approved)' : ''}` : null, c.decision_note].filter(Boolean).join(' · '),
+        why: c.status === 'submitted' && me && (me === c.created_by_id || me === c.submitted_by_id)
+          ? (c.self_ok ? 'You counted this one, and nobody else here can approve it, so you can (recorded as self-approved).' : 'You counted this one, so someone else approves it.') : null,
         onClick: () => openCount(c.id) })) : empty('No counts yet.', null, true)));
   }
   function newCount(L) {

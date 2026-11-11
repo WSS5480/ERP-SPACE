@@ -7,6 +7,7 @@ import { need, requireRole, str, uuid, int, minor, ModuleError } from "./kit.ts"
 import { q } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
 import * as inv from "../../packages/core/inventory.ts";
+import { mayDecideOwn } from "../../packages/core/approvals.ts";
 import * as wms from "../../packages/core/wms.ts";
 import { PostingError } from "../../packages/core/posting.ts";
 
@@ -124,7 +125,7 @@ async function damage(c: Client, co: Company) {
 async function counts(c: Client, co: Company) {
   return q(c, `
     select ct.id, ct.number, ct.status, l.name location, b.code bin, ct.created_at, ct.variance_minor::text,
-           mk.name created_by, sb.name submitted_by, dc.name decided_by, ct.decision_note, ct.created_by created_by_id, ct.submitted_by submitted_by_id,
+           mk.name created_by, sb.name submitted_by, dc.name decided_by, ct.self_approved, ct.decision_note, ct.created_by created_by_id, ct.submitted_by submitted_by_id,
            (select count(*) from inv_count_line x where x.count_id = ct.id and x.entity_id = ct.entity_id)::int lines
       from inv_count ct join location l on l.id = ct.location_id left join inv_bin b on b.id = ct.bin_id
       left join app_user mk on mk.id = ct.created_by left join app_user sb on sb.id = ct.submitted_by left join app_user dc on dc.id = ct.decided_by
@@ -195,7 +196,13 @@ export const module: ErpModule = {
     coGet("/inventory/transfers", safe((c, co) => transfers(c, co)));
     coGet("/inventory/orders-to-move", safe((c, co) => ordersToMove(c, co)));
     coGet("/inventory/damage", safe((c, co) => damage(c, co)));
-    coGet("/inventory/counts", safe((c, co) => counts(c, co)));
+    coGet("/inventory/counts", safe(async (c, co, _u, _m, p) => {
+      // a submitted count the person made: may they approve it as the owner's self-approval (0063)?
+      const rows = await counts(c, co) as { status: string; created_by_id: string; submitted_by_id: string | null }[];
+      const selfOk = p && rows.some((r) => r.status === "submitted" && (r.created_by_id === p || r.submitted_by_id === p))
+        ? await mayDecideOwn(c, p, co.id, inv.COUNT_APPROVERS) : false;
+      return rows.map((r) => ({ ...r, self_ok: selfOk && r.status === "submitted" && (r.created_by_id === p || r.submitted_by_id === p) }));
+    }));
     coGet(`/inventory/counts/${ID}`, safe((c, co, _u, m) => countDetail(c, co, m[2])));
     coGet("/inventory/adjustments", safe(async (c, co) => ({ reasons: inv.REASONS, rows: await adjustments(c, co) })));
     coGet("/inventory/orders-to-pick", safe((c, co) => ordersToPick(c, co)));

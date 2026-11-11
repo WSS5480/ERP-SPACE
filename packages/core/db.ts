@@ -15,6 +15,8 @@ export type Actor = {
   kind: "user" | "agent" | "system";
   id?: string;
   label: string;
+  /** An operator's support session acting inside the tenant: never self-approves for the owner (db.tx sets erp.support). */
+  support?: string | null;
 };
 
 export type Scope = {
@@ -59,6 +61,7 @@ export async function tx<T>(actor: Actor, fn: (c: Client) => Promise<T>): Promis
     await c.query("select set_config('erp.actor_kind', $1, true)", [actor.kind]);
     await c.query("select set_config('erp.actor_label', $1, true)", [actor.label]);
     await c.query("select set_config('erp.actor_id', $1, true)", [actor.id ?? ""]);
+    if (actor.support) await c.query("select set_config('erp.support', $1, true)", [actor.support]);
     // a check that pinned the clock: SQL's erp_now() / business_today() see the same instant as the code
     const at = pinnedIso();
     if (at) await c.query("select set_config('erp.now', $1, true)", [at]);
@@ -77,6 +80,16 @@ export async function tx<T>(actor: Actor, fn: (c: Client) => Promise<T>): Promis
     // caller's answer does not wait on the network. A rollback drops it with the rows it would send.
     if (committed) for (const j of jobs) setImmediate(() => { j().catch(() => { /* the job keeps its own log */ }); });
   }
+}
+
+const SUPPORT = new WeakSet<object>();
+/** A read done in support mode (coGet marks its client, as it marks a look-only read). */
+export const markSupport = (c: object, on: boolean) => { if (on) SUPPORT.add(c); else SUPPORT.delete(c); };
+/** Is this client working for an operator in support mode: a marked read, or a transaction carrying erp.support? */
+export async function inSupport(c: Client): Promise<boolean> {
+  if (SUPPORT.has(c)) return true;
+  const r = await c.query<{ s: string | null }>("select current_setting('erp.support', true) s");
+  return !!r.rows[0]?.s;
 }
 
 const AFTER = new WeakMap<Client, (() => Promise<void>)[]>();

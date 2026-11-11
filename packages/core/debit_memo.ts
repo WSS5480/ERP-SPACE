@@ -16,6 +16,10 @@ import { today as bizToday } from "./clock.ts";
 import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { post } from "./posting.ts";
 import { transition } from "./invoice.ts";
+import { selfApprovalFor, auditSelfApproval } from "./approvals.ts";
+
+/** Who decides a manual debit memo (besides the owner and a controller). */
+export const MEMO_APPROVERS = ["controller", "approver"];
 
 export class MemoError extends Error {}
 function need(cond: unknown, message: string): asserts cond {
@@ -153,38 +157,43 @@ export async function createMemo(c: Client, scope: Scope, b: { vendorId: string;
 export async function approveMemo(c: Client, scope: Scope, id: string, note = "") {
   const m = await memoOf(c, scope.entityId, id);
   need(m.status === "pending_approval", `debit memo ${m.number} is ${m.status.replace("_", " ")}`);
-  need(m.created_by !== scope.actor.id, "whoever wrote a debit memo cannot approve it; another person does");
+  // The maker is never the checker -- unless they are the owner and nobody else here could decide it (0063).
+  const selfApproved = await selfApprovalFor(c, scope.entityId, scope.actor.id || "", [m.created_by], MEMO_APPROVERS,
+    "whoever wrote a debit memo cannot approve it; another person does");
+  if (selfApproved) await auditSelfApproval(c, scope, "vendor_debit_memo", id, { number: m.number, decision: "approved", amount: m.amount_minor });
   if (m.source === "service_chargeback" && m.journal_entry_id) {
-    await c.query(`update vendor_debit_memo set status = 'open', decided_by = $3, decided_at = now(), decision_note = nullif($4,'')
-                    where entity_id = $1 and id = $2`, [scope.entityId, id, scope.actor.id || null, note.trim().slice(0, 300)]);
+    await c.query(`update vendor_debit_memo set status = 'open', decided_by = $3, decided_at = now(), decision_note = nullif($4,''), self_approved = $5
+                    where entity_id = $1 and id = $2`, [scope.entityId, id, scope.actor.id || null, note.trim().slice(0, 300), selfApproved]);
     await audit(c, scope, { table: "vendor_debit_memo", rowId: id, action: "transition", before: { status: m.status }, after: { status: "open" } });
-    return { status: "open", journalEntryId: m.journal_entry_id };
+    return { status: "open", journalEntryId: m.journal_entry_id, selfApproved };
   }
   const v = await vendorOf(c, scope.entityId, m.vendor_id);
   const amt = BigInt(m.amount_minor);
   const je = await post(c, scope, { date: m.memo_date, sourceType: "invoice", sourceId: m.id,
     description: `Debit memo ${m.number} to ${v.name}: ${m.reason}`.slice(0, 300),
     lines: [{ code: "1150", debit: amt, memo: m.number }, { code: m.offset_code, credit: amt, memo: m.number }] });
-  await c.query(`update vendor_debit_memo set status = 'open', journal_entry_id = $3, decided_by = $4, decided_at = now(), decision_note = nullif($5,'')
-                  where entity_id = $1 and id = $2`, [scope.entityId, id, je, scope.actor.id || null, note.trim().slice(0, 300)]);
+  await c.query(`update vendor_debit_memo set status = 'open', journal_entry_id = $3, decided_by = $4, decided_at = now(), decision_note = nullif($5,''), self_approved = $6
+                  where entity_id = $1 and id = $2`, [scope.entityId, id, je, scope.actor.id || null, note.trim().slice(0, 300), selfApproved]);
   await audit(c, scope, { table: "vendor_debit_memo", rowId: id, action: "transition", before: { status: m.status }, after: { status: "open", journalEntryId: je } });
-  return { status: "open", journalEntryId: je };
+  return { status: "open", journalEntryId: je, selfApproved };
 }
 
 export async function rejectMemo(c: Client, scope: Scope, id: string, note: string) {
   const m = await memoOf(c, scope.entityId, id);
   need(m.status === "pending_approval", `debit memo ${m.number} is ${m.status.replace("_", " ")}`);
-  need(m.created_by !== scope.actor.id, "whoever wrote a debit memo cannot decide it");
   need(String(note ?? "").trim().length >= 3, "say why it is turned down");
+  const selfApproved = await selfApprovalFor(c, scope.entityId, scope.actor.id || "", [m.created_by], MEMO_APPROVERS,
+    "whoever wrote a debit memo cannot decide it");
+  if (selfApproved) await auditSelfApproval(c, scope, "vendor_debit_memo", id, { number: m.number, decision: "rejected", amount: m.amount_minor });
   // a chargeback was already moved to 1150 by the service cost: turned down, the company carries it (Dr 6150 Cr 1150)
   let rev: string | null = null;
   if (m.source === "service_chargeback" && m.journal_entry_id) {
     rev = await post(c, scope, { date: (await bizToday(c, scope)), sourceType: "invoice", sourceId: m.id, description: `Debit memo ${m.number} turned down: ${note.trim()}`.slice(0, 300),
       lines: [{ code: SERVICE_EXPENSE, debit: BigInt(m.amount_minor), memo: m.number }, { code: "1150", credit: BigInt(m.amount_minor), memo: m.number }] });
   }
-  await c.query(`update vendor_debit_memo set status = 'rejected', decided_by = $3, decided_at = now(), decision_note = $4, reversal_entry_id = $5 where entity_id = $1 and id = $2`,
-    [scope.entityId, id, scope.actor.id || null, note.trim().slice(0, 300), rev]);
-  return { status: "rejected", journalEntryId: rev };
+  await c.query(`update vendor_debit_memo set status = 'rejected', decided_by = $3, decided_at = now(), decision_note = $4, reversal_entry_id = $5, self_approved = $6 where entity_id = $1 and id = $2`,
+    [scope.entityId, id, scope.actor.id || null, note.trim().slice(0, 300), rev, selfApproved]);
+  return { status: "rejected", journalEntryId: rev, selfApproved };
 }
 
 /**
@@ -254,7 +263,7 @@ export async function memos(c: Client, entityId: string, f: { vendorId?: string 
   return q(c, `
     select m.id, m.number, m.vendor_id, coalesce(v.dba, v.legal_name) vendor, m.source, m.reason, m.amount_minor::text amount_minor,
            (m.amount_minor - coalesce(a.used,0))::text left_minor, m.status, m.memo_date::text memo_date, m.vendor_ref, m.offset_code,
-           st.number ticket_number, i.reference bill_reference, cu.name created_by_name, du.name decided_by_name, m.decision_note, m.created_by
+           st.number ticket_number, i.reference bill_reference, cu.name created_by_name, du.name decided_by_name, m.self_approved, m.decision_note, m.created_by
       from vendor_debit_memo m join vendor v on v.id = m.vendor_id
       left join (select memo_id, sum(amount_minor) used from vendor_memo_application where entity_id = $1 group by memo_id) a on a.memo_id = m.id
       left join service_ticket st on st.id = m.service_ticket_id left join invoice i on i.id = m.invoice_id

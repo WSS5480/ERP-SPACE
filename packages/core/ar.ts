@@ -25,6 +25,7 @@ import { postLines as postTaxLines } from "./tax.ts";
 import { post, profitObjectFor, type PostLine } from "./posting.ts";
 import { format, mulBps } from "./money.ts";
 import { recordFinancingRefund } from "./ar_settlement.ts";
+import { selfApprovalFor, auditSelfApproval } from "./approvals.ts";
 
 export class ArError extends Error {}
 
@@ -941,7 +942,10 @@ export async function requestWriteoff(c: Client, scope: Scope, w: {
   return r.id;
 }
 
-/** A second person approves (and it posts) or rejects. The maker is never the checker. */
+/** Who approves a write-off (besides the owner and a controller). */
+export const WRITEOFF_APPROVERS = ["controller"];
+
+/** A second person approves (and it posts) or rejects. The maker is never the checker (except the owner's self-approval, 0063). */
 export async function decideWriteoff(c: Client, scope: Scope, id: string, d: { decision: "approved" | "rejected"; by: string; note?: string }) {
   const w = await q<{ id: string; status: string; requested_by: string; customer_id: string; invoice_id: string | null; contract_id: string | null;
     amount_minor: string; method: string; reason: string }>(c,
@@ -950,12 +954,15 @@ export async function decideWriteoff(c: Client, scope: Scope, id: string, d: { d
   need(w.length, "no such write-off");
   const x = w[0];
   need(x.status === "pending", `this write-off is already ${x.status}`);
-  need(x.requested_by !== d.by, "whoever asked for a write-off cannot approve it; a second person has to");
+  // The maker is never the checker -- unless they are the owner and nobody else here could approve it (0063).
+  const selfApproved = await selfApprovalFor(c, scope.entityId, d.by, [x.requested_by], WRITEOFF_APPROVERS,
+    "whoever asked for a write-off cannot approve it; a second person has to");
   if (d.decision === "rejected") {
     need(d.note?.trim(), "say why it is rejected");
-    await c.query(`update ar_writeoff set status = 'rejected', decided_by = $2, decided_at = now(), decision_note = $3 where id = $1 and entity_id = $4`,
-      [id, d.by, d.note!.trim(), scope.entityId]);
-    return { status: "rejected" as const, journalEntryId: null };
+    await c.query(`update ar_writeoff set status = 'rejected', decided_by = $2, decided_at = now(), decision_note = $3, self_approved = $5 where id = $1 and entity_id = $4`,
+      [id, d.by, d.note!.trim(), scope.entityId, selfApproved]);
+    if (selfApproved) await auditSelfApproval(c, scope, "ar_writeoff", id, { decision: "rejected", amount: x.amount_minor });
+    return { status: "rejected" as const, journalEntryId: null, selfApproved };
   }
   const amt = B(x.amount_minor);
   const open = await openOf(c, scope.entityId, { invoiceId: x.invoice_id, contractId: x.contract_id });
@@ -968,8 +975,9 @@ export async function decideWriteoff(c: Client, scope: Scope, id: string, d: { d
   const date = (await bizToday(c, scope));
   const je = await post(c, scope, { date, sourceType: "ar", sourceId: id, description: `Write-off ${loc.number}: ${x.reason}`.slice(0, 300),
     lines: [{ code, debit: amt, profitObjectId: po }, { code: "1100", credit: amt, profitObjectId: po }] });
-  await c.query(`update ar_writeoff set status = 'posted', decided_by = $2, decided_at = now(), decision_note = $3, journal_entry_id = $4
-                  where id = $1 and entity_id = $5`, [id, d.by, d.note?.trim() || null, je, scope.entityId]);
+  await c.query(`update ar_writeoff set status = 'posted', decided_by = $2, decided_at = now(), decision_note = $3, journal_entry_id = $4, self_approved = $6
+                  where id = $1 and entity_id = $5`, [id, d.by, d.note?.trim() || null, je, scope.entityId, selfApproved]);
+  if (selfApproved) await auditSelfApproval(c, scope, "ar_writeoff", id, { decision: "approved", amount: x.amount_minor });
   await ledger(c, scope, { customerId: x.customer_id, invoiceId: x.invoice_id, contractId: x.contract_id, locationId: loc.location_id, date,
     kind: "writeoff", amount: -amt, memo: x.reason, journalEntryId: je });
   if (x.contract_id && (await openOf(c, scope.entityId, { contractId: x.contract_id })) === 0n) {
@@ -977,7 +985,7 @@ export async function decideWriteoff(c: Client, scope: Scope, id: string, d: { d
     await contractEvent(c, scope, x.contract_id, "charged_off", { amount: amt.toString() }, x.reason);
   }
   await audit(c, scope, { table: "ar_writeoff", rowId: id, action: "transition", after: { status: "posted" }, reason: d.note || "approved" });
-  return { status: "posted" as const, journalEntryId: je };
+  return { status: "posted" as const, journalEntryId: je, selfApproved };
 }
 
 /** Money collected on something written off: reinstate that much, then take it as a payment. */

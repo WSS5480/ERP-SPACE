@@ -56,7 +56,7 @@ function money(v: unknown): bigint {
  * payment run is cancelled so it can be rebuilt.
  */
 export async function decideRequest(c: Client, co: Company, a: Actor,
-                                    input: { requestId: unknown; decision: unknown; note: unknown; callback?: unknown }) {
+                                    input: { requestId: unknown; decision: unknown; note: unknown; callback?: unknown; confirm?: unknown }) {
   need(typeof input.requestId === "string" && UUID.test(input.requestId), "no such request");
   const decision = input.decision === "approved" ? "approved" : input.decision === "rejected" ? "rejected" : null;
   need(decision, "decide approved or rejected");
@@ -68,7 +68,7 @@ export async function decideRequest(c: Client, co: Company, a: Actor,
   need(req.length, "no such request");
   const s = scopeOf(co, a);
   const status = await decide(c, s, { requestId: input.requestId as string, actorId: a.personId, decision: decision!,
-                                      note: note || undefined, callbackLogged: input.callback === true });
+                                      note: note || undefined, callbackLogged: input.callback === true, confirm: input.confirm });
   const { subject_type: type, subject_id: id } = req[0];
 
   if (status === "approved") {

@@ -58,7 +58,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { pool, tx, q, type Scope, type Client } from "../packages/core/db.ts";
+import { pool, tx, q, markSupport, type Scope, type Client } from "../packages/core/db.ts";
 import {
   ingest, loadConnection, openQuarantine, releaseQuarantine, handlerFor,
   ChannelRefused, type Offered, type Connection,
@@ -649,6 +649,7 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
       const co = await companyFor(c, who, m[1]);
       const a = await acting(c, co, req, who!, false);
       markLookOnly(c, !!a?.preview || (who?.kind === "customer" && who.prospect));
+      markSupport(c, who?.kind === "operator" && !!who.support);
       const out = await fn(c, co, url, m, a?.personId ?? null);
       if (out === null) throw new HttpError(404, "not found");
       // A printable page (a tear sheet) goes out with every header and the CSP, like any page.
@@ -658,6 +659,7 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
       return [200, out];
     } finally {
       markLookOnly(c, false);
+      markSupport(c, false);
       c.release();
     }
   });
@@ -678,7 +680,8 @@ function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body:
       c0.release();
     }
     const body = await readJson(req, opts.maxBody);
-    const out = await tx({ kind: "user", id: actor.personId, label: actor.label }, async (c) => {
+    const support = who?.kind === "operator" && who.support ? who.support.id : null;
+    const out = await tx({ kind: "user", id: actor.personId, label: actor.label, support }, async (c) => {
       const r = await fn(c, co, actor, body, m);
       if (who?.kind === "operator" && who.support) {
         await P.audit(c, auditActor(who), "support.write", co.tenantId, { path: url.pathname, as: actor.personName }, co.id);
@@ -1148,7 +1151,7 @@ coGet("/options", (c, co) => views.formOptions(c, co));
 
 coGet("/approvals", (c, co, _u, _m, p) => views.approvals(c, co, p));
 coPost("/approvals/([0-9a-fA-F-]{36})", (c, co, a, b, m) =>
-  act.decideRequest(c, co, a, { requestId: m[2], decision: b.decision, note: b.note, callback: b.callback }));
+  act.decideRequest(c, co, a, { requestId: m[2], decision: b.decision, note: b.note, callback: b.callback, confirm: b.confirm }));
 
 coGet("/bills", (c, co, url) => views.bills(c, co, param(url, "tab") || "attention"));
 coGet("/bills/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.bill(c, co, m[2]));
