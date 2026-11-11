@@ -48,7 +48,9 @@ export async function settings(c: Client, entityId: string): Promise<Settings> {
            booking_lead_days, link_valid_days
       from fleet_setting where entity_id = $1`, [entityId]);
   const x = r[0];
-  if (!x) return { tz: "America/Chicago", avgMph: 30, roadFactor: 1.3, startMin: 450, endMin: 1110, baseMin: 10,
+  // no delivery settings yet: the time clock's zone if there is one
+  const wz = x ? null : (await q<{ tz: string }>(c, `select timezone tz from workforce_settings where entity_id = $1`, [entityId]))[0]?.tz;
+  if (!x) return { tz: wz ?? "America/Chicago", avgMph: 30, roadFactor: 1.3, startMin: 450, endMin: 1110, baseMin: 10,
     perPieceMin: 4, perStairPieceMin: 3, laborHourMinor: 2200n, fuelPriceMinor: 389n, leadDays: 1, linkDays: 14 };
   return { tz: String(x.time_zone), avgMph: n(x.avg_mph), roadFactor: n(x.road_factor), startMin: n(x.start_min),
     endMin: n(x.end_min), baseMin: n(x.base_service_min), perPieceMin: n(x.per_piece_min),

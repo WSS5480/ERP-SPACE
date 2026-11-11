@@ -144,7 +144,7 @@
     const dollars = (m) => (m == null || m === '' ? '' : (Number(m) / 100).toFixed(2));
     const web = locs.filter((l) => l.kind === 'web');
     const f = {
-      slug: input({ value: v(s && s.slug), maxlength: '40', placeholder: 'buddys' }),
+      slug: input({ value: v(s && s.slug), maxlength: '40', placeholder: 'your-store' }),
       displayName: input({ value: v(s && s.display_name), maxlength: '80' }),
       tagline: input({ value: v(s && s.tagline), maxlength: '140' }),
       brandPrimary: input({ type: 'color', value: (s && s.brand_primary) || '#1f2a44' }),

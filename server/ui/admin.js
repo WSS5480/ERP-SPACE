@@ -188,7 +188,7 @@
         for (const [name, { f, ctl }] of Object.entries(boxes)) { if (f.secret) { if (ctl.value) secrets[name] = ctl.value; } else settings[name] = ctl.value; }
         return post('/admin/connections/save', { kind: k.id, provider: prov.value, scope, settings, secrets });
       }, (r) => r.missing && r.missing.length ? `Saved. Still needed: ${r.missing.join(', ')}.` : 'Saved', { close: dlg.close, errorInto: (x) => say('critical', 'fail', 'Not saved', E.friendly(x)) }) }, 'Save');
-      const to = k.test && k.test !== 'webhook' ? input({ placeholder: k.test === 'email' ? 'you@example.com' : k.test === 'sms' ? '+1 717 555 0100' : 'An address to look up', type: k.test === 'email' ? 'email' : 'text' }) : null;
+      const to = k.test && k.test !== 'webhook' ? input({ placeholder: k.test === 'email' ? 'you@example.com' : k.test === 'sms' ? '+1 555 555 0100' : 'An address to look up', type: k.test === 'email' ? 'email' : 'text' }) : null;
       const test = k.test && cur ? el('button', { class: 'btn', type: 'button', onclick: async (e) => {
         const b = e.currentTarget; E.busy(b, true);
         try { const r = await post('/admin/connections/test', { kind: k.id, scope, to: to ? to.value : '' }); say(r.ok ? 'good' : 'critical', r.ok ? 'ok' : 'fail', r.ok ? 'Working' : 'Not working', r.words); }

@@ -496,9 +496,26 @@ the Sales tax screen (`tax.confirmRates`, owner or controller), which first
 makes the stand-in for stores still on a single rate.
 
 Opening stock: a CSV (sku, location code, bin code, qty, unit_cost, serial,
-lot) is previewed into `opening_stock_run/row`; applying it calls
-`inventory.adjust` with reason `opening_balance` and the row's unit cost (Dr
-1300 / Cr 3000), one savepoint per row. A SKU at a location comes in from an
+lot) with an as-of day in an open period is previewed into
+`opening_stock_run/row`; a row whose SKU already has stock or movements at
+its location is flagged ("already has N on hand; this adds to it") and
+applying needs `confirm`; the import is refused once the company has posted
+sales, and while the Warehouse service is off. Applying it calls
+`inventory.adjust` with reason `opening_balance`, the row's unit cost and
+`postOn` = the as-of day (Dr 1300 / Cr 3000), one savepoint per row. The
+`opening_balance` adjustment reason is the owner's or a controller's. A SKU at a location comes in from an
 opening import once. A bank account's opening balance posts Dr its cash
 account / Cr 3000 once (`opening_bank_balance`). Packs never add tax rates,
 locations or sample data.
+
+Review fixes (Nov 11 2026). The add-a-company form requires a setup pack or
+preset (`createCompany` input `setup`: `pack:<id>` or `preset:<id>`), applied
+in the same transaction. The trucking pack switches Finance settlements off
+(`Pack.off`): hauling is billed on terms, so no finance-company accounts in its
+chart. Sales tax is optional while a company has no store or outlet. Every
+pack, on a fresh company, has nothing missing in the chart and can reach a
+complete checklist without skips (checked). Companies with journal entries
+when 0052 runs get a dismissal, so trading customers do not see the Home card.
+The Home card counts without the tie-outs, and runs them before it would hide.
+Time zones: the time clock falls back to the delivery settings' zone and
+delivery to the time clock's, before the built-in defaults.

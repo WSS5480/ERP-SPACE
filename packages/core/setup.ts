@@ -35,11 +35,12 @@ export const SERVICE_SEED: Partial<Record<ModuleId, ModuleId | null>> = {
 };
 
 /** The modules a pack turns on, with the services that come with them (the ones seeded from a module the pack has). */
-export function packServices(pack: Pick<Pack, "modules">): ModuleId[] {
+export function packServices(pack: Pick<Pack, "modules"> & { off?: ModuleId[] }): ModuleId[] {
   const out = new Set<ModuleId>(pack.modules);
   for (const [svc, from] of Object.entries(SERVICE_SEED) as [ModuleId, ModuleId | null][]) {
     if (from === null || out.has(from)) out.add(svc);
   }
+  for (const m of pack.off ?? []) out.delete(m);
   return MODULE_IDS.filter((m) => out.has(m));
 }
 
@@ -129,6 +130,8 @@ export type Pack = {
   vertical: "furniture" | "retail" | "rto" | "trucking" | "services";
   labels: { location: string; profitObject: string; aging: string };
   modules: ModuleId[];
+  /** services that would come along with the modules (SERVICE_SEED) but this kind of business does not use */
+  off?: ModuleId[];
   accounts: Account[];
   reasons: Reason[];
   settings: Record<string, unknown>;
@@ -229,6 +232,8 @@ export const PACKS: Pack[] = [
     vertical: "trucking",
     labels: { location: "Terminal", profitObject: "Truck", aging: "Settlements" },
     modules: ["ar", "workforce", "fleet", "reports", "group"],
+    // Hauling is billed on terms, not sold on consumer finance plans: no finance-company settlements (and no 1110/1115/2195/6915 in its chart).
+    off: ["settlements"],
     accounts: [
       ["1050", "Undeposited funds", "asset", "D"],
       ["1100", "Accounts receivable, customers", "asset", "D"],

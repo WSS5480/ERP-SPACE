@@ -483,7 +483,8 @@
     loc.addEventListener('change', () => bin.replaceChildren(el('option', { value: '', text: 'No bin' }), binOptions(L, loc.value).map(([v, t]) => el('option', { value: v, text: t }))));
     const prod = select(productOptions(P), '', 'Pick the product');
     const n = input({ inputmode: 'numeric', placeholder: '-1 or 2' });
-    const reason = select(a.reasons.map((r) => [r, E.cap(words(r))]), '', 'Pick a reason');
+    const books = !!(E.S.person && E.S.person.roles.some((r) => r === 'owner' || r === 'controller'));
+    const reason = select(a.reasons.filter((r) => r !== 'opening_balance' || books).map((r) => [r, E.cap(words(r))]), '', 'Pick a reason');
     const note = input({ maxlength: '300', placeholder: 'What happened' });
     const labels = input({ placeholder: 'Labels being taken out (labelled products)' });
     const out = outBox();

@@ -286,7 +286,7 @@ export async function checklist(c: Client, tenantId: string, entityId: string, o
       { label: "How deliveries are taxed is chosen", ok: chosen > 0, detail: chosen ? `by ${await tax.sourcing(c, entityId)}` : null },
       { label: "A person confirmed the rates were checked", ok: nUnchecked === 0,
         detail: nUnchecked ? `${nUnchecked} rate${nUnchecked === 1 ? "" : "s"} not checked yet` : null },
-    ]);
+    ], { optional: !selling.length, detail: selling.length ? null : "No store or outlet sells here yet, so nothing is taxed; optional until one is added" });
   }
 
   // ---- users and roles
@@ -361,6 +361,7 @@ export async function checklist(c: Client, tenantId: string, entityId: string, o
   // ---- go-live check
   const rest = steps.filter((s) => s.status === "todo");
   const ties = opts.tieOuts === false ? [] : await tieOuts(c, tenantId, entityId, L.multiCompany);
+  if (opts.tieOuts === false) ties.push({ id: "skipped", label: "Tie-outs", ok: false, detail: "not run here; open the checklist to run them" });
   add("golive", [
     { label: "Every other step done, skipped or optional", ok: !rest.length, detail: rest.length ? `Still to do: ${rest.map((s) => s.title).join(", ")}` : null },
     ...ties.map((t) => ({ label: t.label, ok: t.ok, detail: t.detail })),
@@ -453,15 +454,31 @@ function cents(s: string): bigint | null {
   return BigInt(m[1]) * 100n + BigInt((m[2] ?? "").padEnd(2, "0"));
 }
 
+/** The day must fall in one of the company's open periods. */
+async function openDay(c: Client, entityId: string, day: unknown, what: string) {
+  need(isDay(day), `give the day ${what} is as of`);
+  const p = await q<{ status: string }>(c, `select status from fiscal_period where entity_id = $1 and $2::date between starts_on and ends_on`, [entityId, day]);
+  need(p.length, `there is no fiscal period holding ${day}; open one in Books or pick a day inside the periods you have`);
+  need(p[0].status !== "closed", `the period holding ${day} is closed; pick a day in an open period`);
+}
+
+/** Opening stock is for before trading starts: once sales are posted, stock comes in through receiving, counts or adjustments. */
+async function refuseOnceTrading(c: Client, entityId: string) {
+  const sold = await q(c, `select 1 from journal_entry where entity_id = $1 and source_type = 'sale' limit 1`, [entityId]);
+  need(!sold.length, "this company has already posted sales, so stock can no longer come in as an opening balance; use a stock count or an adjustment instead");
+}
+
 type RowOut = { row: number; sku: string; location: string; bin: string; qty: number | null; unitCostMinor: string | null; serials: string[]; lot: string | null;
-  action: "add" | "refuse"; message: string | null; valueMinor: string };
+  action: "add" | "refuse"; message: string | null; valueMinor: string; addsToExisting: boolean };
 
 /**
  * Read an opening stock CSV and keep it as a preview: nothing moves yet.
  * Columns (any case): sku, location (its code), bin (optional, its code),
  * qty, unit_cost, serial (optional; several separated by ; one per unit), lot (optional).
  */
-export async function previewOpeningStock(c: Client, scope: Scope, csv: string, filename: string | null) {
+export async function previewOpeningStock(c: Client, scope: Scope, csv: string, filename: string | null, asOf: string) {
+  await refuseOnceTrading(c, scope.entityId);
+  await openDay(c, scope.entityId, asOf, "the opening stock");
   const rows = parseCsv(csv);
   need(rows.length, "that file has no rows under its header");
   need(rows.length <= 5000, "that is more than 5,000 rows; split the file");
@@ -481,7 +498,7 @@ export async function previewOpeningStock(c: Client, scope: Scope, csv: string, 
     const serials = pick(r, "serial", "serials", "serial_no", "serial_number").split(/[;|]/).map((x) => x.trim().toUpperCase()).filter(Boolean);
     const lotS = pick(r, "lot", "lot_code", "dye_lot");
     const o: RowOut = { row: rowNo, sku, location: locCode, bin: binCode, qty: null, unitCostMinor: null, serials, lot: lotS ? lotS.toUpperCase() : null,
-      action: "refuse", message: null, valueMinor: "0" };
+      action: "refuse", message: null, valueMinor: "0", addsToExisting: false };
     const ids: { productId: string | null; locationId: string | null; binId: string | null } = { productId: null, locationId: null, binId: null };
     const refuse = (m: string) => { o.message = m; };
     const p = sku ? await q<{ id: string; name: string; kind: string; serialized: boolean }>(c,
@@ -519,6 +536,15 @@ export async function previewOpeningStock(c: Client, scope: Scope, csv: string, 
       else {
         ids.binId = bin[0]?.id ?? null;
         o.action = "add"; o.qty = qty; o.unitCostMinor = cost!.toString();
+        // stock or movements already here: bringing this in adds to them, so it is flagged and needs a confirm
+        const have = await q<{ on_hand: string }>(c, `select coalesce(sum(on_hand), 0)::text on_hand from stock_level where entity_id = $1 and product_id = $2 and location_id = $3`,
+          [scope.entityId, p[0].id, loc.id]);
+        const moved = await q(c, `select 1 from inv_move where entity_id = $1 and product_id = $2 and (from_location_id = $3 or to_location_id = $3) limit 1`, [scope.entityId, p[0].id, loc.id]);
+        const onHand = Number(have[0]?.on_hand ?? 0);
+        if (onHand !== 0 || moved.length) {
+          o.addsToExisting = true;
+          o.message = onHand !== 0 ? `already has ${onHand} on hand here; this adds to it` : "already has stock movements here; this adds to them";
+        }
         const v = BigInt(Math.round(qty * Number(cost)));
         o.valueMinor = v.toString(); units += qty; value += v;
         seenKey.add(`${p[0].id}|${loc.id}`);
@@ -530,17 +556,18 @@ export async function previewOpeningStock(c: Client, scope: Scope, csv: string, 
     (o as RowOut & { ids?: typeof ids }).ids = ids;
   }
   const ok = out.filter((x) => x.action === "add").length;
-  const run = await one<{ id: string }>(c, `insert into opening_stock_run (entity_id, filename, rows_seen, rows_ok, rows_refused, units, value_minor, created_by)
-    values ($1,$2,$3,$4,$5,$6,$7,$8) returning id`, [scope.entityId, filename, out.length, ok, out.length - ok, units, value.toString(), scope.actor.label]);
+  const run = await one<{ id: string }>(c, `insert into opening_stock_run (entity_id, filename, as_of, rows_seen, rows_ok, rows_refused, units, value_minor, created_by)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning id`, [scope.entityId, filename, asOf, out.length, ok, out.length - ok, units, value.toString(), scope.actor.label]);
   for (const o of out) {
     const ids = (o as RowOut & { ids: { productId: string | null; locationId: string | null; binId: string | null } }).ids;
     delete (o as Partial<RowOut & { ids: unknown }>).ids;
-    await c.query(`insert into opening_stock_row (run_id, entity_id, row_no, sku, location_code, bin_code, qty, unit_cost_minor, serials, lot, product_id, location_id, bin_id, action, message)
-      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+    await c.query(`insert into opening_stock_row (run_id, entity_id, row_no, sku, location_code, bin_code, qty, unit_cost_minor, serials, lot, product_id, location_id, bin_id, action, message, adds_to_existing)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
       [run.id, scope.entityId, o.row, o.sku || null, o.location || null, o.bin || null, o.qty, o.unitCostMinor, o.serials, o.lot,
-       ids.productId, ids.locationId, ids.binId, o.action, o.message]);
+       ids.productId, ids.locationId, ids.binId, o.action, o.message, o.addsToExisting]);
   }
-  return { runId: run.id, seen: out.length, ok, refused: out.length - ok, units, valueMinor: value.toString(), rows: out };
+  return { runId: run.id, asOf, seen: out.length, ok, refused: out.length - ok, addsToExisting: out.filter((x) => x.addsToExisting).length,
+    units, valueMinor: value.toString(), rows: out };
 }
 
 /**
@@ -548,10 +575,15 @@ export async function previewOpeningStock(c: Client, scope: Scope, csv: string, 
  * stock adjustment at the row's unit cost (Dr 1300 / Cr 3000). A row that has
  * gone bad since the preview is refused on its own; the rest go in.
  */
-export async function applyOpeningStock(c: Client, scope: Scope, runId: string) {
-  const run = await q<{ id: string; status: string }>(c, `select id, status from opening_stock_run where id = $1 and entity_id = $2 for update`, [runId, scope.entityId]);
+export async function applyOpeningStock(c: Client, scope: Scope, runId: string, opts: { confirm?: boolean } = {}) {
+  const run = await q<{ id: string; status: string; as_of: string }>(c, `select id, status, as_of::text from opening_stock_run where id = $1 and entity_id = $2 for update`, [runId, scope.entityId]);
   need(run.length, "no such opening stock import");
   need(run[0].status === "previewed", "that import was already brought in");
+  await refuseOnceTrading(c, scope.entityId);
+  await openDay(c, scope.entityId, run[0].as_of, "the opening stock");
+  const flagged = await q<{ n: string }>(c, `select count(*)::text n from opening_stock_row where run_id = $1 and entity_id = $2 and action = 'add' and adds_to_existing`, [runId, scope.entityId]);
+  const nf = Number(flagged[0].n);
+  need(!nf || opts.confirm === true, `${nf} row${nf === 1 ? " adds" : "s add"} to stock already at ${nf === 1 ? "its location" : "their locations"}; confirm to bring ${nf === 1 ? "it" : "them"} in on top`);
   const rows = await q<{ id: string; row_no: number; sku: string; location_code: string; qty: string; unit_cost_minor: string; serials: string[]; lot: string | null;
     product_id: string; location_id: string; bin_id: string | null }>(c, `select id, row_no, sku, location_code, qty, unit_cost_minor, serials, lot, product_id, location_id, bin_id
       from opening_stock_row where run_id = $1 and entity_id = $2 and action = 'add' order by row_no`, [runId, scope.entityId]);
@@ -563,7 +595,7 @@ export async function applyOpeningStock(c: Client, scope: Scope, runId: string) 
       const done = await q(c, `select 1 from opening_stock_row where entity_id = $1 and product_id = $2 and location_id = $3 and adjustment_id is not null`, [scope.entityId, r.product_id, r.location_id]);
       need(!done.length, `${r.sku} at ${r.location_code} already came in from an opening stock import`);
       const adj = await inventory.adjust(c, scope, { locationId: r.location_id, productId: r.product_id, qty: Number(r.qty), reasonCode: "opening_balance",
-        binId: r.bin_id, unitCostMinor: BigInt(r.unit_cost_minor), serials: r.serials, lot: r.lot, note: `Opening stock import, row ${r.row_no}` });
+        binId: r.bin_id, unitCostMinor: BigInt(r.unit_cost_minor), serials: r.serials, lot: r.lot, note: `Opening stock import, row ${r.row_no}`, postOn: run[0].as_of });
       await c.query(`update opening_stock_row set adjustment_id = $3 where id = $1 and entity_id = $2`, [r.id, scope.entityId, adj.id]);
       await c.query("release savepoint opening_stock_row");
       added++; value += adj.valueMinor;
@@ -583,7 +615,7 @@ export async function applyOpeningStock(c: Client, scope: Scope, runId: string) 
 }
 
 export async function openingStockRuns(c: Client, entityId: string) {
-  return q(c, `select id, filename, status, rows_seen, rows_ok, rows_refused, units::text, value_minor::text, created_by, created_at, applied_by, applied_at
+  return q(c, `select id, filename, as_of::text, status, rows_seen, rows_ok, rows_refused, units::text, value_minor::text, created_by, created_at, applied_by, applied_at
     from opening_stock_run where entity_id = $1 order by created_at desc limit 20`, [entityId]);
 }
 
@@ -591,7 +623,7 @@ export async function openingStockRuns(c: Client, entityId: string) {
 
 /** A bank account's balance on the day the books start: Dr its cash account / Cr 3000 (an overdraft the other way). Once per account. */
 export async function openingBankBalance(c: Client, scope: Scope, x: { bankAccountId: string; asOf: string; amountMinor: bigint }) {
-  need(isDay(x.asOf), "give the day the balance is as of");
+  await openDay(c, scope.entityId, x.asOf, "the balance");
   need(x.amountMinor !== 0n, "give the balance; a zero balance needs no entry");
   const b = await q<{ id: string; name: string; code: string; status: string }>(c, `select b.id, b.name, g.code, b.status from bank_account b join gl_account g on g.id = b.gl_account_id
      where b.id = $1 and b.entity_id = $2`, [x.bankAccountId, scope.entityId]);

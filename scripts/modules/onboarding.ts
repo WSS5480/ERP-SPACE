@@ -9,13 +9,14 @@ import { type T, ENTITY, PEOPLE } from "./harness.ts";
 import { tx, q, type Client } from "../../packages/core/db.ts";
 import type { Company, Actor } from "../../server/modules/kit.ts";
 import { createCompany } from "../../server/actions.ts";
-import { applyPack, saveLocation, importCustomers, importOpenAr } from "../../packages/core/setup.ts";
+import { saveLocation, importCustomers, importOpenAr } from "../../packages/core/setup.ts";
 import * as tax from "../../packages/core/tax.ts";
 import * as inventory from "../../packages/core/inventory.ts";
 import { post } from "../../packages/core/posting.ts";
 import * as ob from "../../packages/core/onboarding.ts";
 import { module as onboardingModule } from "../../server/modules/onboarding.ts";
 import { module as setupModule } from "../../server/modules/setup.ts";
+import { module as inventoryModule } from "../../server/modules/inventory.ts";
 
 const ROOT = new URL("../../", import.meta.url).pathname;
 const sys = { kind: "system" as const, label: "onboarding checks" };
@@ -41,17 +42,73 @@ function routes(t: T, entityId: () => string, ...mods: { register: (k: never) =>
   };
 }
 
+/** A brand-new client and company from the add-a-company form, with the setup it picked. */
+async function newCompany(setup: string, vertical = "retail", tag = "") {
+  const stamp = `${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+  const email = `owner-${stamp}@onboard.test`;
+  const made = await inTx((c) => createCompany(c, "onboarding checks", {
+    clientId: null, clientName: `Onboarding Check ${tag}${stamp}`, vertical, chartFrom: null, setup,
+    name: "Onboard Co", legalName: "Onboard Co LLC", einLast4: "", fiscalYearEndMonth: 12, stores: [],
+    banks: [{ purpose: "operating", name: "Operating", bankName: "A Bank", routingLast4: "1234", accountLast4: "5678" }],
+    people: [{ name: "Olive Owner", email, roles: ["owner"] }],
+  })) as { id: string; tenantId: string };
+  const owner = (await inTx((c) => q<{ id: string }>(c, `select id from app_user where tenant_id = $1 and email = $2 /* unscoped: lookup */`, [made.tenantId, email])))[0].id;
+  return { E: made.id, T: made.tenantId, owner };
+}
+
+const todayIso = () => new Date().toISOString().slice(0, 10);
+
+/**
+ * Put in everything a step shown on the checklist asks for, the way a person
+ * would after setup: no skips. Used to show every pack can reach complete.
+ */
+async function fillEverything(E: string, T: string, owner: string, steps: { id: string }[]) {
+  const scope = { tenantId: T, entityId: E, actor: { kind: "user" as const, id: owner, label: "Olive Owner" } };
+  const asOwner = <R>(fn: (c: Client) => Promise<R>) => tx({ kind: "user", id: owner, label: "Olive Owner" }, fn);
+  const has = (id: string) => steps.some((s) => s.id === id);
+  await asOwner((c) => ob.saveCompanyDetails(c, scope, { legalName: "Onboard Co LLC", einLast4: "4321", address: { line1: "1 Main St", city: "Springfield", postal: "12345" }, state: "CO" }));
+  const store = await asOwner((c) => saveLocation(c, scope, { code: "ST1", name: "Main Street", kind: "store", address: { line1: "1 Main St", city: "Springfield", state: "CO", postal: "12345" } }));
+  const wh = await asOwner((c) => saveLocation(c, scope, { code: "DC1", name: "Warehouse", kind: "warehouse", address: { line1: "9 Dock Rd", city: "Springfield", state: "CO", postal: "12346" } }));
+  await inTx(async (c) => {
+    const p = (await q<{ id: string }>(c, `insert into app_user (tenant_id, email, name) values ($1, $2, 'Second Person') returning id /* unscoped: new person */`, [T, `p2-${E}@onboard.test`]))[0].id;
+    await c.query(`insert into role_grant (app_user_id, entity_id, role) values ($1, $2, 'controller')`, [p, E]);
+    for (const [kind, provider, status] of [["email", "smtp", "connected"], ["sms", "twilio", "connected"], ["card", "test", "saved"]])
+      await c.query(`insert into admin_connection (tenant_id, entity_id, kind, provider, status, last_ok_at) values ($1, $2, $3, $4, $5, $6)`,
+        [T, E, kind, provider, status, status === "connected" ? new Date() : null]);
+    const v = (await q<{ id: string }>(c, `insert into vendor (tenant_id, legal_name, status) values ($1, 'Maker Inc', 'active') returning id /* unscoped: new vendor */`, [T]))[0].id;
+    await c.query(`insert into vendor_entity (vendor_id, entity_id, status) values ($1, $2, 'active')`, [v, E]);
+    await c.query(`insert into vendor_feed (entity_id, vendor_id, purpose, name) values ($1, $2, 'products', 'Maker catalog')`, [E, v]);
+    await c.query(`insert into product (entity_id, sku, name, kind, price_minor, cost_minor, status) values ($1, 'ITEM-1', 'Item one', 'stock', 5000, 2000, 'active')`, [E]);
+    await c.query(`insert into label_template (entity_id, kind, name, width_in, height_in, fields) values ($1, 'price_tag', 'Tag', 2, 1, '{sku,price}')`, [E]);
+    const z = (await q<{ id: string }>(c, `insert into delivery_zone (entity_id, code, name, dc_location_id, postal_codes) values ($1, 'Z1', 'Town', $2, '{12345}') returning id`, [E, wh]))[0].id;
+    await c.query(`insert into delivery_window (entity_id, zone_id, label, starts, ends) values ($1, $2, 'Morning', '08:00', '12:00')`, [E, z]);
+    await c.query(`insert into vehicle (entity_id, unit_no, vin_last6, kind, home_location_id, cube_ft, max_weight_lb) values ($1, 'T1', 'ABC123', 'box_truck', $2, 900, 6000)`, [E, wh]);
+  });
+  if (has("web")) {
+    const web = await asOwner((c) => saveLocation(c, scope, { code: "WEB", name: "Online", kind: "web" }));
+    await inTx((c) => c.query(`insert into shop_site (entity_id, slug, display_name, web_location_id) values ($1, $3, 'Onboard Co', $2)`, [E, web, `ob-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`]));
+  }
+  await asOwner(async (c) => {
+    const j = await tax.saveJurisdiction(c, scope, { code: "CO-STATE", name: "State sales tax", level: "state", state: "CO", taxesDelivery: true, taxesLabor: false, taxesWarranty: true, rateBps: 290 });
+    await tax.saveArea(c, scope, { jurisdictionId: j.id!, state: "CO" });
+    await tax.setSourcing(c, scope, "destination");
+    await tax.confirmRates(c, scope);
+    await importCustomers(c, scope, "number,name\nC-1,First Customer", "customers.csv", "Olive Owner");
+    await importOpenAr(c, scope, `customer_number,reference,as_of,balance\nC-1,OLD-1,${todayIso()},250.00`, "ar.csv", "Olive Owner");
+    const bank = (await q<{ id: string }>(c, `select id from bank_account where entity_id = $1 and purpose = 'operating'`, [E]))[0].id;
+    await ob.openingBankBalance(c, scope, { bankAccountId: bank, asOf: todayIso(), amountMinor: 100000n });
+    const pv = await ob.previewOpeningStock(c, scope, "sku,location,qty,unit_cost\nITEM-1,DC1,3,20.00", "stock.csv", todayIso());
+    await ob.applyOpeningStock(c, scope, pv.runId);
+  });
+  void store;
+}
+
 export async function run(t: T) {
   // ------------------------------------------------- a brand-new company
   console.log("  -- a new company from the screen");
-  const made = await inTx((c) => createCompany(c, "onboarding checks", {
-    clientId: null, clientName: `Onboarding Check ${Date.now()}`, vertical: "retail", chartFrom: null,
-    name: "Onboard Co", legalName: "Onboard Co LLC", einLast4: "", fiscalYearEndMonth: 12, stores: [],
-    banks: [{ purpose: "operating", name: "Operating", bankName: "A Bank", routingLast4: "1234", accountLast4: "5678" }],
-    people: [{ name: "Olive Owner", email: "olive@onboard.test", roles: ["owner"] }],
-  })) as { id: string; tenantId: string };
-  const E1 = made.id, T1 = made.tenantId;
-  const owner = (await inTx((c) => q<{ id: string }>(c, `select id from app_user where tenant_id = $1 and email = 'olive@onboard.test' /* unscoped: lookup */`, [T1])))[0].id;
+  await t.throws("new company: picking a pack or preset is part of creating it", () => newCompany(""), /pick what kind of business/);
+  const nc = await newCompany("pack:furniture");
+  const E1 = nc.E, T1 = nc.T, owner = nc.owner;
   const r = routes(t, () => E1, onboardingModule, setupModule);
   const scope = (id = owner, label = "Olive Owner") => ({ tenantId: T1, entityId: E1, actor: { kind: "user" as const, id, label } });
   const asOwner = <R>(fn: (c: Client) => Promise<R>) => tx({ kind: "user", id: owner, label: "Olive Owner" }, fn);
@@ -69,25 +126,49 @@ export async function run(t: T) {
       /* unscoped: counting one new company and its client */`, [entityId, tenantId])))[0];
   const zero = (x: Record<string, string>) => Object.entries(x).filter(([, v]) => v !== "0").map(([k, v]) => `${k}=${v}`);
   const fresh = await counts(E1, T1);
-  t.ok("new company: no products, customers, tax rates, locations, sites, trucks, entries or vendors", !zero(fresh).length, zero(fresh).join(", "));
+  t.ok("new company with its pack: no products, customers, tax rates, locations, sites, trucks, entries or vendors", !zero(fresh).length, zero(fresh).join(", "));
+  const packed = await inTx((c) => q<{ n: string }>(c, `select count(*)::text n from pack_application where entity_id = $1`, [E1]));
+  t.ok("new company: the pack picked on the form is applied", packed[0].n === "1");
 
   const d0 = await list();
-  t.ok("new company: every step shows, none of them done", d0.steps.length === 13 && d0.steps.every((s) => s.status !== "done"),
+  t.ok("new company: every step shows; only the business type and its chart (picked on the form) are done", d0.steps.length === 13
+    && d0.steps.every((s) => s.status !== "done" || s.id === "services" || s.id === "chart") && d0.steps.find((s) => s.id === "services")!.status === "done",
     d0.steps.filter((s) => s.status === "done").map((s) => s.id).join(","));
   t.ok("new company: one store or none, so users and roles are optional", d0.steps.find((s) => s.id === "users")!.status === "optional");
+  t.ok("new company: no selling location yet, so sales tax is optional", d0.steps.find((s) => s.id === "tax")!.status === "optional");
   t.ok("new company: each step says why, has help and a screen to open", d0.steps.every((s) => s.why && s.what && s.skipped && s.screen && s.label));
-  t.ok("new company: the chart lists the account codes the services need and lack",
-    (d0.steps.find((s) => s.id === "chart")!.missingAccounts ?? []).some((m) => m.code === "1300" && m.services.includes("Warehouse"))
-    && (d0.steps.find((s) => s.id === "chart")!.missingAccounts ?? []).some((m) => m.code === "2100"));
   const home0 = await r.get("/onboarding/home", owner);
   t.ok("home: the owner sees the card with the next steps", home0.show === true && home0.next.length === 3 && home0.total === 13);
 
-  // packs add accounts, reasons, settings and services; never tax rates, locations or sample data
-  await asOwner((c) => applyPack(c, scope(), "furniture", "Olive Owner"));
-  const afterPack = await counts(E1, T1);
-  t.ok("pack: applying a pack adds no tax rates, locations or sample data", !zero(afterPack).length, zero(afterPack).join(", "));
+  // a back-office preset has no pack: its chart lacks what Receivables posts to, and the list says so
+  const bo = await newCompany("preset:back_office");
+  const boList = await routes(t, () => bo.E, onboardingModule).get("/onboarding/checklist", bo.owner);
+  const boChart = boList.steps.find((s: any) => s.id === "chart");
+  t.ok("chart: missing account codes are listed with the service that needs them", boChart.status === "todo"
+    && boChart.missingAccounts.some((m: any) => m.code === "1100" && m.services.includes("Receivables")) && boChart.missingAccounts.some((m: any) => m.code === "2100"),
+    JSON.stringify(boChart.missingAccounts.map((m: any) => m.code)));
+  await t.throws("opening stock: refused while the Warehouse service is off", () => routes(t, () => bo.E, onboardingModule)
+    .post("/onboarding/opening-stock/preview", bo.owner, { csv: "sku,location,qty,unit_cost\nX,Y,1,1", asOf: todayIso() }), /Warehouse service is off/);
   t.ok("services: a pack applied turns the step done, single store counted", (await step("services")).status === "done" && /Single store|One location/.test((await step("services")).detail ?? ""));
   t.ok("chart: the pack's chart covers every code the services post to", (await step("chart")).status === "done", JSON.stringify((await step("chart")).missingAccounts));
+
+  // every pack: a fresh company's chart lacks nothing, and the checklist reaches complete with no skips
+  console.log("  -- every pack reaches complete");
+  for (const pack of ["furniture", "appliance", "retail", "rto", "trucking"]) {
+    const x = await newCompany(`pack:${pack}`, pack === "trucking" ? "trucking" : "retail", pack);
+    const rx = routes(t, () => x.E, onboardingModule);
+    const first = await rx.get("/onboarding/checklist", x.owner);
+    const chart = first.steps.find((s: any) => s.id === "chart");
+    t.ok(`pack ${pack}: the chart step has nothing missing`, chart.status === "done" && !chart.missingAccounts.length, JSON.stringify(chart.missingAccounts));
+    await fillEverything(x.E, x.T, x.owner, first.steps);
+    const end = await rx.get("/onboarding/checklist", x.owner);
+    t.ok(`pack ${pack}: the checklist reaches complete with no skips`, end.complete && end.steps.every((s: any) => s.status === "done" || s.status === "optional") && !end.steps.some((s: any) => s.skip),
+      JSON.stringify(end.steps.filter((s: any) => s.status !== "done").map((s: any) => [s.id, s.status, s.checks.filter((c: any) => !c.ok)])));
+  }
+  const tk = await newCompany("pack:trucking", "trucking", "tk2");
+  const tkList = await routes(t, () => tk.E, onboardingModule).get("/onboarding/checklist", tk.owner);
+  t.ok("trucking: no finance settlements, and sales tax optional with no store", !(await inTx((c) => q(c, `select 1 from entity_module where entity_id = $1 and module = 'settlements' and enabled`, [tk.E]))).length
+    && tkList.steps.find((s: any) => s.id === "tax")?.status === "optional");
 
   // the list of codes stays complete: every code: "NNNN" a core file posts to is on it
   const listed = new Set(Object.values(ob.POSTS_TO).flat());
@@ -186,6 +267,7 @@ export async function run(t: T) {
   console.log("  -- opening stock and the bank opening balance");
   const zone = await inTx(async (c) => (await q<{ id: string }>(c, `insert into inv_zone (entity_id, location_id, code, name) values ($1, $2, 'A', 'Aisle A') returning id`, [E1, wh]))[0].id);
   await inTx((c) => c.query(`insert into inv_bin (entity_id, location_id, zone_id, code) values ($1, $2, $3, 'A-01')`, [E1, wh, zone]));
+  const AS_OF = `${todayIso().slice(0, 8)}01`;   // the first of this month: inside the open periods, not today
   const csv = [
     "sku,location,bin,qty,unit_cost,serial,lot",
     "CHAIR-1,DC1,A-01,4,120.50,,",            // goes in
@@ -199,11 +281,13 @@ export async function run(t: T) {
     "LAMP-1,DC1,Z-99,1,10,,",                 // no such bin
     "LAMP-1,ST2,,3,abc,,",                    // cost is not an amount
   ].join("\n");
-  await t.throws("opening stock: a cashier cannot import it", () => r.post("/onboarding/opening-stock/preview", cashier, { csv, filename: "stock.csv" }), /owner, controller/);
-  await t.throws("opening stock: a file without a qty column is refused", () => r.post("/onboarding/opening-stock/preview", owner, { csv: "sku,location\nCHAIR-1,DC1", filename: "x.csv" }), /qty column/);
+  await t.throws("opening stock: a cashier cannot import it", () => r.post("/onboarding/opening-stock/preview", cashier, { csv, filename: "stock.csv", asOf: AS_OF }), /owner, controller/);
+  await t.throws("opening stock: a file without a qty column is refused", () => r.post("/onboarding/opening-stock/preview", owner, { csv: "sku,location\nCHAIR-1,DC1", filename: "x.csv", asOf: AS_OF }), /qty column/);
   const gl = async (code: string) => BigInt((await inTx((c) => q<{ b: string }>(c, `select coalesce(sum(jl.debit_minor - jl.credit_minor), 0)::text b from journal_line jl
       join journal_entry je on je.id = jl.journal_entry_id join gl_account g on g.id = jl.gl_account_id where je.entity_id = $1 and g.code = $2`, [E1, code])))[0].b);
-  const pv = await r.post("/onboarding/opening-stock/preview", owner, { csv, filename: "stock.csv" });
+  await t.throws("opening stock: the as-of day must be in a fiscal period", () => r.post("/onboarding/opening-stock/preview", owner, { csv, filename: "stock.csv", asOf: "1990-01-01" }), /no fiscal period holding 1990-01-01/);
+  await t.throws("opening stock: an as-of day is required", () => r.post("/onboarding/opening-stock/preview", owner, { csv, filename: "stock.csv" }), /give the day/);
+  const pv = await r.post("/onboarding/opening-stock/preview", owner, { csv, filename: "stock.csv", asOf: AS_OF });
   const msg = (row: number) => pv.rows.find((x: any) => x.row === row)?.message ?? "";
   t.ok("opening stock preview: two rows go in, eight are refused", pv.ok === 2 && pv.refused === 8, `${pv.ok}/${pv.refused}`);
   t.ok("opening stock preview: each refusal says why", /no product with SKU NOPE-9/.test(msg(4)) && /no location with the code XX9/.test(msg(5)) && /above zero/.test(msg(6))
@@ -221,10 +305,23 @@ export async function run(t: T) {
   const binQty = await inTx((c) => q<{ qty: string }>(c, `select sum(on_hand)::text qty from stock_level where entity_id = $1 and product_id = $2 and location_id = $3`, [E1, prod.chair, wh]));
   t.ok("opening stock apply: the chairs are on hand at the warehouse", Number(binQty[0].qty) === 4);
   await t.throws("opening stock: the same import is never brought in twice", () => r.post("/onboarding/opening-stock/apply", owner, { runId: pv.runId }), /already brought in/);
-  const again = await r.post("/onboarding/opening-stock/preview", owner, { csv: "sku,location,qty,unit_cost\nCHAIR-1,DC1,1,1.00", filename: "again.csv" });
+  const again = await r.post("/onboarding/opening-stock/preview", owner, { csv: "sku,location,qty,unit_cost\nCHAIR-1,DC1,1,1.00", filename: "again.csv", asOf: AS_OF });
   t.ok("opening stock: a SKU at a place already imported is refused next time", again.ok === 0 && /already came in/.test(again.rows[0].message));
   const adj = await inTx((c) => q(c, `select 1 from inv_adjustment where entity_id = $1 and reason_code = 'opening_balance'`, [E1]));
   t.ok("opening stock: each row is an opening-balance stock adjustment", adj.length === 2);
+  const dates = await inTx((c) => q<{ d: string }>(c, `select distinct je.posting_date::text d from inv_adjustment a join journal_entry je on je.id = a.journal_entry_id
+     where a.entity_id = $1 and a.reason_code = 'opening_balance'`, [E1]));
+  t.ok("opening stock: posted on the as-of day chosen, not today", dates.length === 1 && dates[0].d === AS_OF, JSON.stringify(dates));
+  // a SKU that already has stock at the place is flagged, and adding on top needs a confirm
+  await asOwner((c) => inventory.adjust(c, scope(), { locationId: store, productId: prod.lamp, qty: 2, reasonCode: "found", note: "found in the back" }));
+  const fl = await r.post("/onboarding/opening-stock/preview", owner, { csv: "sku,location,qty,unit_cost\nLAMP-1,ST1,1,10.00", filename: "lamp.csv", asOf: AS_OF });
+  t.ok("opening stock: a row where stock is already on hand is flagged", fl.ok === 1 && fl.addsToExisting === 1 && /already has 2 on hand here; this adds to it/.test(fl.rows[0].message), JSON.stringify(fl.rows[0]));
+  await t.throws("opening stock: flagged rows need a confirm", () => r.post("/onboarding/opening-stock/apply", owner, { runId: fl.runId }), /confirm to bring it in on top/);
+  const fla = await r.post("/onboarding/opening-stock/apply", owner, { runId: fl.runId, confirm: true });
+  t.ok("opening stock: confirmed, it adds on top", fla.added === 1);
+  const r3 = routes(t, () => ENTITY, inventoryModule);
+  await t.throws("roles: a store manager cannot adjust stock in as an opening balance", () => r3.post("/inventory/adjustments", "55555555-0000-0000-0000-000000000018" /* the demo store manager */,
+    { locationId: "33333333-0000-0000-0000-000000000001", productId: prod.lamp, qty: 1, reasonCode: "opening_balance" }), /owner, controller/);
 
   // ---------------------------------------------------- opening balances
   await asOwner(async (c) => {
@@ -269,8 +366,16 @@ export async function run(t: T) {
   const stockTie = g2.tieOuts!.find((x) => x.id === "stock")!;
   t.ok("go-live: a failing tie-out is reported and the step is not done", g2.status === "todo" && !stockTie.ok && /\$50\.00/.test(stockTie.detail), stockTie.detail);
   t.ok("go-live: the other tie-outs still pass", g2.tieOuts!.filter((x) => x.id !== "stock").every((x) => x.ok));
+  t.ok("home: the card comes back while a tie-out fails (it does not hide wrongly)", (await r.get("/onboarding/home", owner)).show === true);
   await asOwner((c) => post(c, scope(), { date: new Date().toISOString().slice(0, 10), sourceType: "manual", sourceId: null, description: "check: reversed",
     lines: [{ code: "3000", debit: 5000n }, { code: "1300", credit: 5000n }] }));
+  t.ok("home: tie-outs agree again, the card is gone", (await r.get("/onboarding/home", owner)).show === false);
+
+  // once sales are posted, stock no longer comes in as an opening balance
+  await asOwner((c) => post(c, scope(), { date: todayIso(), sourceType: "sale", sourceId: null, description: "check: first sale",
+    lines: [{ code: "1050", debit: 1000n }, { code: "4000", credit: 1000n }] }));
+  await t.throws("opening stock: refused once the company has posted sales", () => r.post("/onboarding/opening-stock/preview", owner,
+    { csv: "sku,location,qty,unit_cost\nLAMP-1,DC1,1,10.00", filename: "late.csv", asOf: AS_OF }), /already posted sales/);
 
   // --------------------------------------------------------------- roles
   console.log("  -- who may see and change it");

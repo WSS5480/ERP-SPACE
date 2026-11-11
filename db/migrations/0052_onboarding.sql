@@ -10,8 +10,9 @@
 --   3. Every sales tax rate starts unchecked, whoever or whatever entered it
 --      (seed, migration stand-in, a person). A person confirms them on the
 --      Sales tax screen, which stamps checked_by / checked_at.
---   4. Opening stock comes in from a CSV, previewed first; each applied row
---      is an inventory 'opening_balance' adjustment (Dr 1300 / Cr 3000).
+--   4. Opening stock comes in from a CSV, previewed first, as of a day the
+--      person picks; each applied row is an inventory 'opening_balance'
+--      adjustment (Dr 1300 / Cr 3000) posted on that day.
 --   5. A bank account's opening balance posts Dr its cash account / Cr 3000,
 --      once per account.
 
@@ -59,11 +60,18 @@ create table onboarding_dismissal (
 );
 create unique index onboarding_dismissal_one_live on onboarding_dismissal (entity_id) where withdrawn_at is null;
 
+-- A company already trading when this migration runs does not get the checklist on Home
+-- (it is still under Setup, and anyone can bring it back to Home from there).
+insert into onboarding_dismissal (entity_id, dismissed_by)
+select e.id, 'migration 0052 (already trading)' from entity e
+ where exists (select 1 from journal_entry je where je.entity_id = e.id);
+
 -- -------------------------------------------------------- opening stock --
 create table opening_stock_run (
   id          uuid primary key default gen_random_uuid(),
   entity_id   uuid not null references entity(id),
   filename    text,
+  as_of       date not null,
   status      text not null default 'previewed' check (status in ('previewed', 'applied')),
   rows_seen   integer not null default 0,
   rows_ok     integer not null default 0,
@@ -95,6 +103,8 @@ create table opening_stock_row (
   bin_id          uuid references inv_bin(id),
   action          text not null check (action in ('add', 'refuse')),
   message         text,
+  -- the SKU already had stock or movements at this location when previewed: bringing it in adds to that, and needs a confirm
+  adds_to_existing boolean not null default false,
   adjustment_id   uuid references inv_adjustment(id),
   unique (run_id, row_no)
 );

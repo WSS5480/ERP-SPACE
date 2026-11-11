@@ -354,6 +354,8 @@ export const module: ErpModule = {
     // ---- adjustments
     coPost("/inventory/adjustments", safe(async (c, co, a, b) => {
       await requireRole(c, co, a, MANAGER, "adjusting stock");
+      // an opening balance posts to owner's equity (3000), not shrink: only the owner or a controller brings one in
+      if (str(b.reasonCode, 40) === "opening_balance") await requireRole(c, co, a, ["owner", "controller"], "adjusting stock in as an opening balance");
       return inv.adjust(c, sc(co, a), { locationId: uuid(b.locationId) ?? "", productId: uuid(b.productId) ?? "", qty: num(b.qty),
         reasonCode: str(b.reasonCode, 40), note: str(b.note) || undefined, binId: uuid(b.binId), labels: labels(b.labels) });
     }));

@@ -50,14 +50,17 @@ export async function instantAt(c: Client, entityId: string, locationId: string,
 export async function timezoneFor(c: Client, entityId: string, locationId: string): Promise<string> {
   const r = await q<{ tz: string }>(c, `
     select coalesce((select timezone from workforce_location where location_id = $2 and entity_id = $1),
-                    (select timezone from workforce_settings where entity_id = $1), 'America/New_York') tz`, [entityId, locationId]);
+                    (select timezone from workforce_settings where entity_id = $1), (select time_zone from fleet_setting where entity_id = $1), 'America/New_York') tz`, [entityId, locationId]);
   return r[0].tz;
 }
 
 async function settingsOf(c: Client, entityId: string) {
   const r = await q<{ missed_punch_hours: number; max_shift_hours: number; timezone: string }>(c,
     `select missed_punch_hours, max_shift_hours, timezone from workforce_settings where entity_id = $1`, [entityId]);
-  return r[0] ?? { missed_punch_hours: 12, max_shift_hours: 14, timezone: "America/New_York" };
+  if (r[0]) return r[0];
+  // no time settings yet: the delivery settings' zone if there is one
+  const f = await q<{ tz: string }>(c, `select time_zone tz from fleet_setting where entity_id = $1`, [entityId]);
+  return { missed_punch_hours: 12, max_shift_hours: 14, timezone: f[0]?.tz ?? "America/New_York" };
 }
 
 export async function employeeOf(c: Client, entityId: string, id: string) {

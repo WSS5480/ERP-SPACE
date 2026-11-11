@@ -1607,7 +1607,12 @@ function rowList(make, addLabel, initial) {
 function openNewCompany() {
   const d = openDialog('Add a company', 'Everything it needs to start: its stores, where its money is, and who acts for it', { wide: true });
   fillDialog(d, async () => {
-    const clients = await api('/api/clients');
+    const [clients, biz] = await Promise.all([api('/api/clients'), coApi('/setup/business').catch(() => ({ packs: [], presets: [] }))]);
+    // what kind of business: required, so a new company starts with the right services, accounts and defaults
+    const setupKind = select([['', 'Pick one…'], ...(biz.presets || []).map((p) => [`preset:${p.id}`, `${p.name} (preset)`]),
+      ...(biz.packs || []).map((p) => [`pack:${p.id}`, `${p.name} (setup pack)`])], '');
+    const setupBlurb = el('p', { class: 'fine' });
+    setupKind.addEventListener('change', () => { const [k, id] = setupKind.value.split(':'); const x = ((k === 'pack' ? biz.packs : biz.presets) || []).find((p) => p.id === id); setupBlurb.textContent = x ? x.blurb : ''; });
     const client = select([...clients.map((t) => [t.id, `${t.name} (${plural(t.companies, 'company', 'companies')})`]), ['new', 'A new client…']], S.co.tenant_id || (clients[0] && clients[0].id) || 'new');
     const clientName = input({ maxlength: '60', placeholder: 'The business this company belongs to' });
     const vertical = select(Object.entries(KIND), 'retail');
@@ -1647,9 +1652,10 @@ function openNewCompany() {
     const setUp = el('button', { class: 'btn primary', type: 'button', onclick: async () => {
       out.replaceChildren();
       const body = { clientId: client.value === 'new' ? null : client.value, clientName: clientName.value, vertical: vertical.value, chartFrom: chartFrom.value || null,
-        name: name.value, legalName: legal.value, einLast4: ein.value, fiscalYearEndMonth: Number(fy.value),
+        name: name.value, legalName: legal.value, einLast4: ein.value, fiscalYearEndMonth: Number(fy.value), setup: setupKind.value,
         stores: stores.rows.map((r) => r.value()).filter(Boolean), banks: banks.rows.filter((r) => !r.blank()).map((r) => r.value()),
         people: people.rows.map((r) => r.value()).filter(Boolean) };
+      if (!setupKind.value) { out.replaceChildren(resultBox('warning', 'warn', 'Pick what kind of business this is', 'Choose a preset or a setup pack; it turns on the right services and adds the accounts they need. Any of it can be changed afterwards.')); setupKind.focus(); return; }
       busy(setUp, true, 'Setting it up…');
       try {
         const r = await api('/api/companies', { method: 'POST', body });
@@ -1657,7 +1663,7 @@ function openNewCompany() {
         S.companies = S.me.companies;
         const c = S.companies.find((x) => x.id === r.id);
         d.close();
-        if (c) { await setCompany(c); go('setup'); }
+        if (c) { await setCompany(c); go('checklist'); }
         toast(r.warning || `${body.name.trim()} is set up.`, r.warning ? 'warning' : 'good');
       } catch (e) {
         if (!(e instanceof Stop)) out.replaceChildren(resultBox('critical', 'fail', 'Not set up', friendly(e)));
@@ -1669,6 +1675,7 @@ function openNewCompany() {
       newClient,
       el('div', { class: 'form-grid' },
         formSec('Company'), field('Name', name), field('Legal name', legal), field('EIN', ein, 'Last four digits only'), field('Fiscal year ends', fy),
+        field('Kind of business (required)', setupKind, 'A preset or setup pack: services, accounts and defaults. Never adds sample data.', true), setupBlurb,
         storeHead),
       stores.node,
       el('div', { class: 'form-grid' }, formSec('Bank accounts')),

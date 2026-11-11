@@ -73,14 +73,27 @@
       el('div', { class: 'ob-pad' }, checksList(s), extra));
   }
 
+  const backBtn = (label, go) => el('button', { class: 'btn', type: 'button', onclick: go }, E.icon('chev'), label);
+
+  /** The steps behind the "Finished" count, by status, each opening its card's screen; Back returns to the checklist. */
+  function summary(d) {
+    const groups = [['todo', 'Still to do'], ['done', 'Done'], ['skipped', 'Skipped, with a reason'], ['optional', 'Optional here']];
+    return frag(
+      head(`${d.finished} of ${d.total} finished`, [backBtn('Back to the checklist', () => E.go('checklist'))], 'Setup checklist'),
+      groups.map(([st, title]) => { const l = d.steps.filter((s) => s.status === st); return l.length ? section(title, String(l.length), null, el('div', { class: 'panel' }, l.map((s) => item({
+        title: s.title, detail: st === 'skipped' && s.skip ? s.skip.reason : s.checks.filter((x) => !x.ok).map((x) => x.label).join(' · ') || s.why,
+        badge: chip(...(STATUS[st] || STATUS.todo)), onClick: () => openStep(s) })))) : null; }));
+  }
+
   async function screen(sub) {
     const d = await coApi('/onboarding/checklist');
+    if (sub === 'summary') return summary(d);
     const can = manages();
     const left = d.steps.filter((s) => s.status === 'todo');
     const top = tilesRow(
       tile({ label: 'Finished', value: `${d.finished} of ${d.total}`, tone: d.complete ? 'good' : 'warning', ic: d.complete ? 'ok' : 'clock',
         text: d.complete ? 'Every step is done, skipped or optional' : `${plural(left.length, 'step')} to go`,
-        onClick: left.length ? () => openStep(left[0]) : null }),
+        onClick: () => E.go('checklist', 'summary') }),
       tile({ label: 'Layout', value: d.layout.single ? 'Single store' : `${plural(d.layout.locations, 'location')}`, word: true, tone: 'neutral', ic: 'building',
         text: d.layout.multiCompany ? `${plural(d.layout.companies, 'company', 'companies')} in this client` : 'Counted from your locations', onClick: () => E.go('services') }));
     const homeNote = d.dismissed
@@ -91,7 +104,7 @@
     if (sub === 'company') setTimeout(companyDialog, 0);
     if (sub === 'opening') setTimeout(openingDialog, 0);
     return frag(
-      head('Setup checklist', null, 'Setup'),
+      head('Setup checklist', [backBtn('Back to Home', () => E.go('home'))], 'Setup'),
       el('p', { class: 'lead', text: 'What is left before this company can trade on the system. Each step turns done by itself when its data is there; nothing is ticked by hand. Steps for services that are off do not show.' }),
       top,
       homeNote ? el('div', { class: 'panel' }, homeNote) : null,
@@ -133,15 +146,16 @@
       const can = manages();
       const stockOut = el('div');
       const file = el('input', { type: 'file', accept: '.csv,text/csv' });
+      const stockAsOf = input({ type: 'date', value: E.todayIso() });
       const preview = el('button', { class: 'btn primary', type: 'button', disabled: !can || null, onclick: async (e) => {
         const f = file.files && file.files[0];
         if (!f) { toast('Choose a file first', 'critical'); return; }
         const b = e.currentTarget; E.busy(b, true, 'Reading…');
-        try { showPreview(stockOut, await post('/onboarding/opening-stock/preview', { filename: f.name, csv: await f.text() }), d); }
+        try { showPreview(stockOut, await post('/onboarding/opening-stock/preview', { filename: f.name, csv: await f.text(), asOf: stockAsOf.value }), d); }
         catch (x) { stockOut.replaceChildren(resultBox('critical', 'fail', 'Not read', E.friendly(x))); }
         finally { if (b.isConnected) E.busy(b, false); }
       } }, 'Preview');
-      const runs = o.runs.map((r) => item({ title: `${r.filename || 'Opening stock'} · ${r.status === 'applied' ? 'brought in' : 'previewed, not brought in'}`,
+      const runs = o.runs.map((r) => item({ title: `${r.filename || 'Opening stock'} · as of ${r.as_of} · ${r.status === 'applied' ? 'brought in' : 'previewed, not brought in'}`,
         amount: money(r.value_minor), detail: `${plural(r.rows_ok, 'row')} in, ${r.rows_refused} refused · ${r.applied_by || r.created_by} · ${ago(r.applied_at || r.created_at)}` }));
       const banks = o.banks.length ? o.banks.map((b) => b.as_of
         ? item({ title: b.name, amount: money(b.amount_minor), detail: `As of ${b.as_of} · ••${b.account_last4} · entered by ${b.entered_by}`, badge: chip('good', 'ok', 'Entered') })
@@ -152,7 +166,8 @@
           acts: [btn('Open Business setup', () => { d.close(); E.go('business'); })] }))),
         section('Opening stock', null, null, el('div', { class: 'panel' },
           el('div', { class: 'ob-pad' }, el('p', { class: 'd', text: 'CSV with sku, location (its code), bin (optional), qty, unit_cost, serial (optional; several separated by ; one per unit), lot (optional). You see every row first; nothing moves until you bring it in. Each row posts Dr 1300 / Cr 3000 at its unit cost.' }),
-            el('div', { class: 'form-grid' }, field('CSV file', file, 'Up to 1 MB and 5,000 rows'), el('div', { class: 'dlg-acts' }, preview)), stockOut),
+            el('div', { class: 'form-grid' }, field('CSV file', file, 'Up to 1 MB and 5,000 rows'), field('As of', stockAsOf, 'The day the old books’ stock is as of; it posts on that day, in an open period'),
+              el('div', { class: 'dlg-acts' }, preview)), stockOut),
           runs)),
         section('Bank accounts', null, null, el('div', { class: 'panel' }, banks)),
         el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Close')));
@@ -163,14 +178,18 @@
     const can = manages();
     const rows = r.rows.map((x) => item({ title: `Row ${x.row} · ${x.sku || 'no SKU'} at ${x.location || '?'}${x.bin ? ` / ${x.bin}` : ''}`,
       amount: x.action === 'add' ? money(x.valueMinor) : null,
-      detail: x.action === 'add' ? [`${x.qty} at ${money(x.unitCostMinor)}`, x.serials.length ? `serials ${x.serials.join(', ')}` : null, x.lot ? `lot ${x.lot}` : null].filter(Boolean).join(' · ') : x.message,
-      badge: x.action === 'add' ? chip('good', 'ok', 'Goes in') : chip('critical', 'fail', 'Refused') }));
+      detail: x.action === 'add' ? [`${x.qty} at ${money(x.unitCostMinor)}`, x.serials.length ? `serials ${x.serials.join(', ')}` : null, x.lot ? `lot ${x.lot}` : null, x.addsToExisting ? x.message : null].filter(Boolean).join(' · ') : x.message,
+      badge: x.action !== 'add' ? chip('critical', 'fail', 'Refused') : x.addsToExisting ? chip('warning', 'warn', 'Adds to stock there') : chip('good', 'ok', 'Goes in') }));
+    const confirm = el('input', { type: 'checkbox' });
     box.replaceChildren(
       resultBox(r.refused ? 'warning' : 'good', r.refused ? 'warn' : 'ok', `${plural(r.ok, 'row')} ready, ${r.refused} refused`,
-        `${r.units} units worth ${money(r.valueMinor)} at cost. Refused rows stay out; fix them and import them again.`),
+        `${r.units} units worth ${money(r.valueMinor)} at cost, posted as of ${r.asOf}. Refused rows stay out; fix them and import them again.`),
+      r.addsToExisting ? el('div', {}, resultBox('warning', 'warn', `${plural(r.addsToExisting, 'row')} add to stock already there`,
+        'Those products already have stock or movements at that location. Bringing them in adds on top; it does not replace what is there.'),
+        el('label', { class: 'li check-row' }, confirm, el('div', { class: 't', text: 'Add them on top of what is there' }))) : null,
       el('div', { class: 'ob-rows' }, E.capped(rows, 20, 'rows')),
       r.ok && can ? el('div', { class: 'dlg-acts' }, el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget,
-        () => post('/onboarding/opening-stock/apply', { runId: r.runId }),
+        () => post('/onboarding/opening-stock/apply', { runId: r.runId, confirm: confirm.checked }),
         (x) => `${plural(x.added, 'row')} brought in, ${money(x.valueMinor)}${x.problems.length ? `; ${x.problems.length} refused` : ''}`, { close: d.close }) }, `Bring ${plural(r.ok, 'row')} in`)) : null);
   }
 

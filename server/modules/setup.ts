@@ -8,7 +8,7 @@ import { q } from "../../packages/core/db.ts";
 import { scopeOf, rolesOf } from "../actions.ts";
 import { ModuleError } from "./kit.ts";
 import * as tax from "../../packages/core/tax.ts";
-import { effectiveServices } from "../../packages/core/services.ts";
+import { effectiveServices, PRESETS } from "../../packages/core/services.ts";
 import {
   PACKS, MODULE_IDS, applyPack, enabledModules, setModule, putSetting, importCustomers, importOpenAr, saveLocation,
 } from "../../packages/core/setup.ts";
@@ -36,6 +36,7 @@ export const module: ErpModule = {
       ]);
       return {
         packs: PACKS.map((p) => ({ id: p.id, name: p.name, blurb: p.blurb, modules: p.modules, vertical: p.vertical })),
+        presets: PRESETS.map((p) => ({ id: p.id, name: p.name, blurb: p.blurb })),
         modules: await enabledModules(c, co.id),
         allModules: MODULE_IDS,
         applied, settings, locations, reasons, imports,

@@ -10,8 +10,14 @@ import type { ErpModule, Client, Company } from "./kit.ts";
 import { ModuleError, need, requireRole, str, uuid, minor } from "./kit.ts";
 import { rolesOf, scopeOf } from "../actions.ts";
 import * as ob from "../../packages/core/onboarding.ts";
+import { effectiveServices } from "../../packages/core/services.ts";
 
 const WHO = ["owner", "controller"];
+
+/** Opening stock belongs to the Warehouse service: with it off there is no stock to bring in. */
+async function needWarehouse(c: Client, co: Company) {
+  need((await effectiveServices(c, co.id)).on.includes("inventory"), "the Warehouse service is off for this company, so there is no stock to bring in; turn it on under Services first");
+}
 
 async function plain<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn(); }
@@ -37,8 +43,12 @@ export const module: ErpModule = {
       if (!p) return { show: false };
       const held = await rolesOf(c, co, p);
       if (!WHO.some((r) => held.has(r))) return { show: false };
-      const d = await ob.checklist(c, co.tenantId, co.id);
-      if (d.complete || d.dismissed) return { show: false, complete: d.complete };
+      // the card's count and next steps skip the tie-outs (they run on the checklist and the go-live step);
+      // a list that looks finished without them is checked in full, so the card never hides while a tie-out fails
+      let d = await ob.checklist(c, co.tenantId, co.id, { tieOuts: false });
+      if (d.dismissed) return { show: false, complete: false };
+      if (d.complete || d.steps.every((s) => s.status !== "todo" || s.id === "golive")) d = await ob.checklist(c, co.tenantId, co.id);
+      if (d.complete) return { show: false, complete: true };
       return { show: true, finished: d.finished, total: d.total,
         next: d.steps.filter((s) => s.status === "todo").slice(0, 3).map((s) => ({ id: s.id, title: s.title, why: s.why, screen: s.screen, sub: s.sub ?? null, label: s.label })) };
     });
@@ -79,16 +89,18 @@ export const module: ErpModule = {
     });
     coPost("/onboarding/opening-stock/preview", async (c, co, a, b) => {
       await requireRole(c, co, a, WHO, "bringing in opening stock");
+      await needWarehouse(c, co);
       const csv = typeof b.csv === "string" ? b.csv : "";
       need(csv.length > 0, "choose a CSV file");
       need(csv.length <= 1_000_000, "that file is over the 1 MB limit for one import; split it");
-      return plain(() => ob.previewOpeningStock(c, scopeOf(co, a), csv, str(b.filename, 120) || "upload.csv"));
+      return plain(() => ob.previewOpeningStock(c, scopeOf(co, a), csv, str(b.filename, 120) || "upload.csv", str(b.asOf, 10)));
     }, { maxBody: 1_200_000 });
     coPost("/onboarding/opening-stock/apply", async (c, co, a, b) => {
       await requireRole(c, co, a, WHO, "bringing in opening stock");
+      await needWarehouse(c, co);
       const id = uuid(b.runId);
       need(id, "no such opening stock import");
-      return plain(() => ob.applyOpeningStock(c, scopeOf(co, a), id!));
+      return plain(() => ob.applyOpeningStock(c, scopeOf(co, a), id!, { confirm: b.confirm === true }));
     });
     coPost("/onboarding/opening-bank", async (c, co, a, b) => {
       await requireRole(c, co, a, WHO, "entering a bank opening balance");

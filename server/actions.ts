@@ -18,6 +18,8 @@ import { planSweeps, confirmTransfer, resolveDisbursementAccount } from "../pack
 import { autoMatch, matchManually } from "../packages/core/reconcile.ts";
 import { fromDecimal } from "../packages/core/money.ts";
 import { type Company, explainReason } from "./views.ts";
+import { PACKS, applyPack } from "../packages/core/setup.ts";
+import { PRESETS, presetPack, applyPresetSwitches } from "../packages/core/services.ts";
 
 /** A refusal a person can act on. The server turns it into a 409 with the message. */
 export class ActionError extends Error {}
@@ -1152,6 +1154,11 @@ export async function createCompany(c: Client, operator: string, input: Record<s
   const stores = storesIn(input.stores);
   const banks = banksIn(input.banks, stores);
   const people = peopleIn(input.people);
+  // What kind of business it is: a setup pack or a service preset, picked as part of creating the company.
+  const setup = text(input.setup, 40);
+  const [setupKind, setupId] = setup.split(":");
+  need((setupKind === "pack" && PACKS.some((p) => p.id === setupId)) || (setupKind === "preset" && PRESETS.some((p) => p.id === setupId)),
+    "pick what kind of business this is: a setup pack or a preset");
 
   let tenantId: string;
   let vertical: Vertical;
@@ -1260,8 +1267,13 @@ export async function createCompany(c: Client, operator: string, input: Record<s
       [entityId, pol.subject, pol.min.toString(), JSON.stringify(pol.steps), pol.callback]);
   }
 
+  // the pack adds accounts, pick lists and defaults (never tax rates, locations or sample data); a preset also sets the switches
+  const packId = setupKind === "pack" ? setupId : presetPack(setupId)?.id ?? null;
+  if (packId) await applyPack(c, scope, packId, operator);
+  if (setupKind === "preset") await applyPresetSwitches(c, entityId, setupId, operator);
+
   await audit(c, scope, { table: "entity", rowId: entityId, action: "insert",
-    after: { name: companyName, legalName, stores: stores.length, banks: banks.length, people: people.length, newClient: !existing },
+    after: { name: companyName, legalName, stores: stores.length, banks: banks.length, people: people.length, newClient: !existing, setup },
     reason: "company set up from the screen" });
   const warn = people.length < 2 ? "With one person, nothing they enter can be approved: add a second person before real work starts." : null;
   return { id: entityId, tenantId, warning: warn };
