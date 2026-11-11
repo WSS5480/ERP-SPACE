@@ -11,6 +11,7 @@ import { xlsxRows, isXlsx, FileError } from "../../packages/core/filekit.ts";
 import { loadPin } from "../../packages/core/connections.ts";
 import { TransportError } from "../../packages/core/transports.ts";
 import * as vfiles from "../../packages/core/vendor_files.ts";
+import { canDecideNow } from "../../packages/core/approvals.ts";
 import { productSheet } from "./tearsheet.ts";
 import { q } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
@@ -285,10 +286,10 @@ async function labels(c: Client, co: Company, url: URL) {
   return { items: out };
 }
 
-async function vendors(c: Client, co: Company) {
+async function vendors(c: Client, co: Company, personId: string | null = null) {
   const rows = await q(c, `
     select v.id, coalesce(v.dba, v.legal_name) as name, vp.order_email, vp.account_no, vp.sku_prefix, coalesce(vp.lead_days, 30) lead_days,
-           coalesce(vp.freight_min_minor, 0) freight_min_minor, coalesce(vp.freight_min_qty, 0) freight_min_qty, vp.notes,
+           coalesce(vp.freight_min_minor, 0) freight_min_minor, ve.status, coalesce(vp.freight_min_qty, 0) freight_min_qty, vp.notes,
            (select count(*) from product p where p.entity_id = ve.entity_id and p.vendor_id = v.id) products,
            (select max(created_at) from catalog_import_run r where r.entity_id = ve.entity_id and r.vendor_id = v.id) last_import,
            (select count(*) from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id) feeds,
@@ -299,10 +300,19 @@ async function vendors(c: Client, co: Company) {
            (select count(*) from inbound_file x join connection cn on cn.id = x.connection_id where cn.entity_id = ve.entity_id and cn.vendor_id = v.id and x.status = 'quarantined') files_quarantined
       from vendor_entity ve join vendor v on v.id = ve.vendor_id
       left join vendor_profile vp on vp.entity_id = ve.entity_id and vp.vendor_id = v.id
-     where ve.entity_id = $1 and ve.status = 'active' and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) order by 2`, [co.id]);
+     where ve.entity_id = $1 and ve.status in ('active', 'hold') and exists (select 1 from vendor_merchandise vm where vm.entity_id = ve.entity_id and vm.vendor_id = ve.vendor_id and vm.is_merchandise) order by 2`, [co.id]);
+  // A vendor waiting on approval shows with its request, and whether the person looking can approve it now.
+  const pending = await q<{ subject_id: string; id: string }>(c, `select subject_id, id from approval_request where entity_id = $1 and subject_type = 'vendor' and status = 'open'`, [co.id]);
+  const waiting = new Map(pending.map((r) => [r.subject_id, r.id]));
   const freight = await q(c, `select f.vendor_id, f.location_id, l.name location, f.freight_bps, f.per_unit_minor
                                 from vendor_freight f join location l on l.id = f.location_id where f.entity_id = $1 order by l.name`, [co.id]);
-  return { vendors: rows.map(({ mailbox_key, ...v }) => ({ ...v, inbound_address: mailbox_key ? vfiles.inboundAddress(String(mailbox_key)) : null, freight: freight.filter((f) => f.vendor_id === v.id) })) };
+  const out = [];
+  for (const { mailbox_key, ...v } of rows) {
+    const requestId = v.status === "hold" ? waiting.get(String(v.id)) ?? null : null;
+    out.push({ ...v, pending: v.status === "hold", approval_request_id: requestId, can_approve: requestId ? await canDecideNow(c, co.id, requestId, personId) : false,
+      inbound_address: mailbox_key ? vfiles.inboundAddress(String(mailbox_key)) : null, freight: freight.filter((f) => f.vendor_id === v.id) });
+  }
+  return { vendors: out };
 }
 
 // --------------------------------------------------------------- module
@@ -336,7 +346,7 @@ export const module: ErpModule = {
     });
     coGet("/catalog/margins", async (c, co, url, _m, p) => guard(c, co, p, await margins(c, co, url)));
     coGet("/catalog/labels", (c, co, url) => refuse(() => labels(c, co, url)));
-    coGet("/catalog/vendors", (c, co) => vendors(c, co));
+    coGet("/catalog/vendors", (c, co, _u, _m, p) => vendors(c, co, p));
     coGet("/catalog/templates", async (c, co) => {
       const ts = await q(c, `select t.id, t.name, t.vendor_id, coalesce(v.dba, v.legal_name) vendor, t.category, t.active,
                                     (select count(*) from product_template_applied a where a.entity_id = t.entity_id and a.template_id = t.id) used

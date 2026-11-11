@@ -34,10 +34,15 @@ import { unzip, isZip, isXlsx, xlsxRows, FileError, globTest } from "./filekit.t
 import {
   mapFields, missingFor, unwrapRecords, flatten, applyCatalogRows, recordVendorPrices, recordAvailability, FeedError,
 } from "./vendor_feeds.ts";
-import { parseCsv, CatalogError } from "./catalog.ts";
+import { parseCsv, CatalogError, TEMPLATE_EXAMPLE_SKU } from "./catalog.ts";
 import * as x12 from "./x12.ts";
 
 export class VendorFilesError extends Error {}
+
+/** Held vendor mail: at most this many messages, or this much content, per client at once; content is kept this many days. */
+export const HELD_MAX_COUNT = 200;
+export const HELD_MAX_BYTES = 500 * 1048576;
+export const HELD_KEEP_DAYS = 60;
 const need = (cond: unknown, msg: string): void => { if (!cond) throw new VendorFilesError(msg); };
 
 export const KINDS = ["catalog", "prices", "inventory", "edi"] as const;
@@ -47,6 +52,10 @@ const PURPOSE: Record<Exclude<Kind, "edi">, string> = { catalog: "products", pri
 export const CHANNELS = ["sftp", "api", "email"] as const;
 export const AFTER = ["leave", "move", "delete"] as const;
 export type Carry = { kind: Kind; glob: string };
+
+/** The import template's example row (model B1234-38): left out of every import, whatever channel brought it. */
+export const isExampleRow = (r: Record<string, string>, mapping: Record<string, string>) =>
+  String(r[mapping.vendor_sku ?? ""] ?? "").trim().toUpperCase() === TEMPLATE_EXAMPLE_SKU;
 
 /** Files worth reading in an email; anything else (logos, signatures, PDFs) is left out and named. */
 const DATA_EXT = /\.(csv|tsv|txt|xlsx|json|x12|edi|dat|zip|850|810|855|856|832|846|997)$/i;
@@ -129,10 +138,13 @@ export function readFile(conn: Connection, name: string, bytes: Buffer): { parts
       continue;
     }
     need(!looksX12(f.bytes), `${f.name} is an X12 file, but ${conn.name} does not carry EDI documents; add EDI documents to what it carries`);
-    const rows = tableOf(f.name, f.bytes);
-    const heads = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+    const all = tableOf(f.name, f.bytes);
+    const heads = [...new Set(all.flatMap((r) => Object.keys(r)))];
     const saved = ((conn.config.mapping ?? {}) as Record<string, Record<string, string>>)[kind] ?? {};
     const mapping = mapFields(PURPOSE[kind], heads, saved);
+    // The import template's grey example row is not a product, whichever way the file came.
+    const rows = all.filter((r) => !isExampleRow(r, mapping));
+    need(rows.length, `${f.name} holds only the template's example row (${TEMPLATE_EXAMPLE_SKU}); nothing to apply`);
     const missing = missingFor(PURPOSE[kind], mapping, { costOptional: kind === "catalog" });
     need(!missing.length, `${f.name} (${KIND_WORDS[kind].toLowerCase()}): no column found for ${missing.join(", ").replace(/_/g, " ")}; its columns are ${heads.slice(0, 12).join(", ")}${heads.length > 12 ? "…" : ""}`);
     parts.push({ kind, name: f.name, rows, mapping, heads });
@@ -503,7 +515,8 @@ const senderOf = (m: InboundMail) => {
 };
 
 const domainOf = (addr: string) => addr.slice(addr.lastIndexOf("@") + 1).replace(/[>\s]+$/, "").toLowerCase();
-const sameOrg = (a: string, b: string) => !!a && !!b && (a === b || a.endsWith("." + b) || b.endsWith("." + a));
+// Both must be real domains (a dot each), so a bare "com" never aligns with anything.
+const sameOrg = (a: string, b: string) => !!a && !!b && a.includes(".") && b.includes(".") && (a === b || a.endsWith("." + b) || b.endsWith("." + a));
 
 /**
  * Why this message's sender cannot be believed, or null when it can.
@@ -578,19 +591,28 @@ export async function receiveMail(m: InboundMail) {
   // Each attachment in its own transaction: one that fails to apply is held, and never undoes another.
   for (const a of data) {
     await tx({ kind: "system", label: "inbound email" }, async (c) => {
+      const targets = await targetsFor(c, s.entityId, box.vendor_id, sender, subject, a.name);
+      const suggest = targets.length === 1 ? targets[0] : null;
       const hold = async (reason: string, feed?: { id: string; runId: string | null }) => {
         if (a.bytes.length > MAX_MB * 1048576) { out.ignored.push(`${a.name} (over ${MAX_MB} MB)`); return; }
-        const r = await q(c, `insert into inbound_mail_held (tenant_id, entity_id, vendor_id, sender, subject, message_id, filename, content_type, byte_size, sha256, content, reason, feed_id, feed_run_id)
-          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) on conflict do nothing returning id`,
-          [s.tenantId, s.entityId, box.vendor_id, sender || "(no sender)", subject.slice(0, 300) || null, String(m.MessageID ?? "").slice(0, 300) || null,
-           a.name, a.type ?? null, a.bytes.length, sha256(a.bytes), a.bytes, reason.slice(0, 1000), feed?.id ?? null, feed?.runId ?? null]);
+        // A client holds at most HELD_MAX_COUNT messages or HELD_MAX_BYTES of content at once; past that the record is kept, not the file.
+        const tot = await one<{ n: number; bytes: string }>(c, `select count(*)::int n, coalesce(sum(byte_size), 0)::text bytes from inbound_mail_held
+          where tenant_id = $1 and content is not null /* unscoped: the limit is per client */`, [s.tenantId]);
+        const keep = tot.n < HELD_MAX_COUNT && BigInt(tot.bytes) + BigInt(a.bytes.length) <= BigInt(HELD_MAX_BYTES);
+        const why = keep ? reason : `${reason} (the file itself was not kept: this client already holds ${HELD_MAX_COUNT} messages or ${HELD_MAX_BYTES / 1048576} MB of held mail; apply or set some aside, then ask the vendor to send it again)`;
+        const r = await q(c, `insert into inbound_mail_held (tenant_id, entity_id, vendor_id, sender, subject, message_id, filename, content_type, byte_size, sha256, content, reason, feed_id, feed_run_id,
+            suggest_connection_id, suggest_feed_id)
+          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) on conflict do nothing returning id`,
+          [s.tenantId, s.entityId, box.vendor_id ?? suggest?.vendorId ?? null, sender || "(no sender)", subject.slice(0, 300) || null, String(m.MessageID ?? "").slice(0, 300) || null,
+           a.name, a.type ?? null, a.bytes.length, sha256(a.bytes), keep ? a.bytes : null, why.slice(0, 1000), feed?.id ?? null, feed?.runId ?? null,
+           suggest?.kind === "connection" ? suggest.id : null, suggest?.kind === "feed" ? suggest.id : null]);
         if (r.length) out.held.push(a.name); else out.duplicate++;
       };
-      if (auth) return hold(auth);
-      const targets = await targetsFor(c, s.entityId, box.vendor_id, sender, subject, a.name);
+      if (auth) return hold(`${auth}. Forwarded mail and mail sent through a mailing service land here too: check it and press Apply`);
       if (!targets.length) return hold(`${sender || "the sender"} is not on the sender list of any ${box.vendor_id ? "of this vendor's feeds or connections" : "vendor feed or connection"} here`);
       if (targets.length > 1) return hold(`${sender} matches more than one place (${targets.map((x) => x.name).join(", ")}); say which this file is for, or give the feeds file patterns`);
       const t = targets[0];
+      if (await alwaysHold(c, s.entityId, t.vendorId)) return hold(`this vendor's mail is always held for review; press Apply to run it through ${t.name}`);
       if (t.kind === "connection") {
         const r = await ingest(c, s, t.id, { trigger: "webhook", offered: [{ origin: a.name, originDetail: { subject, messageId: m.MessageID }, sender, contentType: a.type, bytes: a.bytes }] });
         out.accepted += r.fresh; out.duplicate += r.seen - r.fresh; out.quarantined.push(...r.quarantined);
@@ -607,7 +629,10 @@ export async function receiveMail(m: InboundMail) {
 }
 
 export async function heldMail(c: Client, entityId: string, vendorId: string | null = null) {
-  return q(c, `select h.id, h.received_at, h.sender, h.subject, h.filename, h.content_type, h.byte_size, h.reason, h.status, h.vendor_id, coalesce(v.dba, v.legal_name) vendor
+  return q(c, `select h.id, h.received_at, h.sender, h.subject, h.filename, h.content_type, h.byte_size, h.reason, h.status, h.vendor_id, coalesce(v.dba, v.legal_name) vendor,
+            (h.content is not null) has_content, h.content_purged_at,
+            coalesce((select cn.name from connection cn where cn.id = h.suggest_connection_id and cn.entity_id = h.entity_id),
+                     (select f.name from vendor_feed f where f.id = h.suggest_feed_id and f.entity_id = h.entity_id)) suggested
      from inbound_mail_held h left join vendor v on v.id = h.vendor_id
      where h.entity_id = $1 and h.status = 'held' and ($2::uuid is null or h.vendor_id = $2) order by h.received_at desc limit 200`, [entityId, vendorId]);
 }
@@ -627,7 +652,7 @@ export async function assignHeld(c: Client, s: Scope, heldId: string, to: { conn
     `select id, sender, subject, message_id, filename, content_type, content, status from inbound_mail_held where id = $1 and entity_id = $2 for update`, [heldId, s.entityId]))[0];
   need(h, "no such held message");
   need(h.status === "held", "that file has already been dealt with");
-  need(h.content, "that file's content was not kept; ask the vendor to send it again");
+  need(h.content, "that file's content is no longer kept (held mail keeps its file 60 days, and only while the client is under its held-mail limit); ask the vendor to send it again");
   const okSender = /^[^\s@<>]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(h.sender);
   if (to.feedId) {
     const { runFeed, liveEnv, feedSenders } = await import("./vendor_feeds.ts");
@@ -672,3 +697,57 @@ export async function setAsideHeld(c: Client, s: Scope, heldId: string, reason: 
 }
 
 export { maxBytesOf };
+
+// ----------------------------------------------------------- review --
+
+/** Is every message for this vendor held for a person (the vendor's "always hold for review")? */
+export async function alwaysHold(c: Client, entityId: string, vendorId: string): Promise<boolean> {
+  return (await q(c, `select 1 from vendor_mail_rule where entity_id = $1 and vendor_id = $2 and always_hold`, [entityId, vendorId])).length > 0;
+}
+
+export async function setAlwaysHold(c: Client, s: Scope, vendorId: string, on: boolean) {
+  need((await q(c, `select 1 from vendor_entity where entity_id = $1 and vendor_id = $2`, [s.entityId, vendorId])).length, "that vendor is not set up for this company");
+  await c.query(`insert into vendor_mail_rule (entity_id, vendor_id, always_hold, updated_by) values ($1,$2,$3,$4)
+    on conflict (entity_id, vendor_id) do update set always_hold = excluded.always_hold, updated_by = excluded.updated_by, updated_at = now()`, [s.entityId, vendorId, on, s.actor.id || null]);
+  await audit(c, s, { table: "vendor_mail_rule", rowId: vendorId, action: "update", after: { alwaysHold: on } });
+  return { alwaysHold: on };
+}
+
+/** Each vendor here: its "always hold" setting and what is held for it now (the per-vendor review view). */
+export async function holdByVendor(c: Client, entityId: string) {
+  return q(c, `select v.id vendor_id, coalesce(v.dba, v.legal_name) vendor, coalesce(r.always_hold, false) always_hold,
+                      (select count(*)::int from inbound_mail_held h where h.entity_id = ve.entity_id and h.status = 'held' and h.vendor_id = v.id) held
+                 from vendor_entity ve join vendor v on v.id = ve.vendor_id
+                 left join vendor_mail_rule r on r.entity_id = ve.entity_id and r.vendor_id = v.id
+                where ve.entity_id = $1 and ve.status = 'active'
+                  and (r.always_hold or exists (select 1 from connection cn where cn.entity_id = ve.entity_id and cn.vendor_id = v.id and cn.channel = 'email')
+                       or exists (select 1 from vendor_feed f where f.entity_id = ve.entity_id and f.vendor_id = v.id and f.kind = 'email')
+                       or exists (select 1 from inbound_mail_held h where h.entity_id = ve.entity_id and h.vendor_id = v.id and h.status = 'held'))
+                order by 2`, [entityId]);
+}
+
+/** One tap: run held mail through the connection or feed its sender pointed to, with the same mapping. The sender list is not changed. */
+export async function applyHeld(c: Client, s: Scope, heldId: string, who: string) {
+  const h = (await q<{ suggest_connection_id: string | null; suggest_feed_id: string | null }>(c,
+    `select suggest_connection_id, suggest_feed_id from inbound_mail_held where id = $1 and entity_id = $2`, [heldId, s.entityId]))[0];
+  need(h, "no such held message");
+  need(h.suggest_connection_id || h.suggest_feed_id, "this sender matches no single vendor feed or connection; use Assign and say which it is for");
+  return assignHeld(c, s, heldId, { connectionId: h.suggest_connection_id, feedId: h.suggest_feed_id }, false, who);
+}
+
+/** Held content past HELD_KEEP_DAYS is dropped; the record (who, when, what, why) stays. Every client; the scheduler's daily run. */
+export async function purgeHeldContent(c: Client, now = new Date()) {
+  const r = await q(c, `update inbound_mail_held set content = null, content_purged_at = $1
+      where content is not null and received_at < $1::timestamptz - make_interval(days => $2) returning id
+      /* unscoped: the daily purge covers every client's held mail */`, [now.toISOString(), HELD_KEEP_DAYS]);
+  return { purged: r.length };
+}
+
+/** Every vendor-file connection's files (or only one status), newest first: what the Files taken and Quarantined tiles open. */
+export async function allFiles(c: Client, entityId: string, status: string | null) {
+  return q(c, `select f.id, f.origin, f.received_at, f.byte_size, f.status, f.format, f.rows_parsed, f.note, f.quarantine_reason, cn.id connection_id, cn.name connection,
+                      coalesce(v.dba, v.legal_name) vendor
+                 from inbound_file f join connection cn on cn.id = f.connection_id join vendor v on v.id = cn.vendor_id
+                where cn.entity_id = $1 and cn.source_code = 'vendor_files' and ($2::text is null or f.status = $2)
+                order by f.received_at desc limit 300`, [entityId, status]);
+}

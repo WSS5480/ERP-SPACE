@@ -44,6 +44,20 @@ export const module: ErpModule = {
     });
     coGet(`/vendor-files/vendor/${ID}`, async (c, co, _u, m, p) => { await mayRead(c, co, p); return refuse(() => vf.vendorMail(c, co, m[2], !lookOnly(c))); });
 
+    coGet("/vendor-files/files", async (c, co, url, _m, p) => {
+      await mayRead(c, co, p);
+      const st = str(url.searchParams.get("status"), 20);
+      return { files: await vf.allFiles(c, co.id, ["quarantined", "applied", "ignored"].includes(st) ? st : null) };
+    });
+    coGet("/vendor-files/review", async (c, co, _u, _m, p) => { await mayRead(c, co, p); return { vendors: await vf.holdByVendor(c, co.id) }; });
+    coPost(`/vendor-files/held/${ID}/apply`, async (c, co, a, _b, m) => refuse(async () => {
+      await requireRole(c, co, a, MANAGE, "applying held vendor mail");
+      return vf.applyHeld(c, scopeOf(co, a), m[2], a.personName);
+    }));
+    coPost(`/vendor-files/vendor/${ID}/always-hold`, async (c, co, a, b, m) => refuse(async () => {
+      await requireRole(c, co, a, MANAGE, "holding a vendor's mail for review");
+      return vf.setAlwaysHold(c, scopeOf(co, a), m[2], b.on === true);
+    }));
     coPost("/vendor-files/save", async (c, co, a, b) => refuse(async () => {
       await requireRole(c, co, a, MANAGE, "setting up vendor files");
       const d = (b.connection && typeof b.connection === "object" ? b.connection : {}) as vf.Draft;

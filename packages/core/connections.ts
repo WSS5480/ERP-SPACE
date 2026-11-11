@@ -685,10 +685,10 @@ export function maxBytesOf(conn: Pick<Connection, "config">): number {
 
 export type PinOwner = { kind: "connection" | "edi_partner" | "vendor_feed"; id: string; tenantId: string; entityId: string };
 export type Pin = { host: string; port: number; key_type: string; fingerprint: string; pinned_at: string; pinned_by_name: string | null;
-  offered_type: string | null; offered_fingerprint: string | null; offered_at: string | null };
+  offered_type: string | null; offered_fingerprint: string | null; offered_at: string | null; offered_host: string | null; offered_port: number | null };
 
 export async function loadPin(c: Client, owner: Pick<PinOwner, "kind" | "id" | "entityId">): Promise<Pin | null> {
-  return (await q<Pin>(c, `select host, port, key_type, fingerprint, pinned_at, pinned_by_name, offered_type, offered_fingerprint, offered_at
+  return (await q<Pin>(c, `select host, port, key_type, fingerprint, pinned_at, pinned_by_name, offered_type, offered_fingerprint, offered_at, offered_host, offered_port
     from sftp_host_pin where owner_kind = $1 and owner_id = $2 and entity_id = $3`, [owner.kind, owner.id, owner.entityId]))[0] ?? null;
 }
 
@@ -712,10 +712,19 @@ export async function testSftp(c: Client, s: Scope, owner: PinOwner, t: Omit<Sft
   const host = String(t.host ?? "").trim().toLowerCase();
   const pin = await loadPin(c, owner);
   const pinned = pinFor(pin, host, port);
-  const res: SftpTestResult = { ok: false, words: "", fingerprint: null, keyType: null, firstTime: !pinned, changed: false, recorded: pinned?.fingerprint ?? null, files: null, sample: [] };
+  const res: SftpTestResult = { ok: false, words: "", fingerprint: null, keyType: null, firstTime: !pin, changed: false, recorded: pin?.fingerprint ?? null, files: null, sample: [] };
   let session: SftpSession | null = null;
   try {
     session = await openSftp(env, { ...t, host, port, pinned }, "learn");
+    if (pin && !pinned) {
+      // A key is recorded for this connection, but for another server: changing the host or port is a changed key, which only the owner trusts.
+      const k = session.hostKey;
+      await c.query(`update sftp_host_pin set offered_type = $4, offered_fingerprint = $5, offered_at = now(), offered_host = $6, offered_port = $7
+        where owner_kind = $1 and owner_id = $2 and entity_id = $3`, [owner.kind, owner.id, owner.entityId, k.type, k.fingerprint, host, port]);
+      res.changed = true; res.fingerprint = k.fingerprint; res.keyType = k.type;
+      res.words = `This connection's server changed from ${pin.host}${pin.port === 22 ? "" : `:${pin.port}`} to ${host}${port === 22 ? "" : `:${port}`}. Its key (${k.fingerprint}) is not trusted yet; nothing was downloaded. The owner can trust it after checking with the vendor.`;
+      return res;
+    }
     res.fingerprint = session.hostKey.fingerprint; res.keyType = session.hostKey.type;
     const files = await session.list(dir, globs);
     res.files = files.length; res.sample = files.slice(0, 10);
@@ -723,14 +732,13 @@ export async function testSftp(c: Client, s: Scope, owner: PinOwner, t: Omit<Sft
       await c.query(`
         insert into sftp_host_pin (tenant_id, entity_id, owner_kind, owner_id, host, port, key_type, fingerprint, pinned_by, pinned_by_name)
         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-        on conflict (owner_kind, owner_id) do update set host = excluded.host, port = excluded.port, key_type = excluded.key_type, fingerprint = excluded.fingerprint,
-          pinned_at = now(), pinned_by = excluded.pinned_by, pinned_by_name = excluded.pinned_by_name, offered_type = null, offered_fingerprint = null, offered_at = null`,
+        on conflict (owner_kind, owner_id) do nothing`,
         [owner.tenantId, owner.entityId, owner.kind, owner.id, host, port, res.keyType, res.fingerprint, s.actor.id || null, who]);
       await audit(c, s, { table: "sftp_host_pin", rowId: owner.id, action: "insert",
         before: pin ? { host: pin.host, port: pin.port, fingerprint: pin.fingerprint } : undefined,
         after: { host, port, keyType: res.keyType, fingerprint: res.fingerprint, by: who } });
     } else if (pin?.offered_fingerprint) {
-      await c.query(`update sftp_host_pin set offered_type = null, offered_fingerprint = null, offered_at = null where owner_kind = $1 and owner_id = $2 and entity_id = $3`,
+      await c.query(`update sftp_host_pin set offered_type = null, offered_fingerprint = null, offered_at = null, offered_host = null, offered_port = null where owner_kind = $1 and owner_id = $2 and entity_id = $3`,
         [owner.kind, owner.id, owner.entityId]);
     }
     res.ok = true;
@@ -753,11 +761,13 @@ export async function trustOfferedKey(c: Client, s: Scope, owner: Pick<PinOwner,
   const pin = await loadPin(c, owner);
   if (!pin?.offered_fingerprint) throw new TransportError("there is no new server key waiting; press Test first to see what the server shows");
   if (pin.offered_fingerprint !== String(fingerprint ?? "").trim()) throw new TransportError("the server key has changed again since that Test; press Test and check the new one");
-  await c.query(`update sftp_host_pin set key_type = offered_type, fingerprint = offered_fingerprint, pinned_at = now(), pinned_by = $4, pinned_by_name = $5,
-      offered_type = null, offered_fingerprint = null, offered_at = null where owner_kind = $1 and owner_id = $2 and entity_id = $3`,
+  await c.query(`update sftp_host_pin set key_type = offered_type, fingerprint = offered_fingerprint, host = coalesce(offered_host, host), port = coalesce(offered_port, port),
+      pinned_at = now(), pinned_by = $4, pinned_by_name = $5,
+      offered_type = null, offered_fingerprint = null, offered_at = null, offered_host = null, offered_port = null where owner_kind = $1 and owner_id = $2 and entity_id = $3`,
     [owner.kind, owner.id, owner.entityId, s.actor.id || null, who]);
   await audit(c, s, { table: "sftp_host_pin", rowId: owner.id, action: "update", reason: "owner trusted a new server key",
-    before: { fingerprint: pin.fingerprint, keyType: pin.key_type }, after: { fingerprint: pin.offered_fingerprint, keyType: pin.offered_type, by: who } });
+    before: { fingerprint: pin.fingerprint, keyType: pin.key_type, host: pin.host, port: pin.port },
+    after: { fingerprint: pin.offered_fingerprint, keyType: pin.offered_type, host: pin.offered_host ?? pin.host, port: pin.offered_port ?? pin.port, by: who } });
   return { fingerprint: pin.offered_fingerprint };
 }
 

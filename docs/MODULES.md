@@ -108,7 +108,7 @@ Data is placed with textContent only, never innerHTML.
 | periods (periods that open on their own, month-end and year-end close), store-local dates | 0053 | 0034 | Back office (Books → Periods) |
 | scheduler and server errors (in-server jobs, run log, error references) | 0054 | none | Setup (Scheduled jobs), Operator console |
 | selling rules (discount limit, quote life, layaway terms, tenders); demo made up | 0055 | 0035 | Setup (Sales tax → Selling rules) |
-| vendor_files (SFTP and HTTPS transports, vendor file connections, vendor email, SFTP/email-in vendor feeds, EDI over SFTP) | 0057 | none | Setup (Connections → Vendor files), Retail (Catalog → Vendors → Catalog connections) |
+| vendor_files (SFTP and HTTPS transports, vendor file connections, vendor email, SFTP/email-in vendor feeds, EDI over SFTP; one-person approvals) | 0057, 0061, 0062 | none | Setup (Connections → Vendor files), Retail (Catalog → Vendors → Catalog connections) |
 | drill (the rows behind every tile; read-only lists) | none | none | no screen of its own |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
@@ -824,7 +824,10 @@ Outbound puts write `name.part` and rename it, and never overwrite.
 HTTPS ("api" channel) is `vendor_feeds.call`: https only, every hop checked,
 redirects by hand, 10 MB, a timeout; auth none, basic, bearer or a key header.
 `ERP_FEEDS_ALLOW_HOSTS` lets listed hosts sit on a private network (still
-https); checks use it for a local test server.
+https); checks use it for a local test server. The live fetch does its own DNS
+lookup, checks every address there and dials the address it checked (no DNS
+rebinding between check and call), and counts the body while it streams,
+cutting the call at 10 MB whatever Content-Length says.
 
 **Host keys** (`sftp_host_pin`, for a connection, an EDI partner or a vendor
 feed). The first good Test records the server's key (SHA256, as OpenSSH
@@ -832,8 +835,10 @@ prints it) and who recorded it; a run with no recorded key is refused ("press
 Test"), and a different key is refused before any password is sent, in a
 sentence naming both keys. A Test that meets a new key records it as offered;
 only the owner may trust it, by the fingerprint the Test showed, and that is
-an audit row with both keys. A pin is for one host and port; changing either
-starts over with a new Test.
+an audit row with both keys. Changing the host or port is a changed key too:
+the Test shows the new server's key as offered, and only the owner can trust
+it (the pin then moves to the new host and port). An SFTP upload that cannot
+take its final name removes its `.part` file.
 
 **Vendor file connections** (`packages/core/vendor_files.ts`, source
 `vendor_files`, `server/modules/vendor_files.ts` at `/vendor-files/*`): one
@@ -858,22 +863,37 @@ runs through the feed's ETL and field mapping like an API answer;
 
 **Inbound email.** Set `ERP_INBOUND_EMAIL_ADDRESS` to the mail service's
 inbound address (Postmark: `abc123@inbound.postmarkapp.com`) and point its
-inbound webhook at `POST /inbound/email?token=<ERP_EMAIL_INBOUND_TOKEN>`. Each
+inbound webhook at `https://erp:<ERP_EMAIL_INBOUND_TOKEN>@<your host>/inbound/email`
+(Postmark → Server → Settings → Inbound → Webhook URL). Postmark turns the
+user and password in that URL into an `Authorization: Basic` header, so the
+token never travels in the address or the request log. Other services send
+`Authorization: Bearer <token>`. A `?token=` in the address is refused. Each
 company gets `local+<key>@domain` (shown in Admin → Connections → Vendor
 files) and each vendor its own (shown on its card and in Catalog connections);
-`inbound_mailbox` holds the keys. A customer points a vendor at it by asking
-the vendor to send there, or by a forwarding rule in their own mailbox (keep
-the vendor as the From; a forward that rewrites the sender needs the
-forwarding address on the sender list). A message is routed by mailbox key
-(the tenant and company, never anything the message claims) and then by sender
-to the one email connection or email-in feed that lists it (an exact address
-before an @domain; a feed may also require a subject or attachment pattern).
-Unknown senders, a sender two places list, and mail whose SPF or DMARC failed
-are held (`inbound_mail_held`, content kept) until a person assigns them
-(optionally adding the sender) or sets them aside with a reason. Data
-attachments only (CSV, TSV, TXT, XLSX, JSON, X12/EDI, zip); logos and PDFs are
-listed as left out. Mail to an address that is no company's falls through to
-the older `config.mailbox` routes (bank statements).
+`inbound_mailbox` holds the keys. A customer points a vendor at it: ask the vendor to send there. (A forwarding rule in their own mailbox also delivers, but forwarded mail is held for review: see below.)
+A message is routed by mailbox key (the tenant and company, never anything the
+message claims) and then by sender to the one email connection or email-in
+feed that lists it (an exact address before an @domain; a feed may also
+require a subject or attachment pattern).
+
+Mail is applied automatically only when the receiving mail server confirms the
+sender: its own (topmost) Received-SPF says pass and the envelope sender's
+domain is the From domain (or a sub- or parent domain of it). Everything else
+is **held for one-tap review, never applied automatically**: forwarded mail
+(the envelope is the forwarder) and mail sent through a mailing service (the
+envelope is the service), SPF or DMARC failures, unknown senders, and a sender
+two places list. Held mail remembers where its sender would have sent it, so
+**Apply** runs it through that connection's or feed's own mapping in one tap;
+**Assign** sends it elsewhere (optionally adding the sender); **Set aside**
+keeps the record with a reason. A vendor can be set to **Always hold** every
+message for review (Admin → Connections → Vendor files → Mail held → Review by
+vendor). There is no rule that trusts a sender automatically. A client holds
+at most 200 messages or 500 MB of held content at once (past that the record
+is kept without the file), and the daily `held_mail` job drops held files
+after 60 days, keeping each record. Data attachments only (CSV, TSV, TXT,
+XLSX, JSON, X12/EDI, zip); logos and PDFs are listed as left out. Mail to an
+address that is no company's falls through to the older `config.mailbox`
+routes (bank statements).
 
 **EDI over SFTP** (`edi.transportFor`): their outbox folder is read (optional
 pattern, optional archive folder), our documents are put in their inbox
@@ -886,4 +906,20 @@ remains the way to reach AS2-only partners.
 `IMPORT_FIELDS` names in order) and `template.xlsx` (`server/static`, a
 Catalog sheet with an Instructions sheet; the checks hold its headings to
 `IMPORT_FIELDS`). The importer takes `.xlsx` (its Catalog sheet, else the
-first) as well as CSV, and leaves out the example row (model B1234-38).
+first; rows are read in one linear pass, at most 50,000, and Excel date
+cells come out as YYYY-MM-DD) as well as CSV. The example row (model
+B1234-38) is left out on every channel: manual import, SFTP, HTTPS, email and
+every vendor feed. The template's barcode (UPC) column is text-formatted as a
+whole column, so leading zeros survive.
+
+**One-person companies and approvals (migration 0061).** The maker is never
+the checker, except that the owner may decide their own request's step when
+nobody else active in the company holds that step's role or the owner role;
+the step is marked `self_approved` and an audit row says "self-approved: no
+other approver". The database trigger enforces the same rule. This frees every
+type the approval engine routes: vendor, vendor_bank_account (its callback is
+still required), invoice, payment_run, payroll_run, employee,
+employee_change, journal_entry and fiscal_period. Catalog → Vendors lists a
+vendor waiting on approval with "Waiting for approval" and an Approve button
+for whoever may decide it; Add vendor from Catalog offers merchandise
+categories only (the server refuses others).

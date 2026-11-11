@@ -266,11 +266,16 @@ export async function approvals(c: Client, co: Company, personId: string | null)
     let why = "";
     let canDecide = false;
     if (!personId) why = `Pick who you are acting as; ${waiting}`;
-    else if (r.maker_id === personId) why = `You made it, so someone else approves it: ${waiting}`;
+    else if (r.maker_id === personId) {
+      // The owner of a company where nobody else could decide it approves it themselves (recorded as self-approved).
+      const anyoneElse = holders.some((h) => h.id !== personId && (h.role === r.step_role || h.role === "owner"));
+      if (held.has("owner") && !anyoneElse) { canDecide = true; why = "You made it, and nobody else here can approve it, so you can (recorded as self-approved)"; }
+      else why = `You made it, so someone else approves it: ${waiting}`;
+    }
     else if (already.has(personId)) why = `You decided an earlier step; the next is ${waiting}`;
     else if (!held.has(r.step_role)) why = cap(waiting);
     else canDecide = true;
-    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why });
+    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why, self: canDecide && r.maker_id === personId });
   }
 
   const recent = await q(c, `

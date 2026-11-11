@@ -240,8 +240,11 @@ export async function openSftp(env: NetEnv, t: SftpTarget, mode: "require" | "le
       const final = join(dir, safeName(name));
       const part = `${final}.part`;
       await cb<void>((k) => sftp.writeFile(part, bytes, k), `writing ${name} to ${where}`);
-      if (await exists(final)) throw new TransportError(`${name} is already in ${dir} on ${where}; nothing was overwritten`);
-      await cb<void>((k) => sftp.rename(part, final, k), `naming ${name} on ${where}`);
+      // Never leave half a hand-over behind: the .part goes whenever the final name cannot be taken.
+      const dropPart = () => cb<void>((k) => sftp.unlink(part, k), `removing ${name}.part`).catch(() => {});
+      if (await exists(final)) { await dropPart(); throw new TransportError(`${name} is already in ${dir} on ${where}; nothing was overwritten`); }
+      try { await cb<void>((k) => sftp.rename(part, final, k), `naming ${name} on ${where}`); }
+      catch (e) { await dropPart(); throw e; }
       return final;
     },
     async move(dir, name, toDir) {

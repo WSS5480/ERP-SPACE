@@ -73,8 +73,62 @@ export function secretKeyFromEnv(): Buffer | null {
   return k.length === 32 ? k : null;
 }
 
+/**
+ * The live fetch. Its own DNS lookup checks every address a name resolves to
+ * and hands the socket the address it checked, so a name cannot resolve to a
+ * public address for the check and a private one for the call (DNS
+ * rebinding). The body is counted while it streams and the call is cut at
+ * maxBytes, so a lying or missing Content-Length cannot fill memory.
+ */
+export function pinnedFetch(o: { allowHosts?: string[]; maxBytes?: number; ca?: string; lookup?: (host: string) => Promise<string[]> } = {}): FetchLike {
+  const maxBytes = o.maxBytes ?? MAX_ANSWER;
+  return (url, init = {}) => new Promise(async (resolve, reject) => {
+    let u: URL;
+    try { u = new URL(url); } catch { return reject(new FeedError("not a web address")); }
+    const mod = u.protocol === "http:" ? await import("node:http") : await import("node:https");
+    const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const allowed = (o.allowHosts ?? []).includes(host);
+    const lookup = (hostname: string, opts: unknown, cb: (err: Error | null, address: string | { address: string; family: number }[], family?: number) => void) => {
+      const all = typeof opts === "object" && opts !== null && (opts as { all?: boolean }).all;
+      const resolveAll = o.lookup ?? (async (h: string) => (await (await import("node:dns/promises")).lookup(h, { all: true, verbatim: true })).map((a) => a.address));
+      resolveAll(hostname).then((addrs) => {
+        if (!addrs.length) return cb(new FeedError(`${hostname} could not be found`), "");
+        if (!allowed && addrs.some((a) => isPrivateIp(a))) return cb(new FeedError("addresses on private networks are not called"), "");
+        const a = addrs[0], family = a.includes(":") ? 6 : 4;
+        all ? cb(null, [{ address: a, family }]) : cb(null, a, family);
+      }, () => cb(new FeedError(`${hostname} could not be found`), ""));
+    };
+    const req = (mod as typeof import("node:https")).request({
+      protocol: u.protocol, hostname: host, port: u.port || undefined, path: u.pathname + u.search, method: init.method ?? "GET",
+      headers: init.headers, lookup: lookup as never, ca: o.ca, servername: /^[\d.]+$|:/.test(host) ? undefined : host,
+    }, (res) => {
+      const headers = { get: (k: string) => { const v = res.headers[k.toLowerCase()]; return v == null ? null : Array.isArray(v) ? v.join(", ") : String(v); } };
+      let body: Promise<string> | null = null;
+      const text = () => (body ??= new Promise<string>((ok, bad) => {
+        const parts: Buffer[] = [];
+        let n = 0;
+        res.on("data", (d: Buffer) => {
+          n += d.length;
+          if (n > maxBytes) { res.destroy(); req.destroy(); bad(new FeedError(`the answer is over ${Math.round(maxBytes / 1048576) || 1} MB; ask for smaller pages`)); return; }
+          parts.push(d);
+        });
+        res.on("end", () => ok(Buffer.concat(parts).toString("utf8")));
+        res.on("error", (e) => bad(e));
+      }));
+      resolve({ status: res.statusCode ?? 0, headers, text });
+    });
+    req.on("error", (e) => reject(e instanceof FeedError ? e : e));
+    if (init.signal) {
+      if (init.signal.aborted) req.destroy(new Error("aborted"));
+      init.signal.addEventListener("abort", () => req.destroy(new Error("aborted")));
+    }
+    if (init.body) req.write(init.body);
+    req.end();
+  });
+}
+
 export const liveEnv = (): FeedEnv => ({
-  fetch: globalThis.fetch as unknown as FetchLike,
+  fetch: pinnedFetch({ allowHosts: (process.env.ERP_FEEDS_ALLOW_HOSTS ?? "").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean) }),
   secret: (ref) => process.env[secretEnvName(ref)] ?? "",
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   resolve: async (host) => {
@@ -1272,12 +1326,16 @@ export async function runFeed(c: Client, s: Scope, feedId: string, env: FeedEnv,
         return res;
       }
     }
-    const rows = applyEtl(p.rows, f.etl);
-    res.rows = rows.length;
-    need(rows.length, "the feed answered, but with no records");
-    const heads = [...new Set(rows.flatMap((r) => Object.keys(r)))].filter((k) => !k.startsWith("__"));
+    const etlRows = applyEtl(p.rows, f.etl);
+    need(etlRows.length, "the feed answered, but with no records");
+    const heads = [...new Set(etlRows.flatMap((r) => Object.keys(r)))].filter((k) => !k.startsWith("__"));
     const pricing = f.purpose === "products" && await hasPricingFeed(c, s.entityId, f.vendor_id, f.id);
     const mapping = mapFields(f.purpose, heads, f.mapping);
+    // The import template's grey example row (B1234-38) is not a product, by API, SFTP or email alike.
+    const { TEMPLATE_EXAMPLE_SKU } = await import("./catalog.ts");
+    const rows = etlRows.filter((r) => String(r[mapping.vendor_sku ?? ""] ?? "").trim().toUpperCase() !== TEMPLATE_EXAMPLE_SKU);
+    res.rows = rows.length;
+    need(rows.length, "the only record is the import template's example row (B1234-38); nothing to apply");
     const miss = missingFor(f.purpose, mapping, { costOptional: pricing });
     need(!miss.length, `pulled ${rows.length} records, but no column covers ${miss.join(", ")}; open Field mapping and pick them. Nothing was changed`);
     const a = await applyPurpose(c, s, f, rows, mapping, p.skipped);

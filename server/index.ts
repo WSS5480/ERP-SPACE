@@ -1432,7 +1432,13 @@ route("POST", /^\/hooks\/([^/]+)$/, "own", async (req, _url, m) => {
 // field names). The mailbox it was addressed to picks the connection; the
 // sender still has to be on that connection's allow list.
 route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
-  const presented = bearer(req) || url.searchParams.get("token") || "";
+  // The token rides in a header only, never the address (addresses end up in logs): "Authorization: Bearer <token>",
+  // or HTTP Basic with the token as the password -- what Postmark sends for https://erp:<token>@host/inbound/email.
+  const auth = String(req.headers.authorization ?? "");
+  const basic = /^basic\s+(.+)$/i.exec(auth);
+  let presented = bearer(req);
+  if (!presented && basic) { const pair = Buffer.from(basic[1], "base64").toString("utf8"); presented = pair.slice(pair.indexOf(":") + 1); }
+  if (url.searchParams.has("token")) throw new HttpError(401, "send the inbound email token in the Authorization header (Bearer, or Basic with the token as the password), not in the address");
   if (!EMAIL_TOKEN() || !safeEqual(presented, EMAIL_TOKEN())) {
     throw new HttpError(401, "inbound email needs its own token");
   }

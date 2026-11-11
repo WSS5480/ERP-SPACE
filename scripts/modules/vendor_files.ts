@@ -462,7 +462,7 @@ export async function run(t: T) {
     const rioMail = await vf.receiveMail(mail(rioOv.address!, "inventory@coaster.example", [{ name: "coaster_inv_8.csv", content: "sku,qty\nVF-101,1\n" }]));
     const a8 = await read(t, (c) => q<{ qty_available: number }>(c, `select qty_available from vendor_availability where entity_id = $1 and vendor_id = $2 and vendor_sku = 'VF-101'`, [ENTITY, V.COASTER]));
     t.ok("isolation: mail to another client's address stays theirs (held there), even from this company's vendor", rioMail?.company === RIO_ENTITY && rioMail.held.length === 1 && Number(a8[0]?.qty_available) === 99);
-    await t.throws("isolation: another client cannot trust this company's feed key", () => CR.post("/catalog/feeds/:id/trust-key", RIO_OWNER, { fingerprint: fp2 }, qf.id).then(() => { throw new Error("allowed"); }), /no such feed|needs one of|allowed/);
+    await t.throws("isolation: another client cannot trust this company's feed key", () => CR.post("/catalog/feeds/:id/trust-key", RIO_OWNER, { fingerprint: fp2 }, qf.id, RIO_ENTITY), /no such feed/);
 
     // ============================================================ hostile input (review)
     {
@@ -480,6 +480,126 @@ export async function run(t: T) {
       t.ok("zip: 100 stored entries sharing one 1 MB block (declared size 0) are refused, not unpacked to 100 MB", /damaged|unpacks to more/.test(bomb), bomb);
       const ips = ["::ffff:7f00:1", "::ffff:a9fe:a9fe", "0::1", "0:0:0:0:0:0:0:1", "64:ff9b::a9fe:a9fe", "fec0::1"];
       t.ok("network: every spelling of a private IPv6 address is private (mapped, expanded, NAT64, site-local)", ips.every((x) => cat.isPrivateIp(x)) && !cat.isPrivateIp("2606:4700:4700::1111") && !cat.isPrivateIp("::ffff:808:808"));
+    }
+
+    // ============================================================ review fixes (second pass)
+    {
+      // ---- a changed host or port is a changed key, trusted only by the owner
+      const other = memSftp({ pw: { buddys: "Sftp-Pass-7788" }, keys: { keyuser: utils.parseKey(clientKey.public) } });
+      const port2 = await other.start(hostKey1.private);
+      other.mkdirs("/vendor/keyed/done");
+      try {
+        const keyedConn = (await R.get(`/vendor-files/:id`, BUYER, "", keyed.id)).connection;
+        await R.post("/vendor-files/save", BUYER, { connection: { id: keyed.id, vendor_id: V.COASTER, channel: "sftp", name: keyedConn.name, host: "127.0.0.1", port: port2, user: "keyuser",
+          path: "/vendor/keyed", schedule: "0 * * * *", after: "move", moveTo: "/vendor/keyed/done", carries: [{ kind: "inventory", glob: "*.csv" }] } });
+        const moved = await R.post("/vendor-files/:id/test", BUYER, {}, keyed.id);
+        t.ok("host key: pointing a connection at another port is a changed key, not a fresh start (nothing downloaded)", !moved.ok && moved.changed && /server changed from 127\.0\.0\.1:\d+ to 127\.0\.0\.1:\d+/.test(moved.words), moved.words);
+        const r0 = await R.post("/vendor-files/:id/run", BUYER, {}, keyed.id);
+        t.ok("host key: and a run to the new server is refused until the owner trusts it", !r0.ok, r0.words);
+        await t.throws("host key: a buyer cannot trust the moved server", () => R.post("/vendor-files/:id/trust-key", BUYER, { fingerprint: moved.fingerprint }, keyed.id), /needs one of: owner/);
+        await R.post("/vendor-files/:id/trust-key", OWNER, { fingerprint: moved.fingerprint }, keyed.id);
+        const pinNow = await read(t, (c) => C.loadPin(c, { kind: "connection", id: keyed.id, entityId: ENTITY }));
+        const ok2 = await R.post("/vendor-files/:id/test", BUYER, {}, keyed.id);
+        t.ok("host key: once the owner trusts it, the pin moves to the new port and Tests pass", pinNow?.port === port2 && ok2.ok, ok2.words);
+        // ---- an upload that cannot take its name leaves no .part behind
+        other.put("/drop/taken.edi", "x");
+        const sess = await (await import("../../packages/core/transports.ts")).openSftp(await netEnv(), { host: "127.0.0.1", port: port2, user: "buddys", password: "Sftp-Pass-7788", pinned: { fingerprint: fp1, type: "ssh-ed25519" } }, "require");
+        let putErr = "";
+        try { await sess.put("/drop", "taken.edi", Buffer.from("ISA")); } catch (e) { putErr = (e as Error).message; } finally { sess.close(); }
+        t.ok("sftp: an upload whose name is taken is refused and its .part removed", /already in/.test(putErr) && !other.files.has("/drop/taken.edi.part") && other.files.get("/drop/taken.edi")!.data.toString() === "x", putErr);
+      } finally { await other.stop(); }
+
+      // ---- the template's example row is skipped on SFTP too
+      srv.put("/vendor/coaster_catalog_ex.csv", "vendor_sku,name,cost,price\nB1234-38,Example Sofa,1.00,2.00\nVF-102,Vendor Files Ottoman,50.00,129.00\n");
+      const rx = await R.post("/vendor-files/:id/run", BUYER, {}, conn.id);
+      const ex = await read(t, (c) => q<{ vendor_sku: string }>(c, `select vendor_sku from product where entity_id = $1 and vendor_id = $2 and vendor_sku in ('B1234-38','VF-102')`, [ENTITY, V.COASTER]));
+      t.ok("example row: B1234-38 is left out of a file pulled by SFTP, the real row applied", rx.ok && ex.length === 1 && ex[0].vendor_sku === "VF-102", JSON.stringify({ ex, rx: rx.words }));
+
+      // ---- every tile opens what is behind it
+      const allQ = await R.get("/vendor-files/files", BUYER, "?status=quarantined");
+      const ov3 = await R.get("/vendor-files", BUYER);
+      const sumQ = ov3.connections.filter((x: { status: string }) => x.status !== "retired").reduce((n: number, x: { quarantined: number }) => n + Number(x.quarantined), 0);
+      t.ok("drill: the Quarantined tile's view lists every quarantined file across connections, with its connection", allQ.files.length === sumQ && allQ.files.every((f: { status: string; connection: string }) => f.status === "quarantined" && !!f.connection), `${allQ.files.length} vs ${sumQ}`);
+      const allF = await R.get("/vendor-files/files", BUYER);
+      t.ok("drill: the Files tile's view lists the files of every connection", new Set(allF.files.map((f: { connection_id: string }) => f.connection_id)).size >= 3);
+
+      // ---- held mail: forwarded mail held, Apply in one tap, Always hold per vendor
+      const fwd = await vf.receiveMail(mail(ov2.address!, "inventory@coaster.example", [{ name: "coaster_inv_fwd.csv", content: "sku,qty\nVF-102,8\n" }],
+        { Headers: [{ Name: "Received-SPF", Value: "Pass (sender SPF authorized) identity=mailfrom; envelope-from=buyer@buddys-own-mailbox.example" }] }));
+      const hf = (await R.get("/vendor-files", BUYER)).held.find((h: { filename: string }) => h.filename === "coaster_inv_fwd.csv");
+      t.ok("held: a forwarded vendor message is held for review, remembering where it would go", fwd?.held.length === 1 && hf?.suggested === "Coaster email" && /Forwarded mail/.test(hf.reason), JSON.stringify(hf));
+      const ap = await R.post("/vendor-files/held/:id/apply", BUYER, {}, hf.id);
+      const a8b = await read(t, (c) => q<{ qty_available: number }>(c, `select qty_available from vendor_availability where entity_id = $1 and vendor_id = $2 and vendor_sku = 'VF-102'`, [ENTITY, V.COASTER]));
+      const sl = await read(t, (c) => q<{ allowed_senders: string[] }>(c, `select allowed_senders from connection where id = $1 and entity_id = $2`, [emailConn.id, ENTITY]));
+      t.ok("held: Apply runs it through the vendor's own connection in one tap, without changing the sender list", ap.to === "Coaster email" && ap.status === "applied" && Number(a8b[0]?.qty_available) === 8 && !sl[0].allowed_senders.includes("buyer@buddys-own-mailbox.example"), JSON.stringify(ap));
+      await R.post("/vendor-files/vendor/:id/always-hold", BUYER, { on: true }, V.COASTER);
+      const ah = await vf.receiveMail(mail(ov2.address!, "inventory@coaster.example", [{ name: "coaster_inv_ah.csv", content: "sku,qty\nVF-102,9\n" }]));
+      const rv = (await R.get("/vendor-files/review", BUYER)).vendors.find((v: { vendor_id: string }) => v.vendor_id === V.COASTER);
+      t.ok("held: with Always hold on, even a confirmed sender's file waits for review", ah?.held.length === 1 && ah.accepted === 0 && rv?.always_hold === true && rv.held >= 1, JSON.stringify(ah));
+      await R.post("/vendor-files/vendor/:id/always-hold", BUYER, { on: false }, V.COASTER);
+      const off = await vf.receiveMail(mail(ov2.address!, "inventory@coaster.example", [{ name: "coaster_inv_off.csv", content: "sku,qty\nVF-102,10\n" }]));
+      t.ok("held: with it off again, a confirmed sender goes straight through", off?.accepted === 1, JSON.stringify(off));
+      await vf.receiveMail(mail(ov2.address!, "nobody@unlisted.example", [{ name: "unlisted.csv", content: "sku,qty\nVF-102,1\n" }]));
+      const unl = (await R.get("/vendor-files", BUYER)).held.find((h: { filename: string }) => h.filename === "unlisted.csv");
+      t.ok("held: an unknown sender's file has nowhere to Apply to", !!unl && !unl.suggested);
+      await t.throws("held: Apply needs a single place the sender points to; Assign is the way", () => R.post("/vendor-files/held/:id/apply", BUYER, {}, unl.id), /use Assign/);
+
+      // ---- the held-mail limit and the 60-day purge
+      const rioBox = (await R.get("/vendor-files", RIO_OWNER, "", undefined, RIO_ENTITY)).address as string;
+      const rioTenant = (await read(t, (c) => q<{ tenant_id: string }>(c, `select tenant_id from entity where id = $1 /* unscoped: check */`, [RIO_ENTITY])))[0].tenant_id;
+      await tx({ kind: "system", label: "check" }, (c) => c.query(`insert into inbound_mail_held (tenant_id, entity_id, sender, filename, byte_size, sha256, content, reason)
+        select $1, $2, 'filler@example.com', 'filler-' || g || '.csv', 3, md5(g::text) || md5(g::text || 'x'), 'abc'::bytea, 'filler'
+          from generate_series(1, ${vf.HELD_MAX_COUNT}) g`, [rioTenant, RIO_ENTITY]));
+      const over = await vf.receiveMail(mail(rioBox, "stranger@nowhere.example", [{ name: "over.csv", content: "sku,qty\nX,1\n" }]));
+      const overRow = await read(t, (c) => q<{ has: boolean; reason: string }>(c, `select content is not null has, reason from inbound_mail_held where entity_id = $1 and filename = 'over.csv'`, [RIO_ENTITY]));
+      t.ok("held: past the client's held-mail limit the record is kept without the file, and says so", over?.held.length === 1 && overRow[0] && !overRow[0].has && /was not kept/.test(overRow[0].reason), JSON.stringify(overRow));
+      const later = new Date(Date.now() + (vf.HELD_KEEP_DAYS + 1) * 86400000);
+      const pg = await tx({ kind: "system", label: "check" }, (c) => vf.purgeHeldContent(c, later));
+      const left = await read(t, (c) => q<{ n: number; withContent: number }>(c, `select count(*)::int n, count(*) filter (where content is not null)::int "withContent" from inbound_mail_held where entity_id = $1`, [RIO_ENTITY]));
+      t.ok("held: the daily purge drops files older than 60 days and keeps every record", pg.purged >= vf.HELD_MAX_COUNT && left[0].n >= vf.HELD_MAX_COUNT + 1 && left[0].withContent === 0, JSON.stringify({ pg, left }));
+      const { JOBS } = await import("../../server/scheduler.ts");
+      t.ok("held: the purge is one of the scheduler's daily jobs", JOBS.some((j) => j.id === "held_mail" && j.everyMin === 24 * 60));
+
+      // ---- HTTPS: the checked address is the one dialled, and the size cap holds while streaming
+      const big = https.createServer({ key: TLS_KEY, cert: TLS_CERT }, (_req, res) => { res.writeHead(200, { "content-type": "text/csv" }); for (let i = 0; i < 50; i++) res.write("x".repeat(1000)); res.end(); });
+      await new Promise<void>((ok) => big.listen(0, "127.0.0.1", () => ok()));
+      const bport = (big.address() as { port: number }).port;
+      try {
+        const look = async () => ["127.0.0.1"];
+        let e1 = "";
+        try { await feeds.pinnedFetch({ ca: TLS_CERT, lookup: look })(`https://localhost:${bport}/x`); } catch (e) { e1 = (e as Error).message; }
+        t.ok("https: a name that resolves to a private address is refused at connect time, by the same lookup that dials", /private networks/.test(e1), e1);
+        const r1 = await feeds.pinnedFetch({ ca: TLS_CERT, lookup: look, allowHosts: ["localhost"] })(`https://localhost:${bport}/x`);
+        t.ok("https: the allow-list lets a listed host through (still https)", r1.status === 200 && (await r1.text()).length === 50_000);
+        let e2 = "";
+        try { await (await feeds.pinnedFetch({ ca: TLS_CERT, lookup: look, allowHosts: ["localhost"], maxBytes: 10_000 })(`https://localhost:${bport}/x`)).text(); } catch (e) { e2 = (e as Error).message; }
+        t.ok("https: the size cap is enforced while the body streams (no Content-Length to trust)", /over/.test(e2), e2);
+      } finally { await new Promise<void>((ok) => big.close(() => ok())); }
+
+      // ---- the inbound email token rides in a header only
+      const { createServer } = await import("../../server/index.ts");
+      const savedTok = process.env.ERP_EMAIL_INBOUND_TOKEN;
+      process.env.ERP_EMAIL_INBOUND_TOKEN = "in-" + randomBytes(16).toString("hex");
+      const http = await import("node:http");
+      const hs = createServer();
+      await new Promise<void>((ok) => hs.listen(0, "127.0.0.1", () => ok()));
+      const hp = (hs.address() as { port: number }).port;
+      const postMail = (path: string, headers: Record<string, string>) => new Promise<{ status: number; body: string }>((ok, bad) => {
+        const rq = http.request({ host: "127.0.0.1", port: hp, path, method: "POST", headers: { "content-type": "application/json", ...headers } }, (res) => {
+          let b = ""; res.on("data", (d) => (b += d)); res.on("end", () => ok({ status: res.statusCode ?? 0, body: b }));
+        });
+        rq.on("error", bad); rq.end(JSON.stringify({ From: "a@b.example", To: "x@y.example", Attachments: [] }));
+      });
+      try {
+        const viaUrl = await postMail(`/inbound/email?token=${process.env.ERP_EMAIL_INBOUND_TOKEN}`, {});
+        const viaBasic = await postMail("/inbound/email", { authorization: "Basic " + Buffer.from(`erp:${process.env.ERP_EMAIL_INBOUND_TOKEN}`).toString("base64") });
+        const viaBearer = await postMail("/inbound/email", { authorization: `Bearer ${process.env.ERP_EMAIL_INBOUND_TOKEN}` });
+        t.ok("email token: refused in the address; taken as Basic (what Postmark sends for erp:<token>@host) or Bearer", viaUrl.status === 401 && /not in the address/.test(viaUrl.body) && viaBasic.status === 200 && viaBearer.status === 200,
+          `${viaUrl.status} ${viaBasic.status} ${viaBearer.status}`);
+      } finally {
+        await new Promise<void>((ok) => hs.close(() => ok()));
+        if (savedTok === undefined) delete process.env.ERP_EMAIL_INBOUND_TOKEN; else process.env.ERP_EMAIL_INBOUND_TOKEN = savedTok;
+      }
     }
 
     // ============================================================ the catalog import template
@@ -500,6 +620,71 @@ export async function run(t: T) {
     const cpv = await CR.post("/catalog/import/preview", BUYER, { vendorId: V.COASTER, csv: `${names.join(",")}\nB1234-38,Example,1,2,,,,,,,,,,,,,,Active\nVF-300,Real one,10.00,20.00,,,,,,,,,,,,,,Active\n`, filename: "t.csv", mapping: Object.fromEntries(names.map((n) => [n, n])) });
     t.ok("template: a filled-in copy keeps its own rows and still skips the example", cpv.add === 1, JSON.stringify(cpv).slice(0, 200));
     await CR.post(`/catalog/import/runs/:id/abandon`, BUYER, {}, cpv.runId);
+    {
+      const { readZip, elements, MAX_ROWS } = await import("../../packages/core/filekit.ts");
+      const tz = readZip(templateXlsx(), "template", 1000);
+      const sheet = tz.find((e) => e.path === "xl/worksheets/sheet2.xml")!.bytes.toString("utf8");
+      const styles = tz.find((e) => e.path === "xl/styles.xml")!.bytes.toString("utf8");
+      const col = names.indexOf("barcode") + 1;
+      const colEl = [...elements(sheet, "col")].find((x) => new RegExp(`min="${col}"`).test(x.attrs) && new RegExp(`max="${col}"`).test(x.attrs));
+      const styleIdx = Number(/style="(\d+)"/.exec(colEl?.attrs ?? "")?.[1] ?? -1);
+      const xfs = [...elements([...elements(styles, "cellXfs")][0].body, "xf")];
+      t.ok("template: the barcode (UPC) column is text-formatted as a whole column, not only rows 3-502", styleIdx >= 0 && /numFmtId="49"/.test(xfs[styleIdx]?.attrs ?? ""), colEl?.attrs);
+      // a workbook built here: a date cell (style with a date format), a 1904 workbook, and a row cap
+      const wbook = (rowsXml: string, date1904 = false) => zipOf([
+        ["[Content_Types].xml", "<Types/>"],
+        ["xl/workbook.xml", `<workbook xmlns:r="r">${date1904 ? '<workbookPr date1904="1"/>' : ""}<sheets><sheet name="Catalog" sheetId="1" r:id="rId1"/></sheets></workbook>`],
+        ["xl/_rels/workbook.xml.rels", '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>'],
+        ["xl/styles.xml", '<styleSheet><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy\-mm\-dd"/></numFmts><cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/></cellXfs></styleSheet>'],
+        ["xl/worksheets/sheet1.xml", `<worksheet><sheetData>${rowsXml}</sheetData></worksheet>`]]);
+      const dated = xlsxRows(wbook('<row r="1"><c r="A1" t="inlineStr"><is><t>eta</t></is></c><c r="B1" t="inlineStr"><is><t>n</t></is></c></row><row r="2"><c r="A2" s="1"><v>45658</v></c><c r="B2" s="2"><v>45659</v></c><c r="C2"><v>45658</v></c></row>'));
+      t.ok("workbook: Excel date cells come out as dates (built-in and custom formats); plain numbers stay numbers", dated[1][0] === "2025-01-01" && dated[1][1] === "2025-01-02" && dated[1][2] === "45658", JSON.stringify(dated[1]));
+      t.ok("workbook: a 1904-dated workbook converts from its own epoch", xlsxRows(wbook('<row r="1"><c r="A1" s="1"><v>0</v></c></row>', true))[0][0] === "1904-01-01");
+      let capMsg = "";
+      try { xlsxRows(wbook('<row r="1"><c r="A1"><v>1</v></c></row>'.repeat(MAX_ROWS + 2))); } catch (e) { capMsg = (e as Error).message; }
+      t.ok("workbook: more than 50,000 rows is refused with a sentence", /more than 50,000 rows/.test(capMsg), capMsg);
+      const t0 = Date.now();
+      xlsxRows(wbook('<row r="1">' + '<c r="A1"><v>1'.repeat(100_000)));
+      t.ok("workbook: an unclosed row of 100,000 cells reads in linear time", Date.now() - t0 < 2000, `${Date.now() - t0} ms`);
+    }
+
+    // ============================================================ a one-person store (blocker 6)
+    {
+      const { createCustomer } = await import("../../server/platform.ts");
+      const act = await import("../../server/actions.ts");
+      const tag = randomBytes(3).toString("hex");
+      const made = await tx({ kind: "system", label: "check" }, (c) => createCustomer(c, { actor: "check", kind: "operator" },
+        { tenantName: `Mark's Furniture Store ${tag}`, legalName: `Mark's Furniture LLC ${tag}`, state: "TX", pack: "furniture", ownerEmail: `mark-${tag}@example.com`, plan: "standard" }, "https://erp.example"));
+      const mco = await companyOf(t, made.entityId);
+      const mark: Actor = { personId: made.ownerId, personName: "Mark", label: "Mark" };
+      const asMark = <X>(fn: (c: Client) => Promise<X>) => tx({ kind: "user", id: made.ownerId, label: "Mark" }, fn);
+      const cats = await read(t, (c) => q<{ code: string; is_merchandise: boolean }>(c, `select code, is_merchandise from vendor_category where tenant_id = $1 and active /* unscoped: check */`, [made.tenantId]));
+      const merch = cats.find((x) => x.is_merchandise)!, notMerch = cats.find((x) => !x.is_merchandise)!;
+      await t.throws("one-person store: Add vendor from Catalog requires a merchandise category", () => asMark((c) => act.addVendor(c, mco, mark, { name: "Lone Utility Co", category: notMerch.code, merchandise: true })), /not a merchandise category/);
+      const added = await asMark((c) => act.addVendor(c, mco, mark, { name: "Ashton Imports", category: merch.code, merchandise: true }));
+      const before = await CR.get("/catalog/vendors", made.ownerId, "", undefined, made.entityId);
+      const pv = before.vendors.find((v: { id: string }) => v.id === added.id);
+      t.ok("one-person store: the new vendor shows in Catalog → Vendors as waiting for approval, with Approve for the owner", added.status === "pending" && pv?.pending && pv.can_approve && !!pv.approval_request_id, JSON.stringify(pv));
+      await asMark((c) => act.decideRequest(c, mco, mark, { requestId: pv.approval_request_id, decision: "approved", note: "" }));
+      const after = await CR.get("/catalog/vendors", made.ownerId, "", undefined, made.entityId);
+      const aud = await read(t, (c) => q<{ reason: string }>(c, `select reason from audit_event where entity_id = $1 and table_name = 'approval_request' and row_id = $2`, [made.entityId, pv.approval_request_id]));
+      const step = await read(t, (c) => q<{ self_approved: boolean; actor_id: string }>(c, `select s.self_approved, s.actor_id from approval_step s join approval_request r on r.id = s.request_id where r.entity_id = $1 and r.id = $2`, [made.entityId, pv.approval_request_id]));
+      t.ok("one-person store: the owner approves their own vendor (nobody else could), the step marked self-approved with an audit row",
+        after.vendors.find((v: { id: string }) => v.id === added.id)?.pending === false && step[0]?.self_approved && step[0].actor_id === made.ownerId && aud.some((a) => a.reason === "self-approved: no other approver"), JSON.stringify({ step, aud }));
+      const mc = await R.post<{ id: string }>("/vendor-files/save", made.ownerId, { connection: { vendor_id: added.id, channel: "email", name: "Ashton email", senders: "@ashton.example", carries: [{ kind: "prices", glob: "" }] } }, undefined, made.entityId);
+      t.ok("one-person store: and sets up a catalog connection for it", !!mc.id);
+      await tx({ kind: "system", label: "check" }, async (c) => {
+        // a co-owner: someone else who holds the vendor step's role (the new company's steps are the owner's)
+        const u = await c.query<{ id: string }>(`insert into app_user (tenant_id, email, name) values ($1, $2, 'Co-owner') returning id`, [made.tenantId, `co-${tag}@example.com`]);
+        await c.query(`insert into role_grant (app_user_id, entity_id, role) values ($1, $2, 'owner')`, [u.rows[0].id, made.entityId]);
+      });
+      const second = await asMark((c) => act.addVendor(c, mco, mark, { name: "Second Source Furniture", category: merch.code, merchandise: true }));
+      const req2 = (await CR.get("/catalog/vendors", made.ownerId, "", undefined, made.entityId)).vendors.find((v: { id: string }) => v.id === second.id);
+      await t.throws("one-person store: once someone else can approve, the owner may not approve their own request again", () => asMark((c) => act.decideRequest(c, mco, mark, { requestId: req2.approval_request_id, decision: "approved", note: "" })), /maker cannot approve/);
+      t.ok("one-person store: and the screen no longer offers them Approve", req2.pending && !req2.can_approve);
+      await t.throws("one-person store: the database holds the same line (a self-approved step written by hand is refused)", () => tx({ kind: "system", label: "check" }, (c) =>
+        c.query(`update approval_step set decision = 'approved', actor_id = $2, decided_at = now(), self_approved = true where request_id = $1`, [req2.approval_request_id, made.ownerId])), /someone else in this company can approve it/);
+    }
   } finally {
     C.useNetEnv(null);
     await srv.stop();

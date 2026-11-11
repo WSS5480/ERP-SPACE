@@ -526,7 +526,12 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     return section('Vendors', `${d.vendors.length}`, [addVendorBtn()],
       el('p', { class: 'lead', text: 'Where orders go, the freight minimum for a prepaid truck, lead time, freight to each place, and how each vendor’s catalog comes in: by API, from its SFTP server, by email, or as a file you import.' }),
       d.vendors.length ? null : noVendors(),
-      el('div', { class: 'panel' }, d.vendors.map((v) => item({
+      el('div', { class: 'panel' }, d.vendors.map((v) => v.pending ? item({
+        title: v.name, badge: chip('warning', 'clock', 'Waiting for approval'),
+        detail: v.can_approve ? 'Approve it to set up how its catalog comes in and to order from it.' : 'Its catalog connections open once the owner or controller approves it.',
+        acts: v.can_approve && v.approval_request_id ? [el('button', { class: 'btn small primary', type: 'button', onclick: (e) => act(e.currentTarget,
+          () => post(`/approvals/${v.approval_request_id}`, { decision: 'approved' }), `${v.name} approved`) }, 'Approve')] : null,
+      }) : item({
         title: v.name, amount: `${v.lead_days} days`, badge: feedChip(v),
         detail: [v.order_email || 'no order email', v.account_no ? `account ${v.account_no}` : null, v.sku_prefix ? `SKUs ${v.sku_prefix}-…` : null,
           Number(v.freight_min_minor) ? `freight min ${money(v.freight_min_minor)}` : null, v.freight_min_qty ? `${v.freight_min_qty} pieces min` : null,
@@ -543,7 +548,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
   }
 
   /** Add a vendor from Catalog (the Payables form, reused); a new company has none until it does. */
-  const addVendorBtn = (cls = 'btn small') => (E.openAddVendor ? el('button', { class: cls, type: 'button', onclick: () => E.openAddVendor() }, icon('plus'), 'Add vendor') : null);
+  const addVendorBtn = (cls = 'btn small') => (E.openAddVendor ? el('button', { class: cls, type: 'button', onclick: () => E.openAddVendor({ merchandise: true }) }, icon('plus'), 'Add vendor') : null);
   const noVendors = () => el('div', { class: 'panel pad' }, empty('No vendors yet. Add one, then set up how its catalog comes in: API, SFTP, email or file.',
     'Give it a merchandise category (furniture, appliances…) so it shows here; a new vendor may wait on the controller’s approval first.'), el('div', { class: 'dlg-acts' }, addVendorBtn('btn primary')));
 
@@ -900,6 +905,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
   // ----------------------------------------------------------------- import
   const IMP = { vendorId: '', csv: '', filename: '', cols: null, mapping: {}, runId: null, show: 'change' };
   async function tabImport() {
+    FORM = null;   // a vendor may have been added or approved since; the picker reads it fresh
     const fo = await form();
     const runs = (await coApi('/catalog/import/runs')).runs;
     const step = el('div');

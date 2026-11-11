@@ -259,6 +259,7 @@
   async function vendorFilesView() {
     if (VF.view === 'conn') return connView();
     if (VF.view === 'held') return heldView();
+    if (VF.view === 'files') return filesView();
     const d = await coApi('/vendor-files');
     const can = vfManage();
     const live = d.connections.filter((x) => x.status !== 'retired');
@@ -267,19 +268,26 @@
     const failing = live.filter((x) => x.verdict === 'failing' || x.status === 'failed').length;
     const allBtn = VF.vendor ? el('button', { class: 'btn small', type: 'button', onclick: () => goVF({ vendor: null }) }, 'All vendors') : null;
     const addBtn = can ? el('button', { class: 'btn small primary', type: 'button', onclick: () => openVendorConn(d, null, VF.vendor) }, E.icon('plus'), 'Add a vendor connection') : null;
+    const listSection = connList(d, vlist, allBtn, addBtn);
+    if (VF.view === 'connlist') return frag(head('Connections', [backBtn()], 'Vendor files'), listSection);
     return frag(
       el('p', { class: 'lead', text: 'Files your vendors send: catalogs, prices, inventory and EDI documents, from their SFTP server, an HTTPS address, or by email. Each connection belongs to one vendor; files are read through the same mapping as Catalog import and Vendor EDI.' }),
       E.tilesRow(
-        E.tile({ label: 'Connections', value: String(live.length), suffix: failing ? `${failing} failing` : null, tone: failing ? 'critical' : 'neutral', ic: failing ? 'fail' : 'feed', text: 'SFTP, HTTPS and email' }),
-        E.tile({ label: 'Files taken', value: String(files), tone: 'neutral', ic: 'info', text: 'Open a connection to see them' }),
+        E.tile({ label: 'Connections', value: String(live.length), suffix: failing ? `${failing} failing` : null, tone: failing ? 'critical' : 'neutral', ic: failing ? 'fail' : 'feed', text: 'SFTP, HTTPS and email',
+          onClick: () => goVF({ view: 'connlist' }) }),
+        E.tile({ label: 'Files taken', value: String(files), tone: 'neutral', ic: 'info', text: 'Every file, every connection', onClick: () => goVF({ view: 'files', filter: null }) }),
         E.tile({ label: 'Quarantined', value: String(quar), tone: quar ? 'serious' : 'good', ic: quar ? 'warn' : 'ok', text: quar ? 'Held with a reason; open to see' : 'Nothing held',
-          onClick: quar ? () => { const x = live.find((y) => Number(y.quarantined)); goVF({ view: 'conn', id: x.id, filter: 'quarantined' }); } : null }),
+          onClick: () => goVF({ view: 'files', filter: 'quarantined' }) }),
         E.tile({ label: 'Mail held', value: String(d.held.length), tone: d.held.length ? 'warning' : 'good', ic: d.held.length ? 'hold' : 'ok',
-          text: d.held.length ? 'From senders no vendor lists' : 'Nothing held', onClick: d.held.length ? () => goVF({ view: 'held' }) : null })),
+          text: d.held.length ? 'Waiting for your review' : 'Nothing held', onClick: () => goVF({ view: 'held' }) })),
       section('Vendor email address', null, null, el('div', { class: 'panel pad' },
         d.address ? copyBox(d.address) : resultBox('warning', 'info', 'Inbound email is not set up on this server', 'Set ERP_INBOUND_EMAIL_ADDRESS (the inbound address of your mail service) and ERP_EMAIL_INBOUND_TOKEN. Until then, email connections save but nothing arrives.'),
-        el('p', { class: 'fine', text: 'Your company’s own address. Ask each vendor to send files here (or forward them from your mailbox). A file goes to the vendor connection or email-in feed that lists its sender; anyone else’s is held for you. Each vendor also has its own address, on its card under Catalog, Vendors.' }))),
-      section(VF.vendor ? `Connections · ${(d.vendors.find((v) => v.id === VF.vendor) || {}).name || 'one vendor'}` : 'Connections', `${vlist.length}`, [allBtn, addBtn].filter(Boolean), el('div', { class: 'panel' }, vlist.length ? vlist.map((x) => {
+        el('p', { class: 'fine', text: 'Your company’s own address. Ask each vendor to send files here. A file goes straight to the vendor connection or email-in feed that lists its sender only when the receiving mail server confirms the sender (SPF pass for the sender’s own domain). Forwarded mail, mail sent through a mailing service, and anyone not listed are held for one-tap review: nothing is applied automatically. Each vendor also has its own address, on its card under Catalog, Vendors.' }))),
+      listSection);
+  }
+
+  function connList(d, vlist, allBtn, addBtn) {
+    return section(VF.vendor ? `Connections · ${(d.vendors.find((v) => v.id === VF.vendor) || {}).name || 'one vendor'}` : 'Connections', `${vlist.length}`, [allBtn, addBtn].filter(Boolean), el('div', { class: 'panel' }, vlist.length ? vlist.map((x) => {
         const [tone, ic, word] = VERDICT[x.status !== 'active' ? x.status : x.verdict] || VERDICT['never run'];
         const lr = x.last_run;
         return item({ title: `${x.vendor} · ${x.name}`, badge: chip(tone, ic, word),
@@ -287,7 +295,7 @@
             `${plural(Number(x.files), 'file')}`, Number(x.quarantined) ? `${x.quarantined} quarantined` : null].filter(Boolean).join(' · '),
           why: lr ? `Last run ${ago(lr.started_at)}: ${lr.outcome || 'running'}, ${lr.files_new} new of ${lr.files_seen}${lr.error ? ` — ${lr.error}` : ''}` : x.last_error || null,
           onClick: () => goVF({ view: 'conn', id: x.id, filter: null }) });
-      }) : empty('No vendor connections yet.', 'Add one for each vendor that leaves files on its SFTP server, answers from an HTTPS address, or emails them.', true))));
+      }) : empty('No vendor connections yet.', 'Add one for each vendor that leaves files on its SFTP server, answers from an HTTPS address, or emails them.', true)));
   }
 
   async function connView() {
@@ -357,15 +365,40 @@
     const can = vfManage();
     const targets = [...d.connections.filter((x) => x.channel === 'email' && x.status === 'active').map((x) => [`c:${x.id}`, `${x.vendor} · ${x.name} (connection)`]),
       ...d.emailFeeds.map((f) => [`f:${f.id}`, `${f.vendor} · ${f.name} (feed)`])];
+    const rv = (await coApi('/vendor-files/review')).vendors;
     return frag(head('Mail held', [backBtn()], 'Vendor files'),
-      el('p', { class: 'lead', text: 'Attachments mailed to a vendor address by someone no vendor lists, by a sender that matches two vendors, or whose domain did not vouch for the message. Nothing in them has been read. Say which vendor each is from, or set it aside.' }),
-      el('div', { class: 'panel' }, d.held.length ? d.held.map((h) => item({ title: h.filename, badge: chip('warning', 'hold', 'Held'),
-        detail: [h.sender, h.vendor ? `to ${h.vendor}'s address` : null, h.subject, kb(Number(h.byte_size)), ago(h.received_at)].filter(Boolean).join(' · '), why: h.reason,
-        acts: can ? [targets.length ? el('button', { class: 'btn small primary', type: 'button', onclick: () => openAssign(h, targets) }, 'Assign') : null,
+      el('p', { class: 'lead', text: 'Nothing here has been read. Mail lands here when the sender could not be confirmed (forwarded mail, a mailing service, a failed SPF or DMARC check), when no vendor lists the sender, when it matches two vendors, or when its vendor is set to always hold for review. Apply runs it through the vendor’s own mapping; Assign sends it somewhere else; Set aside keeps the record.' }),
+      el('div', { class: 'panel' }, d.held.length ? d.held.map((h) => item({ title: h.filename, badge: chip('warning', 'hold', h.has_content ? 'Held' : 'Record only'),
+        detail: [h.sender, h.vendor ? `for ${h.vendor}` : null, h.suggested ? `would go to ${h.suggested}` : null, h.subject, kb(Number(h.byte_size)), ago(h.received_at)].filter(Boolean).join(' · '), why: h.reason,
+        acts: can ? [h.suggested && h.has_content ? el('button', { class: 'btn small primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post(`/vendor-files/held/${h.id}/apply`, {}),
+            (r) => `Applied through ${r.to}${r.note ? `: ${r.note}` : ''}`) }, 'Apply') : null,
+          targets.length && h.has_content ? el('button', { class: 'btn small', type: 'button', onclick: () => openAssign(h, targets) }, 'Assign') : null,
           el('button', { class: 'btn small', type: 'button', onclick: async (e) => {
             const why = await E.askReason({ title: 'Set this file aside?', sub: `${h.filename} from ${h.sender}`, confirm: 'Set aside' });
             if (why) act(e.currentTarget, () => post(`/vendor-files/held/${h.id}/set-aside`, { reason: why }), 'Set aside');
-          } }, 'Set aside')] : null })) : empty('Nothing held.', null, true)));
+          } }, 'Set aside')] : null })) : empty('Nothing held.', null, true)),
+      section('Review by vendor', `${rv.length}`, null, el('p', { class: 'fine', text: 'Turn on “Always hold” for a vendor to review every file it emails before it is applied, even from a confirmed sender. There is no rule that trusts a sender automatically.' }),
+        el('div', { class: 'panel' }, rv.length ? rv.map((v) => {
+          const box = el('input', { type: 'checkbox', checked: v.always_hold || null, disabled: !can || null, 'aria-label': `Always hold ${v.vendor}` });
+          box.addEventListener('change', () => act(box, () => post(`/vendor-files/vendor/${v.vendor_id}/always-hold`, { on: box.checked }), (r) => r.alwaysHold ? `${v.vendor}: every file held for review` : `${v.vendor}: confirmed senders go straight through`));
+          return el('label', { class: 'li check-row' }, box, el('div', { class: 't', text: `Always hold · ${v.vendor}` }),
+            el('div', { class: 'd', text: v.held ? `${plural(v.held, 'file')} waiting` : 'Nothing waiting' }));
+        }) : empty('No vendor sends email yet.', null, true))));
+  }
+
+  /** Files across every vendor connection (or only the quarantined ones): what the Files and Quarantined tiles open. */
+  async function filesView() {
+    const d = await coApi(`/vendor-files/files${VF.filter ? `?status=${VF.filter}` : ''}`);
+    const can = vfManage();
+    return frag(head(VF.filter === 'quarantined' ? 'Quarantined files' : 'Files taken', [backBtn()], 'Vendor files'),
+      el('div', { class: 'toolbar' }, seg([['', 'All'], ['applied', 'Applied'], ['quarantined', 'Quarantined'], ['ignored', 'Set aside']], VF.filter || '', (v) => goVF({ filter: v || null }))),
+      el('div', { class: 'panel' }, d.files.length ? capped(d.files.map((f) => item({ title: f.origin, badge: chip(...(FILE_STATUS[f.status] || ['neutral', 'info', f.status])),
+        detail: [`${f.vendor} · ${f.connection}`, kb(Number(f.byte_size)), f.rows_parsed != null ? plural(Number(f.rows_parsed), 'row') : null, ago(f.received_at)].filter(Boolean).join(' · '),
+        why: f.quarantine_reason || f.note || null, onClick: () => goVF({ view: 'conn', id: f.connection_id, filter: f.status === 'quarantined' ? 'quarantined' : null }),
+        acts: can && f.status === 'quarantined' ? [el('button', { class: 'btn small', type: 'button', onclick: async (e) => {
+          const why = await E.askReason({ title: 'Set this file aside?', sub: f.origin, confirm: 'Set aside', lead: 'It stays on record; it leaves the quarantine list.' });
+          if (why) act(e.currentTarget, () => post(`/vendor-files/files/${f.id}/dismiss`, { reason: why }), 'Set aside');
+        } }, 'Set aside')] : null })), 30, 'files') : empty(VF.filter === 'quarantined' ? 'Nothing quarantined.' : 'No files yet.', null, true)));
   }
 
   function openAssign(h, targets) {

@@ -1314,16 +1314,18 @@ function vendorForm(o, v) {
   return { f, body, fields };
 }
 
-function openAddVendor() {
-  const d = openDialog('Add a vendor', `${S.co.name} · added as ${S.person ? S.person.name : 'nobody'}`, { wide: true });
+function openAddVendor(opts = {}) {
+  const d = openDialog(opts.merchandise ? 'Add a merchandise vendor' : 'Add a vendor', `${S.co.name} · added as ${S.person ? S.person.name : 'nobody'}`, { wide: true });
   fillDialog(d, async () => {
-    const o = await coApi('/options');
+    const o0 = await coApi('/options');
+    // From Catalog: only merchandise categories, so the vendor shows there.
+    const o = opts.merchandise ? { ...o0, vendorCategories: (o0.vendorCategories || []).filter((c) => c.is_merchandise) } : o0;
     const name = input({ maxlength: '120', placeholder: 'Legal name, as on the W-9' });
     const dba = input({ maxlength: '120', placeholder: 'Optional' });
     const vf = vendorForm(o, null);
     const out = el('div');
-    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/vendors', { name: name.value, dba: dba.value, ...vf.body() }),
-      (r) => r.status === 'active' ? 'Vendor added.' : 'Vendor added; it can take bills once the controller approves it.',
+    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/vendors', { name: name.value, dba: dba.value, ...vf.body(), merchandise: !!opts.merchandise }),
+      (r) => r.status === 'active' ? 'Vendor added.' : opts.merchandise ? 'Vendor added; it shows as waiting for approval until it is approved.' : 'Vendor added; it can take bills once the controller approves it.',
       { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not added', friendly(e))) }) }, 'Add vendor');
     return frag(
       el('p', { class: 'lead', text: 'A new vendor waits on the controller’s approval before bills from it can go through. Bank details are added afterwards, from the vendor, and are approved separately.' }),
