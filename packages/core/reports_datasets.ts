@@ -371,7 +371,7 @@ export const DATASETS: Dataset[] = [
                  round(coalesce(a.on_hand, 0) * coalesce(case when ic.qty > 0 then ic.value_minor / ic.qty end, p.cost_minor, 0))::bigint as stock_value,
                  round(coalesce(a.on_hand, 0) * p.price_minor)::bigint as retail_value,
                  ls.last_sold_on,
-                 (business_today($1) - coalesce(ls.last_sold_on, p.created_at::date))::int as idle_days
+                 (business_today($1) - coalesce(ls.last_sold_on, (p.created_at at time zone business_tz($1))::date))::int as idle_days
             from product p
             left join product_availability a on a.product_id = p.id and a.entity_id = $1
             left join location lo on lo.id = a.location_id and lo.entity_id = $1
@@ -613,7 +613,7 @@ export const DATASETS: Dataset[] = [
       F("has_email", "Left an email", "bool"), F("items", "Items", "number"), F("subtotal", "Cart subtotal", "money"),
       F("converted", "Became an order", "bool"), F("order_number", "Order", "text"), F("order_total", "Order total", "money"),
     ],
-    sql: `select c.created_at::date as started_on, c.updated_at::date as updated_on,
+    sql: `select (c.created_at at time zone business_tz($1))::date as started_on, (c.updated_at at time zone business_tz($1))::date as updated_on,
                  s.display_name as site, c.email is not null and c.email <> '' as has_email, c.item_count as items,
                  c.subtotal_minor as subtotal, c.sales_order_id is not null as converted, so.number as order_number,
                  so.total_minor as order_total

@@ -286,7 +286,7 @@ async function takeMarkup(c: Client, entityId: string, productId: string, qty: n
     const dq = all ? Number(r.qty) : Number(r.qty) * qty / poolQty;
     const dm = all ? BigInt(r.m) : BigInt(Math.round(Number(r.m) * qty / poolQty));
     if (dq === 0 && dm === 0n) continue;
-    await c.query(`insert into ic_markup_move (entity_id, from_entity_id, product_id, qty, markup_minor, kind, transfer_id) values ($1,$2,$3,$4,$5,$6,$7)`,
+    await c.query(`insert into ic_markup_move (entity_id, from_entity_id, product_id, qty, markup_minor, kind, transfer_id, occurred_on) values ($1,$2,$3,$4,$5,$6,$7,business_today($1))`,
       [entityId, r.from_entity_id, productId, -dq, (-dm).toString(), kind, transferId]);
   }
 }

@@ -99,8 +99,25 @@ function jobsSection(d) {
     title: j.label, badge: jobChip(j.status), onClick: j.lastRunId ? () => runDialog(j.lastRunId) : null,
     rows: [['Last run', when(j.lastRunAt), j.lastRunId ? () => runDialog(j.lastRunId) : null], ['Next run', j.nextRunAt ? new Date(j.nextRunAt).toLocaleString() : 'within a minute'],
       j.error ? ['Error', j.error] : null, j.note ? ['Result', j.note] : null],
-    acts: [el('button', { class: 'btn', type: 'button', onclick: (e) => E.act(e.currentTarget, () => api(`/api/platform/jobs/${j.id}/run`, { method: 'POST', body: {} }), (r) => `${j.label}: ${r.status}`).then(() => E.render()) }, icon('refresh'), 'Run now')],
+    acts: [el('button', { class: 'btn', type: 'button', onclick: (e) => runNow(e.currentTarget, j) }, icon('refresh'), 'Run now')],
   }))));
+}
+/** Run now: the server queues it and answers at once; this watches the job log for the run and says how it went. */
+async function runNow(btn, j) {
+  busy(btn, true, 'Queued…');
+  try {
+    const q = await api(`/api/platform/jobs/${j.id}/run`, { method: 'POST', body: {} });
+    toast(q.already ? `${j.label} is already queued` : `${j.label} queued`, 'good');
+    const until = Date.now() + 5 * 60_000;
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const d = await api(`/api/platform/jobs?job=${encodeURIComponent(j.id)}`);
+      const run = d.runs.find((r) => r.trigger === 'manual' && new Date(r.started_at) >= new Date(q.since) && r.status !== 'running');
+      if (run) { toast(`${j.label}: ${run.status}${run.error ? ` — ${run.error}` : ''}`, run.status === 'ok' ? 'good' : 'warning'); E.render(); return; }
+    }
+    toast(`${j.label} is still waiting for the scheduler; it will show in the job log when it runs`, 'warning');
+  } catch (e) { toast(friendly(e), 'critical'); }
+  finally { if (btn.isConnected) busy(btn, false); }
 }
 async function runDialog(id) {
   const d = openDialog('Job run', null);

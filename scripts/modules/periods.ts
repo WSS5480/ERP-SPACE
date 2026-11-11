@@ -122,8 +122,8 @@ export async function run(t: T) {
 
     // =========================================================== auto-opening
     console.log("  -- periods open on their own");
-    // the clock pinned three months on: the months two ahead of then are not open yet
-    const base = monthsOn(realToday, 3);
+    // the clock pinned six months on: the seeds opened months up to three ahead, so the fourth and fifth are missing
+    const base = monthsOn(realToday, 6);
     pinClock(`${base}T17:00:00Z`);
     try {
       const fyEnd = Number((await read<{ fy: number }>(`select fiscal_year_end_month fy from entity where id = $1 /* unscoped: the company */`, [RIO_ENTITY]))[0].fy);
@@ -134,15 +134,23 @@ export async function run(t: T) {
       const after = await periodOf(RIO_ENTITY, twoOn);
       const ev = await read<{ kind: string; reason: string }>(`select kind, reason from period_event where entity_id = $1 and starts_on = $2::date order by at desc limit 1`, [RIO_ENTITY, monthsOn(twoOn, 0)]);
       t.ok("auto-open: a posting two months ahead opens its month, logged", !before && after?.status === "open" && ev[0]?.kind === "auto_opened" && /needed it/.test(ev[0].reason), JSON.stringify(ev[0]));
-      // a date later in the fiscal year (if the year runs past two months on)
-      const late = fy.end > lastDay(monthsOn(base, 2)) ? addDays(fy.end, -3) : null;
-      if (late) {
-        await smallPost(rioScope(), late, "later in the fiscal year");
-        t.ok("auto-open: a date in the current fiscal year opens its month", (await periodOf(RIO_ENTITY, late))?.status === "open");
-      } else t.ok("auto-open: (the fiscal year ends within two months; nothing further to open)", true);
+      // an earlier month of the current fiscal year (the month before the pinned one; the seeds stopped short of it)
+      const past = addDays(monthsOn(base, -1), 9);
+      if (past >= fy.start) {
+        const was = await periodOf(RIO_ENTITY, past);
+        await smallPost(rioScope(), past, "a late bill, earlier this fiscal year");
+        t.ok("auto-open: a past month of the current fiscal year opens", !was && (await periodOf(RIO_ENTITY, past))?.status === "open");
+      } else t.ok("auto-open: (the pinned month starts the fiscal year; no earlier month in it)", true);
+      // a later month of the same fiscal year, past the two months: never on its own
+      const laterInYear = addDays(monthsOn(base, 3), 4);
+      if (laterInYear <= fy.end) {
+        await t.throws("auto-open: a future month of this fiscal year past two months ahead is refused", () => smallPost(rioScope(), laterInYear),
+          /no open period for .*only up to two months ahead.*Books, Periods/);
+        t.ok("auto-open: and nothing was opened for it", !(await periodOf(RIO_ENTITY, laterInYear)));
+      } else t.ok("auto-open: (the fiscal year ends within two months; no later month in it)", true);
       const far = addDays(monthsOn(fy.end, 4), 4);
       await t.throws("auto-open: further ahead is refused, saying what to do", () => smallPost(rioScope(), far),
-        /no open period for .*up to two months ahead or within this fiscal year.*open .* in Books, Periods/);
+        /no open period for .*only up to two months ahead.*open .* in Books, Periods/);
       await t.throws("auto-open: before the fiscal year is refused, saying what to do", () => smallPost(rioScope(), "2019-03-15"),
         /no period for 2019-03-15 .*before this fiscal year.*Books, Periods/);
       t.ok("auto-open: nothing was opened for the refused dates", !(await periodOf(RIO_ENTITY, far)) && !(await periodOf(RIO_ENTITY, "2019-03-15")));

@@ -668,6 +668,10 @@ async function main() {
     }), /duplicate key|reconciliation_match_once/i);
 
   console.log("\nthe intake framework");
+  // The demo's pull connections are paused so the scheduler never fetches from them (seed 0036);
+  // these checks run them by hand with stand-in transports, so they are turned on for the run.
+  await tx(scope(CONTROLLER, "Controller"), (c) => c.query(
+    `update connection set status = 'active' where tenant_id = $1 and status = 'paused'`, [TENANT]));
   await tx(scope(CONTROLLER, "Controller"), async (c) => {
     const srcs = await q<{ n: string }>(c,
       `select count(*) as n from ingest_source /* unscoped: the catalogue is not per-entity */`);

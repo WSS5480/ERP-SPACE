@@ -356,14 +356,14 @@ export async function completeAcross(c: Client, s: Scope, transferId: string) {
     // The markup now in the sibling's stock: this sale's (price less cost), plus whatever these goods already carried from an earlier sibling.
     for (const [i, l] of lines.entries()) {
       const m = docLines[i].netMinor - docLines[i].costMinor;
-      if (m !== 0n) await c.query(`insert into ic_markup_move (entity_id, from_entity_id, product_id, qty, markup_minor, kind, document_id, transfer_id) values ($1,$2,$3,$4,$5,'in',$6,$7)`,
+      if (m !== 0n) await c.query(`insert into ic_markup_move (entity_id, from_entity_id, product_id, qty, markup_minor, kind, document_id, transfer_id, occurred_on) values ($1,$2,$3,$4,$5,'in',$6,$7,business_today($1))`,
         [to.id, s.entityId, byProduct.get(l.product_id), Number(l.qty), m.toString(), doc?.documentId ?? null, land.transferId]);
     }
     const carried = await q<{ product_id: string; from_entity_id: string; qty: string; m: string }>(c, `
       select product_id, from_entity_id, sum(qty)::text qty, sum(markup_minor)::text m from ic_markup_move
        where entity_id = $1 and transfer_id = $2 and kind = 'carry_out' group by 1, 2`, [s.entityId, t.id]);
-    for (const r of carried) await c.query(`insert into ic_markup_move (entity_id, from_entity_id, product_id, qty, markup_minor, kind, document_id, transfer_id)
-        values ($1,$2,$3,$4,$5,'carry_in',$6,$7)`, [to.id, r.from_entity_id, byProduct.get(r.product_id), -Number(r.qty), (-B(r.m)).toString(), doc?.documentId ?? null, land.transferId]);
+    for (const r of carried) await c.query(`insert into ic_markup_move (entity_id, from_entity_id, product_id, qty, markup_minor, kind, document_id, transfer_id, occurred_on)
+        values ($1,$2,$3,$4,$5,'carry_in',$6,$7,business_today($1))`, [to.id, r.from_entity_id, byProduct.get(r.product_id), -Number(r.qty), (-B(r.m)).toString(), doc?.documentId ?? null, land.transferId]);
     if (!doc) return { toCompany: to.name, toTransferNumber: land.number, document: null };
     return { toCompany: to.name, toTransferNumber: land.number, document: doc.number, documentId: doc.documentId, amountMinor: doc.amountMinor,
       invoiceNumber: doc.invoiceNumber };

@@ -77,8 +77,8 @@ import * as P from "./platform.ts";
 import { PlatformError } from "./platform.ts";
 import { resetDemo, DemoResetError } from "../packages/core/platform_demo.ts";
 import { clientIp, describeClientIp } from "./client_ip.ts";
-import { recordError, installProcessHandlers, listErrors, errorByRef } from "./errors.ts";
-import { startScheduler, runDue, jobById, jobsView, runsView, runDetail } from "./scheduler.ts";
+import { recordError, installProcessHandlers, onFatal, listErrors, errorByRef } from "./errors.ts";
+import { startScheduler, queueJob, jobById, jobsView, runsView, runDetail } from "./scheduler.ts";
 import { PeriodError } from "../packages/core/periods.ts";
 import { loadSampleActivity } from "./sample.ts";
 import { MODULES } from "./modules/index.ts";
@@ -1066,10 +1066,8 @@ route("POST", /^\/api\/platform\/jobs\/([a-z_]{2,40})\/run$/, "token", async (re
   const job = jobById(m[1]);
   if (!job) throw new HttpError(404, "no such job");
   await readJson(req);
-  // through the scheduler's lock, so it never runs beside the server's own tick
-  const r = await runDue({ trigger: "manual", only: [job.id], force: true, runner: `operator ${by.actor}` });
-  if (r.skipped) throw new HttpError(409, "the scheduler is running jobs right now; try again in a minute");
-  return [200, r.runs[0]];
+  // queued, not awaited: it runs through the scheduler's lock in the background, and the console polls the job log for it
+  return [202, queueJob(job, `operator ${by.actor}`)];
 });
 route("GET", /^\/api\/platform\/audit$/, "token", async (_req, url, _m, who) => {
   operator(who);
@@ -1586,6 +1584,8 @@ export async function start(): Promise<http.Server> {
   outbox.unref();
   // Due jobs run here, one runner across instances (server/scheduler.ts); render.yaml's cron service stays off.
   const stopScheduler = startScheduler((s) => console.log(s));
+  // after an uncaught exception: stop taking requests, let the ones in flight finish, then go (errors.ts exits within 10s)
+  onFatal(() => new Promise<void>((resolve) => { clearInterval(outbox); stopScheduler(); server.close(() => resolve()); }));
   const stop = () => { clearInterval(outbox); stopScheduler(); server.close(() => pool.end().then(() => process.exit(0))); };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);

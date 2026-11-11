@@ -1056,7 +1056,7 @@ export async function messages(c: Client, entityId: string, filter: { stopId?: s
   return q(c, `
     select m.id, m.kind, m.channel, m.to_addr, m.body, m.status, m.provider, m.created_at, s.number stop_number, cu.name customer
       from customer_message m left join delivery_stop s on s.id = m.stop_id left join customer cu on cu.id = m.customer_id
-     where m.entity_id = $1 and ($2::uuid is null or m.stop_id = $2) and ($3::date is null or m.created_at::date = $3::date)
+     where m.entity_id = $1 and ($2::uuid is null or m.stop_id = $2) and ($3::date is null or (m.created_at at time zone business_tz($1))::date = $3::date)
      order by m.created_at desc limit 200`, [entityId, filter.stopId ?? null, filter.day ?? null]);
 }
 

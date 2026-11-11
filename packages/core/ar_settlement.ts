@@ -608,7 +608,7 @@ export async function lenders(c: Client, entityId: string) {
     from finance_company fc left join bank_account ba on ba.id = fc.bank_account_id where fc.entity_id = $1 order by fc.cascade_rank, fc.name`, [entityId]);
   const plans = await q(c, `select company_id, code, name, promo_months, fee_bps from finance_plan where entity_id = $1 and active order by company_id, promo_months`, [entityId]);
   const banks = await q(c, `select id, name from bank_account where entity_id = $1 and status = 'active' order by name`, [entityId]);
-  const reopened = await q(c, `select f.id, fc.name company, r.number receipt, f.amount_minor::text, f.chargeback_reason, f.chargeback_at::date::text on_day
+  const reopened = await q(c, `select f.id, fc.name company, r.number receipt, f.amount_minor::text, f.chargeback_reason, (f.chargeback_at at time zone business_tz(f.entity_id))::date::text on_day
     from financed_sale f join finance_company fc on fc.id = f.company_id join customer_receipt r on r.id = f.receipt_id
    where f.entity_id = $1 and f.status = 'awaiting_funding' and f.chargeback_at is not null order by f.chargeback_at desc limit 100`, [entityId]);
   const awaiting = await q(c, `select f.id, f.company_id, f.status, r.number receipt, cu.name customer, f.amount_minor::text,

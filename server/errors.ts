@@ -36,6 +36,9 @@ function scrubbed(s: string): string {
     .replace(/\b([A-Za-z]*_?(?:password|passwd|pwd|token|secret|key|code|authorization|cookie|session))(["']?\s*[:=]\s*["']?)[^\s"'&,;}]+/gi, "$1$2[redacted]")
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[email]")
     .replace(/\b\d[\d -]{11,}\d\b/g, (m) => (m.replace(/\D/g, "").length >= 12 ? "[number]" : m))
+    // phone numbers: +1 555 555 0101, (555) 555-0101, 555.555.0101, 5555550101, +44 20 7946 0958
+    .replace(/(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\b\d{3})[\s.-]?\d{3}[\s.-]?\d{4}\b/g, "[phone]")
+    .replace(/\+\d[\d\s.-]{8,16}\d\b/g, "[phone]")
     .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[token]");
 }
 
@@ -99,17 +102,32 @@ export async function alert(ref: string, ctx: ErrorContext, message: string, pat
 // ------------------------------------------------------ process handlers --
 
 let installed = false;
-/** Unhandled rejections are recorded and the service carries on; an uncaught exception is recorded and the process exits (Render restarts it). */
-export function installProcessHandlers(exit: (code: number) => void = (n) => process.exit(n)) {
+let shutdown: () => Promise<void> = async () => {};
+/** What to stop before the process exits after an uncaught exception (the server sets it: close the listener, then the pool). */
+export function onFatal(fn: () => Promise<void>) { shutdown = fn; }
+/**
+ * Unhandled rejections are recorded and the service carries on. An uncaught
+ * exception is recorded, the server stops taking requests and lets the ones in
+ * flight finish (server.close()), and the process exits -- after at most 10
+ * seconds whatever happens -- for Render to restart it.
+ */
+export function installProcessHandlers(exit: (code: number) => void = (n) => process.exit(n), graceMs = 10_000) {
   if (installed) return;
   installed = true;
   process.on("unhandledRejection", (reason) => { void recordError(reason, { kind: "unhandled_rejection" }); });
+  let dying = false;
   process.on("uncaughtException", (err) => {
-    const done = () => exit(1);
-    recordError(err, { kind: "uncaught_exception" }).then(done, done);
-    setTimeout(done, 3000).unref();
+    if (dying) return;
+    dying = true;
+    let gone = false;
+    const done = () => { if (!gone) { gone = true; exit(1); } };
+    setTimeout(done, graceMs).unref();
+    const close = shutdown().catch(() => {});
+    recordError(err, { kind: "uncaught_exception" }).catch(() => "").then(() => close).then(done, done);
   });
 }
+/** Checks only: let the handlers be installed again with another exit. */
+export function resetProcessHandlersForTests() { installed = false; }
 
 // ------------------------------------------------------- operator reads --
 

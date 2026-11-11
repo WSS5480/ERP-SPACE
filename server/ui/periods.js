@@ -62,7 +62,11 @@
     } else if (isOwner()) {
       acts.push(btn('Reopen', async (e) => {
         const b = e.currentTarget;
-        const why = await askReason({ title: `Reopen ${p.label}`, lead: 'Postings dated in the month are allowed again until it closes. If the year it is in was closed, the year-end closing entry is reversed.', label: 'Why it is being reopened', confirm: 'Reopen' });
+        const yc = d.yearClose;
+        const lead = yc
+          ? `${p.label} is in the year ${yc.fyStart} to ${yc.fyEnd}, which is closed. Reopening it reverses that year's closing entry: the year's income and expenses come back out of retained earnings, and ${p.label} and ${yc.lastMonth} stay open until you close the year again. Postings dated in ${p.label} are allowed again.`
+          : 'Postings dated in the month are allowed again until it closes.';
+        const why = await askReason({ title: `Reopen ${p.label}`, lead, label: 'Why it is being reopened', confirm: yc ? 'Reopen, and reverse the year close' : 'Reopen' });
         if (why) act(b, () => post(`/books/periods/${periodId}/reopen`, { reason: why }), `${p.label} reopened`).then(() => E.render());
       }));
     }
@@ -115,7 +119,7 @@
       onClick: y.journal_entry_id ? () => E.openEntry(y.journal_entry_id) : null,
       acts: y.status === 'closed' && isOwner() ? [btn('Reopen', async (e) => {
         const b = e.currentTarget;
-        const why = await askReason({ title: `Reopen the year ending ${y.fy_end}`, lead: 'The closing entry is reversed; months stay closed except the year’s last.', label: 'Why', confirm: 'Reopen the year' });
+        const why = await askReason({ title: `Reopen the year ending ${y.fy_end}`, lead: `The closing entry is reversed: the year's income and expenses come back out of retained earnings. Its months stay closed except the last (${y.fy_end.slice(0, 7)}), which stays open until you close the year again.`, label: 'Why', confirm: 'Reopen the year' });
         if (why) act(b, () => post('/books/years/reopen', { fyEnd: y.fy_end, reason: why }), 'Year reopened').then(() => E.render());
       })] : null }))) : empty('No year closed yet', 'Close a year once it has ended and its months are done.', true));
   }

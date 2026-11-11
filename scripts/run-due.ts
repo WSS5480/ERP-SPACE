@@ -69,8 +69,9 @@ export function isDue(expr: string, since: Date | null, now: Date): boolean {
  * vendor's other feeds.
  */
 export async function runDueVendorFeeds(now: Date, env: FeedEnv = liveEnv(), only?: { entityId: string }) {
-  const rows = await pool.query<{ id: string; name: string; entity_id: string; tenant_id: string; schedule_cron: string | null; every_hours: number | null; last_run_at: Date | null }>(
-    `select f.id, f.name, f.entity_id, e.tenant_id, f.schedule_cron, f.every_hours, f.last_run_at
+  const rows = await pool.query<{ id: string; name: string; entity_id: string; tenant_id: string; schedule_cron: string | null; every_hours: number | null; last_run_at: Date | null; demo: boolean }>(
+    `select f.id, f.name, f.entity_id, e.tenant_id, f.schedule_cron, f.every_hours, f.last_run_at,
+            exists (select 1 from tenant t where t.id = e.tenant_id and t.kind = 'demo') demo
        from vendor_feed f join entity e on e.id = f.entity_id
       where f.active and f.kind = 'api' and f.purpose <> 'orders' and (f.schedule_cron is not null or f.every_hours is not null)
         and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active')
@@ -81,6 +82,8 @@ export async function runDueVendorFeeds(now: Date, env: FeedEnv = liveEnv(), onl
   for (const row of rows.rows) {
     if (!feedDue(row, now, isDue)) continue;
     const ids = { entityId: row.entity_id, tenantId: row.tenant_id };
+    // the demo never calls a real vendor on its own (a check asking for one company still can, against its mocks)
+    if (row.demo && !only) { out.push({ name: row.name, ok: true, note: "demo: skipped", ...ids }); continue; }
     try {
       const r = await tx({ kind: "system", label: "scheduler" }, (cl) =>
         runFeed(cl, { tenantId: row.tenant_id, entityId: row.entity_id, actor: { kind: "system", label: "scheduler" } }, row.id, env, "schedule"));
@@ -136,8 +139,9 @@ export async function runDueCrm(now: Date) {
  * their own schedules in runDueVendorFeeds.
  */
 export async function runDueEdi(_now: Date, env: EdiEnv = liveEdiEnv(), only?: { entityId: string }) {
-  const rows = await pool.query<{ id: string; entity_id: string; tenant_id: string; vendor: string }>(
-    `select p.id, p.entity_id, e.tenant_id, coalesce(v.dba, v.legal_name) vendor
+  const rows = await pool.query<{ id: string; entity_id: string; tenant_id: string; vendor: string; demo: boolean }>(
+    `select p.id, p.entity_id, e.tenant_id, coalesce(v.dba, v.legal_name) vendor,
+            exists (select 1 from tenant t where t.id = e.tenant_id and t.kind = 'demo') demo
        from edi_partner p join entity e on e.id = p.entity_id join vendor v on v.id = p.vendor_id
       where p.edi_enabled and p.transport <> 'manual' and e.status = 'active' and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active') and ($1::uuid is null or p.entity_id = $1)
         and not exists (select 1 from entity_module m where m.entity_id = p.entity_id and m.module = 'edi' and not m.enabled)
@@ -145,6 +149,7 @@ export async function runDueEdi(_now: Date, env: EdiEnv = liveEdiEnv(), only?: {
   const out: { vendor: string; ok: boolean; note: string; entityId: string; tenantId: string }[] = [];
   for (const r of rows.rows) {
     const ids = { entityId: r.entity_id, tenantId: r.tenant_id };
+    if (r.demo && !only) { out.push({ vendor: r.vendor, ok: true, note: "demo: skipped", ...ids }); continue; }
     try {
       // Each file in and each document out commits on its own (see pollPartner), so nothing is lost or sent twice.
       const actor = { kind: "system" as const, label: "scheduler" };
@@ -186,8 +191,9 @@ export const runDueVendorConnections = runDueVendorFeeds;
 
 /** Bank and statement connections that pull on their own schedule (SFTP, APIs). */
 export async function runDueConnections(now: Date) {
-  const due = await pool.query<{ id: string; name: string; schedule_cron: string; last_attempt_at: Date | null; tenant_id: string }>(
-    `select c.id, c.name, c.schedule_cron, c.last_attempt_at, c.tenant_id
+  const due = await pool.query<{ id: string; name: string; schedule_cron: string; last_attempt_at: Date | null; tenant_id: string; entity_id: string | null; demo: boolean }>(
+    `select c.id, c.name, c.schedule_cron, c.last_attempt_at, c.tenant_id, c.entity_id,
+            exists (select 1 from tenant t where t.id = c.tenant_id and t.kind = 'demo') demo
        from connection c
        join source_channel sc on sc.source_code = c.source_code and sc.channel = c.channel
       where c.status = 'active' and sc.mode = 'pull' and c.schedule_cron is not null
@@ -197,6 +203,8 @@ export async function runDueConnections(now: Date) {
   const out: { name: string; ok: boolean; note: string; entityId: string | null; tenantId: string }[] = [];
   for (const row of due.rows) {
     if (!isDue(row.schedule_cron, row.last_attempt_at, now)) continue;
+    // the demo's pulls point at made-up banks and feeds: never fetched on a schedule
+    if (row.demo) { out.push({ name: row.name, ok: true, note: "demo: skipped", entityId: row.entity_id, tenantId: row.tenant_id }); continue; }
     let entityId: string | null = null;
     try {
       const c = await pool.connect();

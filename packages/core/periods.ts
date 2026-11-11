@@ -3,9 +3,10 @@
 // retained earnings.
 //
 // Opening. A posting dated in a month with no period opens that month when the
-// date is no more than two months ahead of the company's business date, or
-// falls in the company's current fiscal year (a late bill dated in January
-// still lands while it is November). Anything else is refused with a sentence
+// date is this month or no more than two months ahead of the company's
+// business date, or falls in an earlier month of the company's current fiscal
+// year (a late bill dated in January still lands while it is November). A
+// month further ahead never opens on its own, even inside the fiscal year. Anything else is refused with a sentence
 // saying what to do. The daily period job keeps three months ahead open for
 // every company of a customer that is not suspended. Every period opened,
 // either way, is a period_event row.
@@ -86,10 +87,11 @@ export async function periodFor(c: Client, scope: Scope | { entityId: string; ac
     const t = await businessToday(c, entityId);
     const ahead = monthsBetween(t, date);
     const fy = fiscalYearOf(t, Number(e.fy));
-    const inYear = date >= fy.start && date <= fy.end;
-    if (!(inYear || (ahead >= 0 && ahead <= 2))) {
-      throw new PeriodError(date > t
-        ? `There is no open period for ${date} (${monthLabel(date)}): months open on their own only up to two months ahead or within this fiscal year. Post it when the day comes, or ask an owner or controller to open ${monthLabel(date)} in Books, Periods.`
+    const near = ahead >= 0 && ahead <= 2;                       // this month or the next two
+    const earlierThisYear = ahead < 0 && date >= fy.start;      // a past month of the current fiscal year
+    if (!(near || earlierThisYear)) {
+      throw new PeriodError(ahead > 0
+        ? `There is no open period for ${date} (${monthLabel(date)}): months open on their own only up to two months ahead. Post it when the day comes, or ask an owner or controller to open ${monthLabel(date)} in Books, Periods.`
         : `There is no period for ${date} (${monthLabel(date)}): it is before this fiscal year, so it does not open on its own. Post it on a day in an open month, or ask an owner or controller to open ${monthLabel(date)} in Books, Periods.`);
     }
     const made = await insertMonth(c, entityId, date);
@@ -161,7 +163,8 @@ async function periodRow(c: Client, entityId: string, periodId: string) {
 }
 
 /** What stands between a month and its close, each item with what is behind it (rows) and the screen that fixes it. */
-export async function checklist(c: Client, tenantId: string, entityId: string, periodId: string): Promise<{ period: { id: string; starts_on: string; ends_on: string; status: string; label: string }; items: CheckItem[]; clear: boolean }> {
+export async function checklist(c: Client, tenantId: string, entityId: string, periodId: string): Promise<{ period: { id: string; starts_on: string; ends_on: string; status: string; label: string }; items: CheckItem[]; clear: boolean;
+  yearClose: { fyStart: string; fyEnd: string; lastMonth: string } | null }> {
   const p = await periodRow(c, entityId, periodId);
   const items: CheckItem[] = [];
   const add = (x: CheckItem) => items.push(x);
@@ -213,7 +216,11 @@ export async function checklist(c: Client, tenantId: string, entityId: string, p
   for (const t of await tieOuts(c, tenantId, entityId, multi)) {
     add({ id: `tie_${t.id}`, label: t.label, ok: t.ok, count: t.ok ? 0 : 1, detail: t.detail, screen: screens[t.id] ?? "books", rows: [{ account: codes[t.id] ?? "", detail: t.detail }] });
   }
-  return { period: { ...p, label: monthLabel(p.starts_on) }, items, clear: items.every((x) => x.ok) };
+  // a month inside a closed year: reopening it reverses the year-end close (the UI says so before it happens)
+  const yc = await q<{ fy_start: string; fy_end: string }>(c, `select fy_start::text, fy_end::text from fiscal_year_close
+    where entity_id = $1 and status = 'closed' and $2::date between fy_start and fy_end`, [entityId, p.starts_on]);
+  const yearClose = yc.length ? { fyStart: yc[0].fy_start, fyEnd: yc[0].fy_end, lastMonth: monthLabel(yc[0].fy_end) } : null;
+  return { period: { ...p, label: monthLabel(p.starts_on) }, items, clear: items.every((x) => x.ok), yearClose };
 }
 
 // ------------------------------------------------------- close / reopen --
@@ -305,6 +312,8 @@ export async function closeYear(c: Client, scope: Scope, fyEnd: string, opts: { 
   const yr = fiscalYearOf(fyEnd, Number(e.fy));
   const t = await businessToday(c, scope);
   need(yr.end < t, `the fiscal year ${yr.start} to ${yr.end} has not ended yet`);
+  // one year close at a time per company: a second one waits here, then finds the first and returns it
+  await c.query(`select pg_advisory_xact_lock(hashtext('erp year close ' || $1::text)) /* unscoped: a lock keyed by the company */`, [scope.entityId]);
   const done = await q<{ id: string; journal_entry_id: string | null; net_income_minor: string }>(c, `
     select id, journal_entry_id, net_income_minor::text from fiscal_year_close where entity_id = $1 and fy_end = $2 and status = 'closed'`, [scope.entityId, yr.end]);
   if (done.length) return { already: true, id: done[0].id, journalEntryId: done[0].journal_entry_id, netIncomeMinor: done[0].net_income_minor, ...yr };
@@ -350,9 +359,12 @@ export async function closeYear(c: Client, scope: Scope, fyEnd: string, opts: { 
       : { code: b.code, debit: -n, profitObjectId: b.profit_object_id, memo: "close to retained earnings" });
   }
   if (net !== 0n) lines.push(net < 0n ? { code, credit: -net, memo: "net income for the year" } : { code, debit: net, memo: "net loss for the year" });
-  const id = (await one<{ id: string }>(c, `
-    insert into fiscal_year_close (entity_id, fy_start, fy_end, retained_code, net_income_minor, closed_by) values ($1,$2,$3,$4,$5,$6) returning id`,
-    [scope.entityId, yr.start, yr.end, code, (-net).toString(), scope.actor.label])).id;
+  const ins = await q<{ id: string }>(c, `
+    insert into fiscal_year_close (entity_id, fy_start, fy_end, retained_code, net_income_minor, closed_by) values ($1,$2,$3,$4,$5,$6)
+    on conflict (entity_id, fy_end) where status = 'closed' do nothing returning id`,
+    [scope.entityId, yr.start, yr.end, code, (-net).toString(), scope.actor.label]);
+  need(ins.length, `the year ${yr.start} to ${yr.end} was just closed by someone else; refresh Books, Periods to see it`);
+  const id = ins[0].id;
   let je: string | null = null;
   if (lines.length) {
     const { post } = await import("./posting.ts");

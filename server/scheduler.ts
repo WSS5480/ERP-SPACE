@@ -139,6 +139,29 @@ export async function runDue(opts: { now?: Date; trigger?: "interval" | "manual"
   }
 }
 
+const waiting = new Set<string>();
+/**
+ * Run a job now, without making the caller wait: it runs through the scheduler's lock in the background
+ * (waiting for a tick in progress, up to five minutes), and the run shows in the job log like any other.
+ * Returns when it was asked, so the caller can look for a manual run started after it.
+ */
+export function queueJob(job: JobDef, runner: string): { queued: true; already: boolean; since: string } {
+  const since = new Date(Date.now() - 2000).toISOString();
+  if (waiting.has(job.id)) return { queued: true, already: true, since };
+  waiting.add(job.id);
+  void (async () => {
+    try {
+      for (let i = 0; i < 20; i++) {
+        const r = await runDue({ trigger: "manual", only: [job.id], force: true, runner });
+        if (!r.skipped) return;
+        await new Promise((res) => setTimeout(res, 15_000));
+      }
+    } catch (e) { await recordError(e, { kind: "job", path: `run now ${job.id}` }); }
+    finally { waiting.delete(job.id); }
+  })();
+  return { queued: true, already: false, since };
+}
+
 /** Start the in-server ticker. Returns a stop function. */
 export function startScheduler(log: (s: string) => void = console.log): () => void {
   if ((process.env.ERP_SCHEDULER ?? "").toLowerCase() === "off") { log("scheduler: off (ERP_SCHEDULER=off)"); return () => {}; }

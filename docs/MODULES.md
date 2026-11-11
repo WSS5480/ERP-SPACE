@@ -686,10 +686,18 @@ delivery settings' company zone, else the store's (or company's) state
 details and each store's form set the zones. Text quiet hours use the
 customer's state, else the company's zone.
 
+Behaviour change (kept on purpose, Nov 11 2026): with no zone set anywhere
+for a store -- not on the store, the company, the time clock or the delivery
+settings -- the time clock and delivery now use the zone of the store's (or
+company's) state before New York. Before 0053 they fell back to New York (time
+clock) or Chicago (delivery) whatever the state. A company in Texas with no
+zone set therefore now clocks and routes in Central time.
+
 **Periods** (`packages/core/periods.ts`). `post()` finds the period through
-`periodFor`: a month with no period opens on its own when the date is no more
-than two months ahead of the company's business date or in its current fiscal
-year (a `period_event` row says so); anything else is refused with a sentence
+`periodFor`: a month with no period opens on its own when the date is this
+month or up to two months ahead of the company's business date, or an earlier
+month of its current fiscal year (a `period_event` row says so); a month
+further ahead never opens on its own, even inside the fiscal year; anything else is refused with a sentence
 saying what to do (an owner or controller opens a month by hand in Books,
 Periods, with a reason). The daily period job keeps three months ahead open for
 every company of a customer that is not suspended. Every other writer of
@@ -760,3 +768,32 @@ connections are built for them).
 **CI** (`.github/workflows/ci.yml`): Postgres 16, `apply.sh --reset --seed`,
 smoke and smoke:modules on every push and pull request; `npm run typecheck`
 runs alongside, not blocking until it is clean. CI never deploys.
+
+### Review fixes (Nov 11 2026, migrations 0056, 0058, 0059; seed 0036)
+
+- The year-end closing entry (`source_type = 'closing'`) is left out of the
+  P&L: Books, Home, Group consolidation and the `pnl_lines` dataset.
+- 0056: a posting reads its period row FOR SHARE, so it cannot pass a
+  month-end close (which takes it FOR UPDATE); an entry's period must be its
+  company's and hold its date; lines cannot be added to an entry in a closed
+  month; a closed month changes status only with a 'reopened' log row in the
+  same transaction (periods.ts writes the log row first).
+- Two year closes of the same company at once: one waits for the other
+  (advisory lock) and returns its close; a clash says so in a sentence.
+- Reopening a month of a closed year says first that the year's closing entry
+  is reversed and the year's last month stays open until the year closes again.
+- A failing pull connection's failure is recorded outside the rolled-back
+  transaction, so it backs off and stops after five failures. The job log keeps
+  90 days. Operator "Run now" queues the job and answers at once; the console
+  watches the job log for the result.
+- 0058: date columns that defaulted to the UTC day (customer_invoice,
+  ar_ledger, maintenance_schedule, fuel_log, ic_document, ic_settlement,
+  ic_markup_move) take the company's business date by trigger; the views
+  ap_aging, sweep_status, connection_health and statement_gaps count from it.
+- The demo never calls a real outside system on a schedule: 0059 (live) and
+  seed 0036 (every reset) set its vendor feeds to on demand, turn its EDI off
+  and pause its pull connections, and the scheduler skips the demo's feeds, EDI
+  and pulls ("demo: skipped"). A person can still run one by hand.
+- Error log redaction also covers phone numbers, passwords in URLs and
+  `api_key=`. After an uncaught exception the server stops taking requests
+  (`server.close()`) and the process exits within 10 seconds.
