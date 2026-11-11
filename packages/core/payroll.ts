@@ -454,14 +454,16 @@ export async function release(
   c: Client,
   scope: Scope,
   runId: string,
-  releasedBy: string
+  releasedBy: string,
+  /** the owner's own release when nobody else could release it; the caller has checked the rule (approvals.selfApprovalFor) */
+  opts: { selfReleased?: boolean } = {}
 ): Promise<void> {
   const run = await one<{ id: string; status: string; built_by: string; net_minor: string }>(
     c,
     `select id, status, built_by, net_minor from payroll_run where id=$1 and entity_id=$2`,
     [runId, scope.entityId]
   );
-  if (run.built_by === releasedBy)
+  if (run.built_by === releasedBy && !opts.selfReleased)
     throw new PayrollError("whoever built the run cannot release it");
 
   const open = await q(
@@ -474,8 +476,8 @@ export async function release(
   if (open.length > 0) throw new PayrollError("approval is still open");
 
   await c.query(
-    `update payroll_run set status='released', released_by=$2, released_at=now() where id=$1`,
-    [runId, releasedBy]
+    `update payroll_run set status='released', released_by=$2, released_at=now(), self_released=$3 where id=$1`,
+    [runId, releasedBy, !!opts.selfReleased && run.built_by === releasedBy]
   );
   await audit(c, scope, {
     table: "payroll_run", rowId: runId, action: "transition",

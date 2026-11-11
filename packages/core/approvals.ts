@@ -170,6 +170,23 @@ export async function selfApprovalFor(c: Client, entityId: string, deciderId: st
   return true;
 }
 
+/**
+ * Who could release a run besides its builder (with the owner and a controller,
+ * who always count), and who could let a bill through the gates: a builder or
+ * an enterer may do it themselves only when none of these is anyone else (0064).
+ */
+export const RUN_RELEASERS: Record<"payment_run" | "payroll_run", string[]> = { payment_run: ["approver", "ap_clerk"], payroll_run: ["hr"] };
+export const GATE_SIGN_OFF = ["controller"];
+
+/** Dollars and cents as the screens show them ($1,234.56). */
+export const usdText = (minor: bigint) => fmtUsd(minor);
+
+/** The owner releasing their own run types its total; refused in a sentence otherwise. */
+export function needTypedTotal(totalMinor: bigint, typed: unknown) {
+  const m = typedMinor(typeof typed === "string" ? typed : "");
+  if (m === null || m !== totalMinor) throw new ApprovalError(`to release your own run, type its total exactly: ${fmtUsd(totalMinor)}`);
+}
+
 /** Audit the maker's own decision (every flow writes the same row). */
 export async function auditSelfApproval(c: Client, scope: Scope, table: string, rowId: string, after: Record<string, unknown>) {
   await audit(c, scope, { table, rowId, action: "transition", reason: "self-approved: no other approver", after });

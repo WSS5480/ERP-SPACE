@@ -110,7 +110,7 @@ Data is placed with textContent only, never innerHTML.
 | selling rules (discount limit, quote life, layaway terms, tenders); demo made up | 0055 | 0035 | Setup (Sales tax → Selling rules) |
 | vendor_files (SFTP and HTTPS transports, vendor file connections, vendor email, SFTP/email-in vendor feeds, EDI over SFTP; one-person approvals) | 0057, 0061, 0062 | none | Setup (Connections → Vendor files), Retail (Catalog → Vendors → Catalog connections) |
 | drill (the rows behind every tile; read-only lists) | none | none | no screen of its own |
-| self-approval follow-through (support mode, typed confirmation, owner digest, counts / write-offs / debit memos / time off) | 0063 | none | a Home card (Self-approvals) |
+| self-approval follow-through (support mode, typed confirmation, owner digest, counts / write-offs / debit memos / time off, run release, bill gates) | 0063, 0064 | none | a Home card (Self-approvals) |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -958,11 +958,23 @@ per business day with every self-approval of the last 24 hours and any role
 removed in the 24 hours before one; it shows on the owner's Home
 (Self-approvals, drills to its lines with Back, each line opens its record)
 and is emailed to the owners through the outbox only when the company has
-email connected. Demo and suspended customers are skipped. Not changed, and
-still dead ends for one person: a payment or payroll run is released by
-someone other than its builder (`payment_run`/`payroll_run` checks in 0004 and
-0007), and a bill stopped at the gates is let through by someone other than
-whoever entered it (`actions.acceptBill`).
+email connected. Demo and suspended customers are skipped.
+
+The last two one-person dead ends (migration 0064) follow the same rule,
+audit row, "(self-approved)" marking and support-mode refusal. A payment or
+payroll run may be released by its own builder only as the owner when nobody
+else in the company could release it (no other owner or controller, nor an
+approver or A/P clerk for payment runs, nor HR for payroll:
+`approvals.RUN_RELEASERS`); the run's total is typed, the run is marked
+`self_released`, and `self_released_guard(<roles>)` with the relaxed
+`*_two_people` checks holds the same line in the database. A bill stopped at
+the gates may be let through by whoever entered it only as the owner when no
+other owner or controller is here (`approvals.GATE_SIGN_OFF`); nothing is
+typed. The bill now records `accepted_by`, `accepted_at` and `self_accepted`,
+and `invoice_accept_guard` enforces both rules in the database: not the
+enterer, unless it is that self-accepted case. The count, run and bill screens
+offer the action (`self_ok`, `self_accept_ok`) only when the rule allows it.
+Both go into the owner digest (flows `release` and `gate`).
 
 Phones: long words (emails, addresses, key fingerprints) wrap
 (`overflow-wrap:anywhere`) in row notes, leads, result boxes, dialog titles,

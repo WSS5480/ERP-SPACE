@@ -971,6 +971,9 @@ function askTypedConfirm(a) {
     setTimeout(() => input.focus(), 0);
   });
 }
+/** The typed-confirmation dialog's input for releasing your own run (its total). */
+const runConfirm = (r, total) => ({ subject: { title: 'Release your own run', detail: `Pay date ${dayLabel(r.pay_date)}` },
+  confirm: { kind: 'amount', prompt: 'Type the run’s total to release your own run', expect: total } });
 /**
  * New bank details for a vendor are approved only after a call to the phone
  * already on file. Resolves to what the approver writes about the call, or null.
@@ -1063,8 +1066,10 @@ function openBill(id) {
     let signOffNote = null;
     if (['exception', 'held'].includes(b.status)) {
       const signs = signsOff();
-      const entered = S.person && b.created_by === S.person.id;
-      if (!signs || entered) signOffNote = entered ? 'You entered this bill, so someone else has to let it through.' : 'The controller or the owner can let it through; anyone can reject it.';
+      // the owner who entered it may let it through when nobody else here could sign it off (recorded as self-approved)
+      const entered = S.person && b.created_by === S.person.id && !b.self_accept_ok;
+      if (b.self_accept_ok) signOffNote = 'You entered this bill, and nobody else here can sign it off, so you can (recorded as self-approved).';
+      else if (!signs || entered) signOffNote = entered ? 'You entered this bill, so someone else has to let it through.' : 'The controller or the owner can let it through; anyone can reject it.';
       const acc = el('button', { class: 'btn primary', type: 'button', disabled: (!signs || entered) || null, onclick: async () => {
         const why = await askReason({ title: b.status === 'held' ? 'Not a duplicate?' : 'Let it through?', sub: `${b.vendor} ${b.reference || ''}`,
           lead: 'It goes on to approval, or straight to the books if it is under the approval threshold.', label: 'Why it is fine', confirm: 'Let it through',
@@ -1092,6 +1097,7 @@ function openBill(id) {
       el('div', { class: 'panel', style: null }, el('div', { class: 'facts' },
         fact('Bill date', dayLabel(b.invoice_date)), fact('Due', b.due_date ? dayLabel(b.due_date) : '—'),
         fact('Entered by', b.created_by_name || '—'),
+        b.accepted_by_name ? fact('Let through by', `${b.accepted_by_name}${b.self_accepted ? ' (self-approved)' : ''}`) : null,
         b.usual_minor != null ? fact('Usually bills', money(b.usual_minor)) : fact('Read with', b.confidence_bps ? `${Math.round(b.confidence_bps / 100)}% confidence` : '—'))),
       section('Coded to', null, null, el('div', { class: 'panel' }, b.lines.map((l) => item({
         title: `${l.code} ${l.account}`, detail: [l.store || 'Company', l.description].filter(Boolean).join(' · '), amount: money(l.amount_minor) })))),
@@ -1219,8 +1225,13 @@ function runItem(r) {
     acts.push(sub);
   }
   if (r.status === 'pending_release' && r.approval_status !== 'open') {
-    const rel = el('button', { class: 'btn small primary', type: 'button', disabled: mine || null,
-      onclick: () => act(rel, () => post(`/payment-runs/${r.id}/release`), (x) => `Released: ${plural(x.bills, 'bill')} paid, ${money(x.total)} out of the operating account in the books.`) }, 'Release');
+    const rel = el('button', { class: 'btn small primary', type: 'button', disabled: (mine && !r.self_ok) || null,
+      onclick: async () => {
+        // the owner releasing their own run (nobody else could) types its total first; the server checks it
+        const confirm = r.self_ok ? await askTypedConfirm(runConfirm(r, money(r.total_minor))) : undefined;
+        if (r.self_ok && confirm == null) return;
+        await act(rel, () => post(`/payment-runs/${r.id}/release`, { confirm }), (x) => `Released: ${plural(x.bills, 'bill')} paid, ${money(x.total)} out of the operating account in the books.`);
+      } }, 'Release');
     acts.push(rel);
   }
   if (['building', 'pending_release'].includes(r.status)) {
@@ -1233,9 +1244,9 @@ function runItem(r) {
   }
   acts.push(el('button', { class: 'btn small', type: 'button', onclick: () => openPaymentRun(r.id) }, 'Open'));
   const why = r.status === 'pending_release' && r.approval_status === 'open' ? `Waiting on the ${ROLE[r.waiting_on] || r.waiting_on || 'approver'}; approve it from Approvals when acting as them.`
-    : mine && r.status === 'pending_release' ? 'You built this run, so someone else has to release it.' : null;
+    : mine && r.status === 'pending_release' ? (r.self_ok ? 'You built this run, and nobody else here can release it, so you can (recorded as self-approved).' : 'You built this run, so someone else has to release it.') : null;
   return item({ title: `Pay date ${dayLabel(r.pay_date)} · ${r.method.toUpperCase()}`,
-    detail: `${plural(r.payments, 'bill')} · built by ${r.built_by_name}${r.released_by_name ? ` · released by ${r.released_by_name}` : ''}`,
+    detail: `${plural(r.payments, 'bill')} · built by ${r.built_by_name}${r.released_by_name ? ` · released by ${r.released_by_name}${r.self_released ? ' (self-approved)' : ''}` : ''}`,
     amount: money(r.total_minor), badge: runStatusChip(r), why, acts });
 }
 function openPaymentRun(id) {
@@ -1244,7 +1255,7 @@ function openPaymentRun(id) {
     const r = await coApi(`/payment-runs/${id}`);
     d.dlg.querySelector('h2').textContent = `Payment run for ${dayLabel(r.pay_date)}`;
     return frag(el('div', { class: 'toolbar' }, el('span', { class: 'big', text: money(r.total_minor) }), runStatusChip(r)),
-      el('p', { class: 'lead', text: `${r.method.toUpperCase()} from ${r.bank_account || 'the operating account'}${r.account_last4 ? ' ••' + r.account_last4 : ''}. Built by ${r.built_by_name}${r.released_by_name ? `, released by ${r.released_by_name}` : ''}.` }),
+      el('p', { class: 'lead', text: `${r.method.toUpperCase()} from ${r.bank_account || 'the operating account'}${r.account_last4 ? ' ••' + r.account_last4 : ''}. Built by ${r.built_by_name}${r.released_by_name ? `, released by ${r.released_by_name}${r.self_released ? ' (self-approved)' : ''}` : ''}.` }),
       el('div', { class: 'panel' }, r.payment_list.map((p) => item({ title: billName(p.vendor, p.reference), detail: `${cap(p.status)}${p.due_date ? ' · was due ' + shortDay(p.due_date) : ''}`,
         amount: money(p.amount_minor), onClick: () => openBill(p.invoice_id) }))));
   });
@@ -1517,9 +1528,15 @@ function groupState(g, runs) {
     state = `Waiting on the ${ROLE[run.waiting_on] || run.waiting_on || 'owner'} to approve the register. Approve it from Approvals when acting as them.`;
     acts.push(el('button', { class: 'btn', type: 'button', onclick: () => go('approvals') }, 'Go to Approvals'));
   } else if (run.status === 'pending_release') {
-    const mine = S.person && run.built_by === S.person.id;
-    state = mine ? 'Approved. You built it, so someone else has to release it.' : 'Approved. Release it for funding.';
-    const b = el('button', { class: 'btn primary', type: 'button', disabled: mine || null, onclick: () => act(b, () => post(`/payroll/runs/${run.id}/release`), 'Released for funding.') }, 'Release');
+    const mine = S.person && run.built_by === S.person.id && !run.self_ok;
+    state = run.self_ok ? 'Approved. You built it, and nobody else here can release it, so you can (recorded as self-approved).'
+      : mine ? 'Approved. You built it, so someone else has to release it.' : 'Approved. Release it for funding.';
+    const b = el('button', { class: 'btn primary', type: 'button', disabled: mine || null, onclick: async () => {
+      // the owner releasing their own payroll (nobody else could) types its total first; the server checks it
+      const confirm = run.self_ok ? await askTypedConfirm(runConfirm(run, money(run.net_minor))) : undefined;
+      if (run.self_ok && confirm == null) return;
+      await act(b, () => post(`/payroll/runs/${run.id}/release`, { confirm }), 'Released for funding.');
+    } }, 'Release');
     acts.push(b);
   } else if (run.status === 'released') {
     state = 'Released. Post it to the books.';
@@ -1562,7 +1579,7 @@ async function screenPayroll() {
         former.length ? section('Left in the last 90 days', null, null, el('div', { class: 'panel' }, former)) : null),
       el('div', {},
         section('Runs', null, null, el('div', { class: 'panel' }, d.runs.length ? capped(d.runs.map((r) => item({
-          title: `${r.pay_group} · ${dayLabel(r.pay_date)}`, detail: `${plural(r.employees, 'person', 'people')} · gross ${money(r.gross_minor)} · built by ${r.built_by_name}${r.released_by_name ? `, released by ${r.released_by_name}` : ''}`,
+          title: `${r.pay_group} · ${dayLabel(r.pay_date)}`, detail: `${plural(r.employees, 'person', 'people')} · gross ${money(r.gross_minor)} · built by ${r.built_by_name}${r.released_by_name ? `, released by ${r.released_by_name}${r.self_released ? ' (self-approved)' : ''}` : ''}`,
           amount: money(r.net_minor), badge: payrollChip(r), onClick: () => openRegister(r.id) })), 5, 'runs') : empty('No runs yet.', null, true))),
         section('Deductions to send on', null, null, el('div', { class: 'panel' }, d.remittances.length ? d.remittances.map((x) => item({
           title: x.name, detail: `due ${dayLabel(x.due_on)}${x.days_late ? ` · ${x.days_late} days late` : ''}${Number(x.employer_match_minor) ? ` · includes ${money(x.employer_match_minor)} employer match` : ''}`,

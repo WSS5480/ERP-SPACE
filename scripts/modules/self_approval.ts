@@ -372,6 +372,129 @@ export async function run(t: T) {
   const walked = await read(t, (c) => OD.digestCompanies(c));
   t.ok("digest: the demo is never walked", demo.length > 0 && !walked.some((w) => demo.some((d) => d.id === w.id)) && walked.some((w) => w.id === C.entityId));
 
+  // ======================================================== 0064: release your own run, let your own bill through
+  const P = await import("../../server/actions.ts");
+  const sinceStart = new Date(Date.now() - 3600_000).toISOString();
+  // a bill the owner entered, stopped at the gates (a new vendor has no template)
+  const gateVendor = await tx(SYS, async (c) => {
+    const v = (await q<{ id: string }>(c, `insert into vendor (tenant_id, legal_name, status) values ($1, $2, 'active') returning id /* unscoped: check setup */`, [A.tenantId, `Gate Test Supply ${A.tag}`]))[0].id;
+    await c.query(`insert into vendor_entity (vendor_id, entity_id, status) values ($1, $2, 'active')`, [v, A.entityId]);
+    return v;
+  });
+  const own = await A.as((c) => P.newBill(c, A.co, A.a, { vendorId: gateVendor, glAccountId: gl, reference: `G-${A.tag}`, invoiceDate: A.today, amount: "300.00" }));
+  const ownView = await read(t, (c) => views.bill(c, A.co, own.id, A.ownerId)) as unknown as { status: string; self_accept_ok: boolean };
+  t.ok("gates: the owner's own stopped bill is theirs to let through (nobody else could), and the screen says so",
+    ["exception", "held"].includes(ownView.status) && ownView.self_accept_ok && /b\.self_accept_ok/.test(appJs), ownView.status);
+  const acc = await A.as((c) => P.acceptBill(c, A.co, A.a, { id: own.id, reason: "checked against the packing slip" }));
+  const ownRow = (await rows<{ self_accepted: boolean; accepted_by: string; status: string }>(t, `select self_accepted, accepted_by, status from invoice where entity_id = $1 and id = $2`, [A.entityId, own.id]))[0];
+  const ownTl = (await read(t, (c) => views.bill(c, A.co, own.id, A.ownerId))) as unknown as { timeline: { reason: string }[]; self_accepted: boolean; accepted_by_name: string };
+  t.ok("gates: the owner lets their own bill through, marked self-approved with an audit row, no typing needed",
+    ["approved", "pending"].includes(acc.status) && ownRow.self_accepted && ownRow.accepted_by === A.ownerId
+    && (await audits(A, "invoice", own.id)).some((r) => r.reason === "self-approved: no other approver"), JSON.stringify(ownRow));
+  t.ok("gates: its history says (self-approved)", ownTl.timeline.some((x) => /\(self-approved\)/.test(x.reason ?? "")) && ownTl.self_accepted
+    && /b\.self_accepted \? ' \(self-approved\)' : ''/.test(appJs));
+
+  // the payment run built and approved earlier (run0, $250.00) is the owner's own to release
+  const pr = ((await read(t, (c) => views.paymentRuns(c, A.co, A.ownerId))).runs as { id: string; self_ok: boolean }[]).find((r: { id: string }) => r.id === run0.id) as { self_ok: boolean } | undefined;
+  t.ok("release: the owner's own approved payment run is theirs to release (nobody else could)", !!pr?.self_ok);
+  await t.throws("release: releasing your own payment run without its total is refused", () => A.as((c) => P.releasePaymentRun(c, A.co, A.a, { id: run0.id })), /type its total exactly: \$250\.00/);
+  await t.throws("release: a different total is refused", () => A.as((c) => P.releasePaymentRun(c, A.co, A.a, { id: run0.id, confirm: "205.00" })), /type its total exactly/);
+  await t.throws("release: support mode never releases the owner's own run", () => tx({ ...supActor }, (c) => P.releasePaymentRun(c, A.co, { ...A.a, label: supActor.label }, { id: run0.id, confirm: "250.00" })), /support mode never self-approves/);
+  const rel = await A.as((c) => P.releasePaymentRun(c, A.co, A.a, { id: run0.id, confirm: "$250.00" })) as { status?: string };
+  const relRow = (await rows<{ self_released: boolean; released_by: string; status: string }>(t, `select self_released, released_by, status from payment_run where entity_id = $1 and id = $2`, [A.entityId, run0.id]))[0];
+  t.ok("release: with the total typed the owner releases their own payment run, marked self-approved with an audit row",
+    relRow.status === "released" && relRow.self_released && relRow.released_by === A.ownerId && (await audits(A, "payment_run", run0.id)).some((r) => r.reason === "self-approved: no other approver"), JSON.stringify({ rel, relRow }));
+  t.ok("release: its history says (self-approved), and the screen asks for the total before releasing",
+    /r\.self_released \? ' \(self-approved\)' : ''/.test(appJs) && /r\.self_ok \? await askTypedConfirm\(runConfirm\(r, money\(r\.total_minor\)\)\)/.test(appJs)
+    && /post\(`\/payment-runs\/\$\{r\.id\}\/release`, \{ confirm \}\)/.test(appJs));
+
+  // a real payroll: a pay group, a salaried hire (self-approved), the run built, approved and released by the owner alone
+  const opBank = (await rows<{ id: string }>(t, `select id from bank_account where entity_id = $1 and purpose = 'operating' and status = 'active' limit 1`, [A.entityId]))[0].id;
+  const start = A.today.slice(8) >= "16" ? A.today.slice(0, 8) + "16" : A.today.slice(0, 8) + "01";
+  const grp = await A.as((c) => P.addPayGroup(c, A.co, A.a, { name: `Office ${A.tag}`, frequency: "semimonthly", firstStartsOn: start, payLagDays: 5, bankAccountId: opBank }));
+  const hire = await A.as(async (c) => P.hireEmployee(c, A.co, A.a, { firstName: "Sam", lastName: "Salaried", position: "Office manager", payGroupId: grp.id, payType: "salary", rate: "52000",
+    storeId: (await q<{ id: string }>(c, `select id from profit_object where entity_id = $1 limit 1`, [A.entityId]))[0]?.id, workState: "TX", hiredOn: addDays(start, -30) }));
+  if (hire.status === "applicant") {
+    const hr = (await rows<{ id: string }>(t, `select id from approval_request where entity_id = $1 and subject_type = 'employee' and subject_id = $2`, [A.entityId, hire.id]))[0];
+    await A.as((c) => P.decideRequest(c, A.co, A.a, { requestId: hr.id, decision: "approved", note: "" }));
+  }
+  const period = (await rows<{ id: string }>(t, `select pp.id from pay_period pp join pay_group pg on pg.id = pp.pay_group_id where pg.entity_id = $1 and pg.id = $2 order by pp.starts_on limit 1`, [A.entityId, grp.id]))[0].id;
+  const built = await A.as((c) => P.buildPayroll(c, A.co, A.a, { periodId: period }));
+  await A.as((c) => P.requestPayroll(c, A.co, A.a, { runId: built.runId }));
+  const net = BigInt(built.net);
+  const usd = AP.usdText(net);
+  const prq = (await rows<{ id: string }>(t, `select id from approval_request where entity_id = $1 and subject_type = 'payroll_run' and subject_id = $2 and status = 'open'`, [A.entityId, built.runId]))[0];
+  if (prq) await A.as((c) => P.decideRequest(c, A.co, A.a, { requestId: prq.id, decision: "approved", note: "", confirm: usd }));
+  const prv = ((await read(t, (c) => views.payroll(c, A.co, A.ownerId))).runs as { id: string; self_ok: boolean }[]).find((r: { id: string }) => r.id === built.runId) as { self_ok: boolean } | undefined;
+  t.ok("release: the owner's own approved payroll is theirs to release", net > 0n && !!prv?.self_ok, `${usd} ${JSON.stringify(prv)}`);
+  await t.throws("release: releasing your own payroll without its total is refused", () => A.as((c) => P.releasePayroll(c, A.co, A.a, { runId: built.runId })), /type its total exactly/);
+  await A.as((c) => P.releasePayroll(c, A.co, A.a, { runId: built.runId, confirm: usd }));
+  const payRow = (await rows<{ self_released: boolean; status: string }>(t, `select self_released, status from payroll_run where entity_id = $1 and id = $2`, [A.entityId, built.runId]))[0];
+  t.ok("release: with the total typed the owner releases their own payroll, marked self-approved with an audit row",
+    payRow.status === "released" && payRow.self_released && (await audits(A, "payroll_run", built.runId)).some((r) => r.reason === "self-approved: no other approver"), JSON.stringify(payRow));
+  const dig = await read(t, (c) => OD.selfApprovals(c, A.entityId, sinceStart, new Date().toISOString()));
+  t.ok("digest: self-released runs and a bill let through by whoever entered it are in the owner's digest",
+    dig.some((i) => i.flow === "release" && i.id === run0.id && i.amountMinor === "25000") && dig.some((i) => i.flow === "release" && i.id === built.runId)
+    && dig.some((i) => i.flow === "gate" && i.id === own.id), JSON.stringify(dig.filter((i) => ["release", "gate"].includes(i.flow)).map((i) => i.title)));
+  await t.throws("database: a run released by someone other than its builder cannot be marked self-released", () => tx(SYS, async (c) => {
+    await c.query(`update payroll_run set released_by = $3, self_released = true where id = $1 and entity_id = $2`, [built.runId, A.entityId, pat.id]);
+  }), /only the builder's own release is marked self-released/);
+
+  // company B (a controller here): neither is self-approved
+  const gvB = await tx(SYS, async (c) => {
+    const v = (await q<{ id: string }>(c, `insert into vendor (tenant_id, legal_name, status) values ($1, $2, 'active') returning id /* unscoped: check setup */`, [B.tenantId, `Gate Test Supply ${B.tag}`]))[0].id;
+    await c.query(`insert into vendor_entity (vendor_id, entity_id, status) values ($1, $2, 'active')`, [v, B.entityId]);
+    // B's payment runs are approved by its controller (setup: the pack gave the owner that step before the controller joined)
+    await c.query(`update approval_policy set steps = '[{"seq":1,"role":"controller"}]'::jsonb where entity_id = $1 and subject_type = 'payment_run'`, [B.entityId]);
+    return v;
+  });
+  const glB = (await rows<{ id: string }>(t, `select id from gl_account where tenant_id = $1 and is_postable and account_type = 'expense' order by code limit 1`, [B.tenantId]))[0].id;
+  const ownB = await B.as((c) => P.newBill(c, B.co, B.a, { vendorId: gvB, glAccountId: glB, reference: `G-${B.tag}`, invoiceDate: B.today, amount: "300.00" }));
+  t.ok("controller here: the owner is not offered their own stopped bill", !((await read(t, (c) => views.bill(c, B.co, ownB.id, B.ownerId))) as unknown as { self_accept_ok: boolean }).self_accept_ok);
+  await t.throws("controller here: the owner cannot let their own bill through the gates", () => B.as((c) => P.acceptBill(c, B.co, B.a, { id: ownB.id, reason: "checked" })), /whoever entered a bill cannot also let it through the gates/);
+  await t.throws("controller here: the database refuses it too (by hand, with or without self_accepted)", () => tx(SYS, (c) =>
+    c.query(`update invoice set accepted_by = $3, accepted_at = now(), self_accepted = true where id = $1 and entity_id = $2`, [ownB.id, B.entityId, B.ownerId])), /someone else in this company can approve it/);
+  await t.throws("database: whoever entered a bill never lets it through unmarked", () => tx(SYS, (c) =>
+    c.query(`update invoice set accepted_by = $3, accepted_at = now() where id = $1 and entity_id = $2`, [ownB.id, B.entityId, B.ownerId])), /whoever entered a bill cannot also let it through the gates/);
+  const ctlA = { personId: ctl, personName: "Casey Controller", label: "Casey" };
+  const accB = await tx({ kind: "user", id: ctl, label: "Casey" }, (c) => P.acceptBill(c, B.co, ctlA, { id: ownB.id, reason: "checked against the PO" }));
+  const runB = await B.as((c) => P.createPaymentRun(c, B.co, B.a, { payDate: B.today, method: "check", invoiceIds: [ownB.id] })) as { id: string };
+  await B.as((c) => P.submitPaymentRun(c, B.co, B.a, { id: runB.id }));
+  const rqB = (await rows<{ id: string }>(t, `select id from approval_request where entity_id = $1 and subject_type = 'payment_run' and subject_id = $2 and status = 'open'`, [B.entityId, runB.id]))[0];
+  if (rqB) await tx({ kind: "user", id: ctl, label: "Casey" }, (c) => P.decideRequest(c, B.co, ctlA, { requestId: rqB.id, decision: "approved", note: "" }));
+  t.ok("controller here: the controller lets it through and approves the run (setup for the release)", accB.status === "approved" || accB.status === "pending");
+  t.ok("controller here: the owner is not offered their own run to release", !((await read(t, (c) => views.paymentRuns(c, B.co, B.ownerId))).runs as { id: string; self_ok: boolean }[]).find((r: { id: string }) => r.id === runB.id)?.self_ok);
+  await t.throws("controller here: the owner cannot release their own payment run, total typed or not", () => B.as((c) => P.releasePaymentRun(c, B.co, B.a, { id: runB.id, confirm: "300.00" })), /whoever built the run cannot release it/);
+  await t.throws("controller here: the database refuses a hand-written self-released payment run", () => tx(SYS, (c) =>
+    c.query(`update payment_run set status = 'released', released_by = $3, released_at = now(), self_released = true where id = $1 and entity_id = $2`, [runB.id, B.entityId, B.ownerId])), /someone else in this company can approve it/);
+  const relB = await tx({ kind: "user", id: ctl, label: "Casey" }, (c) => P.releasePaymentRun(c, B.co, ctlA, { id: runB.id }));
+  t.ok("controller here: the controller releases it, not self-released",
+    !!relB && !(await rows<{ self_released: boolean }>(t, `select self_released from payment_run where entity_id = $1 and id = $2`, [B.entityId, runB.id]))[0].self_released);
+  // payroll in B: the run stands in (setup), built by the owner
+  const opB = (await rows<{ id: string }>(t, `select id from bank_account where entity_id = $1 and purpose = 'operating' and status = 'active' limit 1`, [B.entityId]))[0].id;
+  const grpB = await B.as((c) => P.addPayGroup(c, B.co, B.a, { name: `Office ${B.tag}`, frequency: "semimonthly", firstStartsOn: start, payLagDays: 5, bankAccountId: opB }));
+  const prB = await tx(SYS, async (c) => (await q<{ id: string }>(c, `insert into payroll_run (tenant_id, entity_id, pay_period_id, bank_account_id, status, net_minor, built_by)
+      select $1, $2, pp.id, $4, 'pending_release', 100000, $5 from pay_period pp where pp.pay_group_id = $3 order by pp.starts_on limit 1 returning id /* unscoped: check setup */`,
+    [B.tenantId, B.entityId, grpB.id, opB, B.ownerId]))[0].id);
+  t.ok("controller here: the owner is not offered their own payroll to release", !((await read(t, (c) => views.payroll(c, B.co, B.ownerId))).runs as { id: string; self_ok: boolean }[]).find((r: { id: string }) => r.id === prB)?.self_ok);
+  await t.throws("controller here: the owner cannot release their own payroll", () => B.as((c) => P.releasePayroll(c, B.co, B.a, { runId: prB, confirm: "1000.00" })), /whoever built the run cannot release it/);
+  await t.throws("controller here: the database refuses a hand-written self-released payroll", () => tx(SYS, (c) =>
+    c.query(`update payroll_run set status = 'released', released_by = $3, released_at = now(), self_released = true where id = $1 and entity_id = $2`, [prB, B.entityId, B.ownerId])), /someone else in this company can approve it/);
+  await t.throws("database: a builder releasing their own run unmarked still breaks the two-people check", () => tx(SYS, (c) =>
+    c.query(`update payroll_run set status = 'released', released_by = $3, released_at = now() where id = $1 and entity_id = $2`, [prB, B.entityId, B.ownerId])), /payroll_run_two_people/);
+  const agree2 = await read(t, async (c) => {
+    const out: string[] = [];
+    for (const [x, roles] of [[A, AP.RUN_RELEASERS.payment_run], [A, AP.RUN_RELEASERS.payroll_run], [A, AP.GATE_SIGN_OFF], [B, AP.RUN_RELEASERS.payment_run], [B, AP.RUN_RELEASERS.payroll_run], [B, AP.GATE_SIGN_OFF]] as [Co, string[]][]) {
+      const code = await AP.mayDecideOwn(c, x.ownerId, x.entityId, roles);
+      const sql = (await c.query<{ ok: boolean }>(`select may_self_approve($1::uuid, $2::uuid, $3::text[]) ok`, [x.entityId, x.ownerId, roles])).rows[0].ok;
+      if (code !== sql || code !== (x === A)) out.push(`${x === A ? "A" : "B"} ${roles}: code ${code}, sql ${sql}`);
+    }
+    const mig = readFileSync(ROOT + "db/migrations/0064_self_release.sql", "utf8");
+    if (!/self_released_guard\('approver,ap_clerk'\)/.test(mig) || !/self_released_guard\('hr'\)/.test(mig) || !/self_approve_refusal\(new\.entity_id, new\.accepted_by, array\['controller'\]\)/.test(mig)) out.push("the triggers name other roles than the code");
+    return out;
+  });
+  t.ok("the rule: for releases and the gates, code and database agree (same roles, same answer)", !agree2.length, agree2.join("; "));
+
   // ======================================================== long words wrap on a phone
   const css = readFileSync(ROOT + "server/app.css", "utf8");
   const wrapRule = css.match(/([^{}]*)\{overflow-wrap:anywhere\}/g)?.join(" ") ?? "";

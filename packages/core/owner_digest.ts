@@ -14,7 +14,7 @@ import { type Client, type Scope, q } from "./db.ts";
 import { isConnected, queueEmail } from "./messaging.ts";
 
 export type DigestItem = {
-  flow: "approval" | "count" | "writeoff" | "debit_memo" | "time_off";
+  flow: "approval" | "count" | "writeoff" | "debit_memo" | "time_off" | "release" | "gate";
   id: string; at: string; decision: string; by: string | null; title: string; detail: string;
   amountMinor: string | null; link: string | null; screen: string | null;
 };
@@ -73,6 +73,26 @@ export async function selfApprovals(c: Client, entityId: string, from: string, t
      where r.entity_id = $1 and r.self_approved and r.decided_at > $2::timestamptz and r.decided_at <= $3::timestamptz`, [entityId, from, to]);
   for (const x of leave) out.push({ flow: "time_off", id: x.id, at: x.at, decision: x.status, by: x.by, title: `Time off · ${x.who}`,
     detail: `${x.status}, ${Number(x.total_hours)} h, ${x.starts_on === x.ends_on ? x.starts_on : `${x.starts_on} to ${x.ends_on}`}`, amountMinor: null, link: null, screen: "timeoff" });
+  // 0064: a run released by its own builder, and a bill let through the gates by whoever entered it
+  const pay = await q<{ id: string; at: string; by: string | null; pay_date: string; total: string }>(c, `
+    select pr.id, pr.released_at::text at, u.name by, pr.pay_date::text,
+           (select coalesce(sum(p.amount_minor), 0) from payment p where p.payment_run_id = pr.id)::text total
+      from payment_run pr left join app_user u on u.id = pr.released_by
+     where pr.entity_id = $1 and pr.self_released and pr.released_at > $2::timestamptz and pr.released_at <= $3::timestamptz`, [entityId, from, to]);
+  for (const x of pay) out.push({ flow: "release", id: x.id, at: x.at, decision: "released", by: x.by, title: `Payment run released · pay date ${x.pay_date}`,
+    detail: "released by the person who built it", amountMinor: x.total, link: `payment:${x.id}`, screen: null });
+  const prl = await q<{ id: string; at: string; by: string | null; pay_date: string; net: string }>(c, `
+    select pr.id, pr.released_at::text at, u.name by, pp.pay_date::text, pr.net_minor::text net
+      from payroll_run pr join pay_period pp on pp.id = pr.pay_period_id left join app_user u on u.id = pr.released_by
+     where pr.entity_id = $1 and pr.self_released and pr.released_at > $2::timestamptz and pr.released_at <= $3::timestamptz`, [entityId, from, to]);
+  for (const x of prl) out.push({ flow: "release", id: x.id, at: x.at, decision: "released", by: x.by, title: `Payroll released · pay date ${x.pay_date}`,
+    detail: "released by the person who built it", amountMinor: x.net, link: `payrun:${x.id}`, screen: null });
+  const gates = await q<{ id: string; at: string; by: string | null; vendor: string; reference: string | null; total: string }>(c, `
+    select i.id, i.accepted_at::text at, u.name by, coalesce(v.dba, v.legal_name) vendor, i.reference, i.total_minor::text total
+      from invoice i join vendor v on v.id = i.vendor_id left join app_user u on u.id = i.accepted_by
+     where i.entity_id = $1 and i.self_accepted and i.accepted_at > $2::timestamptz and i.accepted_at <= $3::timestamptz`, [entityId, from, to]);
+  for (const x of gates) out.push({ flow: "gate", id: x.id, at: x.at, decision: "approved", by: x.by, title: `Bill let through the gates · ${x.vendor}${x.reference ? ` ${x.reference}` : ""}`,
+    detail: "let through by the person who entered it", amountMinor: x.total, link: `bill:${x.id}`, screen: null });
   return out.sort((a, b) => a.at.localeCompare(b.at));
 }
 

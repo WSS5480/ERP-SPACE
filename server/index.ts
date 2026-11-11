@@ -1154,7 +1154,7 @@ coPost("/approvals/([0-9a-fA-F-]{36})", (c, co, a, b, m) =>
   act.decideRequest(c, co, a, { requestId: m[2], decision: b.decision, note: b.note, callback: b.callback, confirm: b.confirm }));
 
 coGet("/bills", (c, co, url) => views.bills(c, co, param(url, "tab") || "attention"));
-coGet("/bills/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.bill(c, co, m[2]));
+coGet("/bills/([0-9a-fA-F-]{36})", (c, co, _u, m, p) => views.bill(c, co, m[2], p));
 coPost("/bills", (c, co, a, b) => act.newBill(c, co, a, b));
 coPost("/bills/([0-9a-fA-F-]{36})/accept", (c, co, a, b, m) => act.acceptBill(c, co, a, { id: m[2], reason: b.reason }));
 coPost("/bills/([0-9a-fA-F-]{36})/reject", (c, co, a, b, m) => act.rejectBill(c, co, a, { id: m[2], reason: b.reason }));
@@ -1165,20 +1165,20 @@ coGet("/vendors/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.vendor(c, co, m[2])
 coPost("/vendors/([0-9a-fA-F-]{36})", (c, co, a, b, m) => act.updateVendor(c, co, a, { ...b, id: m[2] }));
 coPost("/vendors/([0-9a-fA-F-]{36})/bank", (c, co, a, b, m) => act.requestVendorBank(c, co, a, { ...b, vendorId: m[2] }));
 
-coGet("/payment-runs", (c, co) => views.paymentRuns(c, co));
-coGet("/payment-runs/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.paymentRun(c, co, m[2]));
+coGet("/payment-runs", (c, co, _u, _m, p) => views.paymentRuns(c, co, p));
+coGet("/payment-runs/([0-9a-fA-F-]{36})", (c, co, _u, m, p) => views.paymentRun(c, co, m[2], p));
 coPost("/payment-runs", (c, co, a, b) => act.createPaymentRun(c, co, a, b));
 coPost("/payment-runs/([0-9a-fA-F-]{36})/submit", (c, co, a, _b, m) => act.submitPaymentRun(c, co, a, { id: m[2] }));
-coPost("/payment-runs/([0-9a-fA-F-]{36})/release", (c, co, a, _b, m) => act.releasePaymentRun(c, co, a, { id: m[2] }));
+coPost("/payment-runs/([0-9a-fA-F-]{36})/release", (c, co, a, b, m) => act.releasePaymentRun(c, co, a, { id: m[2], confirm: b.confirm }));
 coPost("/payment-runs/([0-9a-fA-F-]{36})/cancel", (c, co, a, _b, m) => act.cancelPaymentRun(c, co, a, { id: m[2] }));
 
-coGet("/payroll", (c, co) => views.payroll(c, co));
-coGet("/payroll/runs/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.payrollRun(c, co, m[2]));
+coGet("/payroll", (c, co, _u, _m, p) => views.payroll(c, co, p));
+coGet("/payroll/runs/([0-9a-fA-F-]{36})", (c, co, _u, m, p) => views.payrollRun(c, co, m[2], p));
 coGet("/payroll/periods/([0-9a-fA-F-]{36})/timecards", (c, co, _u, m) => views.timecards(c, co, m[2]));
 coPost("/payroll/periods/([0-9a-fA-F-]{36})/approve-timecards", (c, co, a, _b, m) => act.approveTimecards(c, co, a, { periodId: m[2] }));
 coPost("/payroll/periods/([0-9a-fA-F-]{36})/build", (c, co, a, _b, m) => act.buildPayroll(c, co, a, { periodId: m[2] }));
 coPost("/payroll/runs/([0-9a-fA-F-]{36})/request", (c, co, a, _b, m) => act.requestPayroll(c, co, a, { runId: m[2] }));
-coPost("/payroll/runs/([0-9a-fA-F-]{36})/release", (c, co, a, _b, m) => act.releasePayroll(c, co, a, { runId: m[2] }));
+coPost("/payroll/runs/([0-9a-fA-F-]{36})/release", (c, co, a, b, m) => act.releasePayroll(c, co, a, { runId: m[2], confirm: b.confirm }));
 coPost("/payroll/runs/([0-9a-fA-F-]{36})/post", (c, co, a, _b, m) => act.postPayroll(c, co, a, { runId: m[2] }));
 coPost("/payroll/next-period", (c, co, a, b) => act.openNextPeriod(c, co, a, { payGroupId: b.payGroupId }));
 coPost("/payroll/groups", (c, co, a, b) => act.addPayGroup(c, co, a, b));
