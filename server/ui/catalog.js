@@ -125,15 +125,37 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     }));
     return frag(
       tilesRow(
-        tile({ label: 'Active', value: String(counts.active || 0), tone: 'good', ic: 'ok', text: 'Selling now' }),
-        tile({ label: 'Drafts', value: String(counts.draft || 0), tone: counts.draft ? 'warning' : 'neutral', ic: 'pending', text: 'Need a price or a look', onClick: () => { F.status = 'draft'; render(); } }),
-        tile({ label: 'Floor samples', value: String(counts.floor_sample || 0), tone: 'neutral', ic: 'hold', text: 'Sell as-is, never reorder', onClick: () => { F.status = 'floor_sample'; render(); } }),
-        tile({ label: 'Dropped', value: String(counts.drop || 0), tone: counts.drop ? 'serious' : 'neutral', ic: 'warn', text: 'Sell through, never reorder', onClick: () => { F.status = 'drop'; render(); } })),
+        tile({ label: 'Active', value: String(counts.active || 0), tone: 'good', ic: 'ok', text: 'Selling now', onClick: () => drillStatus('active', 'Active products', counts.active || 0) }),
+        tile({ label: 'Drafts', value: String(counts.draft || 0), tone: counts.draft ? 'warning' : 'neutral', ic: 'pending', text: 'Need a price or a look', onClick: () => drillStatus('draft', 'Draft products', counts.draft || 0) }),
+        tile({ label: 'Floor samples', value: String(counts.floor_sample || 0), tone: 'neutral', ic: 'hold', text: 'Sell as-is, never reorder', onClick: () => drillStatus('floor_sample', 'Floor samples', counts.floor_sample || 0) }),
+        tile({ label: 'Dropped', value: String(counts.drop || 0), tone: counts.drop ? 'serious' : 'neutral', ic: 'warn', text: 'Sell through, never reorder', onClick: () => drillStatus('drop', 'Dropped products', counts.drop || 0) })),
       el('div', { class: 'pc-toolbar' }, search, vSel, cSel, sSel),
       section('Products', `${d.total}`, null,
         el('div', { class: 'panel' }, rows.length ? rows : empty('Nothing matches.', 'Clear a filter, or add a product.', true),
           d.total > d.items.length ? el('button', { class: 'more-row', type: 'button', onclick: () => { F.limit = Math.min(F.limit + 100, 200); render(); } }, `Show more of ${d.total}`) : null)));
   }
+
+  /** Every product in one status (company-wide, as the tile counts), a page of 200 at a time. */
+  function drillStatus(status, title, expect) {
+    return E.drill(title, async () => {
+      const get = (offset) => coApi(`/catalog/products?${new URLSearchParams({ q: '', status, limit: '200', offset: String(offset) })}`);
+      const first = await get(0);
+      const row = (p) => item({ title: p.name, amount: money(p.price_minor), badge: statusChip(p.status),
+        detail: [p.sku, p.vendor, [p.category, p.subcategory].filter(Boolean).join(' / '), `${Number(p.available)} available`].filter(Boolean).join(' · '), onClick: () => openProduct(p.id) });
+      const panel = el('div', { class: 'panel' }, first.items.length ? first.items.map(row) : empty('None.', null, true));
+      let shown = first.items.length;
+      if (first.total > shown) {
+        const more = el('button', { class: 'more-row', type: 'button', onclick: async () => {
+          E.busy(more, true, 'Loading…');
+          try { const r = await get(shown); shown += r.items.length; more.before(...r.items.map(row)); if (shown >= r.total || !r.items.length) more.remove(); }
+          catch (e) { toast(friendly(e), 'critical'); } finally { if (more.isConnected) E.busy(more, false); }
+        } }, `Show more of ${first.total}`);
+        panel.append(more);
+      }
+      return frag(E.drillSum({ count: first.total, noun: 'product', expect: { count: expect }, note: 'Every product in this status, any vendor or category. The ticket price is on the right.' }), panel);
+    });
+  }
+  E.opener('product', (id) => openProduct(id));
 
   async function openProduct(id) {
     const d = openDialog('Product', null, { wide: true, sheet: true });
@@ -381,6 +403,8 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     const lSel = E.storePicker(select(fo.locations.map((l) => [l.id, `Landed at ${l.name}`]), M.location || d.locationId));
     for (const [s, k] of [[vSel, 'vendor'], [cSel, 'category'], [lSel, 'location']]) s.onchange = () => { M[k] = s.value; render(); };
     const low = d.items.filter((x) => x.margin_bps != null && x.margin_bps < 4000);
+    const marginRow = (x) => item({ title: x.name, amount: pct(x.margin_bps), onClick: () => openProduct(x.id),
+      detail: `${x.sku} · ticket ${money(x.price_minor)} · landed ${money(x.landed_minor)} (cost ${money(x.cost_minor)} + freight ${money(x.freight_minor)})` });
     const rows = d.items.map((x) => item({
       title: x.name, amount: pct(x.margin_bps),
       detail: `${x.sku} · ticket ${money(x.price_minor)} · landed ${money(x.landed_minor)} (cost ${money(x.cost_minor)} + freight ${money(x.freight_minor)})${x.map_minor ? ` · MAP ${money(x.map_minor)}` : ''}`,
@@ -388,8 +412,11 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
       onClick: () => openProduct(x.id),
     }));
     return frag(
-      tilesRow(tile({ label: 'Blended margin', value: pct(d.blendedBps), tone: 'neutral', ic: 'info', text: 'Ticket against landed cost' }),
-        tile({ label: 'Under 40%', value: String(low.length), tone: low.length ? 'warning' : 'good', ic: low.length ? 'warn' : 'ok', text: 'Worth a second look' })),
+      tilesRow(tile({ label: 'Blended margin', value: pct(d.blendedBps), tone: 'neutral', ic: 'info', text: 'Ticket against landed cost',
+          onClick: () => E.drillItems('Blended margin', [...d.items].sort((a, b) => (a.margin_bps ?? 99999) - (b.margin_bps ?? 99999)).map(marginRow),
+            { noun: 'product', note: `${pct(d.blendedBps)} across these products: ticket against landed cost (cost plus freight to the store picked). Lowest margin first.` }) }),
+        tile({ label: 'Under 40%', value: String(low.length), tone: low.length ? 'warning' : 'good', ic: low.length ? 'warn' : 'ok', text: 'Worth a second look',
+          onClick: () => E.drillItems('Margin under 40%', low.map(marginRow), { noun: 'product', none: 'Every product is at 40% or more.' }) })),
       el('div', { class: 'pc-toolbar' }, lSel, vSel, cSel),
       section('Margin by product', `${d.items.length}`, null, el('div', { class: 'panel' }, rows.length ? capped(rows, 40, 'products') : empty('Nothing to show.', null, true))));
   }
@@ -857,8 +884,10 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
         (x) => `Built: ${x.add} added, ${x.change} changed`) }, 'Build it') : null;
       const drop = run.status === 'previewed' ? el('button', { class: 'btn', type: 'button', onclick: () => act(drop, async () => { await post(`/catalog/import/runs/${run.id}/abandon`); IMP.runId = null; }, 'Set aside') }, 'Set aside') : null;
       step.replaceChildren(
-        tilesRow(tile({ label: 'Add', value: String(run.added), tone: 'good', ic: 'plus', text: 'New products' }), tile({ label: 'Change', value: String(run.changed), tone: run.changed ? 'warning' : 'neutral', ic: 'refresh', text: 'Cost, price, details' }),
-          tile({ label: 'Unchanged', value: String(run.unchanged), tone: 'neutral', ic: 'ok', text: 'Same as on file' }), tile({ label: 'Skipped', value: String(run.skipped), tone: run.skipped ? 'serious' : 'neutral', ic: 'warn', text: 'Each says why' })),
+        tilesRow(tile({ label: 'Add', value: String(run.added), tone: 'good', ic: 'plus', text: 'New products', onClick: () => { IMP.show = 'add'; render(); } }),
+          tile({ label: 'Change', value: String(run.changed), tone: run.changed ? 'warning' : 'neutral', ic: 'refresh', text: 'Cost, price, details', onClick: () => { IMP.show = 'change'; render(); } }),
+          tile({ label: 'Unchanged', value: String(run.unchanged), tone: 'neutral', ic: 'ok', text: 'Same as on file', onClick: () => { IMP.show = 'same'; render(); } }),
+          tile({ label: 'Skipped', value: String(run.skipped), tone: run.skipped ? 'serious' : 'neutral', ic: 'warn', text: 'Each says why', onClick: () => { IMP.show = 'skip'; render(); } })),
         resultBox(run.status === 'applied' ? 'good' : 'neutral', run.status === 'applied' ? 'ok' : 'info', run.status === 'applied' ? 'Built' : 'Preview: nothing has changed yet', `${run.vendor} · ${run.filename || 'file'} · ${run.rows} rows`),
         el('div', { class: 'toolbar' }, seg([['add', 'Added'], ['change', 'Changed'], ['skip', 'Skipped'], ['same', 'Unchanged']], IMP.show, (k) => { IMP.show = k; render(); }), el('span', { class: 'grow' }), drop, apply),
         el('div', { class: 'panel' }, rows.length ? capped(rows, 30, 'rows') : empty('None.', null, true)),

@@ -6,7 +6,7 @@
   const E = window.ERP;
   if (!E) return;
   const { el, section, coApi, post, register, item, chip, money, ago, dayLabel, empty, seg, head, openDialog, fillDialog,
-    resultBox, toast, busy, friendly, tile, tilesRow, go, render, S, shortDay } = E;
+    resultBox, toast, busy, friendly, tile, tilesRow, go, render, S, shortDay, frag, plural } = E;
   void seg;
 
   const qs = (o) => { const p = new URLSearchParams(); for (const [k, v] of Object.entries(o)) if (v) p.set(k, v); const s = p.toString(); return s ? '?' + s : ''; };
@@ -61,7 +61,13 @@
     fillDialog(d, async () => {
       const o = await coApi(`/shop/orders/${id}`);
       return el('div', {},
-        tilesRow(tile({ label: 'Total', value: money(o.totalMinor) }), tile({ label: 'Paid', value: money(o.paidMinor), tone: o.balanceMinor === '0' ? 'good' : 'warning' }),
+        tilesRow(tile({ label: 'Total', value: money(o.totalMinor), onClick: () => E.drillNode(`Order ${number} total`, async () => frag(
+            E.drillSum({ count: o.lines.length, noun: 'line', totalMinor: o.totalMinor, note: `Lines ${money(o.subtotalMinor)} plus tax ${money(o.taxMinor)}.` }),
+            el('div', { class: 'panel' }, o.lines.map((l) => item({ title: `${l.qty} × ${l.description}`, detail: l.statusText, amount: money(l.lineMinor) })),
+              item({ title: 'Tax', amount: money(o.taxMinor) })))) }),
+          tile({ label: 'Paid', value: money(o.paidMinor), tone: o.balanceMinor === '0' ? 'good' : 'warning',
+            onClick: () => E.drillList('order-receipts', `Paid on ${number}`, { order: id }, { noun: 'payment', expect: { minor: o.paidMinor }, none: 'Nothing paid yet.',
+              note: o.balanceMinor === '0' ? 'Paid in full.' : `${money(o.balanceMinor)} still to pay.` }) }),
           tile({ label: 'Status', value: o.statusText, word: true })),
         section('Lines', o.card || '', null, el('div', { class: 'panel' }, o.lines.map((l) => item({ title: `${l.qty} × ${l.description}`, detail: l.statusText, amount: money(l.lineMinor) })))),
         el('p', { class: 'foot', text: [o.customer, FUL[o.fulfillment], o.fulfillment === 'pickup' ? o.location : o.shipTo, o.promisedOn ? `promised ${dayLabel(o.promisedOn)}` : null].filter(Boolean).join(' · ') }));
@@ -120,12 +126,19 @@
     const d = openDialog(name, 'Every order and payment, any channel', { wide: true });
     fillDialog(d, async () => {
       const h = await coApi(`/shop/customers/${id}`);
+      const orderRow = (o) => item({ title: `${o.number} · ${(CH[o.channel] || [0, o.channel])[1]}`, detail: [o.items, o.location, ago(o.ordered_at)].filter(Boolean).join(' · '),
+        amount: money(o.total_minor), badge: chip(ST[o.status] || 'neutral', 'ok', o.status) });
       return el('div', {},
-        tilesRow(tile({ label: 'Orders', value: String(h.totals.orders) }), tile({ label: 'Paid in', value: money(h.totals.spentMinor) }),
-          tile({ label: 'Channels', value: h.totals.channels.map((c) => (CH[c] || [0, c])[1]).join(', ') || 'None', word: true })),
-        section('Orders', null, null, h.orders.length ? el('div', { class: 'panel' }, h.orders.map((o) => item({
-          title: `${o.number} · ${(CH[o.channel] || [0, o.channel])[1]}`, detail: [o.items, o.location, ago(o.ordered_at)].filter(Boolean).join(' · '),
-          amount: money(o.total_minor), badge: chip(ST[o.status] || 'neutral', 'ok', o.status) }))) : empty('No orders', null, true)),
+        tilesRow(tile({ label: 'Orders', value: String(h.totals.orders), onClick: () => E.drillItems('Orders', h.orders.map(orderRow), { noun: 'order', sub: name, expect: { count: h.totals.orders },
+            totalMinor: h.orders.reduce((a, o) => a + BigInt(o.total_minor), 0n).toString() }) }),
+          tile({ label: 'Paid in', value: money(h.totals.spentMinor), onClick: () => E.drillItems('Paid in', h.receipts.filter((r) => !r.voided_at).map((r) => item({ title: `${r.number} · ${r.method}`,
+            amount: money(r.amount_minor), detail: [(CH[r.channel] || [0, r.channel])[1], r.order_number, ago(r.received_at)].filter(Boolean).join(' · ') })),
+            { noun: 'payment', sub: name, expect: { minor: h.totals.spentMinor }, totalMinor: h.receipts.filter((r) => !r.voided_at).reduce((a, r) => a + BigInt(r.amount_minor), 0n).toString(), note: 'Every door; voided payments left out.' }) }),
+          tile({ label: 'Channels', value: h.totals.channels.map((c) => (CH[c] || [0, c])[1]).join(', ') || 'None', word: true,
+            onClick: () => E.drillItems('Orders by channel', h.totals.channels.map((ch) => { const os = h.orders.filter((o) => o.channel === ch);
+              return item({ title: (CH[ch] || [0, ch])[1], amount: money(os.reduce((a, o) => a + BigInt(o.total_minor), 0n)), detail: plural(os.length, 'order') }); }),
+              { noun: 'channel', sub: name, totalMinor: h.orders.reduce((a, o) => a + BigInt(o.total_minor), 0n).toString() }) })),
+        section('Orders', null, null, h.orders.length ? el('div', { class: 'panel' }, h.orders.map(orderRow)) : empty('No orders', null, true)),
         section('Payments', null, null, h.receipts.length ? el('div', { class: 'panel' }, h.receipts.map((r) => item({
           title: `${r.number} · ${r.method}`, detail: [(CH[r.channel] || [0, r.channel])[1], r.order_number, ago(r.received_at), r.voided_at ? 'voided' : null].filter(Boolean).join(' · '),
           amount: money(r.amount_minor) }))) : empty('No payments', null, true)));

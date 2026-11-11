@@ -115,11 +115,23 @@
     const ni = v.netIncome;
     const bc = v.balanceCheck;
     const el0 = v.eliminations;
+    const period = `${E.shortDay(v.from)} to ${E.shortDay(v.to)}`;
+    const byCo = (title, x, withElim, note) => E.drillItems(title, [...cos.map((c) => item({ title: c.name, amount: money(x.byCompany[c.id]) })),
+      withElim && B(x.eliminatedMinor) !== 0n ? item({ title: 'Eliminated', amount: money(-B(x.eliminatedMinor)), detail: 'Inter-company sales, cost and margin still in stock' }) : null].filter(Boolean),
+      { noun: 'company', plural: 'companies', count: cos.length, totalMinor: String(withElim ? x.combinedMinor : x.sumMinor), note, sub: period });
+    const elimLines = (pick) => v.groups.filter(pick).flatMap((g) => g.accounts.filter((a) => B(a.eliminatedMinor) !== 0n).map((a) => ({ g, a })));
     const tiles = tilesRow(
-      tile({ label: 'Combined net income', value: money(ni.combinedMinor), tone: B(ni.combinedMinor) < 0n ? 'warning' : 'good' }),
-      tile({ label: 'Sum of the companies', value: money(ni.sumMinor) }),
-      tile({ label: 'Eliminated from P&L', value: money(el0.totalPnlMinor), tone: 'neutral' }),
-      tile({ label: 'Due from / to eliminated', value: money(el0.dueFromMinor), suffix: B(el0.dueFromMinor) === B(el0.dueToMinor) ? ' each' : ` / ${money(el0.dueToMinor)}` }));
+      tile({ label: 'Combined net income', value: money(ni.combinedMinor), tone: B(ni.combinedMinor) < 0n ? 'warning' : 'good',
+        onClick: () => byCo('Combined net income', ni, true, 'Each company’s net income, less what is eliminated between them.') }),
+      tile({ label: 'Sum of the companies', value: money(ni.sumMinor), onClick: () => byCo('Sum of the companies', ni, false, 'Each company’s own net income, added up before eliminations.') }),
+      tile({ label: 'Eliminated from P&L', value: money(el0.totalPnlMinor), tone: 'neutral',
+        onClick: () => E.drillItems('Eliminated from P&L', elimLines((g) => g.statement === 'pnl').map(({ g, a }) => item({ title: `${a.code === 'earnings' ? '' : a.code + ' '}${a.name}`,
+          amount: money(a.eliminatedMinor), detail: g.label })),
+          { noun: 'account', sub: period, note: `Net effect on income: ${money(el0.totalPnlMinor)}. Inter-company sales and their cost come out of both sides; markup still in stock comes out of earnings.` }) }),
+      tile({ label: 'Due from / to eliminated', value: money(el0.dueFromMinor), suffix: B(el0.dueFromMinor) === B(el0.dueToMinor) ? ' each' : ` / ${money(el0.dueToMinor)}`,
+        onClick: () => E.drillItems('Due from / to eliminated', elimLines((g) => g.statement === 'bs').map(({ g, a }) => item({ title: `${a.code} ${a.name}`, amount: money(a.eliminatedMinor),
+          detail: [g.label, ...cos.map((c) => `${c.name} ${money(a.byCompany[c.id])}`)].join(' · ') })),
+          { noun: 'account', sub: `as of ${E.shortDay(v.asOf)}`, note: 'What the companies owe each other comes out of both the asset and the liability side. Open Inter-company for each pair.' }) }));
     const warn = bc.balanced ? null : resultBox('serious', 'warn', 'The combined balance sheet is off',
       `Between these companies, due from and due to differ by ${money(bc.combinedMinor)}. Open Inter-company to see which pair, then settle it.`);
     const margin = B(el0.marginInStockMinor) !== 0n ? el('p', { class: 'foot', text: `Markup on goods bought from a sibling and still in stock (${money(el0.marginInStockMinor)}) is taken out of inventory and earnings; markup on goods since sold outside the group or written off (${money(el0.markupRealizedMinor)} in this period) is taken out of cost of goods. At cost (the default transfer price) there is none.` }) : null;

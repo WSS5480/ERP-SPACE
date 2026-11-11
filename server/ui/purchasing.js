@@ -93,12 +93,21 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
     return frag(
       tilesRow(
         tile({ label: 'Open to buy this month', value: money(d.otb.open), tone: open < 0n ? 'critical' : d.otb.over ? 'warning' : 'good', ic: open < 0n ? 'warn' : 'ok',
-          text: budget ? `${money(d.otb.committed)} of ${money(d.otb.budget)} committed${d.otb.over ? `; ${plural(d.otb.over, 'budget')} over` : ''}` : 'No budgets set', onClick: () => go('purchasing', 'budgets') }),
-        tile({ label: 'Open purchase orders', value: money(d.pos.open_minor), tone: 'neutral', ic: 'file', text: `${plural(Number(d.pos.open_n), 'order')}`, onClick: () => go('purchasing', 'pos') }),
+          text: budget ? `${money(d.otb.committed)} of ${money(d.otb.budget)} committed${d.otb.over ? `; ${plural(d.otb.over, 'budget')} over` : ''}` : 'No budgets set',
+          onClick: () => drillBudgets(thisMonth(), 'open_minor', 'Open to buy this month', d.otb.open) }),
+        tile({ label: 'Open purchase orders', value: money(d.pos.open_minor), tone: 'neutral', ic: 'file', text: `${plural(Number(d.pos.open_n), 'order')}`,
+          onClick: () => drillPOs('Open purchase orders', () => true, { minor: d.pos.open_minor }) }),
         tile({ label: 'Waiting on vendors', value: String(d.pos.unack_n), suffix: 'unconfirmed', tone: Number(d.pos.late_n) ? 'serious' : Number(d.pos.unack_n) ? 'warning' : 'good', ic: 'clock',
-          text: Number(d.pos.late_n) ? `${plural(Number(d.pos.late_n), 'order')} past due` : 'None past due', onClick: () => go('purchasing', 'pos') }),
+          text: Number(d.pos.late_n) ? `${plural(Number(d.pos.late_n), 'order')} past due` : 'None past due',
+          onClick: () => drillPOs('Waiting on vendors', (p) => !p.acknowledged_on, { count: Number(d.pos.unack_n) }) }),
         tile({ label: 'Customers waiting', value: String(d.queue), suffix: 'special orders', tone: d.queue ? 'warning' : 'good', ic: d.queue ? 'people' : 'ok',
-          text: d.queue ? 'Not on a vendor PO yet' : 'Every one is ordered', onClick: () => go('purchasing', 'special') })),
+          text: d.queue ? 'Not on a vendor PO yet' : 'Every one is ordered',
+          onClick: () => E.drill('Customers waiting', async () => {
+            const x = await coApi('/purchasing/special-orders');
+            return frag(E.drillSum({ count: x.lines.length, noun: 'customer line', expect: { count: d.queue }, note: 'On order for a customer and on no vendor PO yet. Order them from the Special orders tab.' }),
+              el('div', { class: 'panel' }, x.lines.length ? x.lines.map((l) => item({ title: `${Number(l.qty)} × ${l.description}`, amount: l.order_number,
+                detail: [l.vendor || 'No vendor', l.customer, `ship to ${l.ship_to}`, shortDay(String(l.ordered_at).slice(0, 10))].filter(Boolean).join(' · ') })) : empty('Every customer special order is on a vendor PO.', null, true)));
+          }) })),
       section('Next steps', null, null, el('div', { class: 'panel' },
         item({ title: 'Reorder suggestions', amount: String(d.suggestions), detail: 'Stock at or below its minimum, counting what is on order and what customers are waiting for', onClick: () => go('purchasing', 'reorder') }),
         item({ title: 'Special-order queue', amount: String(d.queue), detail: 'Customer lines on order with no vendor PO', onClick: () => go('purchasing', 'special') }),
@@ -234,6 +243,29 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
           why: opts(l.config) ? `Options: ${opts(l.config)}` : null });
       })))) : section('Queue', null, null, el('div', { class: 'panel' }, empty('Every customer special order is on a vendor PO.', null))),
       d.lines.length ? el('div', { class: 'dlg-acts' }, go_) : null);
+  }
+
+  /** Open POs (the list the PO tab shows), narrowed by pick, adding up to the tile. */
+  function drillPOs(title, pick, expect) {
+    return E.drill(title, async () => {
+      const rows = (await coApi('/purchasing/pos?status=open')).pos.filter(pick);
+      return frag(E.drillSum({ count: rows.length, noun: 'order', totalMinor: rows.reduce((a, p) => a + BigInt(p.total_minor || 0), 0n).toString(), expect }),
+        el('div', { class: 'panel' }, rows.length ? rows.map((p) => item({ title: `${p.number} · ${p.vendor}`, amount: money(p.total_minor),
+          detail: [`to ${p.ship_to}`, `ordered ${shortDay(p.ordered_on)}`, p.expected_on ? `due ${shortDay(p.expected_on)}` : null, p.exported_at ? 'sent' : 'not sent'].filter(Boolean).join(' · '),
+          badge: p.late ? chip('serious', 'warn', 'Past due') : p.acknowledged_on ? chip('good', 'ok', 'Confirmed') : chip('neutral', 'pending', 'Waiting on vendor'),
+          onClick: () => openPO(p.id) })) : empty('No open orders here.', null, true)));
+    });
+  }
+  /** A month's buying budgets, store and category, by one of their columns. */
+  function drillBudgets(month, col, title, expectMinor) {
+    return E.drill(title, async () => {
+      const d = await coApi(`/purchasing/budgets?month=${month}`);
+      const rows = d.rows.filter((r) => Number(r[col]) !== 0 || col === 'open_minor');
+      return frag(E.drillSum({ count: rows.length, noun: 'budget', totalMinor: rows.reduce((a, r) => a + BigInt(r[col] || 0), 0n).toString(), expect: expectMinor != null ? { minor: expectMinor } : null,
+        note: col === 'committed_minor' ? 'On open stock POs due this month.' : col === 'open_minor' ? 'Budget less what open stock POs due this month have committed.' : 'Planned buying for the month.' }),
+        el('div', { class: 'panel' }, rows.length ? rows.map((r) => item({ title: `${r.location} · ${r.category}`, amount: money(r[col]),
+          detail: `budget ${money(r.budget_minor)} · committed ${money(r.committed_minor)} · open ${money(r.open_minor)}` })) : empty('No budgets set for this month.', null, true)));
+    }, { sub: month.slice(0, 7) });
   }
 
   // ------------------------------------------------------------------- POs
@@ -374,9 +406,10 @@ input[type=month]{width:100%;font-size:16px;color:var(--ink);background:var(--pa
     const sum = (k) => d.rows.reduce((a, r) => a + Number(r[k]), 0);
     return frag(
       el('div', { class: 'po-tb' }, mIn, el('button', { class: 'btn', type: 'button', onclick: () => openBudget(d) }, icon('plus'), 'Set a budget'), el('div')),
-      tilesRow(tile({ label: 'Budget', value: money(sum('budget_minor')), tone: 'neutral', ic: 'info', text: 'Planned buying for the month' }),
-        tile({ label: 'Committed', value: money(sum('committed_minor')), tone: 'neutral', ic: 'file', text: 'On open stock POs due this month' }),
-        tile({ label: 'Open to buy', value: money(sum('open_minor')), tone: sum('open_minor') < 0 ? 'critical' : 'good', ic: sum('open_minor') < 0 ? 'warn' : 'ok', text: 'Placing a PO takes it; cancelling gives it back' })),
+      tilesRow(tile({ label: 'Budget', value: money(sum('budget_minor')), tone: 'neutral', ic: 'info', text: 'Planned buying for the month', onClick: () => drillBudgets(d.month, 'budget_minor', 'Budget', String(sum('budget_minor'))) }),
+        tile({ label: 'Committed', value: money(sum('committed_minor')), tone: 'neutral', ic: 'file', text: 'On open stock POs due this month', onClick: () => drillBudgets(d.month, 'committed_minor', 'Committed', String(sum('committed_minor'))) }),
+        tile({ label: 'Open to buy', value: money(sum('open_minor')), tone: sum('open_minor') < 0 ? 'critical' : 'good', ic: sum('open_minor') < 0 ? 'warn' : 'ok', text: 'Placing a PO takes it; cancelling gives it back',
+          onClick: () => drillBudgets(d.month, 'open_minor', 'Open to buy', String(sum('open_minor'))) })),
       Object.keys(byLoc).length ? Object.entries(byLoc).map(([loc, rs]) => section(loc, null, null, el('div', { class: 'panel' }, rs.map((r) => {
         const used = Number(r.budget_minor) ? Math.round((Number(r.committed_minor) / Number(r.budget_minor)) * 100) : 100;
         return el('div', { class: 'li' }, el('div', { class: 't', text: r.category }), el('div', { class: 'amt', text: money(r.open_minor) }),

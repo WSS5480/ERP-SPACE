@@ -88,13 +88,24 @@
   async function accountPage(id) {
     const [x, o] = await Promise.all([coApi(`/trade/accounts/${id}`), opts()]);
     const t = x.account, cr = x.credit;
+    const owed = () => E.drillList('customer-ledger', 'Owed', { customer: t.customer_id }, { sub: t.company_name, noun: 'entry', plural: 'entries', expect: { minor: cr.balanceMinor },
+      none: 'Nothing on the account.', note: 'Invoices add to it; payments and credits take it down.' });
+    const onOrder = () => E.drillList('trade-onorder', 'On order, not billed yet', { customer: t.customer_id }, { sub: t.company_name, noun: 'order', expect: { minor: cr.onOrderMinor },
+      none: 'Nothing on order.', note: 'Open trade orders, less what is paid or already billed.' });
     const acts = [btn('All accounts', () => { st.tab = 'accounts'; go('trade'); }), btn('Edit', () => editDialog(x, o)), btn('Add resale certificate', () => certDialog(id))];
     if (t.status === 'active') acts.push(btn('Suspend', async (e) => { const why = await askReason({ title: 'Suspend the account', sub: t.company_name, label: 'Why', placeholder: 'Unpaid invoices over 60 days' });
       if (why) act(e.currentTarget, () => post(`/trade/accounts/${id}`, { status: 'suspended', statusReason: why }), 'Suspended; its portal sessions are ended'); }));
     else acts.push(btn('Reopen', (e) => act(e.currentTarget, () => post(`/trade/accounts/${id}`, { status: 'active' }), 'Reopened')));
     return frag(head(t.company_name, acts, `Trade account ${t.number}`),
-      tilesRow(tile({ label: 'Owed', value: money(cr.balanceMinor) }), tile({ label: 'On order, unbilled', value: money(cr.onOrderMinor) }),
-        tile({ label: 'Available', value: money(cr.availableMinor), tone: Number(cr.availableMinor) > 0 ? 'good' : 'neutral' }), tile({ label: 'Referral owed', value: money(x.referrals.owedMinor) })),
+      tilesRow(tile({ label: 'Owed', value: money(cr.balanceMinor), onClick: owed }), tile({ label: 'On order, unbilled', value: money(cr.onOrderMinor), onClick: onOrder }),
+        tile({ label: 'Available', value: money(cr.availableMinor), tone: Number(cr.availableMinor) > 0 ? 'good' : 'neutral',
+          onClick: () => E.drillNode('Available on terms', async () => frag(
+            E.drillSum({ count: 3, noun: 'part', totalMinor: cr.availableMinor, note: Number(cr.limitMinor) ? 'The credit limit, less what is owed and what is on order and not billed yet (never below zero).' : 'Card only: no credit limit is set.' }),
+            panel(item({ title: 'Credit limit', amount: money(cr.limitMinor) }), item({ title: 'Less owed', amount: money(-Number(cr.balanceMinor)), onClick: owed }),
+              item({ title: 'Less on order, unbilled', amount: money(-Number(cr.onOrderMinor)), onClick: onOrder }))), { sub: t.company_name }) }),
+        tile({ label: 'Referral owed', value: money(x.referrals.owedMinor),
+          onClick: () => E.drillList('trade-referrals', 'Referral commission owed', { account: id }, { sub: t.company_name, noun: 'referral', expect: { minor: x.referrals.owedMinor },
+            none: 'Nothing owed.', note: 'Earned on delivered (or paid) lines and not on a bill yet; returns give it back.' }) })),
       section('Account', words(t.status), null, panel(
         item({ title: [t.contact_name, t.email, t.phone].filter(Boolean).join(' · '), detail: [words(t.kind), x.rep ? `rep ${x.rep.name}` : 'no rep'].join(' · ') }),
         item({ title: 'Terms', detail: Number(cr.limitMinor) ? `Net ${cr.termsDays}, limit ${money(cr.limitMinor)}${cr.onHold ? ', on hold' : ''}` : 'Card only (no credit limit)' }),
@@ -229,7 +240,10 @@
       catch (e) { toast(friendly(e), 'critical'); }
     });
     return frag(head(p.name, acts, `Room project ${p.number}`),
-      tilesRow(tile({ label: 'Items', value: money(p.itemsTotalMinor) }), tile({ label: 'Budget', value: p.budget_minor ? money(p.budget_minor) : '—', word: !p.budget_minor }),
+      tilesRow(tile({ label: 'Items', value: money(p.itemsTotalMinor), onClick: () => E.drillItems('Items in the project', p.items.filter((it) => it.lineMinor).map((it) => item({ title: it.description, amount: money(it.lineMinor),
+          detail: [`${it.qty} × ${money(it.unitPriceMinor)}`, words(it.stage), it.orderNumber ? `order ${it.orderNumber}` : null].filter(Boolean).join(' · ') })),
+          { sub: p.name, noun: 'item', totalMinor: p.items.reduce((a, it) => a + BigInt(it.lineMinor || 0), 0n).toString(), expect: { minor: p.itemsTotalMinor },
+            note: p.items.some((it) => !it.lineMinor) ? 'Items that could not be priced are left out of the total.' : 'Every product considered, quoted or bought, at today’s price.' }) }), tile({ label: 'Budget', value: p.budget_minor ? money(p.budget_minor) : '—', word: !p.budget_minor }),
         tile({ label: 'Status', value: words(p.status), word: true })),
       section('Room', null, null, panel(item({ title: dims, detail: (p.openings || []).map((x) => `${words(x.kind)}${x.wall ? ' on ' + x.wall : ''}${x.widthIn ? ` ${x.widthIn}"×${x.heightIn || '?'}"` : ''}`).join(' · ') || 'No doors or windows noted' }),
         item({ title: 'Style', detail: p.style_notes || 'No notes yet' }),

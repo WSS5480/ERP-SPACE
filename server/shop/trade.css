@@ -53,3 +53,5 @@ a.tr-item:hover{background:var(--soft)}
 .tr-itemacts{align-items:flex-end}
 .tr-itemacts .tr-field{flex:0 1 110px}
 @media (max-width:420px){.tr-acts .btn.tr-small{min-height:38px;padding:0 12px}}
+a.tr-tile{display:block;color:inherit;text-decoration:none;cursor:pointer}
+a.tr-tile:hover,a.tr-tile:focus-visible{border-color:var(--ink-2)}

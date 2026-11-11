@@ -101,6 +101,10 @@
     laneSel.addEventListener('change', async () => { try { await post(`/fleet/routes/${id}/lane`, { laneId: laneSel.value || null }); toast('Lane set', 'good'); E.render(); } catch (e) { toast(friendly(e), 'critical'); } });
     const groups = new Map();
     for (const x of l.items) { if (!groups.has(x.load_group)) groups.set(x.load_group, []); groups.get(x.load_group).push(x); }
+    const stopOf = new Map(l.items.map((x) => [x.id, (groups.get(x.load_group) || [x])[0]]));
+    const pieces = (title, pick, expect, note) => E.drillItems(title, l.items.filter(pick).map((x) => item({ title: x.description, badge: itemChip(x),
+      detail: [`load ${x.load_group}`, stopOf.get(x.id).customer, x.label, x.bin ? `bin ${x.bin}` : null, x.loaded_by ? `by ${x.loaded_by}` : null].filter(Boolean).join(' · '),
+      why: x.status === 'short' ? `Short: ${x.short_reason}` : null })), { noun: 'piece', expect: { count: expect }, note, none: 'None.' });
     const blocks = [...groups.entries()].map(([g, list]) => {
       const f = list[0];
       const left = list.filter((x) => x.status === 'pending').length;
@@ -122,10 +126,11 @@
         btn('Print manifest', () => go('loading', 'print:' + id), { small: true }), E.canSee('labels') ? btn('Carton labels', () => go('labels', 'manifest:' + id), { small: true }) : null,
         btn('Route', () => go('fleet', 'route:' + id), { small: true })),
       head(`Load ${r.number}`, null, `${dayLabel(r.route_on)} · ${r.unit_no || 'no truck'} · ${r.dc_name}`),
-      tilesRow(tile({ label: 'Loaded', value: `${t.loaded}/${t.pieces}`, tone: t.pending ? 'neutral' : 'good' }),
-        tile({ label: 'Short', value: String(t.short), tone: t.short ? 'warning' : 'neutral' }),
-        tile({ label: 'Payload', value: r.payloadPct == null ? '—' : `${r.payloadPct}%`, tone: r.payloadPct > 100 ? 'critical' : 'neutral', text: `${Math.round(r.weight)} of ${Math.round(r.weight_cap || 0)} lb`, ic: 'info' }),
-        tile({ label: 'Out of order', value: String(t.outOfOrder), tone: t.outOfOrder ? 'warning' : 'neutral' })),
+      tilesRow(tile({ label: 'Loaded', value: `${t.loaded}/${t.pieces}`, tone: t.pending ? 'neutral' : 'good', onClick: () => pieces('Loaded', (x) => x.status === 'loaded', t.loaded, `${t.loaded} of ${t.pieces} pieces on the truck.`) }),
+        tile({ label: 'Short', value: String(t.short), tone: t.short ? 'warning' : 'neutral', onClick: () => pieces('Short', (x) => x.status === 'short', t.short, 'Not going on this route, each with why.') }),
+        tile({ label: 'Payload', value: r.payloadPct == null ? '—' : `${r.payloadPct}%`, tone: r.payloadPct > 100 ? 'critical' : 'neutral', text: `${Math.round(r.weight)} of ${Math.round(r.weight_cap || 0)} lb`, ic: 'info',
+          onClick: () => pieces('Payload', () => true, t.pieces, `${Math.round(r.weight)} lb of the truck’s ${Math.round(r.weight_cap || 0)} lb${r.payloadPct == null ? '' : ` (${r.payloadPct}%)`}: every piece on the route.`) }),
+        tile({ label: 'Out of order', value: String(t.outOfOrder), tone: t.outOfOrder ? 'warning' : 'neutral', onClick: () => pieces('Loaded out of order', (x) => x.out_of_order, t.outOfOrder, 'Put on before an earlier load group; check they come off in the right order.') })),
       el('div', { class: 'toolbar' }, field('Staging lane', laneSel),
         el('span', { class: 'grow' }),
         draft && l.canLock ? btn('Lock route (loaded)', (e) => act(e.currentTarget, () => post(`/fleet/routes/${id}/lock`), 'Route locked; the order is fixed', { errorInto: showErr(err) }), { primary: true }) : null,
@@ -270,12 +275,23 @@
     const from = input({ type: 'date', value: st.rpFrom, 'aria-label': 'From' }), to = input({ type: 'date', value: st.rpTo, 'aria-label': 'To' });
     for (const [n, k] of [[sSel, 'rpState'], [from, 'rpFrom'], [to, 'rpTo']]) n.addEventListener('change', () => { st[k] = n.value; E.render(); });
     const r = await coApi(`/fleet/haul-away/report?state=${st.rpState}&from=${st.rpFrom}&to=${st.rpTo}`);
+    const byKind = (title, val, expect, note) => E.drillItems(title, r.categories.filter((c) => val(c)).map((c) => item({ title: words(c.category), amount: String(val(c)),
+      detail: `collected ${c.collected} · recycled ${c.recycled} · landfill ${c.landfilled} · donated ${c.donated} · not yet disposed ${c.undisposed}` })),
+      { noun: expect != null ? 'unit' : 'kind', note: note || `${r.categories.reduce((a, c) => a + val(c), 0)} in all, ${dayLabel(r.from)} to ${dayLabel(r.to)}.`, expect: expect != null ? { count: Math.round(expect) } : null,
+        count: expect != null ? Math.round(r.categories.reduce((a, c) => a + val(c), 0)) : undefined, none: 'Nothing in this period.' });
     return frag(el('div', { class: 'toolbar' }, sSel, from, to, el('span', { class: 'grow' }), btn('Print', () => window.print(), { small: true })),
       el('div', { class: 'ops-print' },
         el('h2', { text: `${r.program ? r.program.name : r.state} · ${dayLabel(r.from)} to ${dayLabel(r.to)}` }),
         el('p', { class: 'lead', text: r.note + (r.programFeeWords ? ` · program fee ${r.programFeeWords}` : '') }),
-        tilesRow(tile({ label: 'Collected', value: String(r.totals.collected) }), tile({ label: 'Recycled', value: r.totals.recycledPct == null ? '—' : `${r.totals.recycledPct}%` }),
-          tile({ label: 'Program fees', value: money(r.totals.programFeeMinor) })),
+        tilesRow(tile({ label: 'Collected', value: String(r.totals.collected), onClick: () => byKind('Collected', (c) => Number(c.collected), r.totals.collected) }),
+          tile({ label: 'Recycled', value: r.totals.recycledPct == null ? '—' : `${r.totals.recycledPct}%`, onClick: () => byKind('Recycled', (c) => Number(c.recycled), null,
+            r.totals.recycledPct == null ? 'Nothing disposed of yet.' : `${r.totals.recycledPct}% of what was collected went to recycling.`) }),
+          tile({ label: 'Program fees', value: money(r.totals.programFeeMinor), onClick: () => {
+            const fee = r.program ? BigInt(r.program.program_fee_minor || 0) : 0n;
+            return E.drillItems('Program fees', r.categories.map((c) => item({ title: words(c.category), amount: money(fee * BigInt(Math.round(c.collected))), detail: `${c.collected} collected × ${money(fee)} a unit` })),
+              { noun: 'kind', totalMinor: r.categories.reduce((a, c) => a + fee * BigInt(Math.round(c.collected)), 0n).toString(), expect: { minor: r.totals.programFeeMinor },
+                note: r.programFeeWords ? `The program charges ${r.programFeeWords} collected.` : 'No program fee is set for this state.', none: 'Nothing collected in this period.' });
+          } })),
         section('By kind', null, null, r.categories.length ? panel(r.categories.map((c) => item({ title: words(c.category), amount: String(c.collected),
           detail: `recycled ${c.recycled} (${Math.round(c.weight_recycled)} lb) · landfill ${c.landfilled} (${Math.round(c.weight_landfilled)} lb) · donated ${c.donated} · not yet disposed ${c.undisposed}` }))) : empty('Nothing collected in that period', null, true)),
         section('Certificates', null, null, r.certificates.length ? panel(r.certificates.map((c) => item({ title: `${c.certificate_no || 'no certificate'} · ${c.facility}`,
@@ -371,11 +387,22 @@
 
   async function vendorStatement(id) {
     const s = await coApi(`/payables/vendors/${id}/statement`);
+    const left = (b) => BigInt(b.total_minor) - BigInt(b.credited_minor) - BigInt(b.paid_minor);
+    const openMemos = s.memos.filter((m) => m.status === 'open');
+    const owedSum = s.bills.reduce((a, b) => a + left(b), 0n), creditSum = openMemos.reduce((a, m) => a + BigInt(m.left_minor), 0n);
+    const billRows = () => s.bills.map((b) => item({ title: b.reference || 'bill', amount: money(left(b)),
+      detail: `${dayLabel(b.invoice_date)} · total ${money(b.total_minor)} · credits ${money(b.credited_minor)} · paid ${money(b.paid_minor)}`, onClick: () => E.openKind('bill', b.id) }));
+    const memoRows = () => openMemos.map((m) => item({ title: m.number, amount: money(m.left_minor), detail: [dayLabel(m.memo_date), m.reason].filter(Boolean).join(' · '), onClick: () => memoDialog(m.id) }));
     return frag(el('div', { class: 'toolbar' }, btn('All memos', () => go('memos'), { small: true }), el('span', { class: 'grow' }), btn('Print', () => window.print(), { small: true })),
       el('div', { class: 'ops-print' },
         head(`${s.vendor.name}`, null, 'Vendor statement'),
-        tilesRow(tile({ label: 'Owed on bills', value: money(s.totals.owedOnBillsMinor) }), tile({ label: 'Open credits', value: money(s.totals.openCreditsMinor), tone: Number(s.totals.openCreditsMinor) ? 'good' : 'neutral' }),
-          tile({ label: 'Net owed', value: money(s.totals.netOwedMinor) })),
+        tilesRow(tile({ label: 'Owed on bills', value: money(s.totals.owedOnBillsMinor), onClick: () => E.drillItems('Owed on bills', billRows(), { noun: 'bill', totalMinor: owedSum.toString(), expect: { minor: s.totals.owedOnBillsMinor } }) }),
+          tile({ label: 'Open credits', value: money(s.totals.openCreditsMinor), tone: Number(s.totals.openCreditsMinor) ? 'good' : 'neutral',
+            onClick: () => E.drillItems('Open credits', memoRows(), { noun: 'debit memo', totalMinor: creditSum.toString(), expect: { minor: s.totals.openCreditsMinor }, none: 'No open credits.' }) }),
+          tile({ label: 'Net owed', value: money(s.totals.netOwedMinor), onClick: () => E.drillNode('Net owed', async () => frag(
+            E.drillSum({ count: s.bills.length + openMemos.length, noun: 'line', totalMinor: (owedSum - creditSum).toString(), expect: { minor: s.totals.netOwedMinor }, note: 'What is left on bills, less open credits.' }),
+            section('Bills', money(owedSum), null, s.bills.length ? panel(billRows()) : empty('No bills.', null, true)),
+            section('Less open credits', money(creditSum), null, openMemos.length ? panel(memoRows()) : empty('No open credits.', null, true)))) })),
         section('Account', plural(s.lines.length, 'line'), null, s.lines.length ? panel(s.lines.map((l) => item({ title: `${l.kind === 'bill' ? 'Bill' : 'Debit memo'} ${l.ref || ''}`,
           amount: money(l.amountMinor), badge: chip(l.kind === 'bill' ? 'neutral' : 'good', l.kind === 'bill' ? 'file' : 'ok', words(l.status)), detail: dayLabel(l.date),
           onClick: l.kind === 'debit_memo' ? () => memoDialog(l.id) : null }))) : empty('Nothing on the account', null, true)),
@@ -412,7 +439,9 @@
     const ask = btn('Ask for it', (e) => act(e.currentTarget, () => post('/workforce/leave/requests', { leaveTypeId: type.value, startsOn: from.value, endsOn: to.value, hoursPerDay: hpd.value, note: note.value }),
       (r) => `Asked for ${hours(r.totalHours)}; your manager decides`, { errorInto: showErr(err) }), { primary: true });
     return frag(
-      tilesRow(...bal.types.filter((x) => x.kind !== 'unpaid').map((x) => tile({ label: x.name, value: hours(x.available), text: x.pending ? `${hours(x.pending)} waiting` : x.cap_hours ? `cap ${hours(x.cap_hours)}` : null, ic: 'info' }))),
+      tilesRow(...bal.types.filter((x) => x.kind !== 'unpaid').map((x) => tile({ label: x.name, value: hours(x.available), text: x.pending ? `${hours(x.pending)} waiting` : x.cap_hours ? `cap ${hours(x.cap_hours)}` : null, ic: 'info',
+        onClick: () => E.drillList('leave-ledger', x.name, { type: x.id }, { noun: 'entry', plural: 'entries', expect: { hours: x.available }, row: (r) => E.drillRow({ ...r, unit: 'h' }),
+          note: `${hours(x.balance)} hours on the books${x.pending ? `, less ${hours(x.pending)} asked for and waiting` : ''}: ${hours(x.available)} to use.`, none: 'Nothing earned or taken yet.' }) }))),
       section('Ask for time off', null, null, panel(el('div', { class: 'ops-pad' }, el('div', { class: 'form-grid' }, field('Kind', type), field('First day', from), field('Last day', to),
         field('Hours a day', hpd), field('Note', note)), el('div', { class: 'dlg-acts' }, ask), err))),
       section('My requests', mine.length ? plural(mine.length, 'request') : null, null, mine.length ? panel(mine.map((r) => reqCard(r, r.status === 'requested' ? [
