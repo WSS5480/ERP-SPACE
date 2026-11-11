@@ -94,13 +94,18 @@ export function pinnedFetch(o: { allowHosts?: string[]; maxBytes?: number; ca?: 
       resolveAll(hostname).then((addrs) => {
         if (!addrs.length) return cb(new FeedError(`${hostname} could not be found`), "");
         if (!allowed && addrs.some((a) => isPrivateIp(a))) return cb(new FeedError("addresses on private networks are not called"), "");
-        const a = addrs[0], family = a.includes(":") ? 6 : 4;
-        all ? cb(null, [{ address: a, family }]) : cb(null, a, family);
+        // Every address was checked, so every one may be dialled: with all (Node's default autoSelectFamily) the
+        // socket tries them in turn, so a dead first record or an IPv6 address on an IPv4-only host falls through.
+        const fam = (x: string) => (x.includes(":") ? 6 : 4);
+        all ? cb(null, addrs.map((x) => ({ address: x, family: fam(x) }))) : cb(null, addrs[0], fam(addrs[0]));
       }, () => cb(new FeedError(`${hostname} could not be found`), ""));
     };
+    // What fetch() sent on its own: a length for the body (not chunked; some APIs refuse chunked uploads) and a user agent.
+    const headers: Record<string, string> = { "user-agent": "erp-api", ...(init.headers ?? {}) };
+    if (init.body != null && !Object.keys(headers).some((k) => k.toLowerCase() === "content-length")) headers["content-length"] = String(Buffer.byteLength(init.body));
     const req = (mod as typeof import("node:https")).request({
       protocol: u.protocol, hostname: host, port: u.port || undefined, path: u.pathname + u.search, method: init.method ?? "GET",
-      headers: init.headers, lookup: lookup as never, ca: o.ca, servername: /^[\d.]+$|:/.test(host) ? undefined : host,
+      headers, lookup: lookup as never, ca: o.ca, servername: /^[\d.]+$|:/.test(host) ? undefined : host,
     }, (res) => {
       const headers = { get: (k: string) => { const v = res.headers[k.toLowerCase()]; return v == null ? null : Array.isArray(v) ? v.join(", ") : String(v); } };
       let body: Promise<string> | null = null;

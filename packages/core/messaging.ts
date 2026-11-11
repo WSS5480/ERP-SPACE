@@ -26,7 +26,7 @@ import net from "node:net";
 import tls from "node:tls";
 import { createHmac, randomBytes } from "node:crypto";
 import { q, one, audit, tx, afterCommit, pool, type Client, type Scope } from "./db.ts";
-import { call, sealSecret, unsealSecret, liveEnv, FeedError, type FeedEnv } from "./vendor_feeds.ts";
+import { call, sealSecret, unsealSecret, liveEnv, FeedError, type FeedEnv, type FetchLike } from "./vendor_feeds.ts";
 import { isPrivateIp } from "./catalog.ts";
 import { setGeocoderFor, censusGeocoder, GeocodeError, type Geocoder } from "./geocode.ts";
 
@@ -46,6 +46,9 @@ export type MsgEnv = FeedEnv & {
 };
 export const liveMsgEnv = (): MsgEnv => ({
   ...liveEnv(),
+  // Email and text providers keep the platform fetch they have always used on live (every address still checked
+  // before the call). The pinned caller is for vendor feeds and vendor files until it has run on a real network.
+  fetch: globalThis.fetch as unknown as FetchLike,
   smtpAllowPrivate: process.env.ERP_SMTP_ALLOW_PRIVATE === "1",
   smtpAllowPlain: process.env.ERP_SMTP_ALLOW_PLAIN === "1",
   smtpAllowHosts: (process.env.ERP_SMTP_ALLOW_HOSTS ?? "").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),

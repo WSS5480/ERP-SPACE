@@ -883,7 +883,7 @@ async function screenApprovals() {
       el('div', { class: 'panel' }, d.others.length ? d.others.map((a) => approvalItem(a, false)) : empty('Nothing else is open.', null, true))),
     section('Recently decided', null, null,
       el('div', { class: 'panel' }, d.recent.length ? d.recent.map((r) => item({
-        title: subjName(r.subject), detail: `${cap(r.decision)} by ${r.actor_name || 'someone'} as ${r.required_role} · ${ago(r.decided_at)}${r.note ? ' · “' + r.note + '”' : ''}`,
+        title: subjName(r.subject), detail: `${cap(r.decision)} by ${r.actor_name || 'someone'} as ${r.required_role}${r.self_approved ? ' (self-approved: they made it and nobody else here could)' : ''} · ${ago(r.decided_at)}${r.note ? ' · “' + r.note + '”' : ''}`,
         amount: r.amount_minor != null ? money(r.amount_minor) : null,
         badge: r.decision === 'approved' ? chip('good', 'ok', 'Approved') : chip('critical', 'fail', 'Rejected'),
         onClick: r.subject.link ? () => openSubject(r.subject.link) : null })) : empty('Nothing decided yet.', null, true))));
@@ -1045,7 +1045,7 @@ function openBill(id) {
       section('Coded to', null, null, el('div', { class: 'panel' }, b.lines.map((l) => item({
         title: `${l.code} ${l.account}`, detail: [l.store || 'Company', l.description].filter(Boolean).join(' · '), amount: money(l.amount_minor) })))),
       b.requests.length ? section('Approvals', null, null, el('div', { class: 'panel' }, b.requests.flatMap((r) => (r.steps || []).map((s) => item({
-        title: `Step ${s.seq}: ${s.role}`, detail: s.decision ? `${cap(s.decision)} by ${s.actor} · ${ago(s.at)}${s.note ? ' · “' + s.note + '”' : ''}` : `Waiting · made by ${r.maker_name}`,
+        title: `Step ${s.seq}: ${s.role}`, detail: s.decision ? `${cap(s.decision)} by ${s.actor}${s.self_approved ? ' (self-approved)' : ''} · ${ago(s.at)}${s.note ? ' · “' + s.note + '”' : ''}` : `Waiting · made by ${r.maker_name}`,
         badge: s.decision === 'approved' ? chip('good', 'ok', 'Approved') : s.decision === 'rejected' ? chip('critical', 'fail', 'Rejected') : chip('neutral', 'pending', 'Open') }))))) : null,
       b.payments.length ? section('Paid', null, null, el('div', { class: 'panel' }, b.payments.map((p) => item({ title: `Payment run for ${dayLabel(p.pay_date)}`, detail: `${p.method.toUpperCase()} · ${p.run_status}`,
         amount: money(p.amount_minor), onClick: () => openPaymentRun(p.run_id) })))) : null,

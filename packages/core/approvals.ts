@@ -123,7 +123,9 @@ async function holdsRole(c: Client, userId: string, entityId: string, role: stri
 
 /**
  * May the maker decide their own request's step? Only the owner, and only when
- * no one else active in the company holds the step's role or the owner role.
+ * no one else active in the company holds the step's role, the owner role or
+ * the controller role (a controller is a real second pair of eyes even where
+ * the step names another role, so a company that has one keeps maker-checker).
  * The approval types this frees in a one-person company are every type the
  * engine routes: vendor, vendor_bank_account, invoice, payment_run,
  * payroll_run, employee, employee_change, journal_entry, fiscal_period.
@@ -132,7 +134,7 @@ export async function mayDecideOwn(c: Client, userId: string, entityId: string, 
   if (!(await holdsRole(c, userId, entityId, "owner"))) return false;
   const others = await q(c, `
     select 1 from role_grant g join app_user u on u.id = g.app_user_id join entity e on e.id = $2
-     where u.id <> $1 and u.status = 'active' and g.role in ($3, 'owner')
+     where u.id <> $1 and u.status = 'active' and g.role in ($3, 'owner', 'controller')
        and (g.entity_id = $2 or (g.entity_id is null and u.tenant_id = e.tenant_id))
      limit 1`, [userId, entityId, role]);
   return others.length === 0;

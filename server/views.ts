@@ -268,7 +268,7 @@ export async function approvals(c: Client, co: Company, personId: string | null)
     if (!personId) why = `Pick who you are acting as; ${waiting}`;
     else if (r.maker_id === personId) {
       // The owner of a company where nobody else could decide it approves it themselves (recorded as self-approved).
-      const anyoneElse = holders.some((h) => h.id !== personId && (h.role === r.step_role || h.role === "owner"));
+      const anyoneElse = holders.some((h) => h.id !== personId && (h.role === r.step_role || h.role === "owner" || h.role === "controller"));
       if (held.has("owner") && !anyoneElse) { canDecide = true; why = "You made it, and nobody else here can approve it, so you can (recorded as self-approved)"; }
       else why = `You made it, so someone else approves it: ${waiting}`;
     }
@@ -279,7 +279,7 @@ export async function approvals(c: Client, co: Company, personId: string | null)
   }
 
   const recent = await q(c, `
-    select s.decided_at, s.decision, s.note, s.required_role, u.name as actor_name, r.subject_type, r.subject_id,
+    select s.decided_at, s.decision, s.note, s.required_role, s.self_approved, u.name as actor_name, r.subject_type, r.subject_id,
            r.amount_minor, r.status as request_status
       from approval_step s
       join approval_request r on r.id = s.request_id
@@ -414,7 +414,7 @@ export async function bill(c: Client, co: Company, id: string) {
   const requests = await q(c, `
     select r.id, r.status, r.created_at, r.decided_at, mu.name as maker_name,
            (select json_agg(json_build_object('seq', s.seq, 'role', s.required_role, 'decision', s.decision,
-                    'actor', au.name, 'at', s.decided_at, 'note', s.note) order by s.seq)
+                    'actor', au.name, 'at', s.decided_at, 'note', s.note, 'self_approved', s.self_approved) order by s.seq)
               from approval_step s left join app_user au on au.id = s.actor_id where s.request_id = r.id) as steps
       from approval_request r join app_user mu on mu.id = r.maker_id
      where r.entity_id = $2 and r.subject_type = 'invoice' and r.subject_id = $1
