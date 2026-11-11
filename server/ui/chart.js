@@ -163,8 +163,8 @@
       const apply = run.status === 'previewed' ? el('button', { class: 'btn primary', type: 'button', onclick: () => act(apply, () => post(`/chart/import/${runId}/apply`),
         (x) => `Done: ${x.added} added, ${x.updated} updated, ${x.unchanged} unchanged, ${x.refused} refused`, { close: dlg.close }) }, 'Apply') : null;
       out.replaceChildren(frag(
-        tilesRow(tile({ label: 'Add', value: String(run.added), tone: 'good', ic: 'plus', text: 'New accounts' }), tile({ label: 'Update', value: String(run.updated), tone: run.updated ? 'warning' : 'neutral', ic: 'refresh', text: 'Name, group, flags' }),
-          tile({ label: 'Unchanged', value: String(run.unchanged), tone: 'neutral', ic: 'ok', text: 'Same as the chart' }), tile({ label: 'Refused', value: String(run.refused), tone: run.refused ? 'serious' : 'neutral', ic: 'warn', text: 'Each says why' })),
+        tilesRow(tile({ label: 'Add', value: String(run.added), tone: 'good', ic: 'plus', text: 'New accounts', onClick: () => show(runId, 'add') }), tile({ label: 'Update', value: String(run.updated), tone: run.updated ? 'warning' : 'neutral', ic: 'refresh', text: 'Name, group, flags', onClick: () => show(runId, 'update') }),
+          tile({ label: 'Unchanged', value: String(run.unchanged), tone: 'neutral', ic: 'ok', text: 'Same as the chart', onClick: () => show(runId, 'same') }), tile({ label: 'Refused', value: String(run.refused), tone: run.refused ? 'serious' : 'neutral', ic: 'warn', text: 'Each says why', onClick: () => show(runId, 'refuse') })),
         resultBox(run.status === 'applied' ? 'good' : 'neutral', run.status === 'applied' ? 'ok' : 'info', run.status === 'applied' ? 'Applied' : 'Preview: nothing has changed yet', `${run.filename || 'file'} · ${run.rows} rows`),
         el('div', { class: 'toolbar' }, seg([['', 'All'], ['add', 'Add'], ['update', 'Update'], ['refuse', 'Refused'], ['same', 'Unchanged']], filter || '', (k) => show(runId, k)), el('span', { class: 'grow' }), apply),
         el('div', { class: 'panel' }, r.rows.length ? capped(r.rows.map((x) => item({

@@ -25,6 +25,7 @@ const ICONS = {
   recon: 'M4 8h13l-3-3M20 16H7l3 3', feed: 'M4 5h16M4 12h16M4 19h10', more: 'M5 12h.01M12 12h.01M19 12h.01',
   bank: 'M3 9.5L12 4l9 5.5|M5.5 10.5v7M10 10.5v7M14 10.5v7M18.5 10.5v7|M3.5 20h17', plus: 'M12 5v14M5 12h14',
   building: 'R5 3 14 18|M9 7h2M13 7h2M9 11h2M13 11h2M9 15h2M13 15h2', user: 'C12 8 3.5|M5 20c0-3.9 3.1-6.2 7-6.2s7 2.3 7 6.2',
+  back: 'M15 5.5L8.5 12l6.5 6.5',
 };
 function icon(name, cls) {
   const s = document.createElementNS(SVGNS, 'svg');
@@ -256,6 +257,167 @@ function tilesRow(...list) {
   for (const v of vs) v.style.setProperty('--n', String(n));
   return row;
 }
+// ============================================================ drill-down
+// Every figure opens the rows behind it. The screen you were on is kept as it
+// was (its very nodes, so filters, picks and typed text stay, and its scroll)
+// and comes back on Back, or on the phone's own Back: each drill is a history
+// entry on the same address. A drill view that goes on to another screen is
+// parked, so Back from that screen returns to the list, then to the tiles.
+const DRILL = [];            // [{ under: Node[], y, title, sub, load, token, stale }]
+const PARKED = new Map();    // history token -> { frames, own, y }
+let drillSeq = 0, quietRoute = 0;
+const DLG_DRILL = [];        // drills opened from inside a dialog: [{ token, close }]
+/** Open the detail behind a figure: load() returns the node to show. */
+function drill(title, load, opts = {}) {
+  // From inside a dialog the detail opens over it, so the dialog (and what was typed or picked in it) is still there on Back.
+  if (document.querySelector('dialog[open]')) return drillInDialog(title, load, opts);
+  const main = $('#main');
+  const token = `${Date.now().toString(36)}.${++drillSeq}`;
+  DRILL.push({ under: [...main.childNodes], y: window.scrollY, title, sub: opts.sub || null, load, token, stale: false, hash: location.hash });
+  history.pushState({ drill: token }, '', location.href);
+  return paintDrill(true);
+}
+function drillInDialog(title, load, opts) {
+  const token = `${Date.now().toString(36)}.${++drillSeq}`;
+  let viaHistory = false;
+  const frame = { token, close: null };
+  const d = openDialog(title, opts.sub || null, { wide: true, onClose: () => {
+    const i = DLG_DRILL.indexOf(frame);
+    if (i >= 0) DLG_DRILL.splice(i, 1);
+    // closed with its own X or Escape: take its history entry back off too
+    if (!viaHistory && history.state && history.state.drill === token) history.back();
+  } });
+  frame.close = () => { viaHistory = true; d.close(); };
+  DLG_DRILL.push(frame);
+  history.pushState({ drill: token }, '', location.href);
+  fillDialog(d, async () => frag(el('div', { class: 'drill-bar' }, el('button', { class: 'btn drill-back', type: 'button', onclick: () => history.back() }, icon('back'), 'Back')), await load()));
+}
+async function paintDrill(toTop) {
+  const f = DRILL[DRILL.length - 1];
+  const seq = ++S.seq;
+  const row = SCREENS.find((r) => r[0] === S.route.screen);
+  const from = DRILL.length > 1 ? DRILL[DRILL.length - 2].title : row ? row[1] : 'the screen';
+  const body = el('div', { class: 'drill-body' }, loadingNode());
+  $('#main').replaceChildren(...platformBanners(),
+    el('div', { class: 'drill-bar' }, el('button', { class: 'btn drill-back', type: 'button', onclick: () => history.back(), 'aria-label': `Back to ${from}` }, icon('back'), 'Back'),
+      el('span', { class: 'sub', text: `from ${from}` })),
+    head(f.title, null, f.sub || (S.co ? S.co.name : '')), body);
+  if (toTop) window.scrollTo(0, 0);
+  try {
+    const node = await f.load();
+    if (seq !== S.seq) return;
+    body.replaceChildren(node);
+  } catch (e) {
+    if (e instanceof Stop || seq !== S.seq) return;
+    body.replaceChildren(notYoursBox(e) || errorBox(e, () => paintDrill(false)));
+  }
+}
+/** Back (the button or the phone's): put back the view under the drill, as it was. */
+function drillPop(keep) {
+  const back = DRILL[keep];
+  DRILL.length = keep;
+  ++S.seq;
+  const y = back.y;
+  if (back.stale) {
+    // something changed while drilled in (an action, a refresh): draw it again, then find the place
+    const redraw = keep === 0 ? render() : paintDrill(false);
+    Promise.resolve(redraw).then(() => window.scrollTo(0, y));
+    return;
+  }
+  $('#main').replaceChildren(...back.under);
+  window.scrollTo(0, y);
+}
+function onDrillHistory(e) {
+  const st = e.state || {};
+  // Back from a detail opened over a dialog: close it (and any opened from it)
+  while (DLG_DRILL.length && DLG_DRILL[DLG_DRILL.length - 1].token !== st.drill) DLG_DRILL.pop().close();
+  if (st.drill && DLG_DRILL.some((f) => f.token === st.drill)) return;
+  const parked = st.drill && PARKED.get(st.drill);
+  if (parked) {
+    // back to a drill view that had gone on to another screen: the hash changes back too, quietly
+    PARKED.delete(st.drill);
+    DRILL.length = 0; DRILL.push(...parked.frames);
+    ++S.seq;
+    quietRoute = Date.now();
+    $('#main').replaceChildren(...parked.own);
+    window.scrollTo(0, parked.y);
+    return;
+  }
+  // Going on to another screen (a new address) also fires popstate in some browsers: hashchange parks the drill then.
+  if (!st.drill && DRILL.length && location.hash !== DRILL[0].hash) return;
+  const i = st.drill ? DRILL.findIndex((f) => f.token === st.drill) : -1;
+  const keep = i + 1;
+  if (DRILL.length > keep) drillPop(keep);
+}
+/** Leaving a drill view for another screen: park it so Back finds it again. */
+function parkDrill() {
+  if (!DRILL.length) return;
+  PARKED.set(DRILL[DRILL.length - 1].token, { frames: DRILL.slice(), own: [...$('#main').childNodes], y: window.scrollY });
+  while (PARKED.size > 12) PARKED.delete(PARKED.keys().next().value);
+  DRILL.length = 0;
+}
+/** The count and total of a drill list, and a warning when they no longer match the tile they came from. */
+function drillSum({ count, noun, plural: many, totalMinor, totalHours, expect, note }) {
+  let off = null;
+  if (expect) {
+    const hrs = expect.hours != null;
+    const got = hrs ? Math.round(Number(totalHours || 0) * 1000) : expect.minor != null ? BigInt(totalMinor || 0) : BigInt(count);
+    const want = hrs ? Math.round(Number(expect.hours) * 1000) : BigInt(expect.minor != null ? expect.minor : expect.count);
+    if (got !== want) {
+      const fmt = (v) => (hrs ? `${hours(Number(v) / 1000)} h` : expect.minor != null ? money(v) : String(v));
+      off = resultBox('warning', 'warn', 'Changed since the tile was drawn', `The tile showed ${fmt(want)}; these rows come to ${fmt(got)}. Go back and refresh to see it again.`);
+    }
+  }
+  return frag(el('div', { class: 'drill-sum' },
+    el('span', { class: 'k', text: plural(count, noun || 'row', many) }),
+    totalMinor != null ? el('span', { class: 'fv num', text: money(totalMinor) }) : totalHours != null ? el('span', { class: 'fv num', text: `${hours(totalHours)} h` }) : null),
+    note ? el('p', { class: 'sub drill-note', text: note }) : null, off);
+}
+const OPENERS = {};
+/** What a row of a drill list opens, by kind: bill, entry, order, product, ticket... */
+function opener(kind, fn) { OPENERS[kind] = fn; }
+const DRILL_TONE = { 'Past due': 'serious', Late: 'warning', 'On time': 'good', Refund: 'neutral', 'Refund to reverse': 'warning', 'First visit': 'good', 'More than one': 'warning', 'No cost pool': 'neutral' };
+function drillRow(r) {
+  const open = r.open_kind && r.open_id && OPENERS[r.open_kind] ? () => OPENERS[r.open_kind](r.open_id) : null;
+  return item({ title: r.title, detail: [r.on_day ? dayLabel(r.on_day) : null, r.detail ? human(r.detail) : null, r.qty != null && r.amount_minor != null ? `${Number(r.qty)} on hand` : null].filter(Boolean).join(' · '),
+    amount: r.amount_minor != null ? money(r.amount_minor) : r.qty != null ? (r.unit === 'h' ? `${hours(r.qty)} h` : String(Number(r.qty))) : null,
+    badge: r.badge ? chip(DRILL_TONE[r.badge] || 'neutral', DRILL_TONE[r.badge] === 'good' ? 'ok' : 'info', r.badge) : null, onClick: open });
+}
+/**
+ * A drill served by the drill lists (GET /drill/<key>): a page at a time, with
+ * the count and total of every row, so the list reconciles to its tile.
+ */
+function drillList(key, title, params = {}, opts = {}) {
+  return drill(title, async () => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v != null && v !== '') qs.set(k, v);
+    const get = (page) => coApi(`/drill/${key}?${qs.toString()}${qs.toString() ? '&' : ''}page=${page}`);
+    const first = await get(1);
+    const panel = el('div', { class: 'panel' });
+    const row = opts.row || drillRow;
+    let page = 1;
+    const more = el('button', { class: 'more-row', type: 'button', onclick: async () => {
+      busy(more, true, 'Loading…');
+      try { const r = await get(++page); more.before(...r.rows.map(row)); if (page >= r.pages) more.remove(); }
+      catch (e) { page--; if (!(e instanceof Stop)) toast(friendly(e), 'critical'); }
+      finally { if (more.isConnected) busy(more, false); }
+    } }, `Show more of ${first.count}`);
+    panel.append(...(first.rows.length ? first.rows.map(row) : [empty(opts.none || 'Nothing here.', null, true)]));
+    if (first.pages > 1) panel.append(more);
+    return frag(drillSum({ count: first.count, noun: opts.noun, plural: opts.plural, totalMinor: first.totalMinor, totalHours: first.totalHours, expect: opts.expect, note: opts.note }), panel, opts.foot ? el('p', { class: 'foot', text: opts.foot }) : null);
+  }, opts);
+}
+/** A drill whose rows the screen already has: nodes (items) with their count and total. */
+function drillItems(title, nodes, opts = {}) {
+  return drill(title, async () => frag(
+    drillSum({ count: opts.count != null ? opts.count : nodes.length, noun: opts.noun, plural: opts.plural, totalMinor: opts.totalMinor, expect: opts.expect, note: opts.note }),
+    opts.before || null,
+    el('div', { class: 'panel' }, nodes.length ? capped(nodes, 60, opts.noun ? `${opts.plural || opts.noun + 's'}` : 'rows') : empty(opts.none || 'Nothing here.', null, true)),
+    opts.foot ? el('p', { class: 'foot', text: opts.foot }) : null), opts);
+}
+/** A drill to any node (a breakdown, a screen's own list), loaded when it opens. */
+const drillNode = (title, load, opts) => drill(title, load, opts);
+
 function empty(title, sub, quiet) {
   return el('div', { class: 'empty' + (quiet ? ' quiet' : '') }, icon(quiet ? 'info' : 'ok'),
     el('div', {}, el('b', { text: title }), sub ? el('div', { class: 'sub', text: sub }) : null));
@@ -501,6 +663,8 @@ async function render() {
     history.replaceState(null, '', `#/${S.co.id}/home`);
     renderNav();
   }
+  // Drilled in: refresh the list being looked at; what is under it is drawn again on Back.
+  if (DRILL.length) { for (const f of DRILL) f.stale = true; await paintDrill(false); refreshBadge(); return; }
   const seq = ++S.seq;
   const main = $('#main');
   main.replaceChildren(loadingNode());
@@ -526,14 +690,18 @@ async function screenHome() {
   const d = await coApi('/home');
   const mine = d.approvals.mine;
   const tiles = tilesRow(...[
-    canSee('cash') && tile({ label: 'Cash in the books', value: money(d.cash.total), tone: 'neutral', ic: 'bank', text: `Operating ${money(d.cash.operating)}`, onClick: () => go('cash') }),
+    canSee('cash') && tile({ label: 'Cash in the books', value: money(d.cash.total), tone: 'neutral', ic: 'bank', text: `Operating ${money(d.cash.operating)}`, onClick: () => drillCash(d.cash.total) }),
     canSee('approvals') && tile({ label: 'Waiting on you', value: String(mine.length), suffix: 'to decide', tone: mine.length ? 'warning' : 'good', ic: mine.length ? 'clock' : 'ok',
       text: mine.length ? (d.approvals.othersCount ? `${d.approvals.othersCount} more waiting on others` : 'Tap to decide') : (d.approvals.othersCount ? `Nothing for you; ${d.approvals.othersCount} waiting on others` : 'Nothing waiting'),
-      onClick: () => go('approvals') }),
+      onClick: () => drillItems('Waiting on you', mine.map((a) => item({ title: subjName(a.subject), detail: [`From ${a.maker_name}, ${ago(a.created_at)}`, a.steps > 1 ? `step ${a.step_seq} of ${a.steps}` : null].filter(Boolean).join(' · '),
+        amount: a.amount_minor != null ? money(a.amount_minor) : null, onClick: () => openApproval(a) })), { noun: 'decision', none: 'Nothing is waiting on you.',
+        totalMinor: mine.some((a) => a.amount_minor != null) ? mine.reduce((t, a) => t + BigInt(a.amount_minor || 0), 0n).toString() : null }) }),
     canSee('payables') && tile({ label: 'Bills due in 7 days', value: money(d.bills.due7), tone: d.bills.overdue_n ? 'serious' : 'neutral', ic: d.bills.overdue_n ? 'warn' : 'file',
-      text: d.bills.overdue_n ? `${plural(d.bills.overdue_n, 'bill')} past due, ${money(d.bills.overdue)}` : plural(d.bills.due7_n, 'bill'), onClick: () => go('payables', 'topay') }),
+      text: d.bills.overdue_n ? `${plural(d.bills.overdue_n, 'bill')} past due, ${money(d.bills.overdue)}` : plural(d.bills.due7_n, 'bill'),
+      onClick: () => drillList('bills-due7', 'Bills due in the next 7 days', {}, { noun: 'bill', expect: { minor: d.bills.due7 }, none: 'No approved bills fall due in the next week.',
+        foot: 'Approved and scheduled bills due within 7 days, past due included, net of vendor credits. Bills between your own companies are settled in Group and are not here.' }) }),
     canSee('books') && tile({ label: 'Net this month', value: money(d.month.net), tone: 'neutral', ic: 'book',
-      text: `${money(d.month.revenue)} in, ${money(d.month.expenses)} out`, onClick: () => go('books') })].filter(Boolean));
+      text: `${money(d.month.revenue)} in, ${money(d.month.expenses)} out`, onClick: () => drillPnl(d.month.from, d.month.to, d.month.net) })].filter(Boolean));
 
   const items = [];
   for (const a of mine) items.push(item({ title: subjName(a.subject), detail: [`From ${a.maker_name}, ${ago(a.created_at)}`, a.steps > 1 ? `step ${a.step_seq} of ${a.steps}` : null].filter(Boolean).join(' · '),
@@ -595,6 +763,35 @@ async function screenRoleHome() {
       ? mine.map(([name, label, ic]) => item({ title: label, detail: GROUP_HINT[name] || null, onClick: () => go(name) }))
       : empty('No screens here', 'This person holds no roles in this company. Give them one from Setup, or switch who you are acting as.', true))),
     extras);
+}
+/** Cash in the books, account by account (the same bank positions Home adds up). */
+function drillCash(expectMinor) {
+  return drill('Cash in the books', async () => {
+    const d = await coApi('/cash');
+    const total = d.positions.reduce((t, p) => t + BigInt(p.ledger_balance_minor), 0n);
+    return frag(drillSum({ count: d.positions.length, noun: 'account', totalMinor: total.toString(), expect: expectMinor != null ? { minor: expectMinor } : null }),
+      el('div', { class: 'panel' }, d.positions.length ? d.positions.map((p) => item({ title: p.name,
+        detail: [`${p.bank_name} ••${p.account_last4}`, p.location_name, p.last_statement_minor != null ? `bank said ${money(p.last_statement_minor)} on ${shortDay(p.last_statement_on)}` : 'no bank statement yet'].filter(Boolean).join(' · '),
+        amount: money(p.ledger_balance_minor), onClick: () => drillBank(p) })) : empty('No bank accounts yet.', null, true)),
+      el('p', { class: 'foot', text: 'Each account’s balance in the books. Tap one for the entries behind it.' }));
+  });
+}
+/** One bank account's balance in the books, entry by entry. */
+const drillBank = (p) => drillList('bank-lines', p.name, { account: p.bank_account_id }, { noun: 'entry', plural: 'entries', expect: { minor: p.ledger_balance_minor },
+  sub: `${p.bank_name} ••${p.account_last4}`, none: 'Nothing posted to this account yet.', foot: 'Money in is positive, money out negative. Tap an entry to see both sides.' });
+/** Net for a period: revenue less expenses, account by account; an account opens its entries. */
+function drillPnl(from, to, expectMinor) {
+  return drill('Net this month', async () => {
+    const d = await coApi(`/books/pnl?from=${from}&to=${to}`);
+    const signed = (a) => (a.type === 'revenue' ? BigInt(a.total) : -BigInt(a.total));
+    const accts = d.accounts.filter((a) => BigInt(a.total) !== 0n);
+    const net = accts.reduce((t, a) => t + signed(a), 0n);
+    const part = (label, list) => (list.length ? section(label, money(list.reduce((t, a) => t + BigInt(a.total), 0n)), null, el('div', { class: 'panel' },
+      list.map((a) => item({ title: `${a.code} ${a.name}`, amount: money(a.total), onClick: () => openAccount(a, null, from, to) })))) : null);
+    return frag(drillSum({ count: accts.length, noun: 'account', totalMinor: net.toString(), expect: expectMinor != null ? { minor: expectMinor } : null,
+      note: `${dayLabel(from)} to ${dayLabel(to)}: revenue less expenses. Tap an account for its entries.` }),
+      part('Revenue', accts.filter((a) => a.type === 'revenue')), part('Expenses', accts.filter((a) => a.type !== 'revenue')));
+  }, { sub: `${dayLabel(from)} to ${dayLabel(to)}` });
 }
 const GROUP_HINT = { pos: 'Sell, take deposits and payments', aisle: 'Price and build carts on the floor', crm: 'Customer profiles, history and notes',
   leads: 'Follow-ups and the pipeline', myday: 'Today’s calls, tasks and appointments', catalog: 'Products, options and prices',
@@ -813,7 +1010,10 @@ function openBill(id) {
         el('div', { class: 'when', text: `${fmtStamp.format(new Date(t.at))} · ${t.actor_label}` })))))));
   });
 }
-const fact = (k, v) => el('div', {}, el('span', { class: 'k', text: k }), el('div', { class: 'fv', text: v }));
+/** A labelled figure; with onClick it opens what is behind it. */
+const fact = (k, v, onClick) => (onClick
+  ? el('button', { class: 'fact-btn', type: 'button', onclick: onClick, 'aria-label': `${k}: ${v}. Open what is behind it` }, el('span', { class: 'k', text: k }), el('div', { class: 'fv' }, el('span', { text: v }), icon('back', 'go')))
+  : el('div', {}, el('span', { class: 'k', text: k }), el('div', { class: 'fv', text: v })));
 
 async function openNewBill() {
   const d = openDialog('New bill', `${S.co.name} · entered as ${S.person ? S.person.name : 'nobody'}`);
@@ -1833,12 +2033,17 @@ async function screenCash() {
   const waiting = d.waiting.reduce((s, w) => s + BigInt(w.balance_minor), 0n);
   const open = d.transfers.filter((t) => ['expected', 'planned'].includes(t.status));
   const tiles = tilesRow(
-    tile({ label: 'Cash in the books', value: money(total), tone: 'neutral', ic: 'bank', text: plural(d.positions.length, 'account') }),
-    tile({ label: 'Operating account', value: op ? money(op.ledger_balance_minor) : '—', tone: 'neutral', ic: 'bank', text: op ? `${op.bank_name} ••${op.account_last4}` : 'None set up' }),
-    tile({ label: 'Still at the stores', value: money(waiting), tone: waiting ? 'warning' : 'good', ic: waiting ? 'clock' : 'ok', text: waiting ? `${plural(d.waiting.length, 'store account')} to sweep in` : 'Everything swept in' }),
+    tile({ label: 'Cash in the books', value: money(total), tone: 'neutral', ic: 'bank', text: plural(d.positions.length, 'account'), onClick: () => drillCash(total.toString()) }),
+    tile({ label: 'Operating account', value: op ? money(op.ledger_balance_minor) : '—', tone: 'neutral', ic: 'bank', text: op ? `${op.bank_name} ••${op.account_last4}` : 'None set up', onClick: op ? () => drillBank(op) : null }),
+    tile({ label: 'Still at the stores', value: money(waiting), tone: waiting ? 'warning' : 'good', ic: waiting ? 'clock' : 'ok', text: waiting ? `${plural(d.waiting.length, 'store account')} to sweep in` : 'Everything swept in',
+      onClick: () => drillItems('Still at the stores', d.waiting.map((w) => item({ title: w.name, detail: [w.bank_name, w.location_name].filter(Boolean).join(' · '), amount: money(w.balance_minor) })),
+        { noun: 'store account', totalMinor: waiting.toString(), none: 'Everything is swept in.', foot: 'Takings sitting in store accounts, not yet moved into operating.' }) }),
     tile({ label: 'Sweeps in flight', value: String(open.length), tone: open.some((t) => t.overdue) ? 'serious' : open.length ? 'warning' : 'good',
       ic: open.some((t) => t.overdue) ? 'warn' : open.length ? 'clock' : 'ok',
-      text: open.some((t) => t.overdue) ? `${open.filter((t) => t.overdue).length} late` : open.length ? 'To confirm when they land' : 'Nothing outstanding' }));
+      text: open.some((t) => t.overdue) ? `${open.filter((t) => t.overdue).length} late` : open.length ? 'To confirm when they land' : 'Nothing outstanding',
+      onClick: () => drillItems('Sweeps in flight', open.map((t) => item({ title: `${t.from_account} → ${t.to_account}`, detail: `${dayLabel(t.transfer_date)}${t.due_on ? ` · due ${dayLabel(t.due_on)}` : ''}${t.assigned_to ? ` · ${t.assigned_to}’s to do` : ''}`,
+        amount: money(t.amount_minor), badge: t.overdue ? chip('serious', 'warn', 'Late') : chip('warning', 'clock', t.status === 'expected' ? 'Bank to sweep' : 'To move by hand') })),
+        { noun: 'sweep', totalMinor: open.reduce((a, t) => a + BigInt(t.amount_minor), 0n).toString(), none: 'Nothing in flight.', foot: 'Confirm each one on the Cash screen when it lands.' }) }));
   const rows = d.positions.map((p) => item({ title: p.name,
     detail: `${p.bank_name} ••${p.account_last4}${p.location_name ? ' · ' + p.location_name : ''} · ${p.last_statement_minor != null ? `bank said ${money(p.last_statement_minor)} on ${shortDay(p.last_statement_on)}` : 'no bank statement yet'}`,
     amount: money(p.ledger_balance_minor) }));
@@ -1876,10 +2081,20 @@ async function screenRecon() {
     (r) => r.lines ? `${r.matched} of ${plural(r.lines, 'open line')} matched${Number(r.fees) ? `, ${money(r.fees)} of card fees posted` : ''}.` : 'Nothing open to match.') }, 'Run matching');
   return frag(head('Reconcile', [runAll]),
     tilesRow(
-      tile({ label: 'Bank lines to explain', value: String(d.lines.length), tone: d.lines.length ? 'warning' : 'good', ic: d.lines.length ? 'warn' : 'ok', text: d.lines.length ? 'Match them, or book them' : 'Every line explained' }),
-      tile({ label: 'Store deposits not in yet', value: String(d.deposits.length), tone: late.length ? 'serious' : 'neutral', ic: late.length ? 'warn' : 'clock', text: late.length ? `${late.length} late at the bank` : 'None late' }),
-      tile({ label: 'Matched', value: String(auto + manual), tone: 'neutral', ic: 'ok', text: `${auto} automatically, ${manual} by a person` }),
-      tile({ label: 'Card fees posted', value: money(fees), tone: 'neutral', ic: 'cash', text: 'Settlements come in net of fees' })),
+      tile({ label: 'Bank lines to explain', value: String(d.lines.length), tone: d.lines.length ? 'warning' : 'good', ic: d.lines.length ? 'warn' : 'ok', text: d.lines.length ? 'Match them, or book them' : 'Every line explained',
+        onClick: () => drillItems('Bank lines to explain', d.lines.map((l) => item({ title: l.description, detail: `${l.account_name} · ${dayLabel(l.posted_on)}${l.days_open ? ` · open ${l.days_open} days` : ''}`, amount: money(l.amount_minor),
+          acts: [el('button', { class: 'btn small primary', type: 'button', onclick: () => openMatch(l) }, 'Match or book…')] })),
+          { noun: 'bank line', totalMinor: d.lines.reduce((a, l) => a + BigInt(l.amount_minor), 0n).toString(), none: 'Every bank line is explained.' }) }),
+      tile({ label: 'Store deposits not in yet', value: String(d.deposits.length), tone: late.length ? 'serious' : 'neutral', ic: late.length ? 'warn' : 'clock', text: late.length ? `${late.length} late at the bank` : 'None late',
+        onClick: () => drillItems('Store deposits not in yet', [...d.deposits].sort((a, b) => b.days_late - a.days_late).map((x) => item({
+          title: `${x.location_name} · ${x.method} takings for ${shortDay(x.business_date)}`, detail: `into ${x.account_name} · expected ${dayLabel(x.expected_on)}`, amount: money(x.amount_minor),
+          badge: x.days_late > 0 ? chip('serious', 'warn', `${plural(x.days_late, 'day')} late`) : chip('neutral', 'clock', 'Due') })),
+          { noun: 'deposit', totalMinor: d.deposits.reduce((a, x) => a + BigInt(x.amount_minor), 0n).toString(), none: 'Every deposit has landed.' }) }),
+      tile({ label: 'Matched', value: String(auto + manual), tone: 'neutral', ic: 'ok', text: `${auto} automatically, ${manual} by a person`,
+        onClick: () => drillList('recon-matches', 'Bank lines matched', {}, { noun: 'match', plural: 'matches', expect: { count: auto + manual }, none: 'Nothing matched yet.' }) }),
+      tile({ label: 'Card fees posted', value: money(fees), tone: 'neutral', ic: 'cash', text: 'Settlements come in net of fees',
+        onClick: () => drillList('recon-fees', 'Card fees posted by matching', {}, { noun: 'matching run', expect: { minor: fees.toString() }, none: 'No fees posted yet.',
+          foot: 'Each run that matched a card settlement net of fees posted the difference as a fee.' }) })),
     section('Bank lines nobody has explained', null, null, el('div', { class: 'panel' }, d.lines.length ? d.lines.map((l) => item({
       title: l.description, detail: `${l.account_name} · ${dayLabel(l.posted_on)}${l.days_open ? ` · open ${l.days_open} days` : ''}`, amount: money(l.amount_minor),
       acts: [el('button', { class: 'btn small primary', type: 'button', onclick: () => openMatch(l) }, 'Match or book…')] })) : empty('Every bank line is explained.', null))),
@@ -1967,15 +2182,27 @@ async function screenFeeds() {
   const never = accounts.filter((a) => a.never).length;
   const oldest = d.quarantine.reduce((m, f) => Math.max(m, f.days_open || 0), 0);
   const last = cs.filter((c) => c.last_file_at).sort((a, b) => (a.last_file_at < b.last_file_at ? 1 : -1))[0];
+  const feedItem = (c) => { const st = feedState(c); return item({ title: c.name, detail: [c.source_name, c.account_name ? `${c.account_name} ••${c.account_last4}` : null, st.note || null,
+    c.last_file_at ? `last file ${ago(c.last_file_at)}` : 'no files yet'].filter(Boolean).join(' · '), badge: chip(st.tone, st.icon, st.label), why: c.last_error && st.tone === 'critical' ? sentence(c.last_error) : null }); };
+  const byLast = [...cs].sort((a, b) => String(b.last_file_at || '').localeCompare(String(a.last_file_at || '')));
   const tiles = tilesRow(
-    tile({ label: 'Feeds healthy', value: String(healthy), suffix: `of ${cs.length}`, ...(!cs.length ? { tone: 'neutral', ic: 'pending', text: 'No feeds set up yet' }
+    tile({ label: 'Feeds healthy', onClick: () => drillItems('Feeds', [...cs].sort((a, b) => (feedState(a).label === 'Healthy' ? 1 : 0) - (feedState(b).label === 'Healthy' ? 1 : 0)).map(feedItem),
+      { noun: 'feed', note: `${healthy} healthy, ${failing} failing, ${stale} stale, ${idle} not running yet.`, none: 'No feeds set up yet.' }),
+      value: String(healthy), suffix: `of ${cs.length}`, ...(!cs.length ? { tone: 'neutral', ic: 'pending', text: 'No feeds set up yet' }
       : failing ? { tone: 'critical', ic: 'fail', text: `${plural(failing, 'feed')} failing` }
       : stale ? { tone: 'warning', ic: 'clock', text: `${stale} stale: nothing new in 3+ days` } : idle ? { tone: 'neutral', ic: 'pending', text: `${idle} not running yet` } : { tone: 'good', ic: 'ok', text: 'Every feed is healthy' }) }),
     tile({ label: 'Held for review', value: String(d.quarantine.length), suffix: d.quarantine.length === 1 ? 'file' : 'files',
+      onClick: () => drillItems('Files held for review', d.quarantine.map((f) => item({ title: f.origin, detail: `${f.connection_name} · ${ago(f.received_at)}${f.days_open ? ` · waiting ${plural(f.days_open, 'day')}` : ''}`,
+        why: sentence(f.reason), badge: chip('serious', 'hold', 'Held') })), { noun: 'file', none: 'Nothing is held for review.', foot: 'Dismiss a file from the Feeds screen, with a reason.' }),
       ...(d.quarantine.length ? { tone: 'serious', ic: 'hold', text: oldest ? `Oldest waiting ${plural(oldest, 'day')}` : 'Waiting on a person' } : { tone: 'good', ic: 'ok', text: 'Nothing held for review' }) }),
-    tile({ label: 'Missing statement days', value: String(missing), ...(missing ? { tone: 'warning', ic: 'warn', text: `${plural(behind, 'account')} behind, last 30 days${never ? `; ${never} with none yet` : ''}` }
+    tile({ label: 'Missing statement days', value: String(missing),
+      onClick: () => drillItems('Missing statement days', accounts.flatMap((a) => (a.missing_dates || []).map((day) => item({ title: dayLabel(day), detail: `${a.account_name} · ${a.bank_name} ••${a.account_last4}`,
+        badge: chip('warning', 'warn', 'No statement') }))), { noun: 'weekday', none: 'Nothing missing in the last 30 days.', count: missing,
+        foot: 'Weekdays in the last 30 days with no statement on file, from each account’s first statement. Bank holidays are not excluded yet.' }),
+      ...(missing ? { tone: 'warning', ic: 'warn', text: `${plural(behind, 'account')} behind, last 30 days${never ? `; ${never} with none yet` : ''}` }
       : never ? { tone: 'neutral', ic: 'pending', text: `${plural(never, 'account')} with no statement yet` } : { tone: 'good', ic: 'ok', text: 'Nothing missing in the last 30 days' }) }),
-    last ? tile({ label: 'Last file in', value: ago(last.last_file_at), word: true, tone: 'neutral', ic: 'file', text: last.name })
+    last ? tile({ label: 'Last file in', value: ago(last.last_file_at), word: true, tone: 'neutral', ic: 'file', text: last.name,
+      onClick: () => drillItems('Feeds by latest file', byLast.map(feedItem), { noun: 'feed', note: 'Newest first.' }) })
       : tile({ label: 'Last file in', value: 'None yet', word: true, tone: 'neutral', ic: 'file', text: targets.length ? 'Upload a statement to start' : 'No files have come in' }));
 
   const rows = accounts.map((a) => {
@@ -2124,6 +2351,8 @@ function openUpload(targets, id, accounts) {
       ': five weekdays of made-up activity for this account, every line marked SAMPLE. Trial only.') : null);
 }
 
+opener('bill', (id) => openBill(id));
+opener('entry', (id) => openEntry(id));
 const RENDER = { home: screenHome, approvals: screenApprovals, payables: screenPayables, payroll: screenPayroll, books: screenBooks, cash: screenCash, recon: screenRecon, feeds: screenFeeds, setup: screenSetup };
 
 // ========================================================== module screens
@@ -2133,6 +2362,7 @@ window.ERP = {
   canSee, S, $, el, frag, icon, ICONS, chip, money, dayLabel, shortDay, plural, cap, sentence, human, ago, size, todayIso, isoDay,
   api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
   head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input,
+  drill, drillList, drillItems, drillNode, drillSum, drillRow, opener, openKind: (kind, id) => (OPENERS[kind] ? OPENERS[kind](id) : null),
   openEntry, NARROW,
   // defined further down (sign-in and who you are); wrapped so they resolve when called
   isOperator: () => isOperator(), isCustomer: () => isCustomer(), inSupport: () => inSupport(), managesAccount: () => managesAccount(), boot: () => boot(),
@@ -2381,7 +2611,15 @@ function wire() {
   $('#si-forgot').addEventListener('click', () => { siMode('forgot'); $('#si-msg').textContent = 'We will email you a link to choose a new password.'; $('#si-email').focus(); });
   $('#si-askcode').addEventListener('click', askCode);
   $('#si-back').addEventListener('click', () => { history.replaceState(null, '', location.pathname); SI.token = null; siMode('customer'); showSignIn(); });
-  window.addEventListener('hashchange', () => { if (/^#(invite|reset)=/.test(location.hash)) { boot(); return; } if (!S.co && isOperator()) { operatorOnly(); return; } onRoute(); });
+  window.addEventListener('popstate', onDrillHistory);
+  window.addEventListener('hashchange', () => {
+    if (/^#(invite|reset)=/.test(location.hash)) { boot(); return; }
+    if (!S.co && isOperator()) { operatorOnly(); return; }
+    // Back to a parked drill view: it is already on the page; only the route and the menu follow.
+    if (quietRoute && Date.now() - quietRoute < 1500) { quietRoute = 0; const r = parseHash(); if (!r.co || r.co === S.co.id) { S.route = { screen: SCREENS.some(([n]) => n === r.screen) ? r.screen : 'home', sub: r.sub }; renderNav(); return; } }
+    parkDrill();
+    onRoute();
+  });
   let hiddenAt = 0;
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') hiddenAt = Date.now();

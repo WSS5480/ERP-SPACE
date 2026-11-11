@@ -153,7 +153,10 @@
     const mgr = isManager(o);
     const on = rows.filter((r) => r.last_kind && r.last_kind !== 'out').length;
     return frag(el('div', { class: 'wf-pick' }, loc),
-      tilesRow(tile({ label: 'On the clock', value: String(on), tone: 'neutral', ic: 'clock', text: `${plural(rows.length, 'hourly person', 'hourly people')}` })),
+      tilesRow(tile({ label: 'On the clock', value: String(on), tone: 'neutral', ic: 'clock', text: `${plural(rows.length, 'hourly person', 'hourly people')}`,
+        onClick: () => E.drillItems('On the clock', rows.filter((r) => r.last_kind && r.last_kind !== 'out').map((r) => item({ title: r.name,
+          badge: r.last_kind === 'break_start' ? chip('warning', 'clock', 'On break') : chip('good', 'ok', 'On the clock'),
+          amount: r.today_hours ? `${Number(r.today_hours).toFixed(2)} h` : null, detail: r.location || null })), { noun: 'person', plural: 'people', none: 'Nobody is on the clock.', note: 'Clocked in now, on a break included. Hours are today’s so far.' }) })),
       section('Hourly staff', null, null, list(rows.map((r) => {
         const st = !r.last_kind || r.last_kind === 'out' ? ['neutral', 'pause', 'Off'] : r.last_kind === 'break_start' ? ['warning', 'clock', 'On break'] : ['good', 'ok', 'On the clock'];
         const emp = { id: r.employee_id, name: r.name, home_location_id: (o.employees.find((x) => x.id === r.employee_id) || {}).home_location_id };
@@ -214,7 +217,9 @@
       (r) => r.approved.length ? `Approved for ${r.approved.map((x) => `${x.name} ${money(x.payout)}`).join(', ')}` : 'Nothing new to approve') }, 'Approve for payroll');
     const planName = (id) => (d.plans.find((p) => p.id === id) || {}).name || '';
     return frag(
-      tilesRow(tile({ label: 'Commissions payable (2160)', value: money(d.payableMinor), tone: 'neutral', ic: 'book', text: 'Accrued, not yet paid' })),
+      tilesRow(tile({ label: 'Commissions payable (2160)', value: money(d.payableMinor), tone: 'neutral', ic: 'book', text: 'Accrued, not yet paid',
+        onClick: () => E.drillList('gl-lines', 'Commissions payable (2160)', { code: '2160' }, { noun: 'entry', plural: 'entries', expect: { minor: d.payableMinor },
+          foot: 'Accruals add to it, payroll and referral bills take it down. Tap an entry to see both sides.' }) })),
       can ? section('Into payroll', 'commission is earned when a sale is handed over', [accrueBtn], panel(el('div', { class: 'form-grid wf-pad' },
         field('Pay period', period, 'Approve before building that payroll.', true), el('div', { class: 'field' }, approveBtn)))) : null,
       section('Earned, not yet approved', null, null, list(d.accrued.map((a) => item({ title: a.name, amount: money(a.amount_minor), detail: plural(a.events, 'line') })), 'Nothing waiting.')),

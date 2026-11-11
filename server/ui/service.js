@@ -6,6 +6,7 @@
   const E = window.ERP;
   const { el, frag, icon, chip, money, dayLabel, plural, cap, coApi, post, go, toast, act, openDialog, resultBox, fillDialog,
     askReason, head, section, tile, tilesRow, empty, item, capped, seg, fact, friendly, S } = E;
+  E.opener('ticket', (id) => go('service', 'ticket:' + id));
 
   const ICON_WRENCH = 'M14.7 6.3a4 4 0 0 0-5.4 5.1L4 16.7a1.6 1.6 0 0 0 2.3 2.3l5.3-5.3a4 4 0 0 0 5.1-5.4l-2.4 2.4-2.1-.5-.5-2.1z';
   const st = { opts: null, status: 'open', q: '' };
@@ -361,14 +362,20 @@
   async function dashScreen() {
     const d = await coApi('/service/home');
     const tiles = tilesRow(
-      tile({ label: 'Open tickets', value: String(d.open), tone: d.breached.length ? 'warning' : 'neutral', text: d.breached.length ? `${d.breached.length} past due` : null, ic: 'warn' }),
-      tile({ label: 'Due in 24 hours', value: String(d.dueSoon) }),
-      tile({ label: 'Fixed first visit', value: d.firstTimeFix.pct == null ? '—' : `${d.firstTimeFix.pct}%`, text: d.firstTimeFix.resolvedWithVisits ? `of ${plural(d.firstTimeFix.resolvedWithVisits, 'ticket')}` : null, ic: 'info' }),
-      tile({ label: 'Service cost, 30 days', value: money(d.cost30dMinor), text: d.avgDaysToResolve != null ? `${d.avgDaysToResolve} days to resolve` : null, ic: 'clock' }));
+      tile({ label: 'Open tickets', value: String(d.open), tone: d.breached.length ? 'warning' : 'neutral', text: d.breached.length ? `${d.breached.length} past due` : null, ic: 'warn',
+        onClick: () => E.drillList('service-open', 'Open service tickets', {}, { noun: 'ticket', expect: { count: d.open }, none: 'No tickets open.', note: 'Soonest due first.' }) }),
+      tile({ label: 'Due in 24 hours', value: String(d.dueSoon),
+        onClick: () => E.drillList('service-due24', 'Due in the next 24 hours', {}, { noun: 'ticket', expect: { count: d.dueSoon }, none: 'Nothing falls due in the next day.' }) }),
+      tile({ label: 'Fixed first visit', value: d.firstTimeFix.pct == null ? '—' : `${d.firstTimeFix.pct}%`, text: d.firstTimeFix.resolvedWithVisits ? `of ${plural(d.firstTimeFix.resolvedWithVisits, 'ticket')}` : null, ic: 'info',
+        onClick: () => E.drillList('service-ftf', 'Fixed on the first visit', {}, { noun: 'ticket', expect: { count: d.firstTimeFix.resolvedWithVisits }, none: 'No resolved tickets with repair visits yet.',
+          note: `${d.firstTimeFix.fixedFirstTime} of ${d.firstTimeFix.resolvedWithVisits} were fixed (or found no fault) on the first repair visit.` }) }),
+      tile({ label: 'Service cost, 30 days', value: money(d.cost30dMinor), text: d.avgDaysToResolve != null ? `${d.avgDaysToResolve} days to resolve` : null, ic: 'clock',
+        onClick: () => E.drillList('service-cost30', 'Service cost, last 30 days', {}, { noun: 'cost', expect: { minor: d.cost30dMinor }, none: 'No service costs in the last 30 days.' }) }));
     const order = ['new', 'triage', 'awaiting_parts', 'scheduled', 'in_progress', 'resolved', 'closed', 'cancelled'];
     const byStatus = order.map((s) => [s, (d.byStatus.find((x) => x.status === s) || { n: 0 }).n]).filter(([, n]) => n);
     const statusCards = byStatus.map(([s, n]) => item({ title: words(s), amount: String(n), onClick: () => { st.status = s; go('service', 'open'); } }));
-    const ageCards = ['0–2 days', '3–7 days', '8–14 days', '15+ days'].map((b) => item({ title: b, amount: String((d.age.find((x) => x.bucket === b) || { n: 0 }).n) }));
+    const ageCards = ['0–2 days', '3–7 days', '8–14 days', '15+ days'].map((b) => item({ title: b, amount: String((d.age.find((x) => x.bucket === b) || { n: 0 }).n),
+      onClick: () => E.drillList('service-open', `Open tickets, ${b} old`, { age: b }, { noun: 'ticket', expect: { count: (d.age.find((x) => x.bucket === b) || { n: 0 }).n } }) }));
     const late = d.breached.map((b) => item({ title: `${b.number} · ${b.customer || ''}`, badge: statusChip(b.status), detail: `${cap(b.priority)} priority · due ${when(b.sla_due_at)}`,
       onClick: () => go('service', 'ticket:' + b.id) }));
     const vendors = d.vendors.map((v) => item({ title: v.vendor, amount: v.defect_rate_pct != null ? `${v.defect_rate_pct}%` : '—',

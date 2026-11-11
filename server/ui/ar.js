@@ -88,15 +88,24 @@
     const past = B(t.total) - B(t.current) - B(t.unapplied);
     return frag(
       tilesRow(
-        tile({ label: `${d.label} owed`, value: money(t.total), tone: 'neutral', ic: 'book', text: Number(d.differenceMinor) === 0 ? 'Ties to GL 1100' : `GL 1100 off by ${money(d.differenceMinor)}` }),
-        tile({ label: 'Past due', value: money(past), tone: past > 0 ? 'warning' : 'good', ic: past > 0 ? 'warn' : 'ok', text: `${money(t.d90_plus)} over 90 days`, onClick: () => go('ar', 'calls') }),
-        tile({ label: 'To call today', value: String(d.callList), tone: d.callList ? 'warning' : 'good', ic: 'clock', text: 'Collections list', onClick: () => go('ar', 'calls') }),
+        tile({ label: `${d.label} owed`, value: money(t.total), tone: 'neutral', ic: 'book', text: Number(d.differenceMinor) === 0 ? 'Ties to GL 1100' : `GL 1100 off by ${money(d.differenceMinor)}`,
+          onClick: () => drillAging(`${d.label} owed`, ['total'], t.total) }),
+        tile({ label: 'Past due', value: money(past), tone: past > 0 ? 'warning' : 'good', ic: past > 0 ? 'warn' : 'ok', text: `${money(t.d90_plus)} over 90 days`,
+          onClick: () => drillAging('Past due', ['d1_30', 'd31_60', 'd61_90', 'd90_plus'], String(past)) }),
+        tile({ label: 'To call today', value: String(d.callList), tone: d.callList ? 'warning' : 'good', ic: 'clock', text: 'Collections list',
+          onClick: () => E.drill('To call today', async () => {
+            const x = await coApi('/ar/collections');
+            return frag(E.drillSum({ count: x.list.length, noun: 'account', totalMinor: x.list.reduce((a, r) => a + BigInt(r.pastDueMinor || 0), 0n).toString(), expect: { count: d.callList },
+              note: 'Most urgent first; the total is what they have past due. Log calls from the Collections tab.' }),
+              list(x.list.map((r) => item({ title: r.name, amount: money(r.pastDueMinor), detail: [r.phone, r.reason, `balance ${money(r.balanceMinor)}`].filter(Boolean).join(' · '),
+                onClick: () => go('ar', `account~${r.customerId}`) })), 'Nobody to call today.'));
+          }) }),
         tile({ label: 'Deposits held', value: money(d.deposits.totalMinor), tone: Number(d.deposits.differenceMinor) === 0 ? 'neutral' : 'serious', ic: 'cash',
-          text: Number(d.deposits.differenceMinor) === 0 ? 'Ties to GL 2300' : `GL 2300 off by ${money(d.deposits.differenceMinor)}`, onClick: () => go('ar', 'deposits') })),
+          text: Number(d.deposits.differenceMinor) === 0 ? 'Ties to GL 2300' : `GL 2300 off by ${money(d.deposits.differenceMinor)}`, onClick: () => drillDeposits(d.deposits.totalMinor) })),
       section('Aging', `as of ${fmtDay(todayIso())}`, [tieChip(d.differenceMinor)],
-        list([...BUCKETS.map(([k, label]) => item({ title: label, amount: money(t[k]) })),
-          B(t.unapplied) ? item({ title: 'Unapplied cash on accounts', amount: money(t.unapplied) }) : null,
-          item({ title: 'Total', amount: money(t.total), detail: `GL 1100 says ${money(d.glMinor)}` })].filter(Boolean), 'Nothing owed.')),
+        list([...BUCKETS.map(([k, label]) => item({ title: label, amount: money(t[k]), onClick: () => drillAging(label, [k], t[k]) })),
+          B(t.unapplied) ? item({ title: 'Unapplied cash on accounts', amount: money(t.unapplied), onClick: () => drillAging('Unapplied cash on accounts', ['unapplied'], t.unapplied) }) : null,
+          item({ title: 'Total', amount: money(t.total), detail: `GL 1100 says ${money(d.glMinor)}`, onClick: () => drillAging(`${d.label} owed`, ['total'], t.total) })].filter(Boolean), 'Nothing owed.')),
       section(`By ${E.S.co.locationLabel ? E.S.co.locationLabel.toLowerCase() : 'store'}`, null, null,
         list(d.byLocation.map((r) => item({ title: r.name, amount: money(r.total),
           detail: `Current ${money(r.current)} · 1–30 ${money(r.d1_30)} · 31–60 ${money(r.d31_60)} · 61–90 ${money(r.d61_90)} · 90+ ${money(r.d90_plus)}` })), 'Nothing owed.')),
@@ -105,6 +114,34 @@
         d.awaitingFunding.n ? item({ title: `${plural(d.awaitingFunding.n, 'financed sale')} not yet funded`, amount: money(d.awaitingFunding.totalMinor), onClick: () => go('ar', 'finance') }) : null,
         d.activeContracts ? item({ title: `${plural(d.activeContracts, 'installment contract')} open`, onClick: () => go('ar', 'contracts') }) : null,
       ].filter(Boolean), 'Nothing waiting.')));
+  }
+
+  /** The aging, customer by customer, for one bucket or several added together. */
+  function drillAging(title, cols, expectMinor) {
+    return E.drill(title, async () => {
+      const a = await coApi('/ar/aging');
+      const amt = (r) => cols.reduce((s, k) => s + BigInt(r[k] || 0), 0n);
+      const rows = a.customers.filter((r) => amt(r) !== 0n);
+      return frag(E.drillSum({ count: rows.length, noun: 'account', totalMinor: rows.reduce((s, r) => s + amt(r), 0n).toString(), expect: expectMinor != null ? { minor: String(expectMinor) } : null,
+        note: `As of ${fmtDay(a.asOf)}. Largest first.` }),
+        list(rows.sort((x, y) => (amt(y) > amt(x) ? 1 : amt(y) < amt(x) ? -1 : 0)).map((r) => item({ title: r.name, amount: money(amt(r)),
+          detail: `Current ${money(r.current)} · 1–30 ${money(r.d1_30)} · 31–60 ${money(r.d31_60)} · 61–90 ${money(r.d61_90)} · 90+ ${money(r.d90_plus)}${B(r.unapplied) ? ` · unapplied ${money(r.unapplied)}` : ''}`,
+          onClick: r.key && r.key !== 'none' ? () => go('ar', `account~${r.key}`) : null })), 'Nothing here.'));
+    });
+  }
+  /** Deposits held: per order, and money taken with no order. */
+  function drillDeposits(expectMinor) {
+    return E.drill('Deposits held', async () => {
+      const d = await coApi('/ar/deposits');
+      const rows = [...d.orders.map((o) => item({ title: `${o.number} · ${o.customer || 'No customer'}`, amount: money(o.held_minor),
+          detail: `${o.location} · ${cap(o.status)} · paid ${money(o.paid_minor)}, applied ${money(o.applied_minor)}` })),
+        ...d.unassigned.map((r) => item({ title: `${r.number} · ${r.customer || ''}`, amount: money(r.amount_minor), detail: `${fmtDay(r.received_at)} · taken with no order` }))];
+      const total = d.orders.reduce((a, o) => a + BigInt(o.held_minor), 0n) + d.unassigned.reduce((a, r) => a + BigInt(r.amount_minor), 0n);
+      return frag(E.drillSum({ count: rows.length, noun: 'deposit', totalMinor: total.toString(), expect: expectMinor != null ? { minor: String(expectMinor) } : null,
+        note: Number(d.differenceMinor) === 0 ? `Ties to GL 2300 (${money(d.glMinor)}).` : `GL 2300 says ${money(d.glMinor)}; off by ${money(d.differenceMinor)}.` }),
+        list(rows, 'No deposits held.'),
+        el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: () => E.drillList('gl-lines', 'GL 2300 customer deposits', { code: '2300' }, { noun: 'entry', plural: 'entries', expect: { minor: d.glMinor } }) }, 'GL 2300 entries')));
+    });
   }
 
   // ----------------------------------------------------------- customers
@@ -440,7 +477,11 @@
       } catch (e) { cascadeOut.replaceChildren(resultBox('warning', 'warn', 'Check the amount', friendly(e))); } finally { busy(cascadeBtn, false); }
     } }, 'Who to ask');
     return frag(
-      tilesRow(tile({ label: 'Owed by lenders', value: money(d.owedMinor), tone: 'neutral', ic: 'bank', text: Number(d.differenceMinor) === 0 ? 'Ties to GL 1110' : `GL 1110 off by ${money(d.differenceMinor)}` })),
+      tilesRow(tile({ label: 'Owed by lenders', value: money(d.owedMinor), tone: 'neutral', ic: 'bank', text: Number(d.differenceMinor) === 0 ? 'Ties to GL 1110' : `GL 1110 off by ${money(d.differenceMinor)}`,
+        onClick: () => E.drillItems('Owed by lenders', d.awaiting.map((x) => item({ title: `${x.receipt} · ${x.customer || ''}`, amount: money(x.amount_minor),
+          detail: [(d.companies.find((c) => c.id === x.company_id) || {}).name, x.plan, x.order_number, fmtDay(x.on_date)].filter(Boolean).join(' · ') })),
+          { noun: 'financed sale', totalMinor: d.awaiting.reduce((a, x) => a + BigInt(x.amount_minor), 0n).toString(), expect: { minor: String(d.owedMinor) }, none: 'Nothing waiting on funding.',
+            note: 'Financed sales the lenders have not funded yet.' }) })),
       section('Waiting on funding', 'pick the sales one deposit pays for', [settleBtn], list(d.awaiting.map((x) => {
         const box = el('input', { type: 'checkbox', 'aria-label': `Pick ${x.receipt}`, onchange: (e) => {
           if (e.target.checked) {
@@ -489,7 +530,8 @@
     const d = await coApi('/ar/deposits');
     return frag(
       tilesRow(tile({ label: 'Deposits held', value: money(d.totalMinor), tone: Number(d.differenceMinor) === 0 ? 'good' : 'serious', ic: Number(d.differenceMinor) === 0 ? 'ok' : 'warn',
-        text: Number(d.differenceMinor) === 0 ? `Ties to GL 2300 (${money(d.glMinor)})` : `GL 2300 says ${money(d.glMinor)}; off by ${money(d.differenceMinor)}` })),
+        text: Number(d.differenceMinor) === 0 ? `Ties to GL 2300 (${money(d.glMinor)})` : `GL 2300 says ${money(d.glMinor)}; off by ${money(d.differenceMinor)}`,
+        onClick: () => drillDeposits(d.totalMinor) })),
       d.unposted.length ? section('Taken but never posted', 'these explain a difference', null, list(d.unposted.map((r) => item({ title: r.number, amount: money(r.amount_minor), detail: fmtDay(r.received_at) })), '')) : null,
       section('Held on orders', 'paid and not yet delivered', null, list(d.orders.map((o) => item({ title: `${o.number} · ${o.customer || 'No customer'}`, amount: money(o.held_minor),
         detail: `${o.location} · ${cap(o.status)} · paid ${money(o.paid_minor)}, applied ${money(o.applied_minor)}` })), 'No deposits held.')),

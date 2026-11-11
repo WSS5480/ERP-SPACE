@@ -27,6 +27,8 @@
   const localInput = (d) => { const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
   let LOOK = null;
   const lookups = async () => { if (!LOOK || LOOK.co !== S.co.id) LOOK = Object.assign(await coApi('/crm/lookups'), { co: S.co.id }); return LOOK; };
+  E.opener('lead', async (id) => leadDetail(id, await lookups()));
+  E.opener('customer', (id) => go('crm', id));
   const doIt = async (btn, fn, ok, after) => {
     busy(btn, true);
     try { const r = await fn(); if (ok) toast(typeof ok === 'function' ? ok(r) : ok, 'good'); if (after) await after(r); return r; }
@@ -57,6 +59,8 @@
   async function customerPage(id) {
     const [x, look] = await Promise.all([coApi(`/crm/customers/${id}`), lookups()]);
     const cu = x.customer, pf = x.profile || {};
+    const orders = (expect) => E.drillList('customer-orders', 'Every order', { customer: id }, { sub: cu.name, noun: 'order', expect,
+      none: 'No orders yet.', note: 'Every channel, newest first. Quotes and cancelled orders are left out.' });
     const acts = [
       el('button', { class: 'btn', type: 'button', onclick: () => go('crm') }, 'All customers'),
       el('button', { class: 'btn', type: 'button', onclick: () => noteDialog({ customerId: id }) }, 'Add note'),
@@ -75,9 +79,12 @@
       pf.budget_minor ? `Budget about ${money(pf.budget_minor)}` : null, pf.birthday ? `Birthday ${dayLabel(pf.birthday)}` : null,
       pf.preferred_channel ? `Prefers ${pf.preferred_channel === 'sms' ? 'texts' : pf.preferred_channel}` : null].filter(Boolean);
     return el('div', {}, head(cu.name, acts, `Customer ${cu.number}`),
-      tilesRow(tile({ label: 'Lifetime sales', value: money(x.lifetimeValueMinor) }), tile({ label: 'Orders', value: String(x.orderCount) }),
-        tile({ label: 'Last purchase', value: x.lastPurchaseAt ? dayLabel(x.lastPurchaseAt.slice(0, 10)) : 'Never', word: true }),
-        tile({ label: 'Store credit', value: money(x.storeCreditMinor), tone: x.storeCreditMinor !== '0' ? 'good' : 'neutral' })),
+      tilesRow(tile({ label: 'Lifetime sales', value: money(x.lifetimeValueMinor), onClick: () => orders({ minor: x.lifetimeValueMinor }) }),
+        tile({ label: 'Orders', value: String(x.orderCount), onClick: () => orders({ count: x.orderCount }) }),
+        tile({ label: 'Last purchase', value: x.lastPurchaseAt ? dayLabel(x.lastPurchaseAt.slice(0, 10)) : 'Never', word: true, onClick: () => orders(null) }),
+        tile({ label: 'Store credit', value: money(x.storeCreditMinor), tone: x.storeCreditMinor !== '0' ? 'good' : 'neutral',
+          onClick: () => E.drillList('store-credit', 'Store credit', { customer: id }, { sub: cu.name, noun: 'entry', plural: 'entries', expect: { minor: x.storeCreditMinor },
+            none: 'No store credit issued.', note: 'Credit issued, less credit spent at the register or online.' }) })),
       section('Profile', cu.status === 'inactive' ? 'inactive' : null, null, el('div', { class: 'panel' },
         item({ title: [cu.email, cu.phone].filter(Boolean).join(' · ') || 'No contact details', detail: [cu.home ? `Home store ${cu.home}` : null, `Customer since ${dayLabel(cu.created_at.slice(0, 10))}`].filter(Boolean).join(' · '),
           badge: (pf.tags || []).length ? el('span', {}, pf.tags.map((t) => chip('neutral', 'info', t))) : null, why: prefs.join(' · ') || null }),
@@ -299,7 +306,12 @@
     return el('div', {}, head('My day', [el('button', { class: 'btn primary', type: 'button', onclick: () => taskDialog({}) }, 'Add task'),
       el('button', { class: 'btn', type: 'button', onclick: () => taskDialog({ kind: 'appointment', title: 'Design consultation' }) }, 'Book consultation')], whoName),
       whose,
-      tilesRow(tile({ label: 'Overdue', value: String(groups.Overdue.length), tone: groups.Overdue.length ? 'critical' : 'good' }), tile({ label: 'Due today', value: String(groups.Today.length) }), tile({ label: 'Open leads', value: String(x.openLeads), onClick: () => go('leads', 'mine') })),
+      tilesRow(tile({ label: 'Overdue', value: String(groups.Overdue.length), tone: groups.Overdue.length ? 'critical' : 'good',
+          onClick: () => E.drillItems('Overdue', groups.Overdue.map(row), { noun: 'task', expect: { count: x.overdue }, sub: whoName, none: 'Nothing overdue.' }) }),
+        tile({ label: 'Due today', value: String(groups.Today.length),
+          onClick: () => E.drillItems('Due today', groups.Today.map(row), { noun: 'task', sub: whoName, none: 'Nothing else due today.' }) }),
+        tile({ label: 'Open leads', value: String(x.openLeads),
+          onClick: () => E.drillList('crm-leads', 'Open leads', { show: 'open', person: whoId }, { noun: 'lead', sub: whoName, expect: { count: x.openLeads }, none: 'No open leads.' }) })),
       ...Object.entries(groups).map(([g, list]) => section(g, list.length ? String(list.length) : null, null, list.length ? el('div', { class: 'panel' }, list.map(row)) : empty(g === 'Overdue' ? 'Nothing overdue' : 'Nothing here', null, true))));
   }
 
@@ -318,10 +330,17 @@
     const by = Object.fromEntries(x.pipeline.map((p) => [p.stage, p]));
     const stageRows = ['new', 'contacted', 'appointment', 'quoted', 'won', 'lost'].map((s) => el('tr', {}, td(STAGE[s][1]), td(String(by[s] ? by[s].n : 0), 'm'), td(money(by[s] ? by[s].value : 0), 'm')));
     return el('div', {},
-      tilesRow(tile({ label: `Leads, last ${x.days} days`, value: String(x.leads) }),
-        tile({ label: 'Conversion (won ÷ closed)', value: x.conversionBps == null ? '—' : `${(x.conversionBps / 100).toFixed(0)}%`, tone: x.conversionBps >= 3000 ? 'good' : 'neutral' }),
-        tile({ label: 'Average first response', value: x.responseMinutes == null ? '—' : x.responseMinutes < 120 ? `${x.responseMinutes} min` : `${(x.responseMinutes / 60).toFixed(1)} h`, tone: x.responseMinutes != null && x.responseMinutes <= 60 ? 'good' : 'warning' }),
-        tile({ label: 'Overdue follow-ups', value: String(x.overdue.reduce((a, o) => a + o.n, 0)), tone: x.overdue.length ? 'critical' : 'good', onClick: () => go('myday') })),
+      tilesRow(tile({ label: `Leads, last ${x.days} days`, value: String(x.leads),
+          onClick: () => E.drillList('crm-leads', `Leads, last ${x.days} days`, { show: 'window', days: x.days }, { noun: 'lead', expect: { count: x.leads } }) }),
+        tile({ label: 'Conversion (won ÷ closed)', value: x.conversionBps == null ? '—' : `${(x.conversionBps / 100).toFixed(0)}%`, tone: x.conversionBps >= 3000 ? 'good' : 'neutral',
+          onClick: () => E.drillList('crm-leads', 'Leads closed', { show: 'closed', days: x.days }, { noun: 'lead', expect: { count: x.won + x.lost },
+            note: `${x.won} won of ${x.won + x.lost} closed, from leads that came in over the last ${x.days} days.` }) }),
+        tile({ label: 'Average first response', value: x.responseMinutes == null ? '—' : x.responseMinutes < 120 ? `${x.responseMinutes} min` : `${(x.responseMinutes / 60).toFixed(1)} h`, tone: x.responseMinutes != null && x.responseMinutes <= 60 ? 'good' : 'warning' ,
+          onClick: () => E.drillList('crm-leads', 'Leads answered', { show: 'responded', days: x.days }, { noun: 'lead',
+            note: 'Leads from the period that had a first answer; each shows how long it took. The tile is their average.' }) }),
+        tile({ label: 'Overdue follow-ups', value: String(x.overdue.reduce((a, o) => a + o.n, 0)), tone: x.overdue.length ? 'critical' : 'good',
+          onClick: () => E.drillList('crm-overdue', 'Overdue follow-ups', {}, { noun: 'task', expect: { count: x.overdue.reduce((a, o) => a + o.n, 0) }, none: 'Nothing overdue.',
+            note: x.overdue.map((o) => `${o.name} ${o.n}`).join(' · ') || null }) })),
       section('Pipeline by stage', null, null, tbl([['Stage'], ['Leads', 'm'], ['Value', 'm']], stageRows)),
       section('By salesperson', null, null, x.bySales.length ? tbl([['Who'], ['Open', 'm'], ['Won', 'm'], ['Lost', 'm'], ['Reply', 'm']],
         x.bySales.map((r) => el('tr', {}, td(r.who), td(String(r.open), 'm'), td(String(r.won), 'm'), td(String(r.lost), 'm'), td(r.response_min == null ? '—' : r.response_min < 120 ? `${r.response_min} min` : `${(r.response_min / 60).toFixed(1)} h`, 'm')))) : empty('No leads yet', null, true)),

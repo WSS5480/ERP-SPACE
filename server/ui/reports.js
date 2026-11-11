@@ -390,6 +390,11 @@
       try {
         const f = await coApi(`/reports/tax-filing?from=${encodeURIComponent(from.value)}&to=${encodeURIComponent(to.value)}`);
         const tie = f.tie;
+        // Each total is the jurisdictions' figures added up: one row per jurisdiction.
+        const byJur = (title, col, note) => E.drillItems(title, f.rows.map((r) => E.item({ title: `${r.name} · ${r.state}`, amount: money(r[col]),
+          detail: [r.code, r.level, r.filingRef ? `filed under ${r.filingRef}` : null].filter(Boolean).join(' · ') })),
+          { noun: 'jurisdiction', totalMinor: f.rows.reduce((a, r) => a + BigInt(r[col] || 0), 0n).toString(), expect: { minor: f.totals[col] }, sub: `${from.value} to ${to.value}`,
+            note: note || 'Each jurisdiction’s share; a sale counts in every jurisdiction that taxes it, so the state, county and city rows each include it.' });
         out.replaceChildren(frag(
           resultBox(tie.ties ? 'good' : 'critical', tie.ties ? 'ok' : 'warn', tie.ties ? 'Ties to GL 2100' : 'Does not tie to GL 2100', tie.note),
           tie.beforeNote ? resultBox('warning', 'warn', 'Tax from before the upgrade', tie.beforeNote) : null,
@@ -399,8 +404,10 @@
               detail: `charged ${money(x.tax)}, owed ${money(x.owed)}` })))) : null,
           f.uncoveredZips && f.uncoveredZips.length ? section('ZIPs with no local tax set up', plural(f.uncoveredZips.length, 'ZIP'), null, el('div', { class: 'panel' },
             f.uncoveredZips.map((z) => item({ title: `${z.state} ${z.postal}`, amount: money(z.tax), detail: `${plural(z.lines, 'line')} taxed without a local rate; add the local jurisdictions in Setup → Sales tax` })))) : null,
-          E.tilesRow(E.tile({ label: 'Gross sales', value: money(f.totals.grossMinor) }), E.tile({ label: 'Taxable sales', value: money(f.totals.taxableMinor) }),
-            E.tile({ label: 'Tax collected', value: money(f.totals.taxMinor) }), E.tile({ label: 'Net tax due', value: money(f.totals.netTaxMinor), tone: 'good' })),
+          E.tilesRow(E.tile({ label: 'Gross sales', value: money(f.totals.grossMinor), onClick: () => byJur('Gross sales', 'grossMinor') }),
+            E.tile({ label: 'Taxable sales', value: money(f.totals.taxableMinor), onClick: () => byJur('Taxable sales', 'taxableMinor') }),
+            E.tile({ label: 'Tax collected', value: money(f.totals.taxMinor), onClick: () => byJur('Tax collected', 'taxMinor') }),
+            E.tile({ label: 'Net tax due', value: money(f.totals.netTaxMinor), tone: 'good', onClick: () => byJur('Net tax due', 'netTaxMinor', 'Tax collected, less tax given back on returns.') })),
           f.rows.length ? f.rows.map((r) => section(`${r.name} · ${r.state}`, `${r.code}${r.filingRef ? ' · filed under ' + r.filingRef : ''}`, null, el('div', { class: 'panel' },
             row('Gross sales', money(r.grossMinor)), row('Exempt sales', money(r.exemptMinor)),
             Object.entries(r.exemptBy).map(([k, v]) => row(`· ${f.reasons[k] || k}`, money(v))),

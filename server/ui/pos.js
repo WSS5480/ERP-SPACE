@@ -645,21 +645,34 @@
       'Recorded.', async () => { d.close(); E.render(); }) }, 'Record it');
     d.body.append(el('div', { class: 'form-grid' }, field('Kind', kind), field('Amount', amt), field('Note', note, { wide: true })), el('div', { class: 'dlg-acts' }, b), out);
   }
-  function zView(z) {
+  function zView(z, id) {
     const c = z.cash;
+    const L = (key, title, params, expect, extra = {}) => () => E.drillList(key, title, { session: id, ...params }, { expect, sub: `${z.session.number} · ${z.session.register}`, ...extra });
+    const sales = L('pos-sales', 'Sales on this drawer', {}, { minor: z.sales.total }, { noun: 'sale', note: 'Sales and layaways rung here, drafts and cancelled left out. Tax and discounts are in each line.' });
+    const cashTaken = L('pos-receipts', 'Cash taken', { method: 'cash' }, { minor: String(c.cashNetMinor) }, { noun: 'receipt', note: 'Cash in, less cash refunds.' });
+    const moves = (kind, title, minor) => L('pos-cash', title, { kind }, { minor: String(minor) }, { noun: 'movement' });
     return frag(
       el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Session', `${z.session.number} · ${z.session.register}`), fact('Status', z.session.status),
-        fact('Sales', `${z.sales.n} · ${money(z.sales.total)}`), fact('Tax', money(z.sales.tax)), fact('Discounts', money(z.sales.disc)), fact('Returns', `${z.returns.n} · ${money(z.returns.total)}`))),
+        fact('Sales', `${z.sales.n} · ${money(z.sales.total)}`, id ? sales : null), fact('Tax', money(z.sales.tax), id ? sales : null), fact('Discounts', money(z.sales.disc), id ? sales : null),
+        fact('Returns', `${z.returns.n} · ${money(z.returns.total)}`, id ? L('pos-returns', 'Returns on this drawer', {}, { minor: z.returns.total }, { noun: 'return' }) : null))),
       section('By tender', null, null, el('div', { class: 'panel' }, z.tenders.length ? z.tenders.map((t) => item({ title: TENDER[t.method] || t.method, amount: money(Number(t.taken) - Number(t.refunded)),
-        detail: `${plural(t.n, 'receipt')} · ${money(t.taken)} in${Number(t.refunded) ? ` · ${money(t.refunded)} refunded` : ''}` })) : empty('Nothing taken yet.', null, true))),
-      section('Cash drawer', null, null, el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Float', money(c.floatMinor)), fact('Cash taken, net', money(c.cashNetMinor)),
-        fact('Drops', money(c.dropsMinor)), fact('Paid in / out', `${money(c.paidInMinor)} / ${money(c.paidOutMinor)}`), fact('Should hold', money(c.expectedMinor)),
+        detail: `${plural(t.n, 'receipt')} · ${money(t.taken)} in${Number(t.refunded) ? ` · ${money(t.refunded)} refunded` : ''}`,
+        onClick: id ? L('pos-receipts', `${TENDER[t.method] || t.method} taken`, { method: t.method }, { minor: String(Number(t.taken) - Number(t.refunded)) }, { noun: 'receipt' }) : null })) : empty('Nothing taken yet.', null, true))),
+      section('Cash drawer', null, null, el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Float', money(c.floatMinor)), fact('Cash taken, net', money(c.cashNetMinor), id ? cashTaken : null),
+        fact('Drops', money(c.dropsMinor), id ? moves('drop', 'Drops to the safe', c.dropsMinor) : null),
+        fact('Paid in / out', `${money(c.paidInMinor)} / ${money(c.paidOutMinor)}`, id ? L('pos-cash', 'Paid in and out', {}, null, { noun: 'movement', note: 'Every cash movement on this drawer: drops, paid in and paid out.' }) : null),
+        fact('Should hold', money(c.expectedMinor), id ? () => E.drillNode('What the drawer should hold', async () => frag(
+          E.drillSum({ count: 5, noun: 'part', totalMinor: String(c.expectedMinor), note: 'Float, plus cash taken, plus paid in, less drops and paid out.' }),
+          el('div', { class: 'panel' }, item({ title: 'Float', amount: money(c.floatMinor) }), item({ title: 'Cash taken, net', amount: money(c.cashNetMinor), onClick: cashTaken }),
+            item({ title: 'Paid in', amount: money(c.paidInMinor), onClick: moves('paid_in', 'Paid in', c.paidInMinor) }),
+            item({ title: 'Drops', amount: money(-Number(c.dropsMinor)), onClick: moves('drop', 'Drops to the safe', c.dropsMinor) }),
+            item({ title: 'Paid out', amount: money(-Number(c.paidOutMinor)), onClick: moves('paid_out', 'Paid out', c.paidOutMinor) }))), { sub: z.session.number }) : null),
         c.countedMinor != null ? fact('Counted', money(c.countedMinor)) : null, c.overShortMinor != null ? fact('Over / short', money(c.overShortMinor)) : null))),
       z.salespeople.length ? section('By salesperson', null, null, el('div', { class: 'panel' }, z.salespeople.map((p) => item({ title: p.name, amount: money(p.credit), detail: plural(p.n, 'sale') })))) : null);
   }
   function zDialog(id) {
     const d = openDialog('Z report', null, { wide: true });
-    fillDialog(d, async () => frag(zView(await coApi(`/pos/sessions/${id}/z`)), el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: () => window.print() }, 'Print'))));
+    fillDialog(d, async () => frag(zView(await coApi(`/pos/sessions/${id}/z`), id), el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: () => window.print() }, 'Print'))));
   }
   function closeDialog(r, setup) {
     const d = openDialog(`Close ${r.name}`, 'Count the drawer by denomination', { wide: true });

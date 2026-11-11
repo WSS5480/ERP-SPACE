@@ -105,6 +105,7 @@ Data is placed with textContent only, never innerHTML.
 | admin (service switches and presets, single-store rule, connections, outbound message log) | 0049 | none | Setup (Services, Connections) |
 | platform (customers, sign-in, support mode, tenant API tokens, the demo) | 0051 | 0032 (marks the demo) | Platform (Operator console), Account |
 | onboarding (setup checklist, opening stock import, bank opening balance, tax rates checked) | 0052 | none | Setup (Setup checklist), a Home card |
+| drill (the rows behind every tile; read-only lists) | none | none | no screen of its own |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -411,6 +412,28 @@ timeout and row caps (200 a page, 10,000 an export, 2,000 a snapshot). Roles
 are checked when a report is saved and again on every run, including a
 scheduled one, which runs as whoever set the schedule. A module that adds
 data worth reporting on adds a dataset to the catalog, not a screen.
+
+## Drill-downs: every figure opens what is behind it (Nov 11 2026)
+
+Standing rule: every summary number, tile, count and total opens the detail it
+was added up from, with Back returning to where you were (filters, typed text
+and scroll intact) and the phone's Back doing the same. `server/app.js` has the
+one helper: `E.drill(title, load)` keeps the screen's own nodes and pushes a
+history entry; `E.drillItems` (rows the screen already has), `E.drillList(key,
+title, params, { expect })` (a server list, paged) and `E.drillSum` (the count
+and total, with a warning when they no longer match the tile). From inside a
+dialog the detail opens over it. A drill row that goes on to another screen is
+parked, so Back returns to the list. `E.opener(kind, fn)` says what a row opens
+(bill, entry, order, product, ticket, lead, customer, edi). A labelled figure
+is `fact(k, v, onClick)`.
+
+Where no list existed, `packages/core/drill.ts` adds one: `GET
+/api/c/<co>/drill/<key>?page=&...` (`server/modules/drill.ts`), read-only, one
+fixed query per list scoped by `$1`, 50 rows a page with the count and total of
+every row, refusals in sentences, the same role rules as the screen it drills
+from. Each list mirrors the query behind its tile; `scripts/modules/drilldown.ts`
+checks every list adds up to its tile and that another tenant's company is
+refused. A new tile gets a drill; a new list gets a check.
 
 ## Running it
 

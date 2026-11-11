@@ -11,6 +11,7 @@
   if (!E) return;
   const { el, frag, icon, chip, money, plural, cap, coApi, post, go, toast, act, openDialog, resultBox, fillDialog, askReason,
     head, section, tile, tilesRow, empty, item, capped, seg, fact, friendly, render, shortDay, NARROW } = E;
+  E.opener('edi', (id) => openDoc(id));
   /** Tabs: a segmented row on a wide screen, a picker on a phone, so no label is cut off. */
   const tabsOf = (tabs, value, onPick) => {
     if (!NARROW || !NARROW.matches) return seg(tabs, value, onPick);
@@ -74,11 +75,21 @@
     const free = d.vendors.filter((v) => !v.has_partner);
     return frag(
       tilesRow(
-        tile({ label: 'Trading partners', value: String(h.partners), suffix: `${h.on} on`, tone: 'neutral', ic: 'building', text: 'Vendors set up for EDI' }),
+        tile({ label: 'Trading partners', value: String(h.partners), suffix: `${h.on} on`, tone: 'neutral', ic: 'building', text: 'Vendors set up for EDI',
+          onClick: () => E.drillItems('Trading partners', d.partners.map((p) => item({ title: p.vendor, onClick: () => openPartner(d, p, free),
+            badge: p.edi_enabled ? chip(p.usage === 'P' ? 'good' : 'warning', p.usage === 'P' ? 'ok' : 'info', p.usage === 'P' ? 'EDI on · production' : 'EDI on · test') : chip('neutral', 'none', 'EDI off') })),
+            { noun: 'partner', expect: { count: Number(h.partners) }, note: `${h.on} with EDI on.` }) }),
         tile({ label: 'Quarantined', value: String(h.quarantined), tone: Number(h.quarantined) ? 'serious' : 'good', ic: Number(h.quarantined) ? 'warn' : 'ok',
-          text: Number(h.quarantined) ? 'Held with a reason; nothing from them applied' : 'Nothing held', onClick: () => go('edi', 'inbox') }),
+          text: Number(h.quarantined) ? 'Held with a reason; nothing from them applied' : 'Nothing held',
+          onClick: () => E.drillList('edi-docs', 'Quarantined documents', { status: 'quarantined' }, { noun: 'document', expect: { count: Number(h.quarantined) }, none: 'Nothing held.' }) }),
         tile({ label: 'Waiting to go out', value: String(h.queued), suffix: Number(h.failed) ? `${h.failed} failed` : null, tone: Number(h.failed) ? 'critical' : Number(h.queued) ? 'warning' : 'good',
-          ic: 'clock', text: 'Queued or failed documents', onClick: () => go('edi', 'outbox') })),
+          ic: 'clock', text: 'Queued or failed documents',
+          onClick: () => E.drillNode('Waiting to go out', async () => {
+            const [qd, fd] = await Promise.all([coApi('/drill/edi-docs?status=queued'), coApi('/drill/edi-docs?status=failed')]);
+            return frag(section('Queued', null, null, E.drillSum({ count: qd.count, noun: 'document', expect: { count: Number(h.queued) } }), el('div', { class: 'panel' }, qd.rows.length ? qd.rows.map(E.drillRow) : empty('Nothing queued.', null, true))),
+              section('Failed or rejected', null, null, E.drillSum({ count: fd.count, noun: 'document', expect: { count: Number(h.failed) } }), el('div', { class: 'panel' }, fd.rows.length ? fd.rows.map(E.drillRow) : empty('Nothing failed.', null, true))),
+              qd.pages > 1 || fd.pages > 1 ? el('p', { class: 'foot', text: 'The first 50 of each; the Outbox tab lists them all.' }) : null);
+          }) })),
       section('Trading partners', `${d.partners.length}`, [el('button', { class: 'btn small', type: 'button', onclick: () => openPartner(d, null, free) }, icon('plus'), 'Set up a vendor')],
         el('div', { class: 'panel' }, d.partners.length ? d.partners.map((p) => item({
           title: p.vendor,
