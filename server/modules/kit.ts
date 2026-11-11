@@ -62,6 +62,15 @@ export type ErpModule = {
   register: (kit: ModuleKit) => void;
 };
 
+/**
+ * A read made while a tenant owner previews someone else's view, or by a demo
+ * prospect: the handler must not write anything (not even a log row).
+ * index.ts marks the read's client; a handler asks with lookOnly(c).
+ */
+const LOOK_ONLY = new WeakSet<object>();
+export const markLookOnly = (c: object, on: boolean) => { if (on) LOOK_ONLY.add(c); else LOOK_ONLY.delete(c); };
+export const lookOnly = (c: object) => LOOK_ONLY.has(c);
+
 /** A refusal written for a person. The server returns it as a 409 with the message as-is. */
 export class ModuleError extends Error {}
 

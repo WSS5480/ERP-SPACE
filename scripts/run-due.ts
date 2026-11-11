@@ -7,6 +7,9 @@
 // stop the others; each failure is recorded against its own connection, where
 // the health view will show it.
 //
+// A suspended customer's jobs do not run (their data is kept; nothing of theirs
+// moves until they are reactivated). Queued messages of theirs wait.
+//
 // Paid plans only on Render. On the free trial, POST /api/connections/{id}/run
 // does the same thing for one connection on demand.
 
@@ -68,6 +71,7 @@ export async function runDueVendorFeeds(now: Date, env: FeedEnv = liveEnv(), onl
     `select f.id, f.name, f.entity_id, e.tenant_id, f.schedule_cron, f.every_hours, f.last_run_at
        from vendor_feed f join entity e on e.id = f.entity_id
       where f.active and f.kind = 'api' and f.purpose <> 'orders' and (f.schedule_cron is not null or f.every_hours is not null)
+        and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active')
         and ($1::uuid is null or f.entity_id = $1)
       order by f.entity_id, f.vendor_id, array_position(array['products','pricing','images','quantities','freight','acknowledgments'], f.purpose)
       /* unscoped: the scheduler walks every company's feeds */`, [only?.entityId ?? null]);
@@ -92,7 +96,7 @@ export async function runDueVendorFeeds(now: Date, env: FeedEnv = liveEnv(), onl
 export async function runDueCrm(now: Date) {
   const cos = await pool.query<{ id: string; tenant_id: string }>(
     `select e.id, e.tenant_id from entity e
-      where e.status = 'active'
+      where e.status = 'active' and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active')
         and not exists (select 1 from entity_module m where m.entity_id = e.id and m.module = 'crm' and not m.enabled)
         and (exists (select 1 from entity_module m where m.entity_id = e.id and m.module = 'crm' and m.enabled)
              or not exists (select 1 from entity_module m where m.entity_id = e.id))
@@ -132,7 +136,7 @@ export async function runDueEdi(_now: Date, env: EdiEnv = liveEdiEnv(), only?: {
   const rows = await pool.query<{ id: string; entity_id: string; tenant_id: string; vendor: string }>(
     `select p.id, p.entity_id, e.tenant_id, coalesce(v.dba, v.legal_name) vendor
        from edi_partner p join entity e on e.id = p.entity_id join vendor v on v.id = p.vendor_id
-      where p.edi_enabled and p.transport <> 'manual' and e.status = 'active' and ($1::uuid is null or p.entity_id = $1)
+      where p.edi_enabled and p.transport <> 'manual' and e.status = 'active' and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active') and ($1::uuid is null or p.entity_id = $1)
         and not exists (select 1 from entity_module m where m.entity_id = p.entity_id and m.module = 'edi' and not m.enabled)
       order by p.entity_id, 4 /* unscoped: the scheduler walks every company's trading partners */`, [only?.entityId ?? null]);
   const out: { vendor: string; ok: boolean; note: string }[] = [];
@@ -158,7 +162,7 @@ export async function runDueHolds(now: Date, only?: { entityId: string }) {
   const on = now.toISOString().slice(0, 10);
   const rows = await pool.query<{ entity_id: string; tenant_id: string }>(
     `select distinct h.entity_id, e.tenant_id from pos_quote_hold h join entity e on e.id = h.entity_id
-      where h.status = 'active' and h.held_until < $1::date and ($2::uuid is null or h.entity_id = $2)
+      where h.status = 'active' and h.held_until < $1::date and exists (select 1 from tenant t where t.id = e.tenant_id and t.status = 'active') and ($2::uuid is null or h.entity_id = $2)
       /* unscoped: the scheduler walks every company's holds */`, [on, only?.entityId ?? null]);
   const out: { entityId: string; holds: number; released: number; note?: string }[] = [];
   for (const r of rows.rows) {
@@ -182,7 +186,8 @@ async function main() {
     `select c.id, c.name, c.schedule_cron, c.last_attempt_at
        from connection c
        join source_channel sc on sc.source_code = c.source_code and sc.channel = c.channel
-      where c.status = 'active' and sc.mode = 'pull' and c.schedule_cron is not null`
+      where c.status = 'active' and sc.mode = 'pull' and c.schedule_cron is not null
+        and exists (select 1 from tenant t where t.id = c.tenant_id and t.status = 'active')`
   );
 
   let ran = 0;

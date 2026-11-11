@@ -486,7 +486,7 @@
   function certificateDialog(c, after) {
     const d = openDialog('Add a tax-exemption certificate', c.name);
     const number = input({ maxlength: '60', placeholder: 'As printed on the certificate' });
-    const state = input({ maxlength: '2', autocapitalize: 'characters', placeholder: 'PA' });
+    const state = input({ maxlength: '2', autocapitalize: 'characters', placeholder: 'ST' });
     const reason = select([['resale', 'Resale'], ['government', 'Government'], ['nonprofit', 'Nonprofit'], ['agricultural', 'Agricultural'], ['manufacturing', 'Manufacturing'], ['other', 'Other']], 'resale');
     const expires = input({ type: 'date', min: todayIso() });
     const out = outBox();

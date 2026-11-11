@@ -168,7 +168,7 @@ export function mayManage(roles: Set<string>, kind: Kind) {
 
 // ========================================================= rows and secrets
 
-type Row = { id: string; tenant_id: string; entity_id: string | null; kind: string; provider: string; settings: Record<string, unknown>;
+export type Row = { id: string; tenant_id: string; entity_id: string | null; kind: string; provider: string; settings: Record<string, unknown>;
   status: string; last_error: string | null; last_tested_at: string | null; last_ok_at: string | null; updated_by_name: string | null; updated_at: string };
 const COLS = `id, tenant_id, entity_id, kind, provider, settings, status, last_error, last_tested_at, last_ok_at, updated_by_name, updated_at`;
 
@@ -730,8 +730,8 @@ let inflight = 0;
 const idlers: (() => void)[] = [];
 
 /** Queue an email to go after this transaction commits. With none connected it is logged, not sent, at once. */
-export async function queueEmail(c: Client, entityId: string, m: Email, o: Outbound): Promise<SendResult> {
-  const row = await connectionFor(c, entityId, "email");
+export async function queueEmail(c: Client, entityId: string, m: Email, o: Outbound, via?: Row | null): Promise<SendResult> {
+  const row = via !== undefined ? via : await connectionFor(c, entityId, "email");
   if (!row) return logRow(c, entityId, "email", m.to.join(", "), m.subject, m.text, o, null, "logged", null, "no email is connected, so this was logged and not sent");
   const r = await logRow(c, entityId, "email", m.to.join(", "), m.subject, m.text, o, row, "queued", null, null);
   if (o.redact?.length) PENDING.set(r.id, m.text);
@@ -770,6 +770,9 @@ export async function drainQueued(opts: { ids?: string[]; entityId?: string; lim
                      where (status = 'queued' or (status = 'sending' and claimed_at < now() - interval '10 minutes'))
                        and ($1::uuid[] is null or id = any($1)) and ($2::uuid is null or entity_id = $2)
                        and ($4::int is null or created_at < now() - make_interval(secs => $4))
+                       -- a suspended customer's messages wait until they are reactivated
+                       and not exists (select 1 from entity e join tenant t on t.id = e.tenant_id
+                                        where e.id = outbound_message.entity_id and t.status = 'suspended')
                      order by created_at limit $3 for update skip locked)
       returning id, entity_id, channel, to_addr, subject, body, redacted, connection_id, source_table, source_id /* unscoped: the outbox, by id or all due */`,
       [opts.ids ?? null, opts.entityId ?? null, opts.limit ?? 200, opts.olderThanSec ?? null]));

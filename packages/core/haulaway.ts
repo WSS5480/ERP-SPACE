@@ -222,10 +222,15 @@ export async function addHaulAway(c: Client, scope: Scope, stopId: string, b: { 
     await setTradeCredit(c, scope.entityId, st.sales_order_id, tradeLine, trade);
   }
   if (st.sales_order_id) await retotal(c, st.sales_order_id);
+  // the state the item was collected in: the delivery address, else the selling store's state
+  const haulState = String(st.state ?? (st.sales_order_id ? (await q<{ state: string | null }>(c, `select coalesce(l.state, l.address->>'state') state
+      from sales_order so join location l on l.id = so.location_id where so.entity_id = $1 and so.id = $2`, [scope.entityId, st.sales_order_id]))[0]?.state : null) ?? "")
+    .trim().toUpperCase().slice(0, 2);
+  need(/^[A-Z]{2}$/.test(haulState), "the stop's address has no state, so the state recycling program cannot be known; add the state to the customer's address first");
   const r = await one<{ id: string }>(c, `
     insert into stop_haul_away (entity_id, stop_id, category, description, qty, fee_minor, fee_line_id, trade_in_minor, trade_in_line_id, state, weight_lb, created_by)
     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) returning id`,
-    [scope.entityId, stopId, b.category, desc, qty, fee.toString(), feeLine, trade.toString(), tradeLine, (st.state ?? "PA").toUpperCase().slice(0, 2),
+    [scope.entityId, stopId, b.category, desc, qty, fee.toString(), feeLine, trade.toString(), tradeLine, haulState,
      Math.round(rate[0].est * qty * 10) / 10, scope.actor.id || null]);
   await audit(c, scope, { table: "stop_haul_away", rowId: r.id, action: "insert", after: { stop: st.number, category: b.category, qty, fee: fee.toString(), trade: trade.toString() } });
   return { id: r.id, feeMinor: fee * BigInt(Math.round(qty)), tradeInMinor: trade, feeLineId: feeLine, tradeInLineId: tradeLine };
@@ -346,7 +351,7 @@ export async function recordDisposal(c: Client, scope: Scope, b: { dcLocationId:
   need(rows.every((r) => !r.disposal_id), "some of those are already on a disposal");
   const weight = b.weightLb != null && String(b.weightLb) !== "" ? Number(b.weightLb) : rows.reduce((a, r) => a + n(r.weight_lb), 0);
   need(Number.isFinite(weight) && weight >= 0, "give the weight in pounds");
-  const state = String(b.state ?? "").trim().toUpperCase() || rows[0].state || (dc[0]?.state ?? "PA");
+  const state = String(b.state ?? "").trim().toUpperCase() || rows[0].state || (dc[0]?.state ?? "");
   need(/^[A-Z]{2}$/.test(state), "give the two-letter state it was disposed in");
   const number = (await one<{ n: string }>(c, `select next_doc_no($1, 'disposal', 'HD-') n /* unscoped: numbering takes the entity */`, [scope.entityId])).n;
   const d = await one<{ id: string }>(c, `

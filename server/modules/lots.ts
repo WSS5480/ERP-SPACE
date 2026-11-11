@@ -6,7 +6,7 @@
 // packages/core/labels.ts and packages/core/ar_settlement.ts; this file
 // checks who may do what and reads the request.
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
-import { need, requireRole, str, uuid, minor, ModuleError, PublicPage } from "./kit.ts";
+import { need, requireRole, str, uuid, minor, ModuleError, PublicPage, lookOnly } from "./kit.ts";
 import { q } from "../../packages/core/db.ts";
 import { scopeOf, rolesOf } from "../actions.ts";
 import * as inv from "../../packages/core/inventory.ts";
@@ -160,7 +160,8 @@ export const module: ErpModule = {
       const set = await setFor(c, co, s);
       const t = await L.templateFor(c, co.id, set.kind, s.templateId);
       const html = L.printPage(t, set, `${set.kind === "price_tag" ? "Price tags" : "Labels"} · ${co.name}`);
-      await L.logMade(c, sc(co, a), "browser", set.source, set.labels.length, html.length);
+      // a preview (an owner seeing someone's view) or a demo prospect looks only: nothing is logged
+      if (!lookOnly(c)) await L.logMade(c, sc(co, a), "browser", set.source, set.labels.length, html.length);
       return new PublicPage(html);
     }));
     coPost("/labels/zpl", safe(async (c, co, a, b) => {

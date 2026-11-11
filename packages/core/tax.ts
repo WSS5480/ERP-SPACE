@@ -469,7 +469,8 @@ export async function taxSetup(c: Client, entityId: string) {
         and r.effective_from <= current_date and (r.effective_to is null or r.effective_to >= current_date)) rate_bps
     from tax_jurisdiction j where j.entity_id = $1
     order by j.state, array_position(array['state','county','city','special','combined'], j.level), j.code`, [entityId]);
-  const rates = await q(c, `select id, jurisdiction_id, rate_bps, effective_from::text, effective_to::text, note from tax_rate where entity_id = $1 order by effective_from desc`, [entityId]);
+  const rates = await q(c, `select id, jurisdiction_id, rate_bps, effective_from::text, effective_to::text, note, checked_by, checked_at
+    from tax_rate where entity_id = $1 order by effective_from desc`, [entityId]);
   const areas = await q(c, `select a.id, a.jurisdiction_id, a.location_id, l.name location, a.state, a.postal from tax_area a left join location l on l.id = a.location_id
      where a.entity_id = $1 and a.active order by a.state nulls first, a.postal nulls first`, [entityId]);
   const locs = await q<{ id: string; name: string; kind: string; tax_rate_bps: number }>(c,
@@ -479,7 +480,8 @@ export async function taxSetup(c: Client, entityId: string) {
     const s = await stackForLocation(c, entityId, l.id, today(), false);
     stores.push({ id: l.id, name: l.name, rateBps: goodsRate(s), stack: s.map((j) => ({ code: j.code, name: j.name, level: j.level, rateBps: j.rateBps })) });
   }
-  return { sourcing: await sourcing(c, entityId), jurisdictions: jur.map((j) => ({ ...j, rates: rates.filter((r) => r.jurisdiction_id === j.id),
+  const chosen = await q(c, `select 1 from tax_setting where entity_id = $1`, [entityId]);
+  return { sourcing: await sourcing(c, entityId), sourcingChosen: chosen.length > 0, unchecked: await uncheckedRates(c, entityId), jurisdictions: jur.map((j) => ({ ...j, rates: rates.filter((r) => r.jurisdiction_id === j.id),
     areas: areas.filter((a) => a.jurisdiction_id === j.id) })), stores, levels: LEVELS };
 }
 
@@ -488,7 +490,7 @@ export async function saveJurisdiction(c: Client, scope: Scope, e: { id?: string
   rateBps?: number; effectiveFrom?: string }) {
   const before = await storeRates(c, scope.entityId);
   const code = String(e.code ?? "").trim().toUpperCase();
-  need(/^[A-Z0-9][A-Z0-9_-]{1,39}$/.test(code), "a jurisdiction code is 2 to 40 letters, digits or dashes, like TX-PALESTINE");
+  need(/^[A-Z0-9][A-Z0-9_-]{1,39}$/.test(code), "a jurisdiction code is 2 to 40 letters, digits or dashes, like ST-CITY");
   need(String(e.name ?? "").trim().length >= 2, "name the jurisdiction as it appears on the return");
   need((LEVELS as readonly string[]).includes(e.level) && e.level !== "combined", "a jurisdiction is a state, a county, a city or a special district");
   const st = String(e.state ?? "").trim().toUpperCase();
@@ -617,6 +619,38 @@ export async function derivedRate(c: Client, entityId: string, locationId: strin
   const s = await stackForLocation(c, entityId, locationId, today(), false);
   if (s.length === 1 && s[0].level === "combined") return null;
   return goodsRate(s);
+}
+
+// ============================================================ rate checks
+
+/**
+ * Rates in force today or later that nobody has confirmed. Every rate starts
+ * unchecked -- a seed, a migration's stand-in, or one typed in -- so the
+ * rates a company sells with have been looked at by a person once.
+ */
+export async function uncheckedRates(c: Client, entityId: string) {
+  return q<{ id: string; jurisdiction_id: string; code: string; name: string; state: string; rate_bps: number; effective_from: string }>(c, `
+    select r.id, r.jurisdiction_id, j.code, j.name, j.state, r.rate_bps, r.effective_from::text
+      from tax_rate r join tax_jurisdiction j on j.id = r.jurisdiction_id and j.entity_id = r.entity_id
+     where r.entity_id = $1 and j.active and r.checked_at is null and (r.effective_to is null or r.effective_to >= current_date)
+     order by j.state, j.code, r.effective_from`, [entityId]);
+}
+
+/**
+ * A person says the rates were checked against what the states publish.
+ * Stores still on a single rate get their stand-in made first, so that rate
+ * is checked too. Stamps every unchecked rate in force or later.
+ */
+export async function confirmRates(c: Client, scope: Scope) {
+  need(scope.actor.kind === "user", "only a person can say the rates were checked");
+  const locs = await q<{ id: string; state: string | null; tax_rate_bps: number }>(c, `select id, coalesce(state, address->>'state') state, tax_rate_bps from location
+     where entity_id = $1 and status = 'active' and kind in ('store','outlet')`, [scope.entityId]);
+  for (const l of locs) if (l.state && l.tax_rate_bps > 0) await stackForLocation(c, scope.entityId, l.id, today(), true);
+  const r = await c.query(`update tax_rate set checked_by = $2, checked_at = now()
+     where entity_id = $1 and checked_at is null and (effective_to is null or effective_to >= current_date)
+       and jurisdiction_id in (select id from tax_jurisdiction where entity_id = $1 and active)`, [scope.entityId, scope.actor.label]);
+  await audit(c, scope, { table: "tax_rate", rowId: scope.entityId, action: "update", after: { checked: r.rowCount ?? 0 }, reason: "rates checked by a person" });
+  return { checked: r.rowCount ?? 0 };
 }
 
 // ================================================================ filing

@@ -126,7 +126,7 @@
   }
 
   function certDialog(id) {
-    const n = input({ placeholder: 'As printed' }), s = input({ maxlength: '2', placeholder: 'PA' }), e = input({ type: 'date' });
+    const n = input({ placeholder: 'As printed' }), s = input({ maxlength: '2', placeholder: 'ST' }), e = input({ type: 'date' });
     formDialog('Resale certificate', 'Kept on the customer, used for tax-exempt resale orders', [field('Number', n), field('State', s), field('Expires', e)], 'Save',
       () => post(`/trade/accounts/${id}/certificate`, { number: n.value, state: s.value.toUpperCase(), expiresOn: e.value || null }), 'Certificate on file');
   }

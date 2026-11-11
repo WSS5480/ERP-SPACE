@@ -31,13 +31,10 @@ const esc = (s: string) => s.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "
 
 // ------------------------------------------------------------ rate limits --
 // In memory, per process: enough to stop a script hammering checkout or
-// guessing order numbers. Behind Render's proxy the client address is the
-// last x-forwarded-for hop (the one the proxy itself added).
+// guessing order numbers. The client address: server/client_ip.ts.
 const hits = new Map<string, number[]>();
-export function clientIp(req: http.IncomingMessage): string {
-  const xf = String(req.headers["x-forwarded-for"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  return xf.length ? xf[xf.length - 1] : (req.socket?.remoteAddress ?? "?");
-}
+export { clientIp } from "../client_ip.ts";
+import { clientIp } from "../client_ip.ts";
 export const LIMITS = { checkout: { max: 8, ms: 10 * 60_000 }, lookup: { max: 10, ms: 10 * 60_000 }, cart: { max: 240, ms: 10 * 60_000 } };
 function limited(req: http.IncomingMessage, bucket: keyof typeof LIMITS): boolean {
   const { max, ms } = LIMITS[bucket];

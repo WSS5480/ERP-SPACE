@@ -91,7 +91,7 @@ export async function geocodeAddress(c: Client, entityId: string, addressId: str
 /** A dispatcher placed it on the map by hand. */
 export async function setManualGeo(c: Client, entityId: string, addressId: string, lat: number, lng: number): Promise<void> {
   if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180 || (lat === 0 && lng === 0)) {
-    throw new GeocodeError("give a real latitude and longitude, like 40.2601, -76.9336");
+    throw new GeocodeError("give a real latitude and longitude: two numbers in decimal degrees, latitude first");
   }
   const r = await q(c, `update customer_address set geo = point($3, $4), geo_source = 'manual', geo_at = now(), geo_error = null
                          where entity_id = $1 and id = $2 returning id`, [entityId, addressId, lng, lat]);

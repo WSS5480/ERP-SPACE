@@ -6,7 +6,9 @@
 do $$
 declare t record; acct record; cur text;
 begin
-  for t in select id from tenant where exists (select 1 from gl_account g where g.tenant_id = tenant.id and g.code = '1110') loop
+  -- demo tenants only: this file also runs when an operator resets the demo
+  for t in select id from tenant where exists (select 1 from gl_account g where g.tenant_id = tenant.id and g.code = '1110')
+             and id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d') loop
     for acct in select * from (values ('1115', 'Finance company holdbacks receivable', 'asset', 'D'),
                                       ('6915', 'Finance company chargebacks', 'expense', 'D'),
                                       ('2195', 'Unapplied finance deposits', 'liability', 'C')) v(code, name, typ, nb) loop

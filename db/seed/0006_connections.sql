@@ -23,7 +23,7 @@ insert into connection
 select '11111111-1111-1111-1111-111111111111',
        '22222222-2222-2222-2222-222222222222',
        'bank_statement', 'sftp', 'First Valley BAI2 drop',
-       (select id from bank_account where account_last4 = '2210'),
+       (select id from bank_account where account_last4 = '2210' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d')),
        jsonb_build_object(
          'host', 'sftp.firstvalley.example',
          'port', '22',
@@ -42,7 +42,7 @@ insert into connection
 select '11111111-1111-1111-1111-111111111111',
        '22222222-2222-2222-2222-222222222222',
        'bank_statement', 'api', 'Pineywoods transactions API',
-       (select id from bank_account where account_last4 = '8043'),
+       (select id from bank_account where account_last4 = '8043' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d')),
        jsonb_build_object(
          'endpoint', 'https://api.pineywoods.example/v1/accounts/8043/transactions',
          'format', 'ofx',
@@ -58,7 +58,7 @@ insert into connection
 select '11111111-1111-1111-1111-111111111111',
        '22222222-2222-2222-2222-222222222222',
        'bank_statement', 'email', 'Rio Commerce emailed statement',
-       (select id from bank_account where account_last4 = '5512'),
+       (select id from bank_account where account_last4 = '5512' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d')),
        jsonb_build_object('mailbox', 'statements@demo.example', 'format', 'csv',
          'mapping', jsonb_build_object(
            'date', 'Posted Date', 'description', 'Description',
@@ -73,7 +73,7 @@ insert into connection
 select '11111111-1111-1111-1111-111111111111',
        '22222222-2222-2222-2222-222222222222',
        'bank_statement', 'manual_upload', 'Operating account, exported by hand',
-       (select id from bank_account where account_last4 = '7788'),
+       (select id from bank_account where account_last4 = '7788' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d')),
        jsonb_build_object('format', 'bai2'),
        'active',
        '55555555-0000-0000-0000-000000000001';
@@ -114,7 +114,7 @@ insert into connection
 select '11111111-1111-1111-1111-111111111111',
        '22222222-2222-2222-2222-222222222222',
        'payment_file', 'sftp', 'First Valley ACH origination',
-       (select id from bank_account where account_last4 = '7788'),
+       (select id from bank_account where account_last4 = '7788' and tenant_id in ('11111111-1111-1111-1111-111111111111', 'dddd0000-0000-0000-0000-00000000000d')),
        jsonb_build_object('host', 'sftp.firstvalley.example', 'path', '/inbound/ach',
                           'format', 'nacha'),
        'secret://sftp/first-valley/ach',
