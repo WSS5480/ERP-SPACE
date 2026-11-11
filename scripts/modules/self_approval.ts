@@ -202,6 +202,12 @@ export async function run(t: T) {
       const still = await rows<{ status: string }>(t, `select status from approval_request where entity_id = $1 and id = $2`, [A.entityId, sReq]);
       t.ok("support mode: nothing was decided", still[0]?.status === "open");
       await call("POST", "/api/platform/support/end", { cookie, body: {} });
+      // review (Nov 11 2026): the install-wide token is the operator's own key -- it never self-approves for the owner either
+      const viaToken = await fetch(`${base}/api/c/${A.entityId}/approvals/${sReq}`, { method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${process.env.ERP_API_TOKEN}`, "x-erp-as": A.ownerId, "x-forwarded-for": "198.51.100.78" },
+        body: JSON.stringify({ decision: "approved" }) });
+      const vtData = await viaToken.json().catch(() => ({})) as { error?: string };
+      t.ok("support mode: the install-wide API token acting as the owner is refused too (409)", viaToken.status === 409 && /support mode never self-approves/.test(String(vtData.error)), `${viaToken.status} ${vtData.error}`);
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
       if (saved.logins === undefined) delete process.env.ERP_LOGINS; else process.env.ERP_LOGINS = saved.logins;
@@ -340,7 +346,8 @@ export async function run(t: T) {
   t.ok("digest: no email connected, so nothing is emailed", !dA.emailed && !nA[0].emailed_message_id
     && !(await rows(t, `select 1 from outbound_message where entity_id = $1 and purpose = 'owner_digest'`, [A.entityId])).length);
   const again = await tx({ kind: "system", label: "owner digest" }, (c) => OD.makeDigest(c, { ...A.scope, actor: { kind: "system", label: "owner digest" } }, new Date()));
-  t.ok("digest: a day's digest is made once", !again.made && /already made/.test(again.note));
+  t.ok("digest: a day's digest is made once", !again.made
+    && (await rows(t, `select 1 from owner_notification where entity_id = $1 and kind = 'self_approval_digest'`, [A.entityId])).length === 1, again.note);
   const homeA = await read(t, (c) => views.home(c, A.co, A.ownerId)) as { selfDigests: { id: string; items: unknown[] }[] };
   const homePat = await read(t, (c) => views.home(c, A.co, pat.id)) as { selfDigests: unknown[] };
   t.ok("digest: it is on the owner's Home, every line with it, and not on anyone else's", homeA.selfDigests[0]?.id === nA[0].id && homeA.selfDigests[0].items.length === nA[0].items.length && homePat.selfDigests.length === 0);
@@ -467,6 +474,17 @@ export async function run(t: T) {
   await t.throws("controller here: the owner cannot release their own payment run, total typed or not", () => B.as((c) => P.releasePaymentRun(c, B.co, B.a, { id: runB.id, confirm: "300.00" })), /whoever built the run cannot release it/);
   await t.throws("controller here: the database refuses a hand-written self-released payment run", () => tx(SYS, (c) =>
     c.query(`update payment_run set status = 'released', released_by = $3, released_at = now(), self_released = true where id = $1 and entity_id = $2`, [runB.id, B.entityId, B.ownerId])), /someone else in this company can approve it/);
+  // review (Nov 11 2026): releasing needs a releasing role -- a cashier (or a buyer) never releases, the run's own approval notwithstanding
+  const cashB = (await rows<{ id: string }>(t, `insert into app_user (tenant_id, email, name) values ($1, $2, 'Cass Cashier') returning id`, [B.tenantId, `cass-${B.tag}@example.com`]))[0].id;
+  await tx(SYS, (c) => c.query(`insert into role_grant (app_user_id, entity_id, role) values ($1, $2, 'cashier'), ($1, $2, 'buyer')`, [cashB, B.entityId]));
+  const cashA = { personId: cashB, personName: "Cass Cashier", label: "Cass" };
+  await t.throws("release: a cashier cannot release an approved payment run", () => tx({ kind: "user", id: cashB, label: "Cass" }, (c) => P.releasePaymentRun(c, B.co, cashA, { id: runB.id })),
+    /releasing a payment run is for the owner, a controller, an approver or an A\/P clerk/);
+  const cashRuns = (await read(t, (c) => views.paymentRuns(c, B.co, cashB))).runs as { id: string; may_release: boolean }[];
+  t.ok("release: the screen does not offer Release to a cashier", cashRuns.find((r) => r.id === runB.id)?.may_release === false
+    && (await read(t, (c) => views.paymentRuns(c, B.co, ctl))).runs.find((r: { id: string; may_release: boolean }) => r.id === runB.id)?.may_release === true);
+  t.ok("release: who may release is the same set self-release counts", JSON.stringify(AP.releaseRoles("payment_run")) === JSON.stringify(["owner", "controller", ...AP.RUN_RELEASERS.payment_run])
+    && JSON.stringify(AP.releaseRoles("payroll_run")) === JSON.stringify(["owner", "controller", ...AP.RUN_RELEASERS.payroll_run]));
   const relB = await tx({ kind: "user", id: ctl, label: "Casey" }, (c) => P.releasePaymentRun(c, B.co, ctlA, { id: runB.id }));
   t.ok("controller here: the controller releases it, not self-released",
     !!relB && !(await rows<{ self_released: boolean }>(t, `select self_released from payment_run where entity_id = $1 and id = $2`, [B.entityId, runB.id]))[0].self_released);
@@ -478,6 +496,8 @@ export async function run(t: T) {
     [B.tenantId, B.entityId, grpB.id, opB, B.ownerId]))[0].id);
   t.ok("controller here: the owner is not offered their own payroll to release", !((await read(t, (c) => views.payroll(c, B.co, B.ownerId))).runs as { id: string; self_ok: boolean }[]).find((r: { id: string }) => r.id === prB)?.self_ok);
   await t.throws("controller here: the owner cannot release their own payroll", () => B.as((c) => P.releasePayroll(c, B.co, B.a, { runId: prB, confirm: "1000.00" })), /whoever built the run cannot release it/);
+  await t.throws("release: a cashier cannot release payroll", () => tx({ kind: "user", id: cashB, label: "Cass" }, (c) => P.releasePayroll(c, B.co, cashA, { runId: prB })),
+    /releasing payroll is for the owner, a controller or HR/);
   await t.throws("controller here: the database refuses a hand-written self-released payroll", () => tx(SYS, (c) =>
     c.query(`update payroll_run set status = 'released', released_by = $3, released_at = now(), self_released = true where id = $1 and entity_id = $2`, [prB, B.entityId, B.ownerId])), /someone else in this company can approve it/);
   await t.throws("database: a builder releasing their own run unmarked still breaks the two-people check", () => tx(SYS, (c) =>
@@ -494,6 +514,32 @@ export async function run(t: T) {
     return out;
   });
   t.ok("the rule: for releases and the gates, code and database agree (same roles, same answer)", !agree2.length, agree2.join("; "));
+
+  // review (Nov 11 2026): a grant changed in place (moved to another company, or another role) is a role taken away too
+  const mover = (await rows<{ id: string }>(t, `insert into app_user (tenant_id, email, name) values ($1, $2, 'Moe Mover') returning id`, [B.tenantId, `moe-${B.tag}@example.com`]))[0].id;
+  await tx(SYS, (c) => c.query(`insert into role_grant (app_user_id, entity_id, role) values ($1, $2, 'approver')`, [mover, B.entityId]));
+  await tx(SYS, (c) => c.query(`update role_grant set role = 'viewer' where app_user_id = $1 /* unscoped: check */`, [mover]));
+  await tx(SYS, (c) => c.query(`update role_grant set role = 'approver' where app_user_id = $1 /* unscoped: check */`, [mover]));
+  await tx(SYS, async (c) => { await c.query(`update role_grant set role = 'viewer' where app_user_id = $1 /* unscoped: check */`, [mover]); await c.query(`update role_grant set role = 'approver' where app_user_id = $1 /* unscoped: check */`, [mover]); });
+  const moved = await rows<{ role: string }>(t, `select role from role_removal where app_user_id = $1`, [mover]);
+  t.ok("roles: a grant changed by hand to another role is kept as a removal (and changed back in the same transaction, nothing)", moved.filter((m) => m.role === "approver").length === 1, JSON.stringify(moved));
+
+  // review: the digest's window starts where the company's last one ended, so a later run, a second run the same day
+  // or a server that was down drops nothing
+  {
+    const sys = { kind: "system" as const, label: "owner digest" };
+    const last = (await rows<{ e: string }>(t, `select max(window_end)::text e from owner_notification where entity_id = $1`, [A.entityId]))[0].e;
+    const ct2 = await A.as((c) => inv.createCount(c, A.scope, { locationId: A.store })) as { id: string };
+    await A.as((c) => inv.submitCount(c, A.scope, ct2.id, []));
+    await A.as((c) => inv.decideCount(c, A.scope, ct2.id, { approve: true }));
+    const same = await tx(sys, (c) => OD.makeDigest(c, { ...A.scope, actor: sys }, new Date()));
+    t.ok("digest: a second run the same day makes no second digest, and keeps the new self-approval for the next", !same.made && same.items >= 1, same.note);
+    const later = new Date(Date.now() + 25 * 3600_000 + 7 * 60_000);   // tomorrow, a little later than today's run
+    const next = await tx(sys, (c) => OD.makeDigest(c, { ...A.scope, actor: sys }, later));
+    const nrow = (await rows<{ ws: string; items: { id: string }[]; body: string }>(t, `select window_start::text ws, items, body from owner_notification where entity_id = $1 order by window_end desc limit 1`, [A.entityId]))[0];
+    t.ok("digest: tomorrow's starts where today's ended and carries what came after it", next.made && new Date(nrow.ws).getTime() === new Date(last).getTime() && nrow.items.some((i) => i.id === ct2.id), `${nrow.ws} vs ${last}`);
+    t.ok("digest: times are the store's clock, not UTC", !/ UTC/.test(nrow.body) && /(AM|PM)/.test(nrow.body), nrow.body.split("\n")[2]);
+  }
 
   // ======================================================== long words wrap on a phone
   const css = readFileSync(ROOT + "server/app.css", "utf8");

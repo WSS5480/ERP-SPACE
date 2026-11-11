@@ -649,7 +649,8 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
       const co = await companyFor(c, who, m[1]);
       const a = await acting(c, co, req, who!, false);
       markLookOnly(c, !!a?.preview || (who?.kind === "customer" && who.prospect));
-      markSupport(c, who?.kind === "operator" && !!who.support);
+      // the install-wide token speaks for the operator, as a support session does: it never self-approves for the owner either
+      markSupport(c, (who?.kind === "operator" && !!who.support) || who?.kind === "system");
       const out = await fn(c, co, url, m, a?.personId ?? null);
       if (out === null) throw new HttpError(404, "not found");
       // A printable page (a tear sheet) goes out with every header and the CSP, like any page.
@@ -680,7 +681,8 @@ function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body:
       c0.release();
     }
     const body = await readJson(req, opts.maxBody);
-    const support = who?.kind === "operator" && who.support ? who.support.id : null;
+    // An operator's support session, or the install-wide token (the operator's own key): neither self-approves for the owner.
+    const support = who?.kind === "operator" && who.support ? who.support.id : who?.kind === "system" ? "install-token" : null;
     const out = await tx({ kind: "user", id: actor.personId, label: actor.label, support }, async (c) => {
       const r = await fn(c, co, actor, body, m);
       if (who?.kind === "operator" && who.support) {

@@ -452,3 +452,6 @@ pre.stack{white-space:pre-wrap;word-break:break-word;font-size:.8em;max-height:4
 .chip span{min-width:0;overflow:hidden;text-overflow:ellipsis}
 input,textarea,select{max-width:100%}
 .wrapany{overflow-wrap:anywhere;min-width:0}
+/* A bill number is kept on one line (.nw) next to its vendor, but one longer than the
+   screen breaks rather than pushing the list or a dialog's title sideways (review, Nov 11 2026). */
+.li .t .nw,.dlg-h h2 .nw{white-space:normal;overflow-wrap:anywhere}

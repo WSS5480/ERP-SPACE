@@ -177,6 +177,15 @@ export async function selfApprovalFor(c: Client, entityId: string, deciderId: st
  */
 export const RUN_RELEASERS: Record<"payment_run" | "payroll_run", string[]> = { payment_run: ["approver", "ap_clerk"], payroll_run: ["hr"] };
 export const GATE_SIGN_OFF = ["controller"];
+/**
+ * Who may release a run at all: the owner, a controller, and the run's releasing roles. The same set
+ * self-release counts as "someone else who could release it", so the two rules cannot drift apart.
+ */
+export const releaseRoles = (kind: "payment_run" | "payroll_run") => ["owner", "controller", ...RUN_RELEASERS[kind]];
+export const RELEASE_WORDS: Record<"payment_run" | "payroll_run", string> = {
+  payment_run: "releasing a payment run is for the owner, a controller, an approver or an A/P clerk",
+  payroll_run: "releasing payroll is for the owner, a controller or HR",
+};
 
 /** Dollars and cents as the screens show them ($1,234.56). */
 export const usdText = (minor: bigint) => fmtUsd(minor);

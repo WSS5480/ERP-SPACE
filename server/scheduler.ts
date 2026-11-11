@@ -52,13 +52,18 @@ export async function rollPeriods(_now: Date): Promise<JobOutcome> {
 export async function ownerDigests(now: Date): Promise<JobOutcome> {
   const c0 = await pool.connect();
   let cos: { id: string; tenant_id: string }[];
-  try { cos = await digestCompanies(c0); } finally { c0.release(); }
+  let since: Date | null = null;
+  try {
+    cos = await digestCompanies(c0);
+    // where the last finished run of this job started (this run's own row is still 'running')
+    since = (await c0.query<{ at: Date | null }>(`select max(started_at) at from job_run where job = 'owner_digest' and status in ('ok','partial') and started_at < $1 /* unscoped: the install's job log */`, [now])).rows[0]?.at ?? null;
+  } finally { c0.release(); }
   const items: JobItem[] = [];
   let made = 0;
   for (const co of cos) {
     try {
       const actor = { kind: "system" as const, label: "owner digest" };
-      const r = await tx(actor, (c) => makeDigest(c, { tenantId: co.tenant_id, entityId: co.id, actor }, now));
+      const r = await tx(actor, (c) => makeDigest(c, { tenantId: co.tenant_id, entityId: co.id, actor }, now, since));
       if (r.made) made++;
       if (r.made || r.items) items.push({ tenantId: co.tenant_id, entityId: co.id, ok: true, note: r.note });
     } catch (e) {

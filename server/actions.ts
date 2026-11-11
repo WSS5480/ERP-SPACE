@@ -12,7 +12,7 @@ import { today as bizToday } from "../packages/core/clock.ts";
 import { periodFor } from "../packages/core/periods.ts";
 import { type Client, type Scope, q, one, audit } from "../packages/core/db.ts";
 import { categoryInfo, VendorCategoryError } from "../packages/core/vendor_categories.ts";
-import { decide, openRequest, selfApprovalFor, auditSelfApproval, needTypedTotal, RUN_RELEASERS, GATE_SIGN_OFF } from "../packages/core/approvals.ts";
+import { decide, openRequest, selfApprovalFor, auditSelfApproval, needTypedTotal, RUN_RELEASERS, GATE_SIGN_OFF, releaseRoles, RELEASE_WORDS } from "../packages/core/approvals.ts";
 import { runGates, postToLedger, transition } from "../packages/core/invoice.ts";
 import { buildRun, requestRelease, release, postRun, IllustrativeTaxProvider, type Frequency, isFrequency,
          nextPeriod, periodStartingOn, periodStartProblem, PERIODS_PER_YEAR } from "../packages/core/payroll.ts";
@@ -449,12 +449,12 @@ async function makeBankCurrent(c: Client, co: Company, a: Actor, id: string, not
 
 // ------------------------------------------------------------ payment runs
 
-async function runOf(c: Client, co: Company, id: unknown) {
+async function runOf(c: Client, co: Company, id: unknown, lock = false) {
   need(typeof id === "string" && UUID.test(id), "no such payment run");
   const rows = await q<{ id: string; status: string; built_by: string; pay_date: string; method: string;
                           bank_account_id: string }>(c, `
     select id, status, built_by, pay_date::text, method, bank_account_id
-      from payment_run where id = $1 and entity_id = $2`, [id, co.id]);
+      from payment_run where id = $1 and entity_id = $2 ${lock ? "for update" : ""}`, [id, co.id]);
   need(rows.length, "no such payment run");
   return rows[0];
 }
@@ -523,8 +523,11 @@ export async function submitPaymentRun(c: Client, co: Company, a: Actor, input: 
  * itself is the payment-file writer's job, which is still to build.
  */
 export async function releasePaymentRun(c: Client, co: Company, a: Actor, input: { id: unknown; confirm?: unknown }) {
-  const run = await runOf(c, co, input.id);
+  const run = await runOf(c, co, input.id, true);
   need(run.status === "pending_release", run.status === "building" ? "send it for approval first" : `this run is already ${run.status}`);
+  // Releasing moves money: only someone who holds a releasing role (the same roles self-release counts).
+  const held = await rolesOf(c, co, a.personId);
+  need(releaseRoles("payment_run").some((r) => held.has(r)), RELEASE_WORDS.payment_run);
   // Never whoever built it -- unless they are the owner and nobody else here could release it (0064): then the total is typed.
   const selfReleased = await selfApprovalFor(c, co.id, a.personId, [run.built_by], RUN_RELEASERS.payment_run, "whoever built the run cannot release it");
   const req = await q<{ status: string }>(c, `
@@ -648,8 +651,11 @@ export async function requestPayroll(c: Client, co: Company, a: Actor, input: { 
 
 export async function releasePayroll(c: Client, co: Company, a: Actor, input: { runId: unknown; confirm?: unknown }) {
   const id = await payrollRunOf(c, co, input.runId);
-  const st = await one<{ status: string; built_by: string; net_minor: string }>(c, `select status, built_by, net_minor from payroll_run where id = $1 and entity_id = $2`, [id, co.id]);
+  const st = await one<{ status: string; built_by: string; net_minor: string }>(c, `select status, built_by, net_minor from payroll_run where id = $1 and entity_id = $2 for update`, [id, co.id]);
   need(st.status === "pending_release", st.status === "building" ? "send it for approval first" : `this run is ${st.status}`);
+  // Releasing moves money: only someone who holds a releasing role (the same roles self-release counts).
+  const held = await rolesOf(c, co, a.personId);
+  need(releaseRoles("payroll_run").some((r) => held.has(r)), RELEASE_WORDS.payroll_run);
   const req = await q<{ status: string }>(c, `
     select status from approval_request where entity_id = $1 and subject_type = 'payroll_run' and subject_id = $2
      order by created_at desc limit 1`, [co.id, id]);

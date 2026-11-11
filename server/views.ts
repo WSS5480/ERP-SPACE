@@ -10,7 +10,7 @@ import { today as bizToday } from "../packages/core/clock.ts";
 import { type Client, q, one } from "../packages/core/db.ts";
 import { handlerFor } from "../packages/core/connections.ts";
 import { recentDigests } from "../packages/core/owner_digest.ts";
-import { selfApprovalRefusal, selfConfirmFor, SUPPORT_SELF_APPROVAL, RUN_RELEASERS, GATE_SIGN_OFF, type SelfConfirm } from "../packages/core/approvals.ts";
+import { selfApprovalRefusal, selfConfirmFor, SUPPORT_SELF_APPROVAL, RUN_RELEASERS, GATE_SIGN_OFF, releaseRoles, type SelfConfirm } from "../packages/core/approvals.ts";
 
 export type Company = {
   id: string;
@@ -501,10 +501,15 @@ export async function vendor(c: Client, co: Company, id: string) {
 }
 
 /** A run the person built and may release themselves (0064): only the owner, only when nobody else could release it. */
-async function withSelfOk<R extends { built_by: string; status: string }>(c: Client, co: Company, runs: R[], personId: string | null, roles: string[]) {
+async function withSelfOk<R extends { built_by: string; status: string }>(c: Client, co: Company, runs: R[], personId: string | null, kind: "payment_run" | "payroll_run") {
   const theirs = personId ? runs.filter((r) => r.built_by === personId && r.status === "pending_release") : [];
-  const ok = theirs.length ? (await selfApprovalRefusal(c, co.id, personId!, roles)) === null : false;
-  return runs.map((r) => ({ ...r, self_ok: ok && r.built_by === personId && r.status === "pending_release" }));
+  const ok = theirs.length ? (await selfApprovalRefusal(c, co.id, personId!, RUN_RELEASERS[kind])) === null : false;
+  // may this person release at all (the server's rule: a releasing role)?
+  const held = personId ? await q<{ role: string }>(c, `
+    select distinct g.role from role_grant g join app_user u on u.id = g.app_user_id
+     where g.app_user_id = $2 and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $3))`, [co.id, personId, co.tenantId]) : [];
+  const mayRelease = held.some((h) => releaseRoles(kind).includes(h.role));
+  return runs.map((r) => ({ ...r, may_release: mayRelease, self_ok: ok && r.built_by === personId && r.status === "pending_release" }));
 }
 
 export async function paymentRuns(c: Client, co: Company, personId: string | null = null) {
@@ -526,7 +531,7 @@ export async function paymentRuns(c: Client, co: Company, personId: string | nul
       left join bank_account ba on ba.id = pr.bank_account_id
      where pr.entity_id = $1
      order by pr.pay_date desc, pr.created_at desc limit 20`, [co.id]);
-  const runs = await withSelfOk(c, co, runs0, personId, RUN_RELEASERS.payment_run);
+  const runs = await withSelfOk(c, co, runs0, personId, "payment_run");
   const eligible = await q(c, `
     select i.id, coalesce(v.dba, v.legal_name) as vendor, i.reference, i.invoice_date::text, i.due_date::text,
            i.total_minor, (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as credited_minor, i.total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as net_minor,
@@ -605,7 +610,7 @@ export async function payroll(c: Client, co: Company, personId: string | null = 
       left join app_user ru on ru.id = pr.released_by
      where pr.entity_id = $1
      order by pp.pay_date desc, pr.created_at desc limit 12`, [co.id]);
-  const runs = await withSelfOk(c, co, runs0, personId, RUN_RELEASERS.payroll_run);
+  const runs = await withSelfOk(c, co, runs0, personId, "payroll_run");
   const employees = await q(c, `
     select e.id, e.employee_no, e.first_name || ' ' || e.last_name as name, e.position, e.pay_type, e.base_rate_minor, e.status,
            e.hired_on::text, e.terminated_on::text, po.name as store, e.comp_class_code, e.work_state,

@@ -1225,7 +1225,7 @@ function runItem(r) {
     acts.push(sub);
   }
   if (r.status === 'pending_release' && r.approval_status !== 'open') {
-    const rel = el('button', { class: 'btn small primary', type: 'button', disabled: (mine && !r.self_ok) || null,
+    const rel = el('button', { class: 'btn small primary', type: 'button', disabled: (mine && !r.self_ok) || r.may_release === false || null,
       onclick: async () => {
         // the owner releasing their own run (nobody else could) types its total first; the server checks it
         const confirm = r.self_ok ? await askTypedConfirm(runConfirm(r, money(r.total_minor))) : undefined;
@@ -1244,7 +1244,8 @@ function runItem(r) {
   }
   acts.push(el('button', { class: 'btn small', type: 'button', onclick: () => openPaymentRun(r.id) }, 'Open'));
   const why = r.status === 'pending_release' && r.approval_status === 'open' ? `Waiting on the ${ROLE[r.waiting_on] || r.waiting_on || 'approver'}; approve it from Approvals when acting as them.`
-    : mine && r.status === 'pending_release' ? (r.self_ok ? 'You built this run, and nobody else here can release it, so you can (recorded as self-approved).' : 'You built this run, so someone else has to release it.') : null;
+    : mine && r.status === 'pending_release' ? (r.self_ok ? 'You built this run, and nobody else here can release it, so you can (recorded as self-approved).' : 'You built this run, so someone else has to release it.')
+    : r.status === 'pending_release' && r.approval_status !== 'open' && r.may_release === false ? 'Releasing is for the owner, a controller, an approver or an A/P clerk.' : null;
   return item({ title: `Pay date ${dayLabel(r.pay_date)} · ${r.method.toUpperCase()}`,
     detail: `${plural(r.payments, 'bill')} · built by ${r.built_by_name}${r.released_by_name ? ` · released by ${r.released_by_name}${r.self_released ? ' (self-approved)' : ''}` : ''}`,
     amount: money(r.total_minor), badge: runStatusChip(r), why, acts });
@@ -1529,9 +1530,11 @@ function groupState(g, runs) {
     acts.push(el('button', { class: 'btn', type: 'button', onclick: () => go('approvals') }, 'Go to Approvals'));
   } else if (run.status === 'pending_release') {
     const mine = S.person && run.built_by === S.person.id && !run.self_ok;
+    const barred = run.may_release === false;
     state = run.self_ok ? 'Approved. You built it, and nobody else here can release it, so you can (recorded as self-approved).'
-      : mine ? 'Approved. You built it, so someone else has to release it.' : 'Approved. Release it for funding.';
-    const b = el('button', { class: 'btn primary', type: 'button', disabled: mine || null, onclick: async () => {
+      : mine ? 'Approved. You built it, so someone else has to release it.'
+      : barred ? 'Approved. Releasing payroll is for the owner, a controller or HR.' : 'Approved. Release it for funding.';
+    const b = el('button', { class: 'btn primary', type: 'button', disabled: mine || barred || null, onclick: async () => {
       // the owner releasing their own payroll (nobody else could) types its total first; the server checks it
       const confirm = run.self_ok ? await askTypedConfirm(runConfirm(run, money(run.net_minor))) : undefined;
       if (run.self_ok && confirm == null) return;
