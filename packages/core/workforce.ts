@@ -36,7 +36,7 @@ const KIND_WORDS: Record<PunchKind, string> = { in: "punch in", out: "punch out"
 /**
  * A time from a form. With a zone (an ISO instant) it is taken as is; a bare
  * "2026-11-06T09:00" from a phone's date and time pickers is read in the
- * store's own time zone, so a manager in another state enters Enola's 9 a.m.
+ * store's own time zone, so a manager in another state enters that store's 9 a.m.
  */
 export async function instantAt(c: Client, entityId: string, locationId: string, v: string): Promise<Date> {
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(v)) {
@@ -50,14 +50,17 @@ export async function instantAt(c: Client, entityId: string, locationId: string,
 export async function timezoneFor(c: Client, entityId: string, locationId: string): Promise<string> {
   const r = await q<{ tz: string }>(c, `
     select coalesce((select timezone from workforce_location where location_id = $2 and entity_id = $1),
-                    (select timezone from workforce_settings where entity_id = $1), 'America/New_York') tz`, [entityId, locationId]);
+                    (select timezone from workforce_settings where entity_id = $1), (select time_zone from fleet_setting where entity_id = $1), 'America/New_York') tz`, [entityId, locationId]);
   return r[0].tz;
 }
 
 async function settingsOf(c: Client, entityId: string) {
   const r = await q<{ missed_punch_hours: number; max_shift_hours: number; timezone: string }>(c,
     `select missed_punch_hours, max_shift_hours, timezone from workforce_settings where entity_id = $1`, [entityId]);
-  return r[0] ?? { missed_punch_hours: 12, max_shift_hours: 14, timezone: "America/New_York" };
+  if (r[0]) return r[0];
+  // no time settings yet: the delivery settings' zone if there is one
+  const f = await q<{ tz: string }>(c, `select time_zone tz from fleet_setting where entity_id = $1`, [entityId]);
+  return { missed_punch_hours: 12, max_shift_hours: 14, timezone: f[0]?.tz ?? "America/New_York" };
 }
 
 export async function employeeOf(c: Client, entityId: string, id: string) {

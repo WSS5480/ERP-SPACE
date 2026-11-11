@@ -545,7 +545,7 @@ export const DATASETS: Dataset[] = [
                       else greatest(0, extract(epoch from ((s.arrived_at at time zone tz.tz)::time - w.ends)) / 60)::int end as late_minutes,
                  coalesce(s.exception_reason, s.exception) as exception
             from delivery_stop s
-            cross join (select coalesce((select time_zone from fleet_setting where entity_id = $1), 'America/Chicago') as tz) tz
+            cross join (select coalesce((select time_zone from fleet_setting where entity_id = $1), (select timezone from workforce_settings where entity_id = $1), 'America/Chicago') as tz) tz
             left join delivery_window w on w.id = s.window_id and w.entity_id = $1
             left join delivery_zone z on z.id = s.zone_id and z.entity_id = $1
             left join delivery_route r on r.id = s.route_id and r.entity_id = $1

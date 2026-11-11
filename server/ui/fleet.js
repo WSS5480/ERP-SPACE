@@ -132,7 +132,7 @@
   function placeDialog(addressId, label) {
     const d = openDialog('Put it on the map', label || '');
     const err = errSlot();
-    const both = input({ placeholder: '40.2601, -76.9336', inputmode: 'decimal', autocomplete: 'off' });
+    const both = input({ placeholder: 'latitude, longitude', inputmode: 'decimal', autocomplete: 'off' });
     d.body.append(el('p', { class: 'lead', text: 'In a map app, press and hold on the house; copy the two numbers it shows (latitude, longitude) and paste them here.' }),
       field('Latitude, longitude', both),
       el('div', { class: 'dlg-acts' }, btn('Save', (e) => {
@@ -521,7 +521,7 @@
     const err = errSlot();
     const code = input({ class: 'upper', value: x ? x.code : '' }), name = input({ value: x ? x.name : '' });
     const dc = E.storePicker(select(o.locations.map((l) => [l.id, l.name]), x ? x.dc_location_id : st.dc));
-    const postals = el('textarea', { placeholder: '17025, 17011, …' }); postals.value = x ? x.postal_codes.join(', ') : '';
+    const postals = el('textarea', { placeholder: 'ZIP codes, separated by commas' }); postals.value = x ? x.postal_codes.join(', ') : '';
     const fee = input({ inputmode: 'decimal', value: x ? dollars(x.fee_minor) : '0.00' });
     const days = DAYS.map((label, i) => { const c = el('input', { type: 'checkbox', class: 'pickbox', checked: x ? x.days.includes(i) : i > 0 }); return [i, c, label]; });
     d.body.append(field('Code', code), field('Name', name), field('Served from', dc), field('Postal codes', postals), field('Delivery fee ($)', fee),

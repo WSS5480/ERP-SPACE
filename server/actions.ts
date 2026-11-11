@@ -18,6 +18,8 @@ import { planSweeps, confirmTransfer, resolveDisbursementAccount } from "../pack
 import { autoMatch, matchManually } from "../packages/core/reconcile.ts";
 import { fromDecimal } from "../packages/core/money.ts";
 import { type Company, explainReason } from "./views.ts";
+import { PACKS, applyPack } from "../packages/core/setup.ts";
+import { PRESETS, presetPack, applyPresetSwitches } from "../packages/core/services.ts";
 
 /** A refusal a person can act on. The server turns it into a 409 with the message. */
 export class ActionError extends Error {}
@@ -234,7 +236,7 @@ const VENDOR_KEYS: [string, string][] = [
 /** The parts of a vendor record a person types, checked the same way on add and on edit. */
 function vendorFields(input: Record<string, unknown>) {
   const state = text(input.state, 20).toUpperCase() || null;
-  need(!state || STATE.test(state), "the state is two letters, like TX");
+  need(!state || STATE.test(state), "the state is two letters, as on a postal address");
   const postal = text(input.postalCode, 10) || null;
   need(!postal || /^\d{5}(-\d{4})?$/.test(postal), "the ZIP code is five digits, or ZIP+4");
   const phone = text(input.contactPhone, 25) || null;
@@ -886,7 +888,7 @@ export async function hireEmployee(c: Client, co: Company, a: Actor, input: Reco
   const rate = rateOf(input.rate, payType);
   const store = await storeOf(c, co, input.storeId);
   const workState = text(input.workState, 20).toUpperCase();
-  need(STATE.test(workState), "the state they work in, as two letters, like TX");
+  need(STATE.test(workState), "the state they work in, as two letters");
   const comp = text(input.compClassCode, 10) || null;
   need(!comp || /^\d{4}$/.test(comp), "a workers' comp class code is four digits");
   need(isDay(input.hiredOn), "pick the hire date");
@@ -939,7 +941,7 @@ export async function changeEmployee(c: Client, co: Company, a: Actor, input: Re
   const position = input.position === undefined ? e.position : text(input.position, 60) || null;
   const store = input.storeId === undefined ? e.profit_object_id : await storeOf(c, co, input.storeId);
   const workState = input.workState === undefined ? e.work_state : text(input.workState, 20).toUpperCase();
-  need(STATE.test(workState), "the state they work in, as two letters, like TX");
+  need(STATE.test(workState), "the state they work in, as two letters");
   const comp = input.compClassCode === undefined ? e.comp_class_code : text(input.compClassCode, 10) || null;
   need(!comp || /^\d{4}$/.test(comp), "a workers' comp class code is four digits");
   const details = position !== e.position || store !== e.profit_object_id || workState !== e.work_state || comp !== e.comp_class_code;
@@ -1049,9 +1051,9 @@ function storesIn(v: unknown): StoreIn[] {
   const out = list.map((x: Record<string, unknown>) => {
     const code = text(x?.code, 12).toUpperCase(), name = text(x?.name, 60);
     const state = text(x?.state, 20).toUpperCase() || null;
-    need(/^[A-Z0-9-]{2,12}$/.test(code), "each store needs a short code, like ENL");
+    need(/^[A-Z0-9-]{2,12}$/.test(code), "each store needs a short code of 2 to 12 letters or digits");
     need(name.length >= 2, "each store needs a name");
-    need(!state || STATE.test(state), "a store's state is two letters, like TX");
+    need(!state || STATE.test(state), "a store's state is two letters, as on a postal address");
     return { code, name, state };
   });
   need(new Set(out.map((s) => s.code)).size === out.length, "two stores have the same code");
@@ -1152,6 +1154,11 @@ export async function createCompany(c: Client, operator: string, input: Record<s
   const stores = storesIn(input.stores);
   const banks = banksIn(input.banks, stores);
   const people = peopleIn(input.people);
+  // What kind of business it is: a setup pack or a service preset, picked as part of creating the company.
+  const setup = text(input.setup, 40);
+  const [setupKind, setupId] = setup.split(":");
+  need((setupKind === "pack" && PACKS.some((p) => p.id === setupId)) || (setupKind === "preset" && PRESETS.some((p) => p.id === setupId)),
+    "pick what kind of business this is: a setup pack or a preset");
 
   let tenantId: string;
   let vertical: Vertical;
@@ -1260,8 +1267,13 @@ export async function createCompany(c: Client, operator: string, input: Record<s
       [entityId, pol.subject, pol.min.toString(), JSON.stringify(pol.steps), pol.callback]);
   }
 
+  // the pack adds accounts, pick lists and defaults (never tax rates, locations or sample data); a preset also sets the switches
+  const packId = setupKind === "pack" ? setupId : presetPack(setupId)?.id ?? null;
+  if (packId) await applyPack(c, scope, packId, operator);
+  if (setupKind === "preset") await applyPresetSwitches(c, entityId, setupId, operator);
+
   await audit(c, scope, { table: "entity", rowId: entityId, action: "insert",
-    after: { name: companyName, legalName, stores: stores.length, banks: banks.length, people: people.length, newClient: !existing },
+    after: { name: companyName, legalName, stores: stores.length, banks: banks.length, people: people.length, newClient: !existing, setup },
     reason: "company set up from the screen" });
   const warn = people.length < 2 ? "With one person, nothing they enter can be approved: add a second person before real work starts." : null;
   return { id: entityId, tenantId, warning: warn };

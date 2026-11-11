@@ -13,7 +13,7 @@
 // Two guards worth naming:
 //
 //   A file is checked against the account its connection claims. Dropping
-//   Palestine's statement on Enola's feed is caught here, not three weeks
+//   one store's statement on another store's feed is caught here, not three weeks
 //   later in a variance nobody can explain.
 //
 //   Lines are de-duplicated by the database on a fingerprint, so a daily file

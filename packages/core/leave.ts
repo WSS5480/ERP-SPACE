@@ -286,7 +286,7 @@ export async function decide(c: Client, scope: Scope, id: string, d: { approve: 
       [scope.entityId, r.employee_id, t.id, r.starts_on, -n(r.total_hours), id, `${dayWords(r.starts_on)} to ${dayWords(r.ends_on)}`, scope.actor.id || null]);
   }
   // the schedule: shifts on those days are cancelled, and said so
-  const tz = await one<{ tz: string }>(c, `select coalesce((select timezone from workforce_settings where entity_id = $1), 'America/New_York') tz`, [scope.entityId]);
+  const tz = await one<{ tz: string }>(c, `select coalesce((select timezone from workforce_settings where entity_id = $1), (select time_zone from fleet_setting where entity_id = $1), 'America/New_York') tz`, [scope.entityId]);
   const shifts = await q<{ id: string; on_day: string }>(c, `
     select w.id, (w.starts_at at time zone $4)::date::text on_day from work_shift w
      where w.entity_id = $1 and w.employee_id = $2 and w.status = 'scheduled'
@@ -498,7 +498,7 @@ export async function leavePayForPeriod(c: Client, scope: Scope, payPeriodId: st
  * was due on a shift that has started but has not punched in.
  */
 export async function absentToday(c: Client, entityId: string, locationId: string | null) {
-  const tz = (await one<{ tz: string }>(c, `select coalesce((select timezone from workforce_settings where entity_id = $1), 'America/New_York') tz`, [entityId])).tz;
+  const tz = (await one<{ tz: string }>(c, `select coalesce((select timezone from workforce_settings where entity_id = $1), (select time_zone from fleet_setting where entity_id = $1), 'America/New_York') tz`, [entityId])).tz;
   const day = (await one<{ d: string }>(c, `select (now() at time zone $1)::date::text d /* unscoped: the clock */`, [tz])).d;
   const onLeaveToday = await q(c, `
     select e.id employee_id, e.first_name || ' ' || e.last_name name, t.name type, t.kind, r.ends_on::text back_after, d.hours::float hours

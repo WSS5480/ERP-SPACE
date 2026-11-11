@@ -73,7 +73,7 @@ export const H = {
                                       to_char(w.starts_at at time zone x.tz, 'HH24:MI') starts, to_char(w.ends_at at time zone x.tz, 'HH24:MI') ends
                                  from work_shift w join location lo on lo.id = w.location_id
                                  cross join lateral (select coalesce((select timezone from workforce_location wl where wl.location_id = w.location_id and wl.entity_id = $1),
-                                                                     (select timezone from workforce_settings ws where ws.entity_id = $1), 'America/New_York') tz) x
+                                                                     (select timezone from workforce_settings ws where ws.entity_id = $1), (select time_zone from fleet_setting fs where fs.entity_id = $1), 'America/New_York') tz) x
                                 where w.entity_id = $1 and w.employee_id = $2 and w.status = 'scheduled' and w.ends_at >= now() order by w.starts_at limit 7`, [co.id, id]);
     return { employee: e, last: last[0] ?? null, recent, hours, shifts };
   }),

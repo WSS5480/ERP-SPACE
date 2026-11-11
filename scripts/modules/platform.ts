@@ -203,7 +203,7 @@ export async function run(t: T) {
     const conn = await db<{ id: string }>(`select id from connection where entity_id = $1 and channel = 'manual_upload' limit 1`, [ENTITY]);
     if (conn.length) t.ok("another tenant's feed connection reads as not there", (await call("POST", `/api/connections/${conn[0].id}/upload?filename=x.txt`, { cookie: aOwner, body: "x" })).status === 404);
     const addCo = await call("POST", "/api/companies", { cookie: aOwner, body: { clientId: bT, name: "Sneaky", legalName: "Sneaky LLC", people: [{ name: "Al Alpha", email: "a@a.example", roles: ["owner"] }],
-      stores: [{ code: "SNK", name: "Sneaky store", state: "TX" }], banks: [{ purpose: "operating", name: "Operating", bankName: "First Bank", routingLast4: "1234", accountLast4: "5678" }] } });
+      setup: "pack:retail", stores: [{ code: "SNK", name: "Sneaky store", state: "TX" }], banks: [{ purpose: "operating", name: "Operating", bankName: "First Bank", routingLast4: "1234", accountLast4: "5678" }] } });
     const landed = await db<{ tenant_id: string }>(`select tenant_id from entity where name = 'Sneaky'`);
     t.ok("adding a company always lands in the owner's own tenant", addCo.status === 200 && landed.length === 1 && landed[0].tenant_id === aT, addCo.data.error);
     t.ok("a customer cannot use the Operator console", (await call("GET", "/api/platform/customers", { cookie: aOwner })).status === 403);

@@ -23,5 +23,6 @@ import { module as lots } from "./lots.ts";
 import { module as trade } from "./trade.ts";
 import { module as configurator } from "./configurator.ts";
 import { module as admin } from "./admin.ts";
+import { module as onboarding } from "./onboarding.ts";
 
-export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports, group, edi, wms, ops, lots, trade, configurator, admin];
+export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports, group, edi, wms, ops, lots, trade, configurator, admin, onboarding];

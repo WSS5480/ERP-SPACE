@@ -12,7 +12,7 @@
 
 import { createHash, randomBytes, randomInt, scryptSync, timingSafeEqual } from "node:crypto";
 import { q, one, type Client } from "../packages/core/db.ts";
-import { PACKS, applyPack, packById } from "../packages/core/setup.ts";
+import { PACKS, packById } from "../packages/core/setup.ts";
 import { connectionFor, queueEmail, type Row } from "../packages/core/messaging.ts";
 import { createCompany } from "./actions.ts";
 import { DEMO_TENANTS } from "../packages/core/platform_demo.ts";
@@ -262,18 +262,19 @@ export async function createCustomer(c: Client, who: AuditActor, input: Record<s
       routingLast4: /^\d{4}$/.test(text(input.routingLast4, 4)) ? text(input.routingLast4, 4) : "0000",
       accountLast4: /^\d{4}$/.test(text(input.accountLast4, 4)) ? text(input.accountLast4, 4) : "0000" }],
     people: [{ name: ownerName, email: ownerEmail, roles: ["owner"] }],
+    // the pack is applied by createCompany itself (accounts, switches, pick lists; never sample data)
+    setup: `pack:${packId}`,
   }) as { id: string; tenantId: string };
   await c.query(`update tenant set kind = 'customer', plan = $2, created_by = $3, last_activity_at = null where id = $1`, [made.tenantId, plan, who.actor]);
   const owner = await one<{ id: string }>(c, `select id from app_user where tenant_id = $1 and lower(email) = $2 /* unscoped: the new client's owner */`, [made.tenantId, ownerEmail]);
   await c.query(`insert into role_grant (app_user_id, entity_id, role) values ($1, null, 'owner') on conflict do nothing`, [owner.id]);
-  const applied = await applyPack(c, { tenantId: made.tenantId, entityId: made.id, actor: { kind: "user", label: who.actor } }, packId, who.actor);
 
   const login = await newLogin(c, made.tenantId, owner.id, ownerEmail, "customer", who.actor);
   const { token } = await issueToken(c, login, "invite", who.actor);
   const link = `${base}/#invite=${token}`;
   const mail = await sendAccountEmail(c, { ...login, name: ownerName, tenant_name: tenantName }, "invite", token, link, who.actor);
   await audit(c, who, "customer.create", made.tenantId, { tenantName, companyName, pack: packId, plan, owner: ownerEmail, emailed: mail.sent }, made.id);
-  return { tenantId: made.tenantId, entityId: made.id, ownerId: owner.id, loginId: login.id, pack: applied.pack, inviteLink: link, emailed: mail.sent };
+  return { tenantId: made.tenantId, entityId: made.id, ownerId: owner.id, loginId: login.id, pack: pack.id, inviteLink: link, emailed: mail.sent };
 }
 
 /** A tenant owner (or an operator) adds someone: a person with roles in one company, and an invite. */

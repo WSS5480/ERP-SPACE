@@ -104,6 +104,7 @@ Data is placed with textContent only, never innerHTML.
 | configurator (sectionals, fabric/leather grades and swatches, option rules, condition grades; extends catalog, pos, inventory, shop, edi) | 0043 | 0026 | Retail (Sectionals), Operations (As-is grades) |
 | admin (service switches and presets, single-store rule, connections, outbound message log) | 0049 | none | Setup (Services, Connections) |
 | platform (customers, sign-in, support mode, tenant API tokens, the demo) | 0051 | 0032 (marks the demo) | Platform (Operator console), Account |
+| onboarding (setup checklist, opening stock import, bank opening balance, tax rates checked) | 0052 | none | Setup (Setup checklist), a Home card |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -560,3 +561,52 @@ migration 0051 marks the seeded tenants as the demo, so a live database keeps
 its sample data as the demo and nothing else; new customers start clean.
 `./db/apply.sh --reset --seed` still builds the test database (seed 0032 marks
 the demo there).
+## Onboarding: the setup checklist (migration 0052)
+
+`packages/core/onboarding.ts`. The checklist is worked out from the company's
+data on every read; nothing stores a tick. Steps: company details (legal name,
+EIN, address, state, fiscal year), stores and warehouses, business type and
+services (single or multi-store counted), chart of accounts (a pack or an
+imported chart, and every code in `POSTS_TO` for the services that are on;
+the onboarding checks grep `code: "NNNN"` in packages/core so the list stays
+complete), sales tax, users and roles (required only with more than one
+location), connections (email tested; texts if Delivery is on; card payments
+if POS or the web store is on), vendors (a feed or EDI partner if Buying or EDI
+is on), products (a price-tag label if Labels is on), opening balances (open
+A/R if Receivables is on, opening stock if Warehouse is on, a bank balance),
+delivery, web store / trade portal, and the go-live check (1300 vs stock, 2100
+vs tax by jurisdiction, 1110 vs the lenders' aging, inter-company net). Steps
+for a service that is off do not show. A step may be skipped with a reason
+(`onboarding_skip`, never deleted; the go-live check cannot be skipped). The
+Home card shows for the owner and controllers until the list is complete or
+hidden (`onboarding_dismissal`).
+
+Sales tax: every rate starts unchecked (`tax_rate.checked_by/checked_at`),
+whether a seed, a migration stand-in or typed in; a person confirms them on
+the Sales tax screen (`tax.confirmRates`, owner or controller), which first
+makes the stand-in for stores still on a single rate.
+
+Opening stock: a CSV (sku, location code, bin code, qty, unit_cost, serial,
+lot) with an as-of day in an open period is previewed into
+`opening_stock_run/row`; a row whose SKU already has stock or movements at
+its location is flagged ("already has N on hand; this adds to it") and
+applying needs `confirm`; the import is refused once the company has posted
+sales, and while the Warehouse service is off. Applying it calls
+`inventory.adjust` with reason `opening_balance`, the row's unit cost and
+`postOn` = the as-of day (Dr 1300 / Cr 3000), one savepoint per row. The
+`opening_balance` adjustment reason is the owner's or a controller's. A SKU at a location comes in from an
+opening import once. A bank account's opening balance posts Dr its cash
+account / Cr 3000 once (`opening_bank_balance`). Packs never add tax rates,
+locations or sample data.
+
+Review fixes (Nov 11 2026). The add-a-company form requires a setup pack or
+preset (`createCompany` input `setup`: `pack:<id>` or `preset:<id>`), applied
+in the same transaction. The trucking pack switches Finance settlements off
+(`Pack.off`): hauling is billed on terms, so no finance-company accounts in its
+chart. Sales tax is optional while a company has no store or outlet. Every
+pack, on a fresh company, has nothing missing in the chart and can reach a
+complete checklist without skips (checked). Companies with journal entries
+when 0052 runs get a dismissal, so trading customers do not see the Home card.
+The Home card counts without the tie-outs, and runs them before it would hide.
+Time zones: the time clock falls back to the delivery settings' zone and
+delivery to the time clock's, before the built-in defaults.

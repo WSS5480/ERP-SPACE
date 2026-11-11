@@ -327,7 +327,7 @@ function go(screen, sub) { location.hash = `#/${S.co.id}/${screen}${sub ? '/' + 
  * the owner sees everything. The server still checks every action on its own.
  */
 const ROLE_SCREENS = {
-  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business', 'services', 'connections', 'salestax', 'wms', 'settlements', 'trade', 'asis'],
+  controller: ['home', 'approvals', 'payables', 'memos', 'payroll', 'books', 'chart', 'cash', 'recon', 'feeds', 'ar', 'workforce', 'timeoff', 'reports', 'group', 'setup', 'business', 'services', 'connections', 'checklist', 'salestax', 'wms', 'settlements', 'trade', 'asis'],
   approver: ['home', 'approvals', 'storeorders', 'payables', 'memos', 'reports'],
   ap_clerk: ['home', 'payables', 'memos', 'edi', 'reports', 'trade'],
   viewer: ['home', 'books', 'chart', 'reports'],
@@ -666,7 +666,7 @@ async function decide(a, decision, btn, after) {
   let note = '';
   let callback = false;
   if (decision === 'rejected') {
-    note = await askReason({ title: 'Reject this?', sub: subjTitle(a.subject), label: 'Why', confirm: 'Reject', placeholder: 'e.g. Wrong store coded; please re-enter against Socorro.' });
+    note = await askReason({ title: 'Reject this?', sub: subjTitle(a.subject), label: 'Why', confirm: 'Reject', placeholder: 'e.g. Wrong store coded; please re-enter against the right one.' });
     if (note == null) return;
   } else if (a.subject.kind === 'vendor_bank') {
     note = await askCallback(a);
@@ -775,7 +775,7 @@ function openBill(id) {
       const acc = el('button', { class: 'btn primary', type: 'button', disabled: (!signs || entered) || null, onclick: async () => {
         const why = await askReason({ title: b.status === 'held' ? 'Not a duplicate?' : 'Let it through?', sub: `${b.vendor} ${b.reference || ''}`,
           lead: 'It goes on to approval, or straight to the books if it is under the approval threshold.', label: 'Why it is fine', confirm: 'Let it through',
-          placeholder: b.status === 'held' ? 'e.g. Separate meter at the Palestine store.' : 'e.g. Compressor replaced; quote attached.' });
+          placeholder: b.status === 'held' ? 'e.g. Separate meter at the other store.' : 'e.g. Compressor replaced; quote attached.' });
         if (why == null) return;
         await act(acc, () => post(`/bills/${id}/accept`, { reason: why }), (r) => r.status === 'approved' ? 'Approved and posted.' : 'Sent on for approval.', { close: d.close });
       } }, b.status === 'held' ? 'Not a duplicate…' : 'Let it through…');
@@ -1031,7 +1031,7 @@ function vendorForm(o, v) {
     tin: input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4 only', value: v.tin_last4 || '' }),
     w9: checkbox('W-9 on file', v.w9_on_file), is1099: checkbox('Gets a 1099', v.is_1099),
     addr1: input({ maxlength: '120', value: v.address_line1 || '' }), addr2: input({ maxlength: '120', placeholder: 'Optional', value: v.address_line2 || '' }),
-    city: input({ maxlength: '60', value: v.city || '' }), state: input({ maxlength: '2', class: 'upper', placeholder: 'TX', value: v.state || '' }),
+    city: input({ maxlength: '60', value: v.city || '' }), state: input({ maxlength: '2', class: 'upper', placeholder: 'ST', value: v.state || '' }),
     zip: input({ maxlength: '10', inputmode: 'numeric', value: v.postal_code || '' }),
     remit: input({ maxlength: '300', placeholder: 'Only if payments go somewhere other than the address', value: v.remit_to || '' }),
     contact: input({ maxlength: '80', placeholder: 'e.g. Accounts receivable', value: v.contact_name || '' }),
@@ -1148,7 +1148,7 @@ function openEditVendor(v) {
 
 function openVendorBank(v) {
   const d = openDialog(`New bank details for ${v.name}`, 'Nothing changes until the controller and the owner approve');
-  const bankName = input({ maxlength: '80', placeholder: 'e.g. First Keystone Bank' });
+  const bankName = input({ maxlength: '80', placeholder: 'The bank’s name' });
   const routing = input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' });
   const account = input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' });
   const heldAt = input({ maxlength: '120', placeholder: 'e.g. The payee record at our bank' });
@@ -1336,7 +1336,7 @@ async function personForm(e) {
     payType: select([['hourly', 'Hourly'], ['salary', 'Salary']], e ? e.pay_type : 'hourly'),
     rate: input({ inputmode: 'decimal', placeholder: '0.00', value: e ? dollars(e.base_rate_minor) : '' }),
     store: select([['', 'Company-wide'], ...o.stores.map((s) => [s.id, s.name])], e ? e.profit_object_id : ''),
-    state: input({ maxlength: '2', list: 'erp-states', placeholder: 'TX', value: e ? e.work_state : '' }),
+    state: input({ maxlength: '2', list: 'erp-states', placeholder: 'ST', value: e ? e.work_state : '' }),
     comp: input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Optional', value: e ? e.comp_class_code || '' : '' }),
   };
   const rateField = field('Hourly rate', f.rate);
@@ -1510,9 +1510,9 @@ async function screenSetup() {
 
 function openAddStore(c, one) {
   const d = openDialog(`Add a ${one.toLowerCase()}`, S.co.name);
-  const code = input({ maxlength: '12', class: 'upper', placeholder: 'e.g. ENL' });
-  const name = input({ maxlength: '60', placeholder: one === 'Store' ? 'e.g. Enola' : '' });
-  const state = input({ maxlength: '2', class: 'upper', placeholder: 'PA' });
+  const code = input({ maxlength: '12', class: 'upper', placeholder: 'e.g. ST1' });
+  const name = input({ maxlength: '60', placeholder: one === 'Store' ? 'e.g. Downtown' : '' });
+  const state = input({ maxlength: '2', class: 'upper', placeholder: 'ST' });
   const out = el('div');
   const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/setup/stores', { code: code.value, name: name.value, state: state.value }),
     `${one} added.`, { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not added', friendly(e))) }) }, `Add ${one.toLowerCase()}`);
@@ -1528,7 +1528,7 @@ function bankFields(storeCodes, init, unit) {
   const f = {
     purpose: select(Object.entries(PURPOSE), init.purpose || 'operating'),
     name: input({ maxlength: '60', placeholder: 'e.g. Operating', value: init.name || '' }),
-    bankName: input({ maxlength: '80', placeholder: 'e.g. First Keystone Bank' }),
+    bankName: input({ maxlength: '80', placeholder: 'The bank’s name' }),
     routing: input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' }),
     account: input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' }),
     store: el('select', {}),
@@ -1624,27 +1624,32 @@ function rowList(make, addLabel, initial) {
 function openNewCompany() {
   const d = openDialog('Add a company', 'Everything it needs to start: its stores, where its money is, and who acts for it', { wide: true });
   fillDialog(d, async () => {
-    const clients = await api('/api/clients');
+    const [clients, biz] = await Promise.all([api('/api/clients'), coApi('/setup/business').catch(() => ({ packs: [], presets: [] }))]);
+    // what kind of business: required, so a new company starts with the right services, accounts and defaults
+    const setupKind = select([['', 'Pick one…'], ...(biz.presets || []).map((p) => [`preset:${p.id}`, `${p.name} (preset)`]),
+      ...(biz.packs || []).map((p) => [`pack:${p.id}`, `${p.name} (setup pack)`])], '');
+    const setupBlurb = el('p', { class: 'fine' });
+    setupKind.addEventListener('change', () => { const [k, id] = setupKind.value.split(':'); const x = ((k === 'pack' ? biz.packs : biz.presets) || []).find((p) => p.id === id); setupBlurb.textContent = x ? x.blurb : ''; });
     const client = select([...clients.map((t) => [t.id, `${t.name} (${plural(t.companies, 'company', 'companies')})`]), ['new', 'A new client…']], S.co.tenant_id || (clients[0] && clients[0].id) || 'new');
     const clientName = input({ maxlength: '60', placeholder: 'The business this company belongs to' });
-    const vertical = select(Object.entries(KIND), 'rto');
+    const vertical = select(Object.entries(KIND), 'retail');
     const chartFrom = select([...clients.map((t) => [t.id, `Copy ${t.name}’s chart (${t.accounts} accounts)`]), ['', 'Only the accounts the ERP posts to']], S.co.tenant_id || (clients[0] ? clients[0].id : ''));
     const newClient = el('div', { class: 'form-grid' }, field('Client name', clientName), field('Kind of business', vertical), field('Chart of accounts', chartFrom, 'A new client starts from a copy; it can be changed after', true));
-    const name = input({ maxlength: '60', placeholder: 'e.g. Buddy’s Home Furnishings West' });
+    const name = input({ maxlength: '60', placeholder: 'The name it trades under' });
     const legal = input({ maxlength: '120', placeholder: 'As on its tax filings' });
     const ein = input({ maxlength: '4', inputmode: 'numeric', placeholder: 'Last 4' });
     const fy = select(MONTHS.map((m, i) => [i + 1, m]), 12);
-    const verticalNow = () => (client.value === 'new' ? vertical.value : (clients.find((t) => t.id === client.value) || {}).vertical || 'rto');
+    const verticalNow = () => (client.value === 'new' ? vertical.value : (clients.find((t) => t.id === client.value) || {}).vertical || 'retail');
     const storeHead = formSec('Stores');
     const stores = rowList(() => {
-      const code = input({ maxlength: '12', class: 'upper', placeholder: 'e.g. ENL' });
+      const code = input({ maxlength: '12', class: 'upper', placeholder: 'e.g. ST1' });
       const nm = input({ maxlength: '60' });
-      const st = input({ maxlength: '2', class: 'upper', placeholder: 'PA' });
+      const st = input({ maxlength: '2', class: 'upper', placeholder: 'ST' });
       return { fields: [field('Short code', code), field('Name', nm), field('State', st)], focus: () => code.focus(),
         value: () => (code.value.trim() || nm.value.trim() ? { code: code.value, name: nm.value, state: st.value } : null) };
     }, 'Add another', [{}]);
     const storeCodes = () => stores.rows.map((r) => r.value()).filter(Boolean).map((s) => [s.code.trim().toUpperCase(), s.name.trim() || s.code]);
-    const unitNow = () => (UNIT[verticalNow()] || UNIT.rto)[0];
+    const unitNow = () => (UNIT[verticalNow()] || UNIT.retail)[0];
     const banks = rowList((init) => bankFields(storeCodes, init, unitNow()), 'Add another account', [{ purpose: 'operating', name: 'Operating' }]);
     const people = rowList(() => {
       const nm = input({ maxlength: '80' });
@@ -1655,7 +1660,7 @@ function openNewCompany() {
     }, 'Add another person', [{}]);
     const sync = () => {
       newClient.hidden = client.value !== 'new';
-      const [one, many] = UNIT[verticalNow()] || UNIT.rto;
+      const [one, many] = UNIT[verticalNow()] || UNIT.retail;
       storeHead.textContent = many;
       for (const r of banks.rows) r.setUnit(one);
     };
@@ -1664,9 +1669,10 @@ function openNewCompany() {
     const setUp = el('button', { class: 'btn primary', type: 'button', onclick: async () => {
       out.replaceChildren();
       const body = { clientId: client.value === 'new' ? null : client.value, clientName: clientName.value, vertical: vertical.value, chartFrom: chartFrom.value || null,
-        name: name.value, legalName: legal.value, einLast4: ein.value, fiscalYearEndMonth: Number(fy.value),
+        name: name.value, legalName: legal.value, einLast4: ein.value, fiscalYearEndMonth: Number(fy.value), setup: setupKind.value,
         stores: stores.rows.map((r) => r.value()).filter(Boolean), banks: banks.rows.filter((r) => !r.blank()).map((r) => r.value()),
         people: people.rows.map((r) => r.value()).filter(Boolean) };
+      if (!setupKind.value) { out.replaceChildren(resultBox('warning', 'warn', 'Pick what kind of business this is', 'Choose a preset or a setup pack; it turns on the right services and adds the accounts they need. Any of it can be changed afterwards.')); setupKind.focus(); return; }
       busy(setUp, true, 'Setting it up…');
       try {
         const r = await api('/api/companies', { method: 'POST', body });
@@ -1674,7 +1680,7 @@ function openNewCompany() {
         S.companies = S.me.companies;
         const c = S.companies.find((x) => x.id === r.id);
         d.close();
-        if (c) { await setCompany(c); go('setup'); }
+        if (c) { await setCompany(c); go('checklist'); }
         toast(r.warning || `${body.name.trim()} is set up.`, r.warning ? 'warning' : 'good');
       } catch (e) {
         if (!(e instanceof Stop)) out.replaceChildren(resultBox('critical', 'fail', 'Not set up', friendly(e)));
@@ -1686,6 +1692,7 @@ function openNewCompany() {
       newClient,
       el('div', { class: 'form-grid' },
         formSec('Company'), field('Name', name), field('Legal name', legal), field('EIN', ein, 'Last four digits only'), field('Fiscal year ends', fy),
+        field('Kind of business (required)', setupKind, 'A preset or setup pack: services, accounts and defaults. Never adds sample data.', true), setupBlurb,
         storeHead),
       stores.node,
       el('div', { class: 'form-grid' }, formSec('Bank accounts')),

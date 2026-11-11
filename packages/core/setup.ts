@@ -1,7 +1,9 @@
 // Industry packs: what makes the ERP work out of the box for a furniture
 // store, a general retailer, a rent-to-own chain, an appliance dealer or a
 // trucking company. A pack is data -- labels, modules, accounts, reasons and
-// default settings -- applied to one company. It only ever adds.
+// default settings -- applied to one company. It only ever adds. A pack never
+// adds tax rates, locations or any sample data: those are the company's own,
+// entered by a person (scripts/modules/onboarding.ts checks this).
 
 import { adoptOpeningBalances } from "./ar.ts";
 import { derivedRate, locationRateChanged, keepStoreRate } from "./tax.ts";
@@ -33,11 +35,12 @@ export const SERVICE_SEED: Partial<Record<ModuleId, ModuleId | null>> = {
 };
 
 /** The modules a pack turns on, with the services that come with them (the ones seeded from a module the pack has). */
-export function packServices(pack: Pick<Pack, "modules">): ModuleId[] {
+export function packServices(pack: Pick<Pack, "modules"> & { off?: ModuleId[] }): ModuleId[] {
   const out = new Set<ModuleId>(pack.modules);
   for (const [svc, from] of Object.entries(SERVICE_SEED) as [ModuleId, ModuleId | null][]) {
     if (from === null || out.has(from)) out.add(svc);
   }
+  for (const m of pack.off ?? []) out.delete(m);
   return MODULE_IDS.filter((m) => out.has(m));
 }
 
@@ -127,6 +130,8 @@ export type Pack = {
   vertical: "furniture" | "retail" | "rto" | "trucking" | "services";
   labels: { location: string; profitObject: string; aging: string };
   modules: ModuleId[];
+  /** services that would come along with the modules (SERVICE_SEED) but this kind of business does not use */
+  off?: ModuleId[];
   accounts: Account[];
   reasons: Reason[];
   settings: Record<string, unknown>;
@@ -227,6 +232,8 @@ export const PACKS: Pack[] = [
     vertical: "trucking",
     labels: { location: "Terminal", profitObject: "Truck", aging: "Settlements" },
     modules: ["ar", "workforce", "fleet", "reports", "group"],
+    // Hauling is billed on terms, not sold on consumer finance plans: no finance-company settlements (and no 1110/1115/2195/6915 in its chart).
+    off: ["settlements"],
     accounts: [
       ["1050", "Undeposited funds", "asset", "D"],
       ["1100", "Accounts receivable, customers", "asset", "D"],
@@ -236,6 +243,13 @@ export const PACKS: Pack[] = [
       ["3000", "Owner equity", "equity", "C"],
       ["4000", "Freight revenue", "revenue", "C"],
       ["4020", "Fees and other revenue", "revenue", "C"],
+      ["1150", "Vendor chargebacks receivable", "asset", "D"],
+      ["2160", "Commissions payable", "liability", "C"],
+      ["4030", "Delivery and accessorial revenue", "revenue", "C"],
+      ["4095", "Trade-in allowances", "revenue", "D"],
+      ["5000", "Cost of services", "expense", "D"],
+      ["6130", "Commissions", "expense", "D"],
+      ["6150", "Warranty and service expense", "expense", "D"],
       ["6300", "Fleet repairs and maintenance", "expense", "D"],
       ["6310", "Fuel", "expense", "D"],
       ["6800", "Other operating", "expense", "D"],

@@ -22,7 +22,7 @@
 
   // ------------------------------------------------------------ little bits
   const st = { day: null, dc: null, opts: null, scanFocus: false, memoTab: 'open', memoVendor: '', leaveTab: 'mine', haulTab: 'waiting',
-    rpState: 'PA', rpFrom: null, rpTo: null, year: new Date().getFullYear() };
+    rpState: null, rpFrom: null, rpTo: null, year: new Date().getFullYear() };
   const words = (s) => cap(String(s || '').replace(/_/g, ' '));
   const btn = (label, onclick, o = {}) => el('button', { class: 'btn' + (o.primary ? ' primary' : '') + (o.small ? ' small' : ''), type: 'button', onclick, disabled: o.disabled || null }, label);
   const field = (label, control, hint) => el('label', { class: 'field' }, el('span', { text: label }), control, hint ? el('span', { class: 'hint', text: hint }) : null);
@@ -251,8 +251,8 @@
     const dc = E.storePicker(select(o.locations.filter((l) => l.kind !== 'web').map((l) => [l.id, l.name]), st.dc));
     const on = input({ type: 'date', value: todayIso() });
     const method = select([['recycler', 'Recycler'], ['landfill', 'Landfill'], ['donation', 'Donation']], 'recycler');
-    const fac = input({ placeholder: 'Keystone Mattress Recycling' }), wt = input({ inputmode: 'decimal', placeholder: 'Leave empty to use the estimate' });
-    const cert = input({ placeholder: 'Certificate or receipt number' }), stt = input({ maxlength: '2', placeholder: 'PA' }), note = input({});
+    const fac = input({ placeholder: 'Facility name' }), wt = input({ inputmode: 'decimal', placeholder: 'Leave empty to use the estimate' });
+    const cert = input({ placeholder: 'Certificate or receipt number' }), stt = input({ maxlength: '2', placeholder: 'ST' }), note = input({});
     formDialog('Log a disposal', plural(ids.length, 'item'), [field('From', dc), field('Day', on), field('Went to', method), field('Facility', fac), field('Weight (lb)', wt),
       field('Certificate no.', cert, 'Needed for a recycler'), field('State', stt), field('Note', note)], 'Log it',
       () => post('/fleet/haul-away/disposals', { dcLocationId: dc.value, disposedOn: on.value, method: method.value, facility: fac.value, weightLb: wt.value,
@@ -263,7 +263,9 @@
     const setup = await coApi('/fleet/haul-away/setup');
     const y = new Date().getFullYear();
     st.rpFrom = st.rpFrom || `${y}-01-01`; st.rpTo = st.rpTo || todayIso();
-    const states = [...new Set(['PA', 'TX', ...setup.programs.map((p) => p.state)])];
+    const states = [...new Set(setup.programs.map((p) => p.state))];
+    if (!states.length) return empty('No state recycling programs yet', 'Add the program for each state you collect in under Haul-away rates; its report shows here.', true);
+    if (!states.includes(st.rpState)) st.rpState = states[0];
     const sSel = select(states.map((s) => [s, s]), st.rpState, { 'aria-label': 'State' });
     const from = input({ type: 'date', value: st.rpFrom, 'aria-label': 'From' }), to = input({ type: 'date', value: st.rpTo, 'aria-label': 'To' });
     for (const [n, k] of [[sSel, 'rpState'], [from, 'rpFrom'], [to, 'rpTo']]) n.addEventListener('change', () => { st[k] = n.value; E.render(); });

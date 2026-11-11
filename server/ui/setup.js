@@ -63,6 +63,8 @@
         acts: [el('button', { class: 'btn small', type: 'button', onclick: () => openImport('customers') }, 'Import…')] }),
       item({ title: 'Open receivables', detail: 'CSV with customer_number (or email), reference, as_of, due_on, balance. Each posts to 1100 against opening equity; a reference is never imported twice.',
         acts: [el('button', { class: 'btn small', type: 'button', onclick: () => openImport('open-ar') }, 'Import…')] }),
+      item({ title: 'Opening stock and bank balances', detail: 'Stock on hand with what it cost (CSV, previewed first) and each bank account’s opening balance. Both post against opening equity (3000).',
+        acts: [el('button', { class: 'btn small', type: 'button', onclick: () => (E.openOpening ? E.openOpening() : E.go('checklist', 'opening')) }, 'Open…')] }),
       d.imports.map((r) => item({ title: `${r.kind === 'open_ar' ? 'Open receivables' : 'Customers'} · ${r.filename || ''}`,
         detail: `${plural(r.rows_added, 'added', 'added')}, ${r.rows_updated} updated, ${r.rows_refused} refused · ${r.run_by} · ${ago(r.run_at)}` })));
 
@@ -104,16 +106,16 @@
       city: input({ value: a.city || '', maxlength: '60' }),
       state: input({ value: a.state || (l && l.state) || '', maxlength: '2', autocapitalize: 'characters' }),
       postal: input({ value: a.postal || '', maxlength: '10', inputmode: 'numeric' }),
-      tax: input({ value: l ? (Number(l.tax_rate_bps) / 100).toString() : '', inputmode: 'decimal', placeholder: '8.25' }),
-      lat: input({ value: l && l.lat != null ? String(l.lat) : '', inputmode: 'decimal', placeholder: '40.2601' }),
-      lng: input({ value: l && l.lng != null ? String(l.lng) : '', inputmode: 'decimal', placeholder: '-76.9336' }),
+      tax: input({ value: l ? (Number(l.tax_rate_bps) / 100).toString() : '', inputmode: 'decimal' }),
+      lat: input({ value: l && l.lat != null ? String(l.lat) : '', inputmode: 'decimal' }),
+      lng: input({ value: l && l.lng != null ? String(l.lng) : '', inputmode: 'decimal' }),
     };
     const err = el('div', { class: 'result critical', role: 'alert', hidden: true });
     d.body.append(el('div', { class: 'form-grid' },
-      field('Code', f.code, 'Short, like ENL or DC1'), field('Name', f.name), field('Kind', f.kind),
+      field('Code', f.code, 'Short, like ST1 or DC1'), field('Name', f.name), field('Kind', f.kind),
       field('Street', f.line1, null, true), field('City', f.city), field('State', f.state), field('ZIP', f.postal),
       field('Sales tax %', f.tax, 'Charged on taxable sales here'),
-      field('Latitude', f.lat, 'For delivery routing'), field('Longitude', f.lng)), err,
+      field('Latitude', f.lat, 'For delivery routing, in decimal degrees'), field('Longitude', f.lng)), err,
       el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel'),
         el('button', { class: 'btn primary', type: 'button', onclick: (e) => {
           const tax = f.tax.value.trim() === '' ? 0 : Math.round(Number(f.tax.value) * 100);
@@ -181,7 +183,8 @@
       detail: [LEVEL_LABEL[j.level] || j.level, `delivery ${yes(j.taxes_delivery)}`, `labor ${yes(j.taxes_labor)}`, `protection plans ${yes(j.taxes_warranty)}`,
         j.areas.length ? `applies to ${j.areas.map(areaWords).join(', ')}` : 'applies nowhere yet', j.filing_ref ? `filed under ${j.filing_ref}` : null].filter(Boolean).join(' · '),
       why: j.note || null,
-      badge: !j.active ? chip('neutral', 'pause', 'Not in use') : j.for_location_id ? chip('neutral', 'info', 'Single store rate') : null,
+      badge: !j.active ? chip('neutral', 'pause', 'Not in use') : j.rates.some((r) => !r.checked_at && (!r.effective_to || r.effective_to >= E.todayIso())) ? chip('warning', 'warn', 'Not checked')
+        : j.for_location_id ? chip('neutral', 'info', 'Single store rate') : null,
       acts: ctl ? [j.for_location_id ? null : el('button', { class: 'btn small', type: 'button', onclick: () => jurisdictionDialog(j) }, 'Edit'),
         el('button', { class: 'btn small', type: 'button', onclick: () => rateDialog(j) }, 'New rate'),
         el('button', { class: 'btn small', type: 'button', onclick: () => areaDialog(j, d) }, 'Where it applies')].filter(Boolean) : null })))));
@@ -202,7 +205,12 @@
     }
     return frag(
       head('Sales tax', ctl ? [el('button', { class: 'btn primary', type: 'button', onclick: () => jurisdictionDialog(null) }, 'Add a jurisdiction')] : null, 'Setup'),
-      el('p', { class: 'lead', text: 'Each sale is taxed by every jurisdiction where the goods are handed over: the store for take-with and pickup, and for a delivery either the delivery address or the store, as chosen here. Rates come with the dates they apply from. The rates set up for you are placeholders; check them with your accountant.' }),
+      el('p', { class: 'lead', text: 'Each sale is taxed by every jurisdiction where the goods are handed over: the store for take-with and pickup, and for a delivery either the delivery address or the store, as chosen here. Rates come with the dates they apply from. Every rate stays marked unchecked until a person confirms it matches what the state publishes.' }),
+      d.unchecked && d.unchecked.length ? el('div', {}, E.resultBox('warning', 'warn', `${plural(d.unchecked.length, 'rate')} not checked yet`,
+        `${d.unchecked.slice(0, 6).map((r) => `${r.name} ${pct(r.rate_bps)}`).join(', ')}${d.unchecked.length > 6 ? ', …' : ''}. Compare each with the state's published rate, fix any that differ with New rate, then confirm.`),
+        ctl ? el('div', { class: 'dlg-acts' }, el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post('/setup/tax/confirm', {}),
+          (r) => `${plural(r.checked, 'rate')} marked checked by you`) }, 'I checked these rates')) : null) : null,
+      d.sourcingChosen === false ? E.resultBox('neutral', 'info', 'How deliveries are taxed is not chosen yet', 'It works as “where the goods go” until you pick one below.') : null,
       section('Deliveries are taxed', null, null, el('div', { class: 'panel' }, padded(el('div', {}, src)))),
       el('div', { class: 'two' },
         el('div', {}, section('What each store charges', 'on taxable goods today', null, stores), rules),
@@ -212,10 +220,10 @@
   function jurisdictionDialog(j) {
     const d = openDialog(j ? `Edit ${j.name}` : 'Add a jurisdiction', E.S.co.name);
     const levels = Object.entries(LEVEL_LABEL).filter(([k]) => k !== 'combined');
-    const f = { code: input({ value: j ? j.code : '', maxlength: '40', autocapitalize: 'characters', placeholder: 'TX-PALESTINE' }),
-      name: input({ value: j ? j.name : '', maxlength: '120', placeholder: 'City of Palestine' }), level: select(levels, j ? j.level : 'city'),
+    const f = { code: input({ value: j ? j.code : '', maxlength: '40', autocapitalize: 'characters', placeholder: 'ST-CITY' }),
+      name: input({ value: j ? j.name : '', maxlength: '120', placeholder: 'City of …' }), level: select(levels, j ? j.level : 'city'),
       state: input({ value: j ? j.state : '', maxlength: '2', autocapitalize: 'characters' }),
-      rate: input({ inputmode: 'decimal', placeholder: '1.5' }), from: input({ type: 'date', value: E.todayIso() }),
+      rate: input({ inputmode: 'decimal' }), from: input({ type: 'date', value: E.todayIso() }),
       delivery: el('input', { type: 'checkbox', checked: j ? j.taxes_delivery : true }), labor: el('input', { type: 'checkbox', checked: j ? j.taxes_labor : false }),
       plans: el('input', { type: 'checkbox', checked: j ? j.taxes_warranty : true }), active: el('input', { type: 'checkbox', checked: j ? j.active : true }),
       filing: input({ value: j && j.filing_ref ? j.filing_ref : '', maxlength: '60' }), note: input({ value: j && j.note ? j.note : '', maxlength: '300' }) };
@@ -234,10 +242,10 @@
 
   function rateDialog(j) {
     const d = openDialog(`New rate for ${j.name}`, j.rate_bps == null ? 'No rate today' : `Today ${pct(j.rate_bps)}`);
-    const rate = input({ inputmode: 'decimal', placeholder: '1.5' }), from = input({ type: 'date', value: E.todayIso() }), note = input({ maxlength: '300' });
+    const rate = input({ inputmode: 'decimal' }), from = input({ type: 'date', value: E.todayIso() }), note = input({ maxlength: '300' });
     const err = el('div', { class: 'result critical', role: 'alert', hidden: true });
     d.body.append(el('p', { class: 'lead', text: 'The rate in force ends the day before the new one starts. Past sales keep the rate they were charged.' }),
-      el('div', { class: 'panel' }, j.rates.map((r) => item({ title: `${dayLabelSafe(r.effective_from)} to ${r.effective_to ? dayLabelSafe(r.effective_to) : 'now'}`, amount: pct(r.rate_bps), detail: r.note || null }))),
+      el('div', { class: 'panel' }, j.rates.map((r) => item({ title: `${dayLabelSafe(r.effective_from)} to ${r.effective_to ? dayLabelSafe(r.effective_to) : 'now'}`, amount: pct(r.rate_bps), detail: [r.note, r.checked_by ? `checked by ${r.checked_by}` : 'not checked yet'].filter(Boolean).join(' · ') }))),
       el('div', { class: 'form-grid' }, field('New rate %', rate), field('From', from), field('Note', note, null, true)), err,
       el('div', { class: 'dlg-acts' }, el('button', { class: 'btn', type: 'button', onclick: d.close }, 'Cancel'),
         el('button', { class: 'btn primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post(`/setup/tax/jurisdictions/${j.id}/rates`, { ratePct: rate.value,
@@ -248,7 +256,7 @@
   function areaDialog(j, d0) {
     const d = openDialog(`Where ${j.name} applies`, j.state);
     const kind = select([['state', `All of ${j.state}`], ['postal', 'One ZIP code'], ['store', 'One store']], 'postal');
-    const postal = input({ inputmode: 'numeric', maxlength: '5', placeholder: '75801' });
+    const postal = input({ inputmode: 'numeric', maxlength: '5', placeholder: '5 digits' });
     const store = select(d0.stores.map((x) => [x.id, x.name]), d0.stores[0] ? d0.stores[0].id : '');
     const err = el('div', { class: 'result critical', role: 'alert', hidden: true });
     d.body.append(el('div', { class: 'panel' }, j.areas.length ? j.areas.map((a) => item({ title: areaWords(a),
