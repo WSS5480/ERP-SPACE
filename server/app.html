@@ -25,15 +25,43 @@
 <div id="signin" class="signin" hidden>
   <form class="card" id="si-form" autocomplete="on" novalidate>
     <div class="brand">ERP</div>
-    <h1>Sign in</h1>
-    <p class="lead" id="si-msg">Sign in with your name and your access key.</p>
-    <label class="field"><span>Your name</span>
-      <input type="text" id="si-name" name="username" autocomplete="username" maxlength="60" required></label>
-    <label class="field"><span>Access key</span>
-      <input type="password" id="si-key" name="password" autocomplete="current-password" required></label>
+    <h1 id="si-title">Sign in</h1>
+    <p class="lead" id="si-msg">Sign in with your email and password.</p>
+    <div class="seg si-mode" id="si-mode" role="group" aria-label="Who is signing in">
+      <button type="button" data-mode="customer" aria-pressed="true">Business account</button>
+      <button type="button" data-mode="operator" aria-pressed="false">ERP team</button>
+    </div>
+    <div id="si-customer">
+      <label class="field"><span>Email</span>
+        <input type="email" id="si-email" name="email" autocomplete="username" maxlength="200"></label>
+      <label class="field" id="si-pass-f"><span>Password</span>
+        <input type="password" id="si-pass" name="password" autocomplete="current-password" maxlength="200"></label>
+      <label class="field" id="si-code-f" hidden><span>Six-digit code from the email</span>
+        <input type="text" id="si-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]*"></label>
+    </div>
+    <div id="si-operator" hidden>
+      <label class="field"><span>Your name</span>
+        <input type="text" id="si-name" name="username" autocomplete="username" maxlength="60"></label>
+      <label class="field"><span>Password</span>
+        <input type="password" id="si-key" name="password" autocomplete="current-password"></label>
+    </div>
+    <div id="si-setpw" hidden>
+      <label class="field" id="si-newname-f"><span>Your name</span>
+        <input type="text" id="si-newname" autocomplete="name" maxlength="80"></label>
+      <label class="field"><span>New password (at least 10 characters)</span>
+        <input type="password" id="si-new" autocomplete="new-password" maxlength="200"></label>
+      <label class="field"><span>The same again</span>
+        <input type="password" id="si-new2" autocomplete="new-password" maxlength="200"></label>
+    </div>
     <button class="btn primary" type="submit" id="si-go">Sign in</button>
     <div class="result critical" id="si-err" role="alert" hidden></div>
-    <p class="fine">Use the access key you were given. Your name is recorded on everything you do here.</p>
+    <div class="result good" id="si-ok" role="status" hidden></div>
+    <p class="si-links" id="si-links">
+      <button type="button" class="linkbtn" id="si-forgot">Forgot your password?</button>
+      <button type="button" class="linkbtn" id="si-askcode">Email me a sign-in code instead</button>
+      <button type="button" class="linkbtn" id="si-back" hidden>Back to sign in</button>
+    </p>
+    <p class="fine" id="si-fine">Your name is recorded on everything you do here.</p>
   </form>
 </div>
 

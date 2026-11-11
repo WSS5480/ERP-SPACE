@@ -19,7 +19,7 @@
 #     their own. POST /api/connections/{id}/run runs one on demand instead.
 #
 # To move to a real environment: change both `plan: free` lines, uncomment the
-# cron job, and set ERP_SEED to nothing so placeholder data is never loaded.
+# cron job. ERP_SEED is no longer needed: sample data is the demo tenant.
 
 databases:
   - name: erp-db
@@ -53,9 +53,19 @@ services:
       # leak the other.
       - key: ERP_EMAIL_INBOUND_TOKEN
         generateValue: true
-      # Trial only. Loads the placeholder company, banks and connections once.
-      - key: ERP_SEED
-        value: placeholder
+      # Not needed any more (migration 0051): the sample data lives in the
+      # demo tenant, which the Operator console resets from db/seed. Leave
+      # ERP_SEED unset in production. ERP_SEED=placeholder still loads the
+      # seed files at start, for a throwaway trial database.
+      # - key: ERP_SEED
+      #   value: placeholder
+      # Where links in invite and reset emails point (else RENDER_EXTERNAL_URL).
+      # - key: ERP_PUBLIC_URL
+      #   value: https://your-erp.example.com
+      # Operator (ERP team) sign-ins: name:password (10+ characters) or
+      # name:scrypt$... from scripts/hash-password.ts, comma-separated.
+      # - key: ERP_LOGINS
+      #   sync: false
       # Set when the ERP shares a database with another app.
       - key: ERP_DB_SCHEMA
         value: erp

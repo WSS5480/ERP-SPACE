@@ -107,8 +107,12 @@ export const SERVICES: Service[] = [
 /** Screens that are always there: the books themselves, and setting the company up. */
 export const CORE_SCREENS = ["home", "approvals", "payables", "books", "chart", "cash", "recon", "feeds", "setup", "business", "services", "connections"];
 
+/** Screens that follow who signed in (an operator, a customer account), not a service switch or a role. */
+export const PLATFORM_SCREENS = ["operator", "account"];
+
 export const SCREEN_SERVICE: Record<string, ModuleId | null> = Object.fromEntries([
   ...CORE_SCREENS.map((s) => [s, null]),
+  ...PLATFORM_SCREENS.map((s) => [s, null]),
   ...SERVICES.flatMap((s) => s.screens.map((x) => [x, s.id])),
 ]);
 
@@ -205,7 +209,7 @@ export async function effectiveServices(c: Client, entityId: string): Promise<Se
  * The screens a person's menu offers: on for the company, and theirs by role.
  * roleScreens is the page's own map (server/app.js ROLE_SCREENS); the owner sees every screen that is on.
  */
-export function navScreens(state: Pick<ServiceState, "on">, roles: readonly string[], roleScreens: Record<string, string[]>, screens: string[] = Object.keys(SCREEN_SERVICE)): string[] {
+export function navScreens(state: Pick<ServiceState, "on">, roles: readonly string[], roleScreens: Record<string, string[]>, screens: string[] = Object.keys(SCREEN_SERVICE).filter((s) => !PLATFORM_SCREENS.includes(s))): string[] {
   const owner = roles.includes("owner");
   const mine = new Set(["home", ...roles.flatMap((r) => roleScreens[r] ?? [])]);
   return screens.filter((s) => {

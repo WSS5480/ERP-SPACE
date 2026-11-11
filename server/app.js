@@ -354,9 +354,12 @@ function screensForPerson() {
   return set;
 }
 const backOfficeHome = () => !S.person || S.person.roles.some((r) => BACK_OFFICE.includes(r));
+// Screens that follow who signed in rather than the person's roles.
+const PLATFORM_SCREENS = { operator: () => isOperator(), account: () => isCustomer() || inSupport() };
 const visibleScreens = () => {
   const mine = screensForPerson();
-  return SCREENS.filter((r) => (!r[4] || !S.modules || S.modules.includes(r[4])) && (!mine || mine.has(r[0])));
+  return SCREENS.filter((r) => (PLATFORM_SCREENS[r[0]] ? PLATFORM_SCREENS[r[0]]()
+    : (!r[4] || !S.modules || S.modules.includes(r[4])) && (!mine || mine.has(r[0]))));
 };
 const canSee = (name) => visibleScreens().some(([n]) => n === name);
 // the phone's bottom bar: the usual four for the owner, otherwise the person's own first screens
@@ -371,7 +374,7 @@ function renderNav() {
   const cur = S.route.screen;
   const badge = (name) => (name === 'approvals' && badgeCount ? el('span', { class: 'badge', text: String(badgeCount), 'aria-label': `${badgeCount} waiting on you` }) : null);
   // Each group once, in a fixed order; screens keep their registration order inside it.
-  const GROUP_ORDER = ['Back office', 'Retail', 'Operations', 'Setup'];
+  const GROUP_ORDER = ['Back office', 'Retail', 'Operations', 'Setup', 'Account', 'Platform'];
   const byGroup = new Map();
   for (const row of visibleScreens()) {
     const g = row[3] || 'Back office';
@@ -393,7 +396,10 @@ function renderNav() {
     el('button', { type: 'button', class: tabsNow().includes(cur) ? null : 'on', onclick: openMore }, icon('more'), 'More'));
   $('#co-name').textContent = S.co.name;
   $('#as-name').textContent = S.person ? `${S.person.name}${S.person.roles.length ? ' · ' + roles(S.person.roles) : ''}` : 'Pick a person';
-  $('#who').replaceChildren('Signed in as ', el('b', { text: S.me.viewer.name }));
+  $('#as-switch').hidden = !mayPickPerson();
+  const k = $('#as-switch').querySelector('.sw-k');
+  if (k) k.textContent = isCustomer() ? (previewing() ? 'Previewing' : 'You, as') : 'Acting as';
+  $('#who').replaceChildren('Signed in as ', el('b', { text: S.me.viewer.name }), inSupport() ? el('span', { text: ' · support mode' }) : '');
 }
 function openMore() {
   const d = openDialog('More', S.co.name, { sheet: true });
@@ -413,18 +419,21 @@ function openCompanyPicker() {
   for (const [tenant, list] of groups) {
     d.body.append(el('div', { class: 'group' }, el('div', { class: 'k', text: `Client: ${tenant}` }), el('div', { class: 'menu' }, list.map(pick))));
   }
-  d.body.append(el('div', { class: 'group' }, el('div', { class: 'menu' },
+  if (!isCustomer() || S.me.viewer.owner) d.body.append(el('div', { class: 'group' }, el('div', { class: 'menu' },
     el('button', { type: 'button', onclick: () => { d.close(); openNewCompany(); } }, icon('plus'), 'Add a company'))));
 }
 function openPersonPicker() {
-  const d = openDialog('Act as', `Whose approvals and whose name go on what you do in ${S.co.name}`, { sheet: true });
+  if (!mayPickPerson()) return;
+  const owner = isCustomer();
+  const d = openDialog(owner ? 'Preview as' : 'Act as', owner ? `See ${S.co.name} the way one of your people sees it` : `Whose approvals and whose name go on what you do in ${S.co.name}`, { sheet: true });
   d.body.append(
-    el('p', { class: 'lead', text: 'The rules follow the person: the one who enters a bill cannot approve it, and whoever builds a run cannot release it. Switch here to see each person’s queue.' }),
+    el('p', { class: 'lead', text: owner ? 'A preview is read-only: you see their screens and queues, and anything that changes data is refused until you switch back to yourself.'
+      : 'The rules follow the person: the one who enters a bill cannot approve it, and whoever builds a run cannot release it. Switch here to see each person’s queue. Support mode records it.' }),
     el('div', { class: 'menu' }, S.people.map((p) => el('button', { type: 'button', class: S.person && p.id === S.person.id ? 'on' : null,
       onclick: () => { setPerson(p); d.close(); renderNav(); render(); } },
       icon('user'), el('span', {}, p.name, el('span', { class: 'sub', text: p.roles.length ? ` · ${roles(p.roles)}` : ' · no roles here' }))))));
 }
-function setPerson(p) { S.person = p; if (p) store.set(`erp.as.${S.co.id}`, p.id); }
+function setPerson(p) { S.person = p; if (p && !isCustomer()) store.set(`erp.as.${S.co.id}`, p.id); }
 /**
  * The version running, and when it went live, under the name top left: every
  * deploy changes both. The page loads app.js?v=<version>-<start time in base 36>,
@@ -449,10 +458,16 @@ async function setCompany(c) {
   S.people = await api(`/api/c/${c.id}/people`);
   // the services this company shows (switches, parents, and the single-store rule), and its layout
   try { const m = await api(`/api/c/${c.id}/setup/modules`); S.modules = m.modules; S.layout = m.layout || null; } catch (_) { S.modules = null; S.layout = null; }
-  const saved = store.get(`erp.as.${c.id}`);
-  const byName = S.people.find((p) => p.name.toLowerCase() === (S.me.viewer.name || '').toLowerCase());
-  const owner = S.people.find((p) => p.roles.includes('owner'));
-  setPerson(S.people.find((p) => p.id === saved) || byName || owner || S.people[0] || null);
+  if (isCustomer()) {
+    // A customer is always themselves; an owner's preview starts again from themselves on every company.
+    S.person = S.people.find((p) => p.id === S.me.viewer.personId) || null;
+    api('/api/me/company', { method: 'POST', body: { id: c.id } }).catch(() => {});
+  } else {
+    const saved = store.get(`erp.as.${c.id}`);
+    const byName = S.people.find((p) => p.name.toLowerCase() === (S.me.viewer.name || '').toLowerCase());
+    const owner = S.people.find((p) => p.roles.includes('owner'));
+    setPerson(S.people.find((p) => p.id === saved) || byName || owner || S.people[0] || null);
+  }
   S.billTab = 'attention';
 }
 function parseHash() {
@@ -478,6 +493,8 @@ async function refreshBadge() {
   } catch (_) { /* the screen will show any error */ }
 }
 async function render() {
+  // an operator outside support mode has no company: the console is the whole app
+  if (!S.co && isOperator()) return operatorOnly();
   // a screen the person you're acting as doesn't work in sends you to their Home
   if (S.route && !canSee(S.route.screen)) {
     S.route = { screen: 'home', sub: '' };
@@ -490,12 +507,12 @@ async function render() {
   try {
     const node = await RENDER[S.route.screen](S.route.sub);
     if (seq !== S.seq) return;
-    main.replaceChildren(node, el('footer', { class: 'pagefoot' },
+    main.replaceChildren(...platformBanners(), node, el('footer', { class: 'pagefoot' },
       el('span', { text: `Signed in as ${S.me.viewer.name}` }), el('span', { text: `Version ${S.me.version}` }),
       el('span', { text: 'Times are in your time zone' })));
   } catch (e) {
     if (e instanceof Stop || seq !== S.seq) return;
-    main.replaceChildren(notYoursBox(e) || errorBox(e, () => render()));
+    main.replaceChildren(...platformBanners(), notYoursBox(e) || errorBox(e, () => render()));
   }
   refreshBadge();
 }
@@ -2110,6 +2127,8 @@ window.ERP = {
   api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
   head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input,
   openEntry, NARROW,
+  // defined further down (sign-in and who you are); wrapped so they resolve when called
+  isOperator: () => isOperator(), isCustomer: () => isCustomer(), inSupport: () => inSupport(), managesAccount: () => managesAccount(), boot: () => boot(),
   /** homeCard(async () => node | null): a card on Home, after the tiles */
   homeCard(fn, opts = {}) {
     const src = document.currentScript && /\/ui\/([a-z]+)\.js/.exec(document.currentScript.src);
@@ -2132,30 +2151,110 @@ window.ERP = {
 };
 
 // ================================================================ sign in
+// One page for both kinds of user: a business account (email and password, or
+// an emailed code) and the ERP team (name and password). An invite or reset
+// link (#invite=… / #reset=…) opens the set-a-password form on the same page.
+const SI = { mode: 'customer', token: null, purpose: null };
+function siMode(mode) {
+  SI.mode = mode;
+  const setpw = mode === 'setpw';
+  $('#si-mode').hidden = setpw || mode === 'forgot';
+  for (const b of $('#si-mode').querySelectorAll('button')) b.setAttribute('aria-pressed', String(b.dataset.mode === (mode === 'code' || mode === 'forgot' ? 'customer' : mode)));
+  $('#si-customer').hidden = !(mode === 'customer' || mode === 'code' || mode === 'forgot');
+  $('#si-pass-f').hidden = mode !== 'customer';
+  $('#si-code-f').hidden = mode !== 'code';
+  $('#si-operator').hidden = mode !== 'operator';
+  $('#si-setpw').hidden = !setpw;
+  $('#si-newname-f').hidden = SI.purpose !== 'invite';
+  $('#si-forgot').hidden = mode !== 'customer';
+  $('#si-askcode').hidden = mode !== 'customer';
+  $('#si-back').hidden = !(mode === 'code' || mode === 'forgot' || setpw);
+  $('#si-title').textContent = setpw ? (SI.purpose === 'invite' ? 'Set up your sign-in' : 'Choose a new password') : mode === 'forgot' ? 'Reset your password' : 'Sign in';
+  $('#si-go').replaceChildren(setpw ? 'Save and sign in' : mode === 'forgot' ? 'Email me a reset link' : 'Sign in');
+  $('#si-fine').textContent = mode === 'operator' ? 'For the ERP’s own team. Customers’ companies open only in support mode, which is recorded.' : 'Your name is recorded on everything you do here.';
+  $('#si-err').hidden = true;
+}
 function showSignIn(msg) {
   show('signin');
-  $('#si-msg').textContent = msg || 'Sign in with your name and your access key.';
-  $('#si-err').hidden = true;
+  if (SI.mode === 'setpw') SI.mode = 'customer';
+  siMode(SI.mode);
+  $('#si-msg').textContent = msg || (SI.mode === 'operator' ? 'Sign in with your name and your password.' : 'Sign in with your email and password.');
   for (const dl of document.querySelectorAll('dialog[open]')) dl.close();
-  ($('#si-name').value ? $('#si-key') : $('#si-name')).focus();
+  (SI.mode === 'operator' ? ($('#si-name').value ? $('#si-key') : $('#si-name')) : ($('#si-email').value ? $('#si-pass') : $('#si-email'))).focus();
+}
+async function siPost(path, body) {
+  const res = await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'x-erp-page': '1', 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error((data && data.error) || `The service answered ${res.status}`);
+  return data;
 }
 async function signIn(ev) {
   ev.preventDefault();
-  const name = $('#si-name').value.trim(), key = $('#si-key').value.trim();
-  const err = $('#si-err');
+  const err = $('#si-err'), okBox = $('#si-ok');
   const fail = (title, text) => { err.replaceChildren(icon('fail'), el('div', {}, el('b', { text: title }), el('span', { text }))); err.hidden = false; };
-  if (!name || !key) { fail(name ? 'Paste the access key' : 'Put your name in', name ? 'It is the ERP_API_TOKEN value in Render.' : 'Everything you do here is recorded against it.'); (name ? $('#si-key') : $('#si-name')).focus(); return; }
+  const said = (text) => { okBox.replaceChildren(icon('ok'), el('div', {}, el('span', { text }))); okBox.hidden = false; };
+  err.hidden = true; okBox.hidden = true;
+  let path, body;
+  if (SI.mode === 'operator') {
+    const name = $('#si-name').value.trim(), key = $('#si-key').value;
+    if (!name || !key) { fail(name ? 'Put your password in' : 'Put your name in', name ? 'It is the password set for you in ERP_LOGINS.' : 'Everything you do here is recorded against it.'); return; }
+    path = '/session'; body = { name, key };
+  } else if (SI.mode === 'setpw') {
+    const a = $('#si-new').value, b = $('#si-new2').value;
+    if (a.length < 10) { fail('Too short', 'Use at least 10 characters.'); return; }
+    if (a !== b) { fail('They do not match', 'Type the same password in both boxes.'); return; }
+    path = SI.purpose === 'invite' ? '/account/accept' : '/account/reset'; body = { token: SI.token, password: a, name: $('#si-newname').value.trim() };
+  } else {
+    const email = $('#si-email').value.trim();
+    if (!email) { fail('Put your email in', 'The address your invite came to.'); $('#si-email').focus(); return; }
+    if (SI.mode === 'forgot') path = '/account/forgot', body = { email };
+    else if (SI.mode === 'code') { const code = $('#si-code').value.trim(); if (!/^\d{6}$/.test(code)) { fail('Six digits', 'Type the code from the email.'); return; } path = '/session'; body = { email, code }; }
+    else { const password = $('#si-pass').value; if (!password) { fail('Put your password in', 'Or ask for a sign-in code by email.'); return; } path = '/session'; body = { email, password }; }
+  }
   const go = $('#si-go');
-  busy(go, true, 'Signing in…'); err.hidden = true;
+  busy(go, true, 'Working…');
   try {
-    const res = await fetch('/session', { method: 'POST', credentials: 'same-origin', headers: { 'x-erp-page': '1', 'content-type': 'application/json' }, body: JSON.stringify({ name, key }) });
-    const body = await res.json().catch(() => null);
-    if (!res.ok) throw new Error((body && body.error) || `The service answered ${res.status}`);
-    $('#si-key').value = '';
+    const r = await siPost(path, body);
+    if (SI.mode === 'forgot') { said(r.note); return; }
+    $('#si-key').value = ''; $('#si-pass').value = ''; $('#si-new').value = ''; $('#si-new2').value = ''; $('#si-code').value = '';
+    if (SI.mode === 'setpw') { history.replaceState(null, '', location.pathname); SI.mode = 'customer'; SI.token = null; }
     show('boot');
     await boot();
   } catch (e) { fail('Not signed in', friendly(e)); }
   finally { busy(go, false); }
+}
+async function askCode() {
+  const email = $('#si-email').value.trim();
+  if (!email) { $('#si-email').focus(); return; }
+  try {
+    const r = await siPost('/session/code', { email });
+    siMode('code');
+    $('#si-ok').replaceChildren(icon('ok'), el('div', {}, el('span', { text: r.note }))); $('#si-ok').hidden = false;
+    $('#si-code').focus();
+  } catch (e) { $('#si-err').replaceChildren(icon('fail'), el('div', {}, el('span', { text: friendly(e) }))); $('#si-err').hidden = false; }
+}
+/** An invite or reset link: check it, then show the set-a-password form. */
+async function linkFromHash() {
+  const m = /^#(invite|reset)=([A-Za-z0-9_-]{20,100})$/.exec(location.hash);
+  if (!m) return false;
+  SI.token = m[2];
+  show('signin');
+  try {
+    const res = await fetch(`/account/token?t=${encodeURIComponent(m[2])}`, { credentials: 'same-origin', cache: 'no-store' });
+    const info = await res.json().catch(() => null);
+    if (!res.ok) throw new Error((info && info.error) || 'That link did not work.');
+    SI.purpose = info.purpose;
+    siMode('setpw');
+    $('#si-msg').textContent = info.purpose === 'invite' ? `${info.tenant}: choose the password for ${info.email}.` : `Choose a new password for ${info.email}.`;
+    if (info.purpose === 'invite') $('#si-newname').value = info.name || '';
+    $('#si-new').focus();
+  } catch (e) {
+    history.replaceState(null, '', location.pathname);
+    SI.token = null;
+    siMode('customer');
+    $('#si-msg').textContent = friendly(e);
+  }
+  return true;
 }
 async function signOut() {
   try { await fetch('/session/end', { method: 'POST', credentials: 'same-origin', headers: { 'x-erp-page': '1' } }); } catch (_) { /* gone anyway */ }
@@ -2163,13 +2262,71 @@ async function signOut() {
   showSignIn('Signed out.');
 }
 
+// ============================================================ who you are
+const viewerKind = () => (S.me && S.me.viewer && S.me.viewer.kind) || 'system';
+const isOperator = () => viewerKind() === 'operator';
+const isCustomer = () => viewerKind() === 'customer';
+const inSupport = () => isOperator() && !!S.me.viewer.support;
+/** A customer who owns their account, or an operator supporting one, manages sign-ins and tokens. */
+const managesAccount = () => (isCustomer() && !!S.me.viewer.owner) || inSupport();
+/** Choosing whose view to see: an operator in support mode, a tenant owner (preview, read-only), or the system token. */
+const mayPickPerson = () => (isCustomer() ? !!S.me.viewer.owner : true);
+const previewing = () => isCustomer() && S.person && S.person.id !== S.me.viewer.personId;
+function platformBanners() {
+  const out = [];
+  if (inSupport()) {
+    const s = S.me.viewer.support;
+    out.push(el('div', { class: 'banner support', role: 'status' }, icon('warn'), el('span', {}, el('b', { text: `Support mode: ${s.tenantName}. ` }),
+      'Everything you do here is recorded on the customer’s log.',
+      el('button', { type: 'button', class: 'linkbtn', onclick: leaveSupport }, 'Leave support mode'))));
+  }
+  if (previewing()) {
+    out.push(el('div', { class: 'banner preview', role: 'status' }, icon('user'), el('span', {}, el('b', { text: `Previewing ${S.person.name}’s view. ` }),
+      'Read-only: changes are refused until you switch back.',
+      el('button', { type: 'button', class: 'linkbtn', onclick: () => { setPerson(S.people.find((p) => p.id === S.me.viewer.personId) || null); renderNav(); render(); } }, 'Back to me'))));
+  }
+  if (S.co && S.co.tenant_kind === 'demo') {
+    const exp = isCustomer() && S.me.viewer.prospect && S.me.viewer.expiresAt ? ` Your demo sign-in ends ${fmtDate.format(new Date(S.me.viewer.expiresAt))}.` : '';
+    out.push(el('div', { class: 'banner' }, icon('info'), el('span', { text: `Demo company with sample data; the ERP team resets it from time to time.${exp}` })));
+  }
+  return out;
+}
+async function leaveSupport() {
+  try { await api('/api/platform/support/end', { method: 'POST', body: {} }); } catch (e) { if (!(e instanceof Stop)) toast(friendly(e), 'critical'); return; }
+  S.co = null;
+  show('boot');
+  await boot();
+}
+/** An operator outside support mode has no company: the console is the whole app. */
+async function operatorOnly() {
+  S.co = null; S.person = null; S.people = [];
+  show('app');
+  $('#co-switch').hidden = true; $('#as-switch').hidden = true;
+  $('#nav').replaceChildren(el('div', { class: 'nav-group', text: 'Platform' }), el('a', { href: '#/operator', class: 'on' }, icon('server'), 'Operator console'));
+  $('#tabbar').replaceChildren(el('a', { href: '#/operator', class: 'on' }, icon('server'), 'Console'), el('button', { type: 'button', onclick: signOut }, icon('out'), 'Sign out'));
+  $('#who').replaceChildren('Signed in as ', el('b', { text: S.me.viewer.name }));
+  const main = $('#main');
+  main.replaceChildren(loadingNode());
+  try {
+    if (!RENDER.operator) throw new Error('The Operator console did not load (server/ui/platform.js).');
+    main.replaceChildren(await RENDER.operator(''), el('footer', { class: 'pagefoot' }, el('span', { text: `Signed in as ${S.me.viewer.name}` }), el('span', { text: `Version ${S.me.version}` })));
+  } catch (e) { if (!(e instanceof Stop)) main.replaceChildren(errorBox(e, operatorOnly)); }
+}
+
 // =================================================================== boot
 async function boot() {
   try {
+    if (await linkFromHash()) return;
     S.me = await api('/api/me');
     S.companies = S.me.companies;
     showVersion();
-    if (!S.companies.length) { $('#boot-msg').replaceChildren('No companies are set up in this database yet.'); $('#boot .spin').hidden = true; return; }
+    $('#co-switch').hidden = false; $('#as-switch').hidden = !mayPickPerson();
+    if (!S.companies.length) {
+      if (isOperator()) { await operatorOnly(); return; }
+      $('#boot-msg').replaceChildren(el('div', { text: isCustomer() ? 'Your sign-in has no company to open yet. Ask your account owner to give you a role.' : 'No companies are set up in this database yet.' }),
+        el('button', { class: 'btn', type: 'button', onclick: signOut }, 'Sign out'));
+      $('#boot .spin').hidden = true; show('boot'); return;
+    }
     const r = parseHash();
     const pickId = r.co || store.get('erp.company') || S.me.defaultCompany;
     const c = S.companies.find((x) => x.id === pickId) || S.companies.find((x) => x.id === S.me.defaultCompany) || S.companies[0];
@@ -2213,7 +2370,11 @@ function wire() {
   $('#co-switch').addEventListener('click', openCompanyPicker);
   $('#as-switch').addEventListener('click', openPersonPicker);
   $('#si-form').addEventListener('submit', signIn);
-  window.addEventListener('hashchange', onRoute);
+  for (const b of $('#si-mode').querySelectorAll('button')) b.addEventListener('click', () => { siMode(b.dataset.mode); showSignIn(); });
+  $('#si-forgot').addEventListener('click', () => { siMode('forgot'); $('#si-msg').textContent = 'We will email you a link to choose a new password.'; $('#si-email').focus(); });
+  $('#si-askcode').addEventListener('click', askCode);
+  $('#si-back').addEventListener('click', () => { history.replaceState(null, '', location.pathname); SI.token = null; siMode('customer'); showSignIn(); });
+  window.addEventListener('hashchange', () => { if (/^#(invite|reset)=/.test(location.hash)) { boot(); return; } if (!S.co && isOperator()) { operatorOnly(); return; } onRoute(); });
   let hiddenAt = 0;
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') hiddenAt = Date.now();

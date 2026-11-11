@@ -37,10 +37,20 @@
 //   Secrets live in environment variables named from the connection's
 //   credential_ref, never in the database.
 //
-// The token is an operator key, not per-person sign-in, and choosing who to
-// act as is the operator's to make. That is right for the trial and wrong for
-// real books: per-person sign-in, with each person only ever acting as
-// themselves, comes before any real data does.
+// People sign in two ways (server/platform.ts holds the accounts):
+//
+//   Customer users -- a business that bought the ERP -- sign in with an email
+//   and a password (scrypt, salted per user) and see only their own tenant's
+//   companies, as themselves, with their own roles. A tenant owner may
+//   preview another of their people's view, read-only.
+//
+//   Platform operators (the developer team) sign in with a name and a password
+//   from ERP_LOGINS. They run the Operator console and see a customer's
+//   companies only in support mode, which is recorded and shows a banner;
+//   "act as" exists only there.
+//
+// Every route that names a company resolves it from the URL and refuses it
+// (as "no such company") when it is outside what the session may open.
 
 import http from "node:http";
 import { readFileSync } from "node:fs";
@@ -61,7 +71,11 @@ import "../packages/core/statements.ts"; // registers the bank_statement handler
 import { migrate } from "../scripts/migrate.ts";
 import * as views from "./views.ts";
 import * as act from "./actions.ts";
-import { ActionError, type Actor } from "./actions.ts";
+import { ActionError, rolesOf, type Actor } from "./actions.ts";
+import * as P from "./platform.ts";
+import { PlatformError } from "./platform.ts";
+import { resetDemo, DemoResetError } from "../packages/core/platform_demo.ts";
+import { clientIp } from "./modules/trade.ts";
 import { loadSampleActivity } from "./sample.ts";
 import { MODULES } from "./modules/index.ts";
 import { ModuleError, PublicPage, PublicAsset } from "./modules/kit.ts";
@@ -75,13 +89,13 @@ import { TaxError } from "../packages/core/tax.ts";
 import { WorkforceError } from "../packages/core/workforce.ts";
 
 const PORT = Number(process.env.PORT ?? 10000);
-const TOKEN = process.env.ERP_API_TOKEN ?? "";
-const EMAIL_TOKEN = process.env.ERP_EMAIL_INBOUND_TOKEN ?? "";
-// The company the install-wide feed screens (connections, quarantine,
-// statement intake) open on: ERP_ENTITY_ID if set, otherwise the first
-// company created here -- never a hard-coded demo company.
-let ENTITY = (process.env.ERP_ENTITY_ID ?? "").trim();
-const NO_COMPANY = "00000000-0000-0000-0000-000000000000";
+// Read when used, not when loaded, so a check can set them before it starts a server.
+const TOKEN = () => process.env.ERP_API_TOKEN ?? "";
+const EMAIL_TOKEN = () => process.env.ERP_EMAIL_INBOUND_TOKEN ?? "";
+// There is no install-wide company any more: each person opens on their own
+// last (or first) company. ERP_ENTITY_ID stays only as the default for the
+// system token and for an operator, when it is a company they may open.
+const DEV_ENTITY = () => (process.env.ERP_ENTITY_ID ?? "").trim();
 const TRIAL = process.env.ERP_SEED === "placeholder";
 const TRIAL_ENDS = process.env.ERP_TRIAL_ENDS ?? "";
 const VERSION = (process.env.RENDER_GIT_COMMIT ?? "").slice(0, 7) || "dev";
@@ -218,14 +232,17 @@ function bearer(req: http.IncomingMessage): string {
 
 // A separate key for signing sessions, derived from the token, so the token
 // itself never signs anything a browser holds.
-const sessionKey = () => createHmac("sha256", TOKEN).update("erp/session/v1").digest();
+const sessionKey = () => createHmac("sha256", TOKEN()).update("erp/session/v1").digest();
 
 function cleanName(v: unknown): string {
   return String(v ?? "").replace(/[\u0000-\u001f\u007f<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 60);
 }
 
-function sessionCookie(name: string, expSeconds: number): string {
-  const payload = Buffer.from(JSON.stringify({ n: name, e: expSeconds })).toString("base64url");
+/** What a session cookie carries: n name, e expiry; k 'o' operator (s: support session) or 'c' customer (l login, v version). */
+type CookieData = { n: string; e: number; k?: "o" | "c"; s?: string; l?: string; v?: number };
+
+function sessionCookie(d: CookieData): string {
+  const payload = Buffer.from(JSON.stringify(d)).toString("base64url");
   const sig = createHmac("sha256", sessionKey()).update(payload).digest("base64url");
   return `${SESSION_COOKIE}=${payload}.${sig}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_HOURS * 3600}`;
 }
@@ -240,7 +257,7 @@ function cookieValue(req: http.IncomingMessage, name: string): string {
   return "";
 }
 
-export function sessionFrom(req: http.IncomingMessage): { name: string; exp: number } | null {
+export function sessionFrom(req: http.IncomingMessage): (CookieData & { name: string; exp: number }) | null {
   const raw = cookieValue(req, SESSION_COOKIE);
   const dot = raw.indexOf(".");
   if (dot < 1) return null;
@@ -250,57 +267,130 @@ export function sessionFrom(req: http.IncomingMessage): { name: string; exp: num
   try {
     const d = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     if (typeof d.e !== "number" || d.e * 1000 <= Date.now()) return null;
-    return { name: cleanName(d.n) || "Operator", exp: d.e };
+    return { ...d, name: cleanName(d.n) || "Operator", exp: d.e };
   } catch {
     return null;
   }
 }
 
-type Who = { via: "token" } | { via: "session"; name: string; exp: number };
+type Support = { id: string; tenantId: string; tenantName: string; since: string; reason: string };
+type Who =
+  | { via: "token"; kind: "system"; name: string }
+  | { via: "apitoken"; kind: "tenant"; name: string; tenantId: string; tokenId: string }
+  | { via: "session"; kind: "operator"; name: string; exp: number; support: Support | null }
+  | { via: "session"; kind: "customer"; name: string; exp: number; loginId: string; userId: string; tenantId: string;
+      tenantName: string; tenantKind: string; email: string; prospect: boolean; expiresAt: string | null };
 
-function authenticate(req: http.IncomingMessage): Who | null {
+async function authenticate(req: http.IncomingMessage): Promise<Who | null> {
   const presented = bearer(req);
   // A script that sends a wrong token is refused outright, not quietly
   // judged by whatever cookie happens to ride along.
-  if (presented) return safeEqual(presented, TOKEN) ? { via: "token" } : null;
+  if (presented) {
+    if (presented.startsWith(P.API_TOKEN_PREFIX)) {
+      const c = await pool.connect();
+      try {
+        const t = await P.tokenWho(c, presented);
+        return t ? { via: "apitoken", kind: "tenant", name: `API token ${t.name}`, tenantId: t.tenantId, tokenId: t.tokenId } : null;
+      } finally { c.release(); }
+    }
+    return safeEqual(presented, TOKEN()) ? { via: "token", kind: "system", name: "API token" } : null;
+  }
   const s = sessionFrom(req);
-  return s ? { via: "session", ...s } : null;
+  if (!s) return null;
+  if (s.k === "c") {
+    const c = await pool.connect();
+    try {
+      const l = s.l ? await P.loginById(c, s.l) : null;
+      if (!l || l.session_version !== s.v || l.status !== "active" || P.blocked(l)) return null;
+      return { via: "session", kind: "customer", name: l.name, exp: s.exp, loginId: l.id, userId: l.app_user_id, tenantId: l.tenant_id,
+        tenantName: l.tenant_name, tenantKind: l.tenant_kind, email: l.email, prospect: l.kind === "prospect", expiresAt: l.expires_at };
+    } finally { c.release(); }
+  }
+  // An operator. Cookies from before customers existed carry no kind and are operators too.
+  let support: Support | null = null;
+  if (s.s) {
+    const c = await pool.connect();
+    try {
+      const r = await P.supportSession(c, s.s, s.name);
+      if (r) support = { id: r.id, tenantId: r.tenant_id, tenantName: r.tenant_name, since: r.started_at, reason: r.reason };
+    } finally { c.release(); }
+  }
+  return { via: "session", kind: "operator", name: s.name, exp: s.exp, support };
 }
 
 /** What the audit trail records as the actor, when nobody has been chosen. */
 const labelFor = (who: Who | null, apiLabel: string): string =>
-  who?.via === "session" ? `${who.name} (web)` : apiLabel;
+  who?.via === "session" ? `${who.name} (${who.kind === "operator" && who.support ? "support" : "web"})` : who?.kind === "tenant" ? who.name : apiLabel;
 
-// A crude brake on guessing. The token is long enough that guessing is
-// hopeless anyway; this keeps the log from filling with it.
-let failWindow = 0;
-let failCount = 0;
-function noteSignInFailure(): void {
-  const now = Date.now();
-  if (now - failWindow > 10 * 60_000) { failWindow = now; failCount = 0; }
-  failCount++;
+const auditActor = (who: Who | null): P.AuditActor =>
+  !who || who.kind === "system" ? { actor: "api", kind: "system" }
+    : who.kind === "tenant" ? { actor: who.name, kind: "token" }
+      : who.kind === "operator" ? { actor: who.name, kind: "operator", supportId: who.support?.id ?? null }
+        : { actor: who.email, kind: "customer" };
+
+// ------------------------------------------------------------ sign-in brakes
+//
+// Wrong passwords are counted per name (or email) AND address, and per
+// address. A name locks for 15 minutes after 5 wrong tries from one address;
+// an address that keeps failing waits longer each time (up to 8 seconds) and
+// is refused for 15 minutes after 40. Nothing counted against one address
+// ever stops a correct password from another, and there is no install-wide
+// lock any more: made-up names cannot lock out the real ones.
+const FAIL_MS = 15 * 60_000;
+const fails = new Map<string, { n: number; since: number }>();
+function failsOf(key: string) {
+  const f = fails.get(key);
+  if (!f || Date.now() - f.since >= FAIL_MS) return 0;
+  return f.n;
 }
-const signInThrottled = () => Date.now() - failWindow <= 10 * 60_000 && failCount >= 30;
-
-// Named developer logins: ERP_LOGINS="steve:5480,hunter:1234" in Render's
-// environment, never in the repository. Each is a name and its own key, and
-// a person signing in that way is recorded by that name. A short key is easy
-// to guess, so each login locks for 15 minutes after 5 wrong keys.
-const LOGINS = new Map<string, string>(
-  (process.env.ERP_LOGINS ?? "").split(",").map((x) => x.trim()).filter(Boolean).map((x) => {
-    const i = x.indexOf(":");
-    return [x.slice(0, i).trim().toLowerCase(), x.slice(i + 1).trim()] as [string, string];
-  }).filter(([n, k]) => n && k));
-const loginFails = new Map<string, { n: number; since: number }>();
-const loginLocked = (name: string) => {
-  const f = loginFails.get(name);
-  return !!f && f.n >= 5 && Date.now() - f.since < 15 * 60_000;
-};
-const noteLoginFailure = (name: string) => {
-  const f = loginFails.get(name);
-  if (!f || Date.now() - f.since >= 15 * 60_000) loginFails.set(name, { n: 1, since: Date.now() });
+function noteFail(key: string) {
+  const f = fails.get(key);
+  if (!f || Date.now() - f.since >= FAIL_MS) fails.set(key, { n: 1, since: Date.now() });
   else f.n++;
-};
+  if (fails.size > 50_000) for (const [k, v] of fails) if (Date.now() - v.since >= FAIL_MS) fails.delete(k);
+}
+const userKey = (name: string, ip: string) => `u:${name.toLowerCase()}|${ip}`;
+const ipKey = (ip: string) => `ip:${ip}`;
+const USER_LIMIT = 5, IP_LIMIT = 40;
+function signInGate(name: string, ip: string): void {
+  if (failsOf(ipKey(ip)) >= IP_LIMIT) throw new HttpError(429, "too many wrong sign-ins from this address; wait 15 minutes and try again");
+  if (failsOf(userKey(name, ip)) >= USER_LIMIT) throw new HttpError(429, "too many wrong tries for that sign-in; wait 15 minutes and try again");
+}
+async function signInFailed(name: string, ip: string, what: string): Promise<never> {
+  noteFail(userKey(name, ip));
+  noteFail(ipKey(ip));
+  const n = failsOf(ipKey(ip));
+  await sleep(Math.min(8000, 700 * 2 ** Math.max(0, Math.floor(n / 5) - 1)));
+  console.log(`sign-in refused (${what})`);
+  throw new HttpError(401, what === "customer" ? "that email and password did not match" : "that access key did not match");
+}
+const signInOk = (name: string, ip: string) => fails.delete(userKey(name, ip));
+/** A plain rate limit (codes, reset emails): true when over. */
+function overRate(key: string, max: number): boolean {
+  if (failsOf(`r:${key}`) >= max) return true;
+  noteFail(`r:${key}`);
+  return false;
+}
+
+// Operator logins: ERP_LOGINS="steve:<password or scrypt hash>,hunter:..." in
+// Render's environment, never in the repository. A password is at least 10
+// characters; a value starting scrypt$ is a hash from scripts/hash-password.ts.
+// The old 4-digit keys are refused, with a sentence saying what to set.
+function operatorLogins(): Map<string, string> {
+  return new Map<string, string>(
+    (process.env.ERP_LOGINS ?? "").split(",").map((x) => x.trim()).filter(Boolean).map((x) => {
+      const i = x.indexOf(":");
+      return [x.slice(0, i).trim().toLowerCase(), x.slice(i + 1).trim()] as [string, string];
+    }).filter(([n, k]) => n && k));
+}
+function operatorKeyMatches(key: string, stored: string): "ok" | "short" | "no" {
+  if (stored.startsWith("scrypt$")) return P.verifyPassword(key, stored) ? "ok" : "no";
+  if (!key || !safeEqual(key, stored)) return "no";
+  return stored.length >= P.MIN_PASSWORD ? "ok" : "short";
+}
+
+/** Where links in emails point: ERP_PUBLIC_URL, else Render's own address. Never the request's Host header. */
+const publicBase = () => (process.env.ERP_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 
 // --------------------------------------------------------------------- page
 
@@ -323,11 +413,13 @@ const MISSING_PAGE = `<!doctype html><meta charset="utf-8"><title>ERP</title>
 
 // ------------------------------------------------------------------ helpers
 
-const scopeFor = (conn: Connection, label: string, kind: "user" | "agent" | "system" = "user"): Scope => ({
-  tenantId: conn.tenant_id,
-  entityId: conn.entity_id ?? ENTITY,
-  actor: { kind, label },
-});
+/** A feed connection files into its own company. One with no company is refused, never filed into some other company. */
+function scopeFor(conn: Connection, label: string, kind: "user" | "agent" | "system" = "user"): Scope {
+  if (!conn.entity_id) {
+    throw new HttpError(409, `${conn.name} is not attached to a company, so nothing it brings in can be filed; attach it to one first`);
+  }
+  return { tenantId: conn.tenant_id, entityId: conn.entity_id, actor: { kind, label } };
+}
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -351,21 +443,130 @@ async function companyOr404(c: Client, id: string): Promise<views.Company> {
   return co;
 }
 
+/** The companies a customer user holds a role in (all of the tenant's with a client-wide grant). */
+async function grantedCompanies(c: Client, userId: string, tenantId: string): Promise<Set<string> | "all"> {
+  const r = await q<{ entity_id: string | null }>(c, `
+    select g.entity_id from role_grant g join app_user u on u.id = g.app_user_id
+     where g.app_user_id = $1 and u.tenant_id = $2 /* unscoped: the person's own grants */`, [userId, tenantId]);
+  if (r.some((x) => x.entity_id === null)) return "all";
+  return new Set(r.map((x) => x.entity_id!));
+}
+
+/**
+ * May this session open this company? The system token opens any; a tenant
+ * token and a customer user only their own tenant's (a customer only where
+ * they hold a role); an operator only the tenant they are supporting.
+ */
+async function mayOpen(c: Client, who: Who | null, co: { id: string; tenantId: string }): Promise<boolean> {
+  if (!who) return false;
+  if (who.kind === "system") return true;
+  if (who.kind === "tenant") return co.tenantId === who.tenantId;
+  if (who.kind === "operator") return !!who.support && who.support.tenantId === co.tenantId;
+  if (co.tenantId !== who.tenantId) return false;
+  const g = await grantedCompanies(c, who.userId, who.tenantId);
+  return g === "all" || g.has(co.id);
+}
+
+/** The company named in the URL, if this session may open it; "no such company" otherwise, whether or not it exists. */
+async function companyFor(c: Client, who: Who | null, id: string): Promise<views.Company> {
+  const co = await companyOr404(c, id);
+  if (!(await mayOpen(c, who, co))) throw new HttpError(404, "no such company");
+  return co;
+}
+
+/** Every company this session may open, in the shape /api/me has always sent. */
+async function companiesFor(c: Client, who: Who | null) {
+  const all = await views.companies(c);
+  if (!who) return [];
+  if (who.kind === "system") return all;
+  if (who.kind === "tenant") return all.filter((x) => x.tenant_id === who.tenantId);
+  if (who.kind === "operator") return who.support ? all.filter((x) => x.tenant_id === who.support!.tenantId) : [];
+  const g = await grantedCompanies(c, who.userId, who.tenantId);
+  return all.filter((x) => x.tenant_id === who.tenantId && (g === "all" || g.has(x.id)));
+}
+
+/** Where this session opens: a customer's last company, else their first; ERP_ENTITY_ID only for the system token or an operator who may open it. */
+async function defaultCompanyFor(c: Client, who: Who | null, list: { id: string }[]): Promise<string | null> {
+  if (!list.length) return null;
+  if (who?.kind === "customer") {
+    const l = await P.loginById(c, who.loginId);
+    if (l?.last_entity_id && list.some((x) => x.id === l.last_entity_id)) return l.last_entity_id;
+    return list[0].id;
+  }
+  const dev = DEV_ENTITY();
+  if (dev && list.some((x) => x.id === dev)) return dev;
+  return list[0].id;
+}
+
+/** The company a legacy install-wide route (?co=, else the session's default) is about. */
+async function legacyCompany(c: Client, who: Who | null, url: URL): Promise<views.Company> {
+  const asked = url.searchParams.get("co") ?? "";
+  if (asked) return companyFor(c, who, asked);
+  const id = await defaultCompanyFor(c, who, await companiesFor(c, who));
+  if (!id) throw new HttpError(404, "there is no company for you to open here yet");
+  return companyFor(c, who, id);
+}
+
 const actingId = (req: http.IncomingMessage): string | null => {
   const v = String(req.headers["x-erp-as"] ?? "").trim();
   return UUID.test(v) ? v : null;
 };
+const namedSomeone = (req: http.IncomingMessage) => String(req.headers["x-erp-as"] ?? "").trim() !== "";
 
-/** The person a change is done as: named by the request, and one of the company's own. */
-async function actorFor(c: Client, co: views.Company, req: http.IncomingMessage, who: Who): Promise<Actor> {
-  const id = actingId(req);
-  if (!id) throw new HttpError(400, "pick who you are acting as");
+/** A person of this company who also belongs to this tenant (not a guest granted in from elsewhere). */
+async function personOfTenant(c: Client, co: views.Company, id: string, tenantId: string) {
   const p = await views.person(c, co, id);
-  if (!p) throw new HttpError(403, "that person cannot act for this company");
-  const label = who.via === "session"
-    ? (who.name.toLowerCase() === p.name.toLowerCase() ? `${who.name} (web)` : `${who.name} (web) as ${p.name}`)
-    : `api as ${p.name}`;
-  return { personId: p.id, personName: p.name, label };
+  if (!p) return null;
+  const t = await q<{ tenant_id: string }>(c, `select tenant_id from app_user where id = $1 /* unscoped: the person's own row */`, [id]);
+  return t[0]?.tenant_id === tenantId ? p : null;
+}
+
+type Acting = { personId: string; personName: string; label: string; preview: boolean } | null;
+
+/**
+ * Who a request is done as. A customer user is always themselves; a tenant
+ * owner may name another of their people to preview that view, read-only.
+ * An operator may name anyone, but only inside the tenant they are supporting
+ * (they can open nothing else). The system token names anyone, as before.
+ */
+async function acting(c: Client, co: views.Company, req: http.IncomingMessage, who: Who, write: boolean): Promise<Acting> {
+  const id = actingId(req);
+  if (who.kind === "customer") {
+    if (namedSomeone(req) && !id) throw new HttpError(403, "you can only act as yourself");
+    if (!id || id === who.userId) {
+      const me = await views.person(c, co, who.userId);
+      if (!me) throw new HttpError(403, "you hold no role in this company");
+      return { personId: me.id, personName: me.name, label: `${who.name} (web)`, preview: false };
+    }
+    const mine = await rolesOf(c, co, who.userId);
+    if (!mine.has("owner")) throw new HttpError(403, "you can only act as yourself");
+    const p = await personOfTenant(c, co, id, who.tenantId);
+    if (!p) throw new HttpError(403, "that person is not one of this company's own");
+    if (write) throw new HttpError(403, `previewing ${p.name}'s view is read-only; switch back to yourself to make changes`);
+    return { personId: p.id, personName: p.name, label: `${who.name} (web) previewing ${p.name}`, preview: true };
+  }
+  if (!id) {
+    if (write) throw new HttpError(400, "pick who you are acting as");
+    return null;
+  }
+  const p = who.kind === "tenant" ? await personOfTenant(c, co, id, who.tenantId) : await views.person(c, co, id);
+  if (!p) {
+    if (write || who.kind !== "system") throw new HttpError(403, "that person cannot act for this company");
+    return null;
+  }
+  const label = who.kind === "operator"
+    ? (who.name.toLowerCase() === p.name.toLowerCase() ? `${who.name} (support)` : `${who.name} (support) as ${p.name}`)
+    : who.kind === "tenant" ? `${who.name} as ${p.name}` : `api as ${p.name}`;
+  return { personId: p.id, personName: p.name, label, preview: false };
+}
+
+/** Customer activity, at most one write every five minutes per tenant. */
+const lastSeen = new Map<string, number>();
+async function touchTenant(c: Client, tenantId: string) {
+  const at = lastSeen.get(tenantId) ?? 0;
+  if (Date.now() - at < 5 * 60_000) return;
+  lastSeen.set(tenantId, Date.now());
+  await c.query(`update tenant set last_activity_at = now() where id = $1`, [tenantId]);
 }
 
 /**
@@ -394,6 +595,9 @@ const routes: { method: string; path: RegExp; auth: "none" | "token" | "own"; fn
 const route = (method: string, path: RegExp, auth: "none" | "token" | "own", fn: Handler) =>
   routes.push({ method, path, auth, fn });
 
+/** Every route, for checks that walk them all (tenant isolation). */
+export const routeList = () => routes.map((r) => ({ method: r.method, path: r.path, auth: r.auth }));
+
 /** A browser request that changes something must carry the page's header. */
 function requirePageHeader(req: http.IncomingMessage): void {
   if (req.headers["x-erp-page"] !== "1") {
@@ -403,15 +607,14 @@ function requirePageHeader(req: http.IncomingMessage): void {
 
 const CO = "/api/c/([0-9a-fA-F-]{36})";
 
-/** A read about one company. The acting person, if named, must be one of its own. */
+/** A read about one company the session may open. The acting person, if named, must be allowed (see acting()). */
 function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: RegExpMatchArray, personId: string | null) => Promise<unknown>) {
-  route("GET", new RegExp(`^${CO}${tail}$`), "token", async (req, url, m) => {
+  route("GET", new RegExp(`^${CO}${tail}$`), "token", async (req, url, m, who) => {
     const c = await pool.connect();
     try {
-      const co = await companyOr404(c, m[1]);
-      let personId = actingId(req);
-      if (personId && !(await views.person(c, co, personId))) personId = null;
-      const out = await fn(c, co, url, m, personId);
+      const co = await companyFor(c, who, m[1]);
+      const a = await acting(c, co, req, who!, false);
+      const out = await fn(c, co, url, m, a?.personId ?? null);
       if (out === null) throw new HttpError(404, "not found");
       // A printable page (a tear sheet) goes out with every header and the CSP, like any page.
       if (out instanceof PublicPage) return [200, new Html(out.text)];
@@ -422,20 +625,29 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
   });
 }
 
-/** A change to one company, done as a named person, in one transaction. */
+/** A change to one company the session may open, done as a named person, in one transaction. */
 function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body: Record<string, unknown>, m: RegExpMatchArray) => Promise<unknown>, opts: { maxBody?: number } = {}) {
-  route("POST", new RegExp(`^${CO}${tail}$`), "token", async (req, _url, m, who) => {
-    const body = await readJson(req, opts.maxBody);
+  route("POST", new RegExp(`^${CO}${tail}$`), "token", async (req, url, m, who) => {
     const c0 = await pool.connect();
     let co: views.Company;
     let actor: Actor;
     try {
-      co = await companyOr404(c0, m[1]);
-      actor = await actorFor(c0, co, req, who!);
+      // The company is checked before the body is even read.
+      co = await companyFor(c0, who, m[1]);
+      const a = (await acting(c0, co, req, who!, true))!;
+      actor = { personId: a.personId, personName: a.personName, label: a.label };
     } finally {
       c0.release();
     }
-    const out = await tx({ kind: "user", id: actor.personId, label: actor.label }, (c) => fn(c, co, actor, body, m));
+    const body = await readJson(req, opts.maxBody);
+    const out = await tx({ kind: "user", id: actor.personId, label: actor.label }, async (c) => {
+      const r = await fn(c, co, actor, body, m);
+      if (who?.kind === "operator" && who.support) {
+        await P.audit(c, auditActor(who), "support.write", co.tenantId, { path: url.pathname, as: actor.personName }, co.id);
+      }
+      if (who?.kind === "customer" || who?.kind === "tenant") await touchTenant(c, co.tenantId);
+      return r;
+    });
     return [200, out];
   });
 }
@@ -466,7 +678,9 @@ for (const mod of MODULES) mod.register({ coGet, coPost, publicRoute });
 
 // Module screens: server/ui/<id>.js, read once at start like app.js.
 const UI_JS = new Map<string, string>();
-for (const mod of MODULES) { const t = readHere(join("ui", `${mod.id}.js`)); if (t) UI_JS.set(mod.id, t); }
+// platform.js: the Operator console and the account screen (sign-ins, API tokens, password).
+const UI_IDS = [...MODULES.map((x) => x.id), "platform"];
+for (const id of UI_IDS) { const t = readHere(join("ui", `${id}.js`)); if (t) UI_JS.set(id, t); }
 route("GET", /^\/ui\/([a-z]+)\.js$/, "none", async (_req, _url, m) => {
   const t = UI_JS.get(m[1]);
   if (!t) throw new HttpError(404, "not found");
@@ -490,7 +704,7 @@ route("GET", /^\/health$/, "none", async () => {
 // once someone has signed in.
 route("GET", /^\/$/, "none", async () => [200, new Html(
   APP && APP_JS && APP_CSS ? APP.replaceAll("__VERSION__", ASSET_VERSION).replace("<!--MODULE_SCRIPTS-->",
-    MODULES.map((x) => `<script src="/ui/${x.id}.js?v=${ASSET_VERSION}" defer></script>`).join("\n")) : MISSING_PAGE)]);
+    UI_IDS.filter((id) => UI_JS.has(id)).map((id) => `<script src="/ui/${id}.js?v=${ASSET_VERSION}" defer></script>`).join("\n")) : MISSING_PAGE)]);
 route("GET", /^\/app\.js$/, "none", async () => {
   if (!APP_JS) throw new HttpError(404, "not found");
   return [200, new Asset(APP_JS, "text/javascript; charset=utf-8")];
@@ -501,34 +715,62 @@ route("GET", /^\/app\.css$/, "none", async () => {
 });
 route("GET", /^\/favicon\.ico$/, "none", async () => [204, null]);
 
-// Sign in with the operator key and a name for the audit trail.
+// ------------------------------------------------------------------ sign in
+
+const customerCookie = (l: { id: string; name: string; session_version: number }) =>
+  sessionCookie({ n: l.name, e: Math.floor(Date.now() / 1000) + SESSION_HOURS * 3600, k: "c", l: l.id, v: l.session_version });
+
+async function signedIn(c: Client, l: P.Login): Promise<Reply> {
+  await c.query(`update platform_login set last_sign_in_at = now() where id = $1 and tenant_id = $2`, [l.id, l.tenant_id]);
+  await c.query(`update tenant set last_activity_at = now() where id = $1`, [l.tenant_id]);
+  console.log(`signed in: customer ${l.id}`);
+  return [200, { name: l.name, kind: "customer", until: new Date(Date.now() + SESSION_HOURS * 3600_000).toISOString() }, { "set-cookie": customerCookie(l) }];
+}
+
+// One page signs in both kinds: a customer's email and password (or an emailed
+// code), or an operator's name and password.
 route("POST", /^\/session$/, "none", async (req) => {
   requirePageHeader(req);
-  if (signInThrottled()) throw new HttpError(429, "too many wrong keys; wait ten minutes and try again");
+  const ip = clientIp(req);
   const body = await readJson(req);
+  if (typeof body.email === "string" && body.email.trim()) {
+    const email = P.cleanEmail(body.email);
+    signInGate(email, ip);
+    const password = typeof body.password === "string" ? body.password : "";
+    const code = typeof body.code === "string" ? body.code.trim() : "";
+    if (!password && !code) throw new HttpError(400, "put your password in");
+    return tx({ kind: "system", label: "sign-in" }, async (c) => {
+      const l = await P.loginByEmail(c, email);
+      const ok = code ? !!l && l.status === "active" && await P.useCode(c, l, code)
+                      : P.verifyPassword(password, l?.status === "active" ? l.pw_hash : null) && !!l;
+      if (!ok || !l) {
+        // the wrong code's try is counted in the database; keep it when we refuse
+        await c.query("commit"); await c.query("begin");
+        return signInFailed(email, ip, "customer");
+      }
+      const why = P.blocked(l);
+      if (why) throw new HttpError(403, why);
+      signInOk(email, ip);
+      return signedIn(c, l);
+    });
+  }
   const key = String(body.key ?? "");
   const name = cleanName(body.name);
   if (!name) throw new HttpError(400, "put your name in, so what you do here is recorded against it");
   const login = name.toLowerCase();
-  if (LOGINS.has(login)) {
-    if (loginLocked(login)) throw new HttpError(429, "too many wrong keys for that name; wait 15 minutes and try again");
-    if (!key || !safeEqual(key, LOGINS.get(login)!)) {
-      noteLoginFailure(login);
-      noteSignInFailure();
-      await sleep(700);
-      console.log(`sign-in refused for ${login}`);
-      throw new HttpError(401, "that access key did not match");
-    }
-    loginFails.delete(login);
-  } else if (!key || !safeEqual(key, TOKEN)) {
-    noteSignInFailure();
-    await sleep(700);
-    console.log("sign-in refused");
-    throw new HttpError(401, "that access key did not match");
+  signInGate(login, ip);
+  const logins = operatorLogins();
+  if (logins.has(login)) {
+    const m = operatorKeyMatches(key, logins.get(login)!);
+    if (m === "no") return signInFailed(login, ip, "operator");
+    if (m === "short") throw new HttpError(403, `the operator login ${login} still uses a short key; set a password of at least ${P.MIN_PASSWORD} characters (or a hash from scripts/hash-password.ts) for it in ERP_LOGINS`);
+  } else if (!key || !safeEqual(key, TOKEN())) {
+    return signInFailed(login, ip, "operator");
   }
+  signInOk(login, ip);
   const exp = Math.floor(Date.now() / 1000) + SESSION_HOURS * 3600;
-  console.log(`signed in: ${name}`);
-  return [200, { name, until: new Date(exp * 1000).toISOString() }, { "set-cookie": sessionCookie(name, exp) }];
+  console.log(`signed in: operator ${name}`);
+  return [200, { name, kind: "operator", until: new Date(exp * 1000).toISOString() }, { "set-cookie": sessionCookie({ n: name, e: exp, k: "o" }) }];
 });
 
 route("POST", /^\/session\/end$/, "none", async (req) => {
@@ -536,37 +778,284 @@ route("POST", /^\/session\/end$/, "none", async (req) => {
   return [200, { ok: true }, { "set-cookie": CLEAR_COOKIE }];
 });
 
+// An emailed six-digit code instead of the password. The answer is the same whether or not the email has an account.
+route("POST", /^\/session\/code$/, "none", async (req) => {
+  requirePageHeader(req);
+  const body = await readJson(req);
+  const email = P.cleanEmail(body.email);
+  if (!P.EMAIL.test(email)) throw new HttpError(400, "enter your email address");
+  const ip = clientIp(req);
+  if (overRate(`code-ip:${ip}`, 10) || overRate(`code:${email}`, 3)) throw new HttpError(429, "too many codes asked for; wait 15 minutes and try again");
+  await tx({ kind: "system", label: "sign-in code" }, async (c) => {
+    const l = await P.loginByEmail(c, email);
+    if (!l || l.status !== "active" || P.blocked(l)) return;
+    const { token } = await P.issueToken(c, l, "code", "sign-in page");
+    await P.sendAccountEmail(c, l, "code", token, null, "sign-in page");
+  });
+  return [200, { ok: true, note: "If that email signs in here, a code is on its way. It works for 10 minutes." }];
+});
+
+// Forgotten password: a link by email, same answer either way.
+route("POST", /^\/account\/forgot$/, "none", async (req) => {
+  requirePageHeader(req);
+  const body = await readJson(req);
+  const email = P.cleanEmail(body.email);
+  if (!P.EMAIL.test(email)) throw new HttpError(400, "enter your email address");
+  const ip = clientIp(req);
+  if (overRate(`forgot-ip:${ip}`, 10) || overRate(`forgot:${email}`, 3)) throw new HttpError(429, "too many reset emails asked for; wait 15 minutes and try again");
+  await tx({ kind: "system", label: "password reset" }, async (c) => {
+    const l = await P.loginByEmail(c, email);
+    if (!l || l.status === "disabled" || P.blocked(l) || l.kind === "prospect") return;
+    const { token } = await P.issueToken(c, l, "reset", "sign-in page");
+    await P.sendAccountEmail(c, l, "reset", token, `${publicBase()}/#reset=${token}`, "sign-in page");
+    await P.audit(c, { actor: email, kind: "customer" }, "login.reset_requested", l.tenant_id, {});
+  });
+  return [200, { ok: true, note: "If that email signs in here, a reset link is on its way. It works for an hour." }];
+});
+
+route("GET", /^\/account\/token$/, "none", async (_req, url) => {
+  const c = await pool.connect();
+  try {
+    const info = await P.tokenInfo(c, url.searchParams.get("t") ?? "");
+    if (!info) throw new HttpError(404, "that link has expired or was already used; ask for a new one");
+    return [200, info];
+  } finally { c.release(); }
+});
+
+// An invite or reset link: set the password, and be signed in.
+route("POST", /^\/account\/(?:accept|reset)$/, "none", async (req) => {
+  requirePageHeader(req);
+  const ip = clientIp(req);
+  if (overRate(`token-ip:${ip}`, 30)) throw new HttpError(429, "too many tries from this address; wait 15 minutes");
+  const body = await readJson(req);
+  return tx({ kind: "system", label: "account link" }, async (c) => {
+    const l = await P.usePasswordToken(c, String(body.token ?? ""), body.password, body.name);
+    fails.delete(userKey(l.email, ip));
+    return signedIn(c, l);
+  });
+});
+
 // ------------------------------------------------------ the app's own API
 
-// Who is signed in, and every company the operator keeps books for.
+// Who is signed in, and every company they may open.
 route("GET", /^\/api\/me$/, "token", async (_req, _url, _m, who) => {
   const c = await pool.connect();
   try {
+    const companies = await companiesFor(c, who);
+    const w = who!;
+    const viewer: Record<string, unknown> = w.via === "session"
+      ? { name: w.name, via: "session", kind: w.kind, until: new Date(w.exp * 1000).toISOString() }
+      : { name: w.name, via: "token", kind: w.kind };
+    if (w.kind === "operator") viewer.support = w.support ? { tenantId: w.support.tenantId, tenantName: w.support.tenantName, since: w.support.since, reason: w.support.reason } : null;
+    if (w.kind === "customer") {
+      Object.assign(viewer, { personId: w.userId, email: w.email, tenantId: w.tenantId, tenantName: w.tenantName, demo: w.tenantKind === "demo",
+        prospect: w.prospect, expiresAt: w.expiresAt, owner: !w.prospect && await P.isTenantOwner(c, w.userId, w.tenantId) });
+    }
+    if (w.kind === "tenant") viewer.tenantId = w.tenantId;
     return [200, {
-      viewer: who?.via === "session" ? { name: who.name, via: "session", until: new Date(who.exp * 1000).toISOString() }
-                                     : { name: "API token", via: "token" },
+      viewer,
       trial: TRIAL,
       trialEnds: TRIAL_ENDS || null,
       version: VERSION,
-      defaultCompany: ENTITY,
-      companies: await views.companies(c),
+      defaultCompany: await defaultCompanyFor(c, who, companies),
+      companies,
     }];
   } finally { c.release(); }
 });
 
-// The clients kept here, and a new company for one of them (or for a new client).
-route("GET", /^\/api\/clients$/, "token", async () => {
+// The company a customer opened last is where they open next time.
+route("POST", /^\/api\/me\/company$/, "token", async (req, _url, _m, who) => {
+  const body = await readJson(req);
+  if (who?.kind !== "customer") return [200, { ok: true }];
   const c = await pool.connect();
-  try { return [200, await views.clients(c)]; } finally { c.release(); }
+  try {
+    const co = await companyFor(c, who, String(body.id ?? ""));
+    await c.query(`update platform_login set last_entity_id = $2 where id = $1 and tenant_id = $3`, [who.loginId, co.id, who.tenantId]);
+    return [200, { ok: true }];
+  } finally { c.release(); }
+});
+
+// A customer changes their own password.
+route("POST", /^\/api\/account\/password$/, "token", async (req, _url, _m, who) => {
+  if (who?.kind !== "customer") throw new HttpError(403, "only a customer sign-in has a password here");
+  const body = await readJson(req);
+  const ip = clientIp(req);
+  signInGate(who.email, ip);
+  return tx({ kind: "user", id: who.userId, label: `${who.name} (web)` }, async (c) => {
+    const l = await P.loginById(c, who.loginId);
+    if (!l || !P.verifyPassword(String(body.current ?? ""), l.pw_hash)) {
+      noteFail(userKey(who.email, ip));
+      throw new HttpError(401, "your current password did not match");
+    }
+    const pw = P.checkPassword(body.next, l.email);
+    await c.query(`update platform_login set pw_hash = $2, password_set_at = now(), session_version = session_version + 1 where id = $1 and tenant_id = $3`,
+      [l.id, P.hashPassword(pw), l.tenant_id]);
+    await P.audit(c, auditActor(who), "login.password_changed", l.tenant_id);
+    const fresh = (await P.loginById(c, l.id))!;
+    return [200, { ok: true }, { "set-cookie": customerCookie(fresh) }];
+  });
+});
+
+// The clients this session may see, and a new company for one of them.
+route("GET", /^\/api\/clients$/, "token", async (_req, _url, _m, who) => {
+  const c = await pool.connect();
+  try {
+    const all = await views.clients(c) as { id: string }[];
+    const w = who!;
+    const mine = w.kind === "system" ? all
+      : w.kind === "operator" ? all.filter((t) => w.support && t.id === w.support.tenantId)
+        : all.filter((t) => t.id === w.tenantId);
+    return [200, mine];
+  } finally { c.release(); }
 });
 route("POST", /^\/api\/companies$/, "token", async (req, _url, _m, who) => {
   const body = await readJson(req);
-  const label = who?.via === "session" ? `${who.name} (web)` : "api";
-  const made = await tx({ kind: "user", label }, (c) => act.createCompany(c, label, body));
-  // On a brand-new install the feed screens had no company to open on; the first one made is it.
-  const madeId = (made as { id?: string; entityId?: string } | null)?.entityId ?? (made as { id?: string } | null)?.id;
-  if (ENTITY === NO_COMPANY && typeof madeId === "string") ENTITY = madeId;
+  const w = who!;
+  const label = labelFor(who, "api");
+  if (w.kind === "operator") {
+    if (!w.support) throw new HttpError(403, "create customers from the Operator console, or enter a customer in support mode to add a company to it");
+    body.clientId = w.support.tenantId;
+  } else if (w.kind === "customer") {
+    const c0 = await pool.connect();
+    try {
+      if (w.prospect || !(await P.isTenantOwner(c0, w.userId, w.tenantId))) throw new HttpError(403, "adding a company is for the account owner");
+    } finally { c0.release(); }
+    body.clientId = w.tenantId;
+  } else if (w.kind === "tenant") {
+    throw new HttpError(403, "an API token cannot add companies");
+  }
+  const made = await tx({ kind: "user", label }, async (c) => {
+    const r = await act.createCompany(c, label, body);
+    if (w.kind === "operator" || w.kind === "customer") {
+      await P.audit(c, auditActor(who), "company.create", (r as { tenantId: string }).tenantId, { name: body.name }, (r as { id: string }).id);
+    }
+    return r;
+  });
   return [200, made];
+});
+
+// --------------------------------------------------- the Operator console
+
+function operator(who: Who | null): P.AuditActor {
+  if (who?.kind === "system") return { actor: "api", kind: "system" };
+  if (who?.kind !== "operator") throw new HttpError(403, "the Operator console is for the ERP's own team");
+  return auditActor(who);
+}
+const tenantParam = (m: RegExpMatchArray) => {
+  if (!UUID.test(m[1])) throw new HttpError(404, "no such customer");
+  return m[1];
+};
+const read = async <T>(fn: (c: Client) => Promise<T>): Promise<T> => {
+  const c = await pool.connect();
+  try { return await fn(c); } finally { c.release(); }
+};
+const TID = "([0-9a-fA-F-]{36})";
+
+route("GET", /^\/api\/platform\/customers$/, "token", async (_r, _u, _m, who) => { operator(who); return [200, await read((c) => P.customers(c))]; });
+route("GET", new RegExp(`^/api/platform/customers/${TID}$`), "token", async (_r, _u, m, who) => {
+  operator(who); return [200, await read((c) => P.customerDetail(c, tenantParam(m)))];
+});
+route("GET", /^\/api\/platform\/packs$/, "token", async (_r, _u, _m, who) => { operator(who); return [200, { packs: P.packs(), plans: P.PLANS }]; });
+route("POST", /^\/api\/platform\/customers$/, "token", async (req, _u, _m, who) => {
+  const by = operator(who);
+  const body = await readJson(req);
+  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.createCustomer(c, by, body, publicBase()))];
+});
+route("POST", new RegExp(`^/api/platform/customers/${TID}/(suspend|reactivate)$`), "token", async (req, _u, m, who) => {
+  const by = operator(who);
+  const body = await readJson(req);
+  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) =>
+    P.setTenantStatus(c, by, tenantParam(m), m[2] === "suspend" ? "suspended" : "active", body.reason))];
+});
+route("POST", new RegExp(`^/api/platform/customers/${TID}/users$`), "token", async (req, _u, m, who) => {
+  const by = operator(who);
+  const body = await readJson(req);
+  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.inviteUser(c, by, tenantParam(m), body, publicBase()))];
+});
+route("POST", new RegExp(`^/api/platform/customers/${TID}/logins/${TID}/invite$`), "token", async (_req, _u, m, who) => {
+  const by = operator(who);
+  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.reinvite(c, by, tenantParam(m), m[2], publicBase()))];
+});
+// Support mode: the cookie now names a support session, recorded on the customer's log.
+route("POST", new RegExp(`^/api/platform/customers/${TID}/support$`), "token", async (req, _u, m, who) => {
+  if (who?.kind !== "operator") throw new HttpError(403, "support mode is for the ERP's own team, signed in");
+  const body = await readJson(req);
+  const s = await tx({ kind: "user", label: `${who.name} (operator)` }, (c) => P.startSupport(c, who.name, tenantParam(m), body.reason));
+  return [200, s, { "set-cookie": sessionCookie({ n: who.name, e: who.exp, k: "o", s: s.id }) }];
+});
+route("POST", /^\/api\/platform\/support\/end$/, "token", async (_req, _u, _m, who) => {
+  if (who?.kind !== "operator") throw new HttpError(403, "support mode is for the ERP's own team, signed in");
+  if (who.support) await tx({ kind: "user", label: `${who.name} (operator)` }, (c) => P.endSupport(c, who.name, who.support!.id));
+  return [200, { ok: true }, { "set-cookie": sessionCookie({ n: who.name, e: who.exp, k: "o" }) }];
+});
+route("GET", /^\/api\/platform\/audit$/, "token", async (_req, url, _m, who) => {
+  operator(who);
+  const t = url.searchParams.get("tenant");
+  return [200, await read((c) => q(c, `select at, actor, actor_kind, tenant_id, action, detail from platform_audit
+      where ($1::uuid is null or tenant_id = $1) order by at desc limit 200 /* unscoped: the platform log */`, [t && UUID.test(t) ? t : null]))];
+});
+route("GET", /^\/api\/platform\/prospects$/, "token", async (_r, _u, _m, who) => { operator(who); return [200, await read((c) => P.prospects(c))]; });
+route("POST", /^\/api\/platform\/prospects$/, "token", async (req, _u, _m, who) => {
+  const by = operator(who);
+  const body = await readJson(req);
+  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.createProspect(c, by, body))];
+});
+route("POST", new RegExp(`^/api/platform/prospects/${TID}/end$`), "token", async (_req, _u, m, who) => {
+  const by = operator(who);
+  return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.endProspect(c, by, tenantParam(m)))];
+});
+// Wipe and reload the demo tenants, and nothing else (packages/core/platform_demo.ts).
+route("POST", /^\/api\/platform\/demo\/reset$/, "token", async (req, _u, _m, who) => {
+  const by = operator(who);
+  const body = await readJson(req);
+  if (String(body.confirm ?? "") !== "RESET DEMO") throw new HttpError(400, "type RESET DEMO to confirm; the demo's data is wiped and reloaded");
+  const r = await resetDemo(by.actor, { log: (s) => console.log(s) });
+  if (r.reloadSample) {
+    await loadSampleActivity((s) => console.log(s)).catch((e) => console.error(`sample activity could not load after the reset: ${describeError(e)}`));
+  }
+  return [200, r];
+});
+
+// ------------------------------------------- a tenant's own users and tokens
+
+/** The tenant an account-owner route acts on: a customer's own (owner only), or the one an operator is supporting. */
+async function ownerTenant(who: Who | null): Promise<{ tenantId: string; by: P.AuditActor; selfUserId: string | null }> {
+  if (who?.kind === "operator" && who.support) return { tenantId: who.support.tenantId, by: auditActor(who), selfUserId: null };
+  if (who?.kind === "customer") {
+    const owner = !who.prospect && await read((c) => P.isTenantOwner(c, who.userId, who.tenantId));
+    if (!owner) throw new HttpError(403, "managing sign-ins and API tokens is for the account owner");
+    return { tenantId: who.tenantId, by: auditActor(who), selfUserId: who.userId };
+  }
+  throw new HttpError(403, "managing sign-ins and API tokens is for the account owner");
+}
+const ownerTx = <T>(o: { by: P.AuditActor }, fn: (c: Client) => Promise<T>) => tx({ kind: "user", label: o.by.actor }, fn);
+
+route("GET", /^\/api\/tenant\/users$/, "token", async (_r, _u, _m, who) => {
+  const o = await ownerTenant(who);
+  return [200, await read((c) => P.users(c, o.tenantId))];
+});
+route("POST", /^\/api\/tenant\/users$/, "token", async (req, _u, _m, who) => {
+  const o = await ownerTenant(who);
+  const body = await readJson(req);
+  return [200, await ownerTx(o, (c) => P.inviteUser(c, o.by, o.tenantId, body, publicBase()))];
+});
+route("POST", new RegExp(`^/api/tenant/users/${TID}/(invite|disable|enable)$`), "token", async (_req, _u, m, who) => {
+  const o = await ownerTenant(who);
+  return [200, await ownerTx(o, (c) => m[2] === "invite" ? P.reinvite(c, o.by, o.tenantId, m[1], publicBase())
+    : P.setLoginStatus(c, o.by, o.tenantId, m[1], m[2] === "enable", o.selfUserId))];
+});
+route("GET", /^\/api\/tenant\/tokens$/, "token", async (_r, _u, _m, who) => {
+  const o = await ownerTenant(who);
+  return [200, await read((c) => P.apiTokens(c, o.tenantId))];
+});
+route("POST", /^\/api\/tenant\/tokens$/, "token", async (req, _u, _m, who) => {
+  const o = await ownerTenant(who);
+  const body = await readJson(req);
+  return [200, await ownerTx(o, (c) => P.createApiToken(c, o.by, o.tenantId, body.name))];
+});
+route("POST", new RegExp(`^/api/tenant/tokens/${TID}/(rotate|revoke)$`), "token", async (_req, _u, m, who) => {
+  const o = await ownerTenant(who);
+  return [200, await ownerTx(o, (c) => m[2] === "rotate" ? P.rotateApiToken(c, o.by, o.tenantId, m[1]) : P.revokeApiToken(c, o.by, o.tenantId, m[1]))];
 });
 
 coGet("/people", (c, co) => views.people(c, co));
@@ -660,15 +1149,14 @@ coPost("/feeds/files/([0-9a-fA-F-]{36})/dismiss", async (c, co, a, b, m) => {
 // ------------------------------------------- the first screen's API, kept
 
 // Everything the original feeds screen showed, for the default company.
-route("GET", /^\/api\/overview$/, "token", async (_req, _url, _m, who) => {
+route("GET", /^\/api\/overview$/, "token", async (_req, url, _m, who) => {
   const c = await pool.connect();
   try {
-    const co = await views.loadCompany(c, ENTITY);
-    if (!co) throw new HttpError(404, "the configured company does not exist in this database");
+    const co = await legacyCompany(c, who, url);
     return [200, {
       entity: { name: co.name },
       viewer: who?.via === "session" ? { name: who.name, via: "session", until: new Date(who.exp * 1000).toISOString() }
-                                     : { name: "API token", via: "token" },
+                                     : { name: who?.name ?? "API token", via: "token" },
       trial: TRIAL, trialEnds: TRIAL_ENDS || null, version: VERSION, now: new Date().toISOString(),
       ...(await views.feeds(c, co)),
     }];
@@ -693,49 +1181,64 @@ route("GET", /^\/api\/sources$/, "token", async () => {
   } finally { c.release(); }
 });
 
-route("GET", /^\/api\/connections$/, "token", async () => {
+route("GET", /^\/api\/connections$/, "token", async (_req, url, _m, who) => {
   const c = await pool.connect();
   try {
-    const co = await views.loadCompany(c, ENTITY);
-    if (!co) throw new HttpError(404, "the configured company does not exist in this database");
+    const co = await legacyCompany(c, who, url);
     return [200, await views.connections(c, co)];
   } finally { c.release(); }
 });
 
-route("GET", /^\/api\/quarantine$/, "token", async () => {
+route("GET", /^\/api\/quarantine$/, "token", async (_req, url, _m, who) => {
   const c = await pool.connect();
-  try { return [200, await openQuarantine(c, ENTITY)]; } finally { c.release(); }
+  try { return [200, await openQuarantine(c, (await legacyCompany(c, who, url)).id)]; } finally { c.release(); }
 });
 
-route("GET", /^\/api\/intake$/, "token", async () => {
+route("GET", /^\/api\/intake$/, "token", async (_req, url, _m, who) => {
   const c = await pool.connect();
   try {
-    return [200, await q(c, `select * from statement_intake where entity_id = $1 order by account_name`, [ENTITY])];
+    const co = await legacyCompany(c, who, url);
+    return [200, await q(c, `select * from statement_intake where entity_id = $1 order by account_name`, [co.id])];
   } finally { c.release(); }
 });
 
-route("GET", /^\/api\/gaps$/, "token", async () => {
+route("GET", /^\/api\/gaps$/, "token", async (_req, url, _m, who) => {
   const c = await pool.connect();
   try {
-    const co = await views.loadCompany(c, ENTITY);
-    if (!co) throw new HttpError(404, "the configured company does not exist in this database");
+    const co = await legacyCompany(c, who, url);
     return [200, (await views.gaps(c, co)).slice(0, 200).map(({ bank_account_id: _id, ...g }) => g)];
   } finally { c.release(); }
 });
 
-route("GET", /^\/api\/runs$/, "token", async () => {
+route("GET", /^\/api\/runs$/, "token", async (_req, url, _m, who) => {
   const c = await pool.connect();
   try {
+    const co = await legacyCompany(c, who, url);
     return [200, await q(c, `
       select c.name, r.trigger, r.started_at, r.files_seen, r.files_new, r.files_failed, r.outcome, r.error
         from ingest_run r join connection c on c.id = r.connection_id
-       where c.entity_id = $1 order by r.started_at desc limit 50`, [ENTITY])];
+       where c.entity_id = $1 order by r.started_at desc limit 50`, [co.id])];
   } finally { c.release(); }
 });
+
+/** A connection is reached through its company: the session must be able to open it. One with no company is refused. */
+async function mayUseConnection(conn: Connection, who: Who | null): Promise<void> {
+  const c = await pool.connect();
+  try {
+    if (!conn.entity_id) {
+      if (who?.kind !== "system") throw new HttpError(404, "no such connection");
+      scopeFor(conn, "check");
+      return;
+    }
+    const co = await views.loadCompany(c, conn.entity_id);
+    if (!co || !(await mayOpen(c, who, co))) throw new HttpError(404, "no such connection");
+  } finally { c.release(); }
+}
 
 // Hand upload. The body is the file.
 route("POST", /^\/api\/connections\/([^/]+)\/upload$/, "token", async (req, url, m, who) => {
   const conn = await connectionOr404(m[1]);
+  await mayUseConnection(conn, who);
   if (conn.channel !== "manual_upload") {
     throw new HttpError(409, `${conn.name} is a ${conn.channel} connection, not an upload one`);
   }
@@ -743,13 +1246,12 @@ route("POST", /^\/api\/connections\/([^/]+)\/upload$/, "token", async (req, url,
   if (!bytes.length) throw new HttpError(400, "the request body is empty; send the file as the body");
   const filename = (url.searchParams.get("filename") ?? "upload").slice(0, 200);
   let label = labelFor(who, "api upload");
-  const as = actingId(req);
-  if (as && conn.entity_id) {
+  if (conn.entity_id) {
     const c0 = await pool.connect();
     try {
-      const co = await views.loadCompany(c0, conn.entity_id);
-      const p = co ? await views.person(c0, co, as) : null;
-      if (p && who?.via === "session" && p.name.toLowerCase() !== who.name.toLowerCase()) label = `${who.name} (web) as ${p.name}`;
+      const co = await companyFor(c0, who, conn.entity_id);
+      const a = await acting(c0, co, req, who!, false);
+      if (a) label = a.label;
     } finally { c0.release(); }
   }
   const result = await tx({ kind: "user", label }, async (c) => {
@@ -772,7 +1274,7 @@ route("POST", /^\/api\/connections\/([^/]+)\/upload$/, "token", async (req, url,
 
 // A person decides a quarantined file was not worth reading. It stays on
 // record; it leaves the list, with their name and reason in the audit trail.
-route("POST", /^\/api\/quarantine\/([^/]+)\/dismiss$/, "token", async (req, _url, m, who) => {
+route("POST", /^\/api\/quarantine\/([^/]+)\/dismiss$/, "token", async (req, url, m, who) => {
   if (!UUID.test(m[1])) throw new HttpError(404, "no such file");
   const body = await readJson(req);
   const reason = String(body.reason ?? "").trim().slice(0, 500);
@@ -780,9 +1282,10 @@ route("POST", /^\/api\/quarantine\/([^/]+)\/dismiss$/, "token", async (req, _url
   const c0 = await pool.connect();
   let conn: Connection;
   try {
+    const co = await legacyCompany(c0, who, url);
     const hit = await q<{ connection_id: string; status: string }>(c0, `
       select f.connection_id, f.status from inbound_file f join connection c on c.id = f.connection_id
-       where f.id = $1 and c.entity_id = $2`, [m[1], ENTITY]);
+       where f.id = $1 and c.entity_id = $2`, [m[1], co.id]);
     if (!hit.length) throw new HttpError(404, "no such file");
     if (hit[0].status !== "quarantined") throw new HttpError(409, "that file is not in quarantine any more");
     conn = await loadConnection(c0, hit[0].connection_id);
@@ -794,8 +1297,9 @@ route("POST", /^\/api\/quarantine\/([^/]+)\/dismiss$/, "token", async (req, _url
 
 // Pull on demand. Free hosting has no cron, so this is how a scheduled
 // connection gets run until there is one.
-route("POST", /^\/api\/connections\/([^/]+)\/run$/, "token", async (_req, _url, m) => {
+route("POST", /^\/api\/connections\/([^/]+)\/run$/, "token", async (_req, _url, m, who) => {
   const conn = await connectionOr404(m[1]);
+  await mayUseConnection(conn, who);
   if (conn.channel !== "sftp" && conn.channel !== "api") {
     throw new HttpError(409, `${conn.name} is a push channel; it is run by whatever sends to it`);
   }
@@ -836,7 +1340,7 @@ route("POST", /^\/hooks\/([^/]+)$/, "own", async (req, _url, m) => {
 // sender still has to be on that connection's allow list.
 route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
   const presented = bearer(req) || url.searchParams.get("token") || "";
-  if (!EMAIL_TOKEN || !safeEqual(presented, EMAIL_TOKEN)) {
+  if (!EMAIL_TOKEN() || !safeEqual(presented, EMAIL_TOKEN())) {
     throw new HttpError(401, "inbound email needs its own token");
   }
   const raw = await readBody(req);
@@ -878,7 +1382,7 @@ route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
 // ------------------------------------------------------------------- server
 
 // The engine's refusals are written for people; pass them on as they are.
-const REFUSALS = [ModuleError, TaxError, InventoryError, ArError, PostingError, PricingError, SetupError, PosError, WorkforceError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
+const REFUSALS = [PlatformError, DemoResetError, ModuleError, TaxError, InventoryError, ArError, PostingError, PricingError, SetupError, PosError, WorkforceError, ActionError, ApprovalError, TransitionError, PayrollError, BankingError, ReconcileError];
 
 function refusal(e: unknown): string | null {
   if (REFUSALS.some((K) => e instanceof K)) return (e as Error).message;
@@ -891,6 +1395,15 @@ function refusal(e: unknown): string | null {
       .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "").replace(/\s+/g, " ").trim();
   }
   return null;
+}
+
+/**
+ * The path as the request log shows it. A path segment that is a secret -- a
+ * tear sheet, unsubscribe or self-schedule link, any long random token -- is
+ * shown as [token]; ids (uuids) and ordinary words stay.
+ */
+export function logPath(path: string): string {
+  return path.split("/").map((seg) => (/^[A-Za-z0-9_-]{16,}$/.test(seg) && !UUID.test(seg) && /[0-9_-]/.test(seg) ? "[token]" : seg)).join("/");
 }
 
 export function createServer(): http.Server {
@@ -908,7 +1421,7 @@ export function createServer(): http.Server {
       }
       let who: Who | null = null;
       if (r.auth === "token") {
-        who = authenticate(req);
+        who = await authenticate(req);
         if (!who) throw new HttpError(401, "sign in, or send a valid API token");
         if (who.via === "session" && method !== "GET") requirePageHeader(req);
       }
@@ -938,13 +1451,13 @@ export function createServer(): http.Server {
       }
     } finally {
       // method, path, status, time. Never bodies, never tokens.
-      console.log(`${req.method} ${url.pathname} ${status} ${Date.now() - t0}ms`);
+      console.log(`${req.method} ${logPath(url.pathname)} ${status} ${Date.now() - t0}ms`);
     }
   });
 }
 
 export async function start(): Promise<http.Server> {
-  if (TOKEN.length < 32) {
+  if (TOKEN().length < 32) {
     throw new Error("ERP_API_TOKEN must be set to at least 32 characters. Refusing to start open.");
   }
   if (!process.env.DATABASE_URL && !process.env.PGHOST) {
@@ -955,10 +1468,6 @@ export async function start(): Promise<http.Server> {
   if (!APP || !APP_JS || !APP_CSS) console.warn("the app files are not all in server/; the root address will say so");
   const applied = await migrate({ seed: TRIAL });
   console.log(applied.length ? `migrations: applied ${applied.length}` : "migrations: up to date");
-  if (!ENTITY) {
-    const first = await pool.query<{ id: string }>("select id from entity where status = 'active' order by created_at, name limit 1");
-    ENTITY = first.rows[0]?.id ?? NO_COMPANY;
-  }
   if (TRIAL) {
     // Placeholder activity for the trial's placeholder company. Never allowed
     // to stop the service starting.

@@ -50,7 +50,7 @@ Purchasing turns those lines into vendor POs. POS never builds POs itself.
 
 1. Money is `bigint` minor units. Use `minor()` and `bps()` from `server/modules/kit.ts`. Never floats.
 2. Every query names `entity_id = $n` (or says `/* unscoped: why */`). Pass SQL through `guard()` when you build it dynamically.
-3. Nothing is deleted. Corrections are reversals, voids with reasons, or status changes.
+3. Nothing is deleted. Corrections are reversals, voids with reasons, or status changes. The one exception is the demo reset (`packages/core/platform_demo.ts`, see Platform), guarded to the demo tenants.
 4. The database enforces the rules that cost money if broken (check constraints and triggers), and the code says them in plain words too.
 5. Errors a person will read are sentences. Throw `ModuleError` (via `need()`), which comes back as a 409 with the message as-is.
 6. A module never writes another module's tables except through that module's exported functions in `packages/core/<module>.ts`. `stock_level` especially: only `packages/core/inventory.ts` changes it.
@@ -62,7 +62,7 @@ Purchasing turns those lines into vendor POs. POS never builds POs itself.
 | Piece | Path |
 |---|---|
 | schema | `db/migrations/00NN_<id>.sql` (your number below; forward-only) |
-| demo data | `db/seed/00NN_<id>.sql` (loaded only with `ERP_SEED=placeholder`) |
+| demo data | `db/seed/00NN_<id>.sql` (the demo tenants only; loaded by `apply.sh --seed`, by `ERP_SEED=placeholder`, and by the Operator console's Reset demo, so it must never touch another tenant) |
 | rules | `packages/core/<id>.ts` (pure functions taking a `Client`) |
 | API | `server/modules/<id>.ts`, `register(kit)` using `kit.coGet` / `kit.coPost` / `kit.publicRoute` |
 | screens | `server/ui/<id>.js`, uses `window.ERP` helpers and `ERP.register(...)` |
@@ -103,6 +103,7 @@ Data is placed with textContent only, never innerHTML.
 | trade (trade and designer accounts, the trade portal, room projects and follow-ups, the designer as a commission role; extends crm, catalog, tax, ar, shop, workforce) | 0044, 0047 | 0027 | Retail (Trade accounts, Room projects) |
 | configurator (sectionals, fabric/leather grades and swatches, option rules, condition grades; extends catalog, pos, inventory, shop, edi) | 0043 | 0026 | Retail (Sectionals), Operations (As-is grades) |
 | admin (service switches and presets, single-store rule, connections, outbound message log) | 0049 | none | Setup (Services, Connections) |
+| platform (customers, sign-in, support mode, tenant API tokens, the demo) | 0051 | 0032 (marks the demo) | Platform (Operator console), Account |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -468,3 +469,94 @@ services with open records lists them and needs `confirm`. Also through
 messaging now: CRM campaigns (consent checked again at send), store order
 decisions to the submitter, vendor feed alerts, A/R collections texts and
 emails. Review requests (`RecordOnlyReviews`) and letters stay record-only.
+
+## Platform: the ERP sold to many businesses (migration 0051)
+
+The ERP is a product the developer sells to many retail businesses. A
+**tenant** (client) is one customer; its **entities** are its companies. The
+sample data (Demo Furniture Co, Rio Freight) is the **demo**, not anyone's
+books. `tenant.kind` is `customer` or `demo`, `tenant.status` is `active` or
+`suspended` (nobody of theirs signs in, their tokens stop, nothing is deleted),
+`tenant.plan` is a label for billing.
+
+**Two kinds of user.**
+
+- *Platform operators* (the developer team): `ERP_LOGINS="name:password,..."`
+  in Render, a password of 10+ characters or `scrypt$...` from
+  `scripts/hash-password.ts`; the old 4-digit keys are refused with a sentence
+  saying what to set. Signing in with a name and `ERP_API_TOKEN` also makes an
+  operator. An operator sees the Operator console and **no company** until
+  they enter a tenant in **support mode** (a reason is required;
+  `platform_support_session`, `platform_audit` rows for start, every change
+  and end; the audit trail labels changes `name (support) as person`; a banner
+  shows the whole time). "Act as" exists only there.
+- *Customer users*: `platform_login`, one per `app_user`, in ONE tenant. Email
+  (unique across the install) and a scrypt password (N 16384, r 8, p 1, a
+  16-byte salt of its own: `scrypt$N$r$p$salt$hash`), 10+ characters.
+  Invites (7 days), password resets (1 hour) and emailed six-digit sign-in
+  codes (10 minutes, 5 tries) are single-use `platform_login_token` rows, only
+  the sha256 kept; the email is queued through `messaging.queueEmail` with the
+  token redacted in `outbound_message` (purposes `platform_invite`,
+  `platform_reset`, `platform_code`), through the email connection of
+  `ERP_PLATFORM_MAIL_COMPANY` when set, else the customer's own. With none
+  connected the operator copies the invite link from the console. Links point
+  at `ERP_PUBLIC_URL`, else `RENDER_EXTERNAL_URL`, never the request's Host.
+  A customer sees only the companies of their tenant where they hold a role
+  (all of them with a client-wide grant), always as themselves, with their own
+  roles. A tenant owner (a client-wide owner grant) may **preview** another of
+  their people's view with `x-erp-as`: reads only; a change is refused.
+  `session_version` ends every older session on a password change, reset,
+  disable or suspension.
+
+**Sessions** are the same signed cookie, now carrying the kind (`o`/`c`), the
+login and its version, or the support session. **Sign-in brakes** are per name
+(or email) and client address (5 wrong tries lock that pair for 15 minutes)
+and per address (growing delay; 40 wrong tries refuse that address for 15
+minutes). There is no install-wide lock, so made-up names cannot lock out a
+real login, and a correct password from another address always works.
+
+**Every company route** (`coGet`, `coPost`, and so every module route; the
+install-wide feed routes, which now take `?co=` or the person's default;
+connections; `/api/clients`; `/api/companies`) resolves the company from the
+URL through `companyFor()` and answers "no such company" (404) when the
+session may not open it, before the body is read. `scripts/modules/platform.ts`
+walks every registered `/api/c/<co>/...` route (GET and POST) as a customer
+against another tenant's company and the demo's. There is no global default
+company: a customer opens on their last company (`platform_login.last_entity_id`)
+or their first; `ERP_ENTITY_ID` is only the default for the system token or an
+operator who may open it. A feed connection with no company is refused, never
+filed into some other company. The request log shows link tokens (tear sheets,
+unsubscribe, self-schedule) as `[token]`.
+
+**API tokens per tenant** (`platform_api_token`): an owner makes, rotates and
+revokes named tokens (`erpt_...`), shown once, kept as sha256 with a short
+prefix. A token opens only its tenant's companies and acts only as its
+tenant's people. `ERP_API_TOKEN` stays the install-wide system token.
+
+**Operator console** (`server/ui/platform.js`, `/api/platform/*`): customers
+(companies, stores, sign-ins, people, services on, last activity, plan,
+status); create a customer (tenant, first company with one store and its
+operating account, the chosen setup pack through `setup.applyPack`, the owner
+person with a client-wide owner grant, an invite; no sample data); suspend and
+reactivate; enter support mode; new invite links; demo sign-ins for prospects
+(owner of the demo, 1 to 30 days, the password shown once; they end on time
+and survive a demo reset); Reset demo. The **Account** screen
+(`/api/tenant/*`) is where an owner invites people, turns sign-ins on and off
+and manages API tokens, and where anyone changes their password.
+
+**Demo reset** (`packages/core/platform_demo.ts`), the documented exception to
+"nothing is deleted": in one transaction, only for `DEMO_TENANTS` marked
+`kind = 'demo'`, it collects the demo's rows from the catalog (tenant_id or
+entity_id, then anything whose foreign key leads to those), refuses if any row
+outside the demo points at one, lifts the append-only triggers for that
+transaction only, deletes children before parents, reruns every `db/seed`
+file, and refuses if any row it wrote is outside the demo (by xmin).
+`audit_event` and `platform_audit` are never touched. A seed file is therefore
+written for the demo tenants only (0019, 0024, 0028 and 0030 were narrowed to
+them).
+
+**Seeds vs production.** Production no longer needs `ERP_SEED=placeholder`:
+migration 0051 marks the seeded tenants as the demo, so a live database keeps
+its sample data as the demo and nothing else; new customers start clean.
+`./db/apply.sh --reset --seed` still builds the test database (seed 0032 marks
+the demo there).

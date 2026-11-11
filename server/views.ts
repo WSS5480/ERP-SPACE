@@ -28,10 +28,10 @@ const secretEnvName = (ref: string): string =>
 export async function companies(c: Client) {
   return await q<{
     id: string; name: string; legal_name: string; tenant_id: string; tenant_name: string;
-    vertical: string; location_label: string; profit_object_label: string;
+    vertical: string; location_label: string; profit_object_label: string; tenant_kind: string; tenant_status: string;
   }>(c, `
     select e.id, e.name, e.legal_name, t.id as tenant_id, t.name as tenant_name, t.vertical,
-           t.location_label, t.profit_object_label
+           t.location_label, t.profit_object_label, t.kind as tenant_kind, t.status as tenant_status
       from entity e join tenant t on t.id = e.tenant_id
      where e.status = 'active'
      order by t.name, e.name /* unscoped: the operator's list of every company it keeps books for */`);
@@ -1155,7 +1155,7 @@ export async function setup(c: Client, co: Company) {
 /** The clients kept here, for starting a new company: its chart can be copied from any of them. */
 export async function clients(c: Client) {
   return await q(c, `
-    select t.id, t.name, t.vertical,
+    select t.id, t.name, t.vertical, t.kind,
            (select count(*) from entity e where e.tenant_id = t.id)::int as companies,
            (select count(*) from gl_account g where g.tenant_id = t.id)::int as accounts
       from tenant t order by t.name /* unscoped: the operator's list of clients */`);
