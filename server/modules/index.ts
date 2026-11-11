@@ -27,5 +27,6 @@ import { module as onboarding } from "./onboarding.ts";
 import { module as periods } from "./periods.ts";
 import { module as jobs } from "./jobs.ts";
 import { module as drill } from "./drill.ts";
+import { module as vendorFiles } from "./vendor_files.ts";
 
-export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports, group, edi, wms, ops, lots, trade, configurator, admin, onboarding, drill, periods, jobs];
+export const MODULES: ErpModule[] = [setup, catalog, purchasing, inventory, pos, ar, workforce, fleet, shop, chart, crm, service, reports, group, edi, wms, ops, lots, trade, configurator, admin, vendorFiles, onboarding, drill, periods, jobs];

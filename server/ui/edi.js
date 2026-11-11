@@ -33,7 +33,7 @@
   const NAMES = { '850': 'Purchase order', '855': 'PO acknowledgment', '856': 'Ship notice', '810': 'Invoice', '832': 'Price catalog', '846': 'Inventory advice',
     '997': 'Functional ack', freight: 'Freight by store', unknown: 'Unreadable file' };
   const CHANNEL_WORDS = { edi: 'EDI', api: 'Vendor API feed', email: 'Email', file: 'File (download / import)', off: 'Not exchanged' };
-  const TRANSPORT_WORDS = { manual: 'Manual upload and download', dropfolder: 'Drop folder on the server', van: 'VAN or EDI service (HTTPS)', sftp: 'SFTP (not built yet)', as2: 'AS2 (not built yet)' };
+  const TRANSPORT_WORDS = { manual: 'Manual upload and download', dropfolder: 'Drop folder on the server', van: 'VAN or EDI service (HTTPS)', sftp: 'SFTP', as2: 'AS2 (not built yet)' };
   const STATUS = {
     queued: ['neutral', 'pending', 'Queued'], sent: ['good', 'ok', 'Sent'], received: ['neutral', 'info', 'Received'], applied: ['good', 'ok', 'Applied'],
     quarantined: ['serious', 'hold', 'Quarantined'], acknowledged: ['good', 'ok', 'Acknowledged'], rejected: ['critical', 'fail', 'Rejected'],
@@ -138,12 +138,13 @@
         sendUrl: input({ value: tc.sendUrl || '', placeholder: 'https://' }), listUrl: input({ value: tc.listUrl || '', placeholder: 'https://' }), ackUrl: input({ value: tc.ackUrl || '', placeholder: 'https://' }),
         auth: select([['bearer', 'Bearer token'], ['header', 'Key header'], ['basic', 'User and password'], ['none', 'None']], tc.auth || 'bearer'), headerName: input({ value: tc.headerName || '', placeholder: 'x-api-key' }),
         url: input({ value: tc.url || '', placeholder: 'https://' }), as2To: input({ value: tc.as2To || '' }),
+        pattern: input({ value: tc.pattern || '', placeholder: '*.edi (blank = every file)' }), archiveFolder: input({ value: tc.archiveFolder || '', placeholder: '/out/done (blank = leave them)' }),
       };
-      const SHOW = { manual: [], dropfolder: ['folder'], van: ['sendUrl', 'listUrl', 'ackUrl', 'auth', 'headerName', 'user'], sftp: ['host', 'port', 'user', 'inFolder', 'outFolder'], as2: ['url', 'as2To'] };
+      const SHOW = { manual: [], dropfolder: ['folder'], van: ['sendUrl', 'listUrl', 'ackUrl', 'auth', 'headerName', 'user'], sftp: ['host', 'port', 'user', 'inFolder', 'outFolder', 'pattern', 'archiveFolder'], as2: ['url', 'as2To'] };
       const LABEL = { folder: 'Folder name', host: 'Host', port: 'Port', user: 'User', inFolder: 'Their outbox (we read)', outFolder: 'Their inbox (we write)', sendUrl: 'Send address',
-        listUrl: 'Inbox address', ackUrl: 'Acknowledge address', auth: 'Authentication', headerName: 'Key header name', url: 'AS2 address', as2To: 'Their AS2 id' };
+        listUrl: 'Inbox address', ackUrl: 'Acknowledge address', auth: 'Authentication', headerName: 'Key header name', url: 'AS2 address', as2To: 'Their AS2 id', pattern: 'File pattern', archiveFolder: 'Move taken files to' };
       const tFields = Object.fromEntries(Object.entries(tf).map(([k, c]) => [k, field(LABEL[k], c)]));
-      const SECRETS = { manual: [], dropfolder: [], van: ['vanToken', 'vanApiKey', 'vanPassword'], sftp: ['sftpPassword', 'sftpKey'], as2: ['as2Password'] };
+      const SECRETS = { manual: [], dropfolder: [], van: ['vanToken', 'vanApiKey', 'vanPassword'], sftp: ['sftpPassword', 'sftpKey', 'sftpPassphrase'], as2: ['as2Password'] };
       const setMasked = Object.fromEntries((det ? det.secrets : []).map((x) => [x.name, x.masked]));
       const sIn = Object.fromEntries(list.secretNames.map((n) => [n, input({ type: 'password', autocomplete: 'new-password', placeholder: setMasked[n] ? 'Set; type to replace' : 'Not set' })]));
       const sFields = Object.fromEntries(list.secretNames.map((n) => [n, field(n.replace(/([A-Z])/g, ' $1').toLowerCase(), sIn[n])]));
@@ -151,11 +152,31 @@
       const syncT = () => {
         for (const [k, f] of Object.entries(tFields)) f.hidden = !SHOW[transport.value].includes(k);
         for (const [k, f] of Object.entries(sFields)) f.hidden = !SECRETS[transport.value].includes(k);
-        note.replaceChildren(transport.value === 'sftp' || transport.value === 'as2'
-          ? resultBox('warning', 'warn', `${transport.value.toUpperCase()} is not built yet`, 'The settings and password are kept, and a poll or send says so plainly. Until it is, use a drop folder, a VAN, or download and upload by hand.')
+        note.replaceChildren(transport.value === 'as2'
+          ? resultBox('warning', 'warn', 'AS2 is not built yet', 'It needs S/MIME signing, encryption and MDN receipts. The settings are kept; use SFTP, a VAN, or download and upload by hand.')
+          : transport.value === 'sftp' ? sftpBox
           : transport.value === 'dropfolder' && !list.dropDirSet ? resultBox('warning', 'warn', 'No drop directory on the server', 'Set ERP_EDI_DROP_DIR in the service environment; partner folders sit under it.')
           : transport.value === 'dropfolder' ? el('p', { class: 'muted', text: `Vendor files go in <drop directory>/${E.S.co.id}/<folder>/in; what we send is written to …/<folder>/out.` }) : '');
       };
+      // SFTP: the server's key, recorded on the first good Test; a changed key is refused until the owner trusts it.
+      const sftpOut = el('div', { role: 'status', 'aria-live': 'polite' });
+      const pinLine = (pin) => pin ? el('p', { class: 'fine', text: `Server key ${pin.fingerprint}, recorded by ${pin.pinned_by_name || 'someone'} ${day(pin.pinned_at)}.${pin.offered_fingerprint ? ` The server has since shown ${pin.offered_fingerprint}.` : ''}` })
+        : el('p', { class: 'fine', text: 'No server key recorded yet. Save, then Test SFTP: it shows the key and records it.' });
+      const pinBox = el('div', {}, pinLine(det && det.pin));
+      const testSftp = p ? el('button', { class: 'btn small', type: 'button', onclick: async (e) => {
+        const b = e.currentTarget; E.busy(b, true);
+        try {
+          const r = await post(`/edi/partners/${p.id}/test-sftp`, {});
+          sftpOut.replaceChildren(resultBox(r.ok ? 'good' : 'critical', r.ok ? 'ok' : 'fail', r.ok ? (r.firstTime ? 'Connected; key recorded' : 'Connected') : r.changed ? 'The server key changed' : 'Not working',
+            `${r.words}${r.fingerprint ? ` Key: ${r.fingerprint}.` : ''}`));
+          if (r.changed && (E.S.person && E.S.person.roles || []).includes('owner')) sftpOut.append(el('button', { class: 'btn primary', type: 'button', onclick: (ev) => act(ev.currentTarget,
+            () => post(`/edi/partners/${p.id}/trust-key`, { fingerprint: r.fingerprint }), `New key trusted: ${r.fingerprint}`, { close: again }) }, `Trust the new key ${r.fingerprint}`));
+          pinBox.replaceChildren(pinLine((await coApi(`/edi/partners/${p.id}`)).pin));
+        } catch (x) { sftpOut.replaceChildren(resultBox('critical', 'fail', 'Not tested', friendly(x))); }
+        finally { if (b.isConnected) E.busy(b, false); }
+      } }, 'Test SFTP') : null;
+      const sftpBox = el('div', {}, el('p', { class: 'muted', text: 'We read their outbox folder and write to their inbox folder (as name.part, renamed when complete). Files over 20 MB are left on the server.' }),
+        pinBox, testSftp, sftpOut);
       transport.onchange = syncT; syncT();
       // 850 layout: parties, routing, dates, item ids and references this vendor wants.
       const o = cur.options || {};

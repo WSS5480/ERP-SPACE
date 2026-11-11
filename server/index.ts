@@ -69,6 +69,7 @@ import { PayrollError } from "../packages/core/payroll.ts";
 import { BankingError } from "../packages/core/banking.ts";
 import { ReconcileError } from "../packages/core/reconcile.ts";
 import "../packages/core/statements.ts"; // registers the bank_statement handler
+import { receiveMail as receiveVendorMail, type InboundMail } from "../packages/core/vendor_files.ts"; // and the vendor_files one
 import { migrate } from "../scripts/migrate.ts";
 import * as views from "./views.ts";
 import * as act from "./actions.ts";
@@ -82,7 +83,7 @@ import { startScheduler, queueJob, jobById, jobsView, runsView, runDetail } from
 import { PeriodError } from "../packages/core/periods.ts";
 import { loadSampleActivity } from "./sample.ts";
 import { MODULES } from "./modules/index.ts";
-import { ModuleError, PublicPage, PublicAsset, markLookOnly } from "./modules/kit.ts";
+import { ModuleError, PublicPage, PublicAsset, Download, markLookOnly } from "./modules/kit.ts";
 import { InventoryError } from "../packages/core/inventory.ts";
 import { ArError } from "../packages/core/ar.ts";
 import { PostingError } from "../packages/core/posting.ts";
@@ -131,9 +132,9 @@ class Html {
 
 /** A static file, served as-is. */
 class Asset {
-  text: string;
+  text: string | Buffer;
   type: string;
-  constructor(text: string, type: string) {
+  constructor(text: string | Buffer, type: string) {
     this.text = text;
     this.type = type;
   }
@@ -652,6 +653,8 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
       if (out === null) throw new HttpError(404, "not found");
       // A printable page (a tear sheet) goes out with every header and the CSP, like any page.
       if (out instanceof PublicPage) return [200, new Html(out.text)];
+      // A file to save (an import template): its own type, named for the download.
+      if (out instanceof Download) return [200, new Asset(out.bytes, out.type), { "content-disposition": `attachment; filename="${out.filename.replace(/[^A-Za-z0-9._-]/g, "_")}"` }];
       return [200, out];
     } finally {
       markLookOnly(c, false);
@@ -1429,7 +1432,13 @@ route("POST", /^\/hooks\/([^/]+)$/, "own", async (req, _url, m) => {
 // field names). The mailbox it was addressed to picks the connection; the
 // sender still has to be on that connection's allow list.
 route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
-  const presented = bearer(req) || url.searchParams.get("token") || "";
+  // The token rides in a header only, never the address (addresses end up in logs): "Authorization: Bearer <token>",
+  // or HTTP Basic with the token as the password -- what Postmark sends for https://erp:<token>@host/inbound/email.
+  const auth = String(req.headers.authorization ?? "");
+  const basic = /^basic\s+(.+)$/i.exec(auth);
+  let presented = bearer(req);
+  if (!presented && basic) { const pair = Buffer.from(basic[1], "base64").toString("utf8"); presented = pair.slice(pair.indexOf(":") + 1); }
+  if (url.searchParams.has("token")) throw new HttpError(401, "send the inbound email token in the Authorization header (Bearer, or Basic with the token as the password), not in the address");
   if (!EMAIL_TOKEN() || !safeEqual(presented, EMAIL_TOKEN())) {
     throw new HttpError(401, "inbound email needs its own token");
   }
@@ -1439,6 +1448,10 @@ route("POST", /^\/inbound\/email$/, "own", async (req, url) => {
     Attachments?: { Name: string; Content: string; ContentType?: string }[];
   };
   try { msg = JSON.parse(raw.toString("utf8")); } catch { throw new HttpError(400, "that is not an inbound-email payload"); }
+
+  // Vendor mail to a company's (or one vendor's) own address: routed by mailbox and sender, unknown senders held.
+  const vendorMail = await receiveVendorMail(msg as InboundMail);
+  if (vendorMail) return [200, vendorMail];
 
   const to = String(msg.OriginalRecipient ?? msg.To ?? "").toLowerCase();
   const addr = to.includes("<") ? to.slice(to.lastIndexOf("<") + 1, to.lastIndexOf(">")) : to.split(",")[0].trim();

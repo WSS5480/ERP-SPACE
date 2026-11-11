@@ -456,8 +456,8 @@ export async function runFeeds(t: T) {
     options: { host: "sftp.global.example", port: 22, user: "riverside", path: "/outbound/", pattern: "*.csv" } } });
   const gview = await cr.get<{ feeds: { id: string; transport_note: string | null }[] }>("/catalog/vendors/:id/feeds", "", V.GLOBAL);
   const sr = await cr.post<feeds.RunResult>("/catalog/feeds/:id/run", BUYER, {}, sftp.id).catch((e: Error) => ({ ok: false, note: e.message }) as feeds.RunResult);
-  t.ok("SFTP: the setting is kept, and the card and a run say plainly it is not built yet", /not built in this version yet/.test(gview.feeds.find((f) => f.id === sftp.id)?.transport_note ?? "")
-    && /not built in this version yet/.test(sr.note));
+  t.ok("SFTP: the feed is real now: no \"not built\" note, and a run before any Test refuses in words because no server key is recorded",
+    !gview.feeds.find((f) => f.id === sftp.id)?.transport_note && !sr.ok && /No server key is recorded/.test(sr.note), sr.note);
 
   // ------------------------------------------------------------ isolation
   await rio(t, (c, s) => t.throws("isolation: another company cannot run this company's feed", () => feeds.runFeed(c, s, pf.id, net.env()), /no such feed/));

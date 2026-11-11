@@ -121,6 +121,25 @@ async function holdsRole(c: Client, userId: string, entityId: string, role: stri
   return rows.length > 0;
 }
 
+/**
+ * May the maker decide their own request's step? Only the owner, and only when
+ * no one else active in the company holds the step's role, the owner role or
+ * the controller role (a controller is a real second pair of eyes even where
+ * the step names another role, so a company that has one keeps maker-checker).
+ * The approval types this frees in a one-person company are every type the
+ * engine routes: vendor, vendor_bank_account, invoice, payment_run,
+ * payroll_run, employee, employee_change, journal_entry, fiscal_period.
+ */
+export async function mayDecideOwn(c: Client, userId: string, entityId: string, role: string): Promise<boolean> {
+  if (!(await holdsRole(c, userId, entityId, "owner"))) return false;
+  const others = await q(c, `
+    select 1 from role_grant g join app_user u on u.id = g.app_user_id join entity e on e.id = $2
+     where u.id <> $1 and u.status = 'active' and g.role in ($3, 'owner', 'controller')
+       and (g.entity_id = $2 or (g.entity_id is null and u.tenant_id = e.tenant_id))
+     limit 1`, [userId, entityId, role]);
+  return others.length === 0;
+}
+
 export type Decision = "approved" | "rejected";
 
 /**
@@ -157,8 +176,6 @@ export async function decide(
   );
 
   if (req.status !== "open") throw new ApprovalError(`request is already ${req.status}`);
-  if (req.maker_id === input.actorId)
-    throw new ApprovalError("the maker cannot approve their own request");
 
   const steps = await q<{ id: string; seq: number; required_role: string; decision: string | null }>(
     c,
@@ -173,7 +190,16 @@ export async function decide(
   const next = steps.find((s) => s.decision === null);
   if (!next) throw new ApprovalError("no step is waiting");
 
-  if (!(await holdsRole(c, input.actorId, req.entity_id, next.required_role)))
+  // The maker is never the checker -- unless they are the owner and nobody else in the company
+  // could decide this step (a one-person store would otherwise wait forever). Checked again by the database.
+  let selfApproved = false;
+  if (req.maker_id === input.actorId) {
+    if (!(await mayDecideOwn(c, input.actorId, req.entity_id, next.required_role)))
+      throw new ApprovalError("the maker cannot approve their own request");
+    selfApproved = true;
+  }
+
+  if (!selfApproved && !(await holdsRole(c, input.actorId, req.entity_id, next.required_role)))
     throw new ApprovalError(`actor does not hold the role ${next.required_role} for this entity`);
 
   if (req.requires_callback && input.decision === "approved" && !input.callbackLogged)
@@ -184,10 +210,15 @@ export async function decide(
   await c.query(
     `update approval_step
         set decision = $2, actor_id = $3, decided_at = now(), note = $4,
-            callback_logged_at = case when $5 then now() else null end
+            callback_logged_at = case when $5 then now() else null end, self_approved = $6
       where id = $1`,
-    [next.id, input.decision, input.actorId, input.note ?? null, input.callbackLogged ?? false]
+    [next.id, input.decision, input.actorId, input.note ?? null, input.callbackLogged ?? false, selfApproved]
   );
+  if (selfApproved) {
+    await audit(c, scope, { table: "approval_request", rowId: input.requestId, action: "transition",
+      reason: "self-approved: no other approver",
+      after: { subject: req.subject_type, subjectId: req.subject_id, step: next.seq, role: next.required_role, decision: input.decision } });
+  }
 
   let status: "open" | "approved" | "rejected" = "open";
   if (input.decision === "rejected") status = "rejected";
@@ -209,4 +240,19 @@ export async function decide(
   });
 
   return status;
+}
+
+/** Could this person decide the request's waiting step now (the same rules decide() applies)? For screens that offer an Approve button. */
+export async function canDecideNow(c: Client, entityId: string, requestId: string, personId: string | null): Promise<boolean> {
+  if (!personId) return false;
+  const r = (await q<{ maker_id: string; status: string }>(c, `select maker_id, status from approval_request where id = $1 and entity_id = $2`, [requestId, entityId]))[0];
+  if (!r || r.status !== "open") return false;
+  const steps = await q<{ required_role: string; decision: string | null; actor_id: string | null }>(c, `
+    select s.required_role, s.decision, s.actor_id from approval_step s join approval_request r on r.id = s.request_id and r.entity_id = $2
+     where s.request_id = $1 order by s.seq`, [requestId, entityId]);
+  const next = steps.find((s) => s.decision === null);
+  if (!next) return false;
+  if (r.maker_id === personId) return mayDecideOwn(c, personId, entityId, next.required_role);
+  if (steps.some((s) => s.actor_id === personId)) return false;
+  return holdsRole(c, personId, entityId, next.required_role);
 }

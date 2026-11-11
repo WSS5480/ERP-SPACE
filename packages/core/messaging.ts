@@ -26,7 +26,7 @@ import net from "node:net";
 import tls from "node:tls";
 import { createHmac, randomBytes } from "node:crypto";
 import { q, one, audit, tx, afterCommit, pool, type Client, type Scope } from "./db.ts";
-import { call, sealSecret, unsealSecret, liveEnv, FeedError, type FeedEnv } from "./vendor_feeds.ts";
+import { call, sealSecret, unsealSecret, liveEnv, FeedError, type FeedEnv, type FetchLike } from "./vendor_feeds.ts";
 import { isPrivateIp } from "./catalog.ts";
 import { setGeocoderFor, censusGeocoder, GeocodeError, type Geocoder } from "./geocode.ts";
 
@@ -46,6 +46,9 @@ export type MsgEnv = FeedEnv & {
 };
 export const liveMsgEnv = (): MsgEnv => ({
   ...liveEnv(),
+  // Email and text providers keep the platform fetch they have always used on live (every address still checked
+  // before the call). The pinned caller is for vendor feeds and vendor files until it has run on a real network.
+  fetch: globalThis.fetch as unknown as FetchLike,
   smtpAllowPrivate: process.env.ERP_SMTP_ALLOW_PRIVATE === "1",
   smtpAllowPlain: process.env.ERP_SMTP_ALLOW_PLAIN === "1",
   smtpAllowHosts: (process.env.ERP_SMTP_ALLOW_HOSTS ?? "").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
@@ -126,9 +129,9 @@ export const KINDS: Kind[] = [
       { id: "mapbox", name: "Mapbox", fields: [{ name: "accessToken", label: "Access token", secret: true, required: true }] },
     ] },
   { id: "vendor_api", name: "Vendor APIs", group: "Operations", state: "summary", link: { screen: "catalog", label: "Open Catalog, Vendors" },
-    note: "Each vendor's product, price, stock and order APIs are set up on the vendor, under Catalog, Vendors, API setup.", providers: [] },
+    note: "Each vendor's product, price, stock and order feeds are set up on the vendor, under Catalog, Vendors, API setup: by API, from the vendor's SFTP server, or from its email. Vendor files (SFTP, HTTPS or email, carrying catalogs, prices, inventory and EDI) are under the Vendor files tab here.", providers: [] },
   { id: "edi", name: "EDI trading partners", group: "Operations", state: "summary", link: { screen: "edi", label: "Open Vendor EDI" },
-    note: "X12 partners are set up in Vendor EDI. Files move by hand or through a drop folder; SFTP and AS2 transport are not built yet.", providers: [] },
+    note: "X12 partners are set up in Vendor EDI. Files move by SFTP (the server's key recorded on the first test), a VAN or EDI service, a drop folder, or by hand. AS2 is not built yet.", providers: [] },
   { id: "printers", name: "Label printers", group: "Operations", state: "summary", link: { screen: "labels", label: "Open Labels" },
     note: "Network label printers on your own network are set up in Labels.", providers: [] },
   { id: "bank", name: "Bank feeds", group: "Money", state: "stored", link: { screen: "feeds", label: "Open Feeds" },
@@ -341,7 +344,7 @@ async function summaryFor(c: Client, entityId: string, kind: string): Promise<Re
   if (kind === "vendor_api") return one(c, `select count(*)::int feeds, count(*) filter (where active)::int active,
       count(*) filter (where active and last_ok = false)::int failing, count(distinct vendor_id)::int vendors from vendor_feed where entity_id = $1`, [entityId]);
   if (kind === "edi") return one(c, `select count(*)::int partners, count(*) filter (where edi_enabled)::int enabled,
-      count(*) filter (where transport in ('sftp','as2'))::int waiting_on_transport from edi_partner where entity_id = $1`, [entityId]);
+      count(*) filter (where transport = 'as2')::int waiting_on_transport from edi_partner where entity_id = $1`, [entityId]);
   if (kind === "printers") return one(c, `select count(*)::int printers from label_printer where entity_id = $1`, [entityId]);
   if (kind === "bank") return one(c, `select (select count(*)::int from connection where entity_id = $1 and source_code = 'bank_statement') connections,
       (select count(*)::int from bank_statement bs join bank_account b on b.id = bs.bank_account_id where b.entity_id = $1) statements`, [entityId]);

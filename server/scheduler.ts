@@ -20,6 +20,7 @@ import { drainQueued } from "../packages/core/messaging.ts";
 import { runDueReports } from "../packages/core/reports.ts";
 import { runDueConnections, runDueVendorFeeds, runDueCrm, runDueEdi, runDueHolds } from "../scripts/run-due.ts";
 import { recordError, redact } from "./errors.ts";
+import { purgeHeldContent } from "../packages/core/vendor_files.ts";
 
 export type JobItem = { tenantId?: string | null; entityId?: string | null; ok: boolean; note: string };
 export type JobOutcome = { items: JobItem[]; summary: string };
@@ -60,6 +61,8 @@ export const JOBS: JobDef[] = [
     run: async (now) => { const r = await runDueHolds(now); return { items: r.map((x) => ({ tenantId: x.tenantId, entityId: x.entityId, ok: !x.note, note: `${x.holds} holds ran out, ${x.released} lines back${x.note ? ` — ${x.note}` : ""}` })), summary: `${plural(r.length, "company")} with holds ending` }; } },
   { id: "reports", label: "Scheduled reports", everyMin: 60, what: "Runs reports people scheduled and prepares their emails.",
     run: async () => { const r = await runDueReports(pool, tx); return { items: r.runs.map((x) => ({ tenantId: x.tenantId, entityId: x.entityId, ok: x.ok, note: `${x.name}: ${x.note}` })), summary: `${r.due} reports were due` }; } },
+  { id: "held_mail", label: "Held vendor mail", everyMin: 24 * 60, what: "Drops the files of vendor mail held more than 60 days for review; the record of each message stays.",
+    run: async (now) => { const r = await tx({ kind: "system", label: "scheduler" }, (c) => purgeHeldContent(c, now)); return { items: [], summary: `${plural(r.purged, "held file")} past 60 days dropped (records kept)` }; } },
   { id: "outbox", label: "Outbox sweep", everyMin: 15, what: "Sends email and texts a restart left queued (the server also drains it every minute).",
     run: async () => { const r = await drainQueued({ limit: 1000, olderThanSec: 60 }); return { items: [], summary: `${r.sent} sent, ${r.failed} failed` }; } },
 ];

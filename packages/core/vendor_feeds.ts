@@ -56,6 +56,7 @@ export type FeedEnv = {
   resolve?: (host: string) => Promise<string[]>;   // DNS; when present every hop's addresses are checked
   secretKey?: Buffer | null;                    // ERP_SECRET_KEY, 32 bytes
   allowHttp?: boolean;                          // ERP_FEEDS_ALLOW_HTTP=1, development only
+  allowHosts?: string[];                        // ERP_FEEDS_ALLOW_HOSTS: hosts that may sit on a private network (still https)
   imageFetch?: ImageFetch;
   now?: () => Date;
 };
@@ -72,8 +73,67 @@ export function secretKeyFromEnv(): Buffer | null {
   return k.length === 32 ? k : null;
 }
 
+/**
+ * The live fetch. Its own DNS lookup checks every address a name resolves to
+ * and hands the socket the address it checked, so a name cannot resolve to a
+ * public address for the check and a private one for the call (DNS
+ * rebinding). The body is counted while it streams and the call is cut at
+ * maxBytes, so a lying or missing Content-Length cannot fill memory.
+ */
+export function pinnedFetch(o: { allowHosts?: string[]; maxBytes?: number; ca?: string; lookup?: (host: string) => Promise<string[]> } = {}): FetchLike {
+  const maxBytes = o.maxBytes ?? MAX_ANSWER;
+  return (url, init = {}) => new Promise(async (resolve, reject) => {
+    let u: URL;
+    try { u = new URL(url); } catch { return reject(new FeedError("not a web address")); }
+    const mod = u.protocol === "http:" ? await import("node:http") : await import("node:https");
+    const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const allowed = (o.allowHosts ?? []).includes(host);
+    const lookup = (hostname: string, opts: unknown, cb: (err: Error | null, address: string | { address: string; family: number }[], family?: number) => void) => {
+      const all = typeof opts === "object" && opts !== null && (opts as { all?: boolean }).all;
+      const resolveAll = o.lookup ?? (async (h: string) => (await (await import("node:dns/promises")).lookup(h, { all: true, verbatim: true })).map((a) => a.address));
+      resolveAll(hostname).then((addrs) => {
+        if (!addrs.length) return cb(new FeedError(`${hostname} could not be found`), "");
+        if (!allowed && addrs.some((a) => isPrivateIp(a))) return cb(new FeedError("addresses on private networks are not called"), "");
+        // Every address was checked, so every one may be dialled: with all (Node's default autoSelectFamily) the
+        // socket tries them in turn, so a dead first record or an IPv6 address on an IPv4-only host falls through.
+        const fam = (x: string) => (x.includes(":") ? 6 : 4);
+        all ? cb(null, addrs.map((x) => ({ address: x, family: fam(x) }))) : cb(null, addrs[0], fam(addrs[0]));
+      }, () => cb(new FeedError(`${hostname} could not be found`), ""));
+    };
+    // What fetch() sent on its own: a length for the body (not chunked; some APIs refuse chunked uploads) and a user agent.
+    const headers: Record<string, string> = { "user-agent": "erp-api", ...(init.headers ?? {}) };
+    if (init.body != null && !Object.keys(headers).some((k) => k.toLowerCase() === "content-length")) headers["content-length"] = String(Buffer.byteLength(init.body));
+    const req = (mod as typeof import("node:https")).request({
+      protocol: u.protocol, hostname: host, port: u.port || undefined, path: u.pathname + u.search, method: init.method ?? "GET",
+      headers, lookup: lookup as never, ca: o.ca, servername: /^[\d.]+$|:/.test(host) ? undefined : host,
+    }, (res) => {
+      const headers = { get: (k: string) => { const v = res.headers[k.toLowerCase()]; return v == null ? null : Array.isArray(v) ? v.join(", ") : String(v); } };
+      let body: Promise<string> | null = null;
+      const text = () => (body ??= new Promise<string>((ok, bad) => {
+        const parts: Buffer[] = [];
+        let n = 0;
+        res.on("data", (d: Buffer) => {
+          n += d.length;
+          if (n > maxBytes) { res.destroy(); req.destroy(); bad(new FeedError(`the answer is over ${Math.round(maxBytes / 1048576) || 1} MB; ask for smaller pages`)); return; }
+          parts.push(d);
+        });
+        res.on("end", () => ok(Buffer.concat(parts).toString("utf8")));
+        res.on("error", (e) => bad(e));
+      }));
+      resolve({ status: res.statusCode ?? 0, headers, text });
+    });
+    req.on("error", (e) => reject(e instanceof FeedError ? e : e));
+    if (init.signal) {
+      if (init.signal.aborted) req.destroy(new Error("aborted"));
+      init.signal.addEventListener("abort", () => req.destroy(new Error("aborted")));
+    }
+    if (init.body) req.write(init.body);
+    req.end();
+  });
+}
+
 export const liveEnv = (): FeedEnv => ({
-  fetch: globalThis.fetch as unknown as FetchLike,
+  fetch: pinnedFetch({ allowHosts: (process.env.ERP_FEEDS_ALLOW_HOSTS ?? "").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean) }),
   secret: (ref) => process.env[secretEnvName(ref)] ?? "",
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   resolve: async (host) => {
@@ -82,6 +142,7 @@ export const liveEnv = (): FeedEnv => ({
   },
   secretKey: secretKeyFromEnv(),
   allowHttp: process.env.ERP_FEEDS_ALLOW_HTTP === "1",
+  allowHosts: (process.env.ERP_FEEDS_ALLOW_HOSTS ?? "").split(",").map((h) => h.trim().toLowerCase()).filter(Boolean),
 });
 
 // ---------------------------------------------------------- the network --
@@ -93,6 +154,7 @@ async function checkHop(env: FeedEnv, raw: string): Promise<URL> {
   try { u = new URL(raw); } catch { throw new FeedError(`${raw.slice(0, 60)} is not a web address`); }
   need(u.protocol === "https:" || (u.protocol === "http:" && env.allowHttp), "feeds call https addresses only");
   const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (env.allowHosts?.includes(h)) return u;      // an operator's own allow-list (a VPN'd vendor, a test server)
   const named = h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal") || isPrivateIp(h);
   need(!named, "addresses on private networks are not called");
   if (env.resolve && !/^[\d.]+$|:/.test(h)) {
@@ -141,7 +203,7 @@ export async function call(env: FeedEnv, url: string, init: FetchInit, timeoutMs
 
 // ------------------------------------------------------------- secrets --
 
-export const SECRET_NAMES = ["apiKey", "token", "password", "clientSecret", "atpKeyCode", "atpPassword", "sftpPassword"] as const;
+export const SECRET_NAMES = ["apiKey", "token", "password", "clientSecret", "atpKeyCode", "atpPassword", "sftpPassword", "sftpKey", "sftpPassphrase"] as const;
 const SECRET_SET = new Set<string>(SECRET_NAMES);
 
 /** AES-256-GCM under ERP_SECRET_KEY, bound to its owner and name (the AAD), so a sealed value cannot be moved to another row. */
@@ -687,6 +749,12 @@ function cleanDraft(d: FeedDraft): FeedRow {
   };
 }
 
+/** Who may send an email-in feed its file: addresses and @domains ("vendor.com" counts as @vendor.com). */
+export function feedSenders(o: Record<string, unknown>): string[] {
+  return String(o.fromContains ?? "").split(/[\s,;]+/).map((x) => x.trim().toLowerCase()).filter(Boolean)
+    .map((x) => (x.includes("@") ? x : `@${x}`));
+}
+
 export function validateFeed(f: FeedRow, opts: { forTest?: boolean } = {}) {
   need((PURPOSES as readonly string[]).includes(f.purpose), `a feed's purpose is one of ${PURPOSES.join(", ")}`);
   need(f.name || opts.forTest, "give the feed a name");
@@ -695,6 +763,24 @@ export function validateFeed(f: FeedRow, opts: { forTest?: boolean } = {}) {
   need(["query", "json", "xml"].includes(f.request_format), "the request is query parameters, a JSON body or an XML body");
   need(["json", "xml", "csv"].includes(f.response_format), "the answer is JSON, XML or CSV");
   if (f.kind === "api") need(/^https?:\/\/[^\s/]+/i.test(f.url), "the feed needs its address, starting with https://");
+  if (f.kind === "sftp" || f.kind === "email") need(PULL_PURPOSES.includes(f.purpose) && !["freight", "acknowledgments"].includes(f.purpose),
+    `an ${f.kind === "sftp" ? "SFTP" : "email-in"} feed carries products, prices, quantities or photos; freight and order status come by API`);
+  if (f.kind === "sftp") {
+    const o = f.options;
+    need(String(o.host ?? "").trim() && /^[a-z0-9.:_-]{1,200}$/i.test(String(o.host).trim()), "an SFTP feed needs the vendor's host, like sftp.vendor.com");
+    need(String(o.user ?? "").trim(), "an SFTP feed needs the user name");
+    const port = o.port == null || o.port === "" ? 22 : Number(o.port);
+    need(Number.isInteger(port) && (port === 22 || (port >= 1024 && port < 65536)), "the SFTP port is 22 or the vendor's own port (1024 or above)");
+    if (o.pattern) need(/^[A-Za-z0-9 ._*?()\[\]+-]{1,80}$/.test(String(o.pattern)), "the file pattern uses letters, digits, * and ? (like price*.csv)");
+    if (o.maxMb != null && o.maxMb !== "") need(Number(o.maxMb) >= 1 && Number(o.maxMb) <= 50, "the largest file is 1 to 50 MB");
+  }
+  if (f.kind === "email") {
+    const list = feedSenders(f.options);
+    need(list.length, "an email-in feed lists who sends the file: an address, or @vendor.com for anyone there");
+    for (const x of list) need(/^(@[a-z0-9.-]+\.[a-z]{2,}|[^\s@<>]+@[a-z0-9.-]+\.[a-z]{2,})$/i.test(x), `${x} is not an email address or an @domain`);
+    need(!f.schedule_cron && !f.every_hours, "an email-in feed runs when the vendor's mail arrives; it has no schedule");
+    if (f.options.pattern) need(/^[A-Za-z0-9 ._*?()\[\]+-]{1,80}$/.test(String(f.options.pattern)), "the attachment pattern uses letters, digits, * and ? (like price*.csv)");
+  }
   need(["none", "page", "offset", "cursor", "link"].includes(String(f.paging.mode ?? "none")), "paging is none, page, offset, cursor or next link");
   need(["none", "header", "query", "bearer", "basic", "oauth2", "auto"].includes(String(f.auth.mode ?? "none")), "authentication is none, key header, key parameter, bearer, basic or OAuth");
   if (f.request_format !== "query" && f.method === "GET") need(!f.body_template, "a GET request carries no body; choose POST or query parameters");
@@ -909,6 +995,9 @@ async function pull(c: Client, entityId: string, env: FeedEnv, f: FeedRow, creds
 // ------------------------------------------------------------- testing --
 
 export type TestResult = {
+  /** SFTP: the server's key (recorded on the first good Test), files matching; email: the vendor's address */
+  sftp?: { fingerprint: string | null; keyType: string | null; firstTime: boolean; changed: boolean; recorded: string | null; files: number | null; words: string; sample: { name: string; size: number; modifiedAt: string }[] };
+  address?: string | null;
   ok: boolean; status: number | null; url: string | null; requestHeaders: Record<string, string>; sample: string; recordsFound: number;
   columns: string[]; mapping: Record<string, string>; missing: string[]; rows: Record<string, string>[]; problem: string | null; calls: number;
 };
@@ -930,7 +1019,8 @@ export async function testFeed(c: Client, s: Scope, env: FeedEnv, d: FeedDraft):
     if (f.id) need((await q(c, `select 1 from vendor_feed where id = $1 and entity_id = $2`, [f.id, s.entityId])).length, "no such feed");
   }
   validateFeed(f, { forTest: true });
-  need(f.kind === "api", f.kind === "manual" ? "a manual feed has nothing to call; upload its file on the Import tab" : `${f.kind.toUpperCase()} pulls are not built in this version yet, so there is nothing to test`);
+  need(f.kind !== "manual", "a manual feed has nothing to call; upload its file on the Import tab");
+  if (f.kind === "sftp" || f.kind === "email") return testFileFeed(c, s, env, f, d);
   need(f.purpose !== "orders", "an order feed is tested by sending a PO; it pulls nothing");
   const res: TestResult = { ok: false, status: null, url: null, requestHeaders: {}, sample: "", recordsFound: 0, columns: [], mapping: {}, missing: [], rows: [], problem: null, calls: 0 };
   let creds: Record<string, string> = {};
@@ -971,7 +1061,7 @@ export async function testFeed(c: Client, s: Scope, env: FeedEnv, d: FeedDraft):
 }
 
 async function hasPricingFeed(c: Client, entityId: string, vendorId: string, exceptId: string | null) {
-  return (await q(c, `select 1 from vendor_feed where entity_id = $1 and vendor_id = $2 and purpose = 'pricing' and active and kind = 'api'
+  return (await q(c, `select 1 from vendor_feed where entity_id = $1 and vendor_id = $2 and purpose = 'pricing' and active and kind in ('api','sftp','email')
                         and id is distinct from $3 limit 1`, [entityId, vendorId, exceptId])).length > 0;
 }
 
@@ -1050,8 +1140,9 @@ export async function recordVendorPrices(c: Client, s: Scope, vendorId: string, 
            and h.promo_cost_minor is not distinct from $7::bigint and h.effective_from is not distinct from $8::date and h.effective_to is not distinct from $9::date`,
         [s.entityId, vendorId, sku, ...vals]);
       if (same.length) continue;
-      await c.query(`insert into vendor_price_history (entity_id, vendor_id, vendor_sku, cost_minor, map_minor, msrp_minor, promo_cost_minor, effective_from, effective_to, feed_id)
-                     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [s.entityId, vendorId, sku, ...vals, feedId]);
+      // clock_timestamp, not now(): two price files in one transaction (an SFTP run) must keep their order, the later one winning.
+      await c.query(`insert into vendor_price_history (entity_id, vendor_id, vendor_sku, cost_minor, map_minor, msrp_minor, promo_cost_minor, effective_from, effective_to, feed_id, recorded_at)
+                     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, clock_timestamp())`, [s.entityId, vendorId, sku, ...vals, feedId]);
       recorded++;
     } catch (e) { if (e instanceof FeedError || e instanceof CatalogError) bad++; else throw e; }
   }
@@ -1208,11 +1299,11 @@ export async function requestStop(c: Client, s: Scope, feedId: string) {
  * written whatever happens; the work itself sits in a savepoint, so a feed
  * that fails changes nothing.
  */
-export async function runFeed(c: Client, s: Scope, feedId: string, env: FeedEnv, trigger: "manual" | "schedule" = "manual",
-  stopCheck?: () => Promise<boolean>): Promise<RunResult> {
+export async function runFeed(c: Client, s: Scope, feedId: string, env: FeedEnv, trigger: "manual" | "schedule" | "email" = "manual",
+  stopCheck?: () => Promise<boolean>, given?: GivenFile[]): Promise<RunResult> {
   const f = await loadFeed(c, s.entityId, feedId);
-  need(f.kind === "api", f.kind === "manual" ? "a manual feed has nothing to pull; upload its file on the Import tab"
-    : `${f.kind.toUpperCase()} pulls are not built in this version yet; the settings are kept for when they are`);
+  need(f.kind !== "manual", "a manual feed has nothing to pull; upload its file on the Import tab");
+  need(f.kind !== "email" || given?.length, "an email-in feed runs when the vendor's mail arrives; there is nothing to pull");
   need(f.purpose !== "orders", "an order feed sends POs when you send them; there is nothing to run");
   const startedAt = new Date();
   const run = await one<{ id: string }>(c, `insert into vendor_feed_run (entity_id, feed_id, purpose, trigger, run_by) values ($1,$2,$3,$4,$5) returning id`,
@@ -1224,24 +1315,48 @@ export async function runFeed(c: Client, s: Scope, feedId: string, env: FeedEnv,
   await c.query("savepoint feed_run");
   try {
     const creds = await credentialsFor(c, s.entityId, env, f);
-    const p = await pull(c, s.entityId, env, f, creds, false, stop);
-    const rows = applyEtl(p.rows, f.etl);
-    res.rows = rows.length;
-    need(rows.length, "the feed answered, but with no records");
-    const heads = [...new Set(rows.flatMap((r) => Object.keys(r)))].filter((k) => !k.startsWith("__"));
+    let taken: TakenFile[] = [];
+    let p: { rows: Record<string, string>[]; skipped: string[] };
+    if (f.kind === "api") p = await pull(c, s.entityId, env, f, creds, false, stop);
+    else {
+      const got = f.kind === "sftp" ? await sftpFiles(c, s, f, creds, false) : await givenFiles(c, s, f, given ?? []);
+      taken = got.files;
+      p = { rows: got.rows, skipped: [] };
+      if (!taken.length) {
+        res.note = got.note ?? "no new files";
+        await c.query("release savepoint feed_run");
+        res.ok = true;
+        await c.query(`update vendor_feed_run set finished_at = now(), outcome = 'ok', rows = 0, note = $3 where id = $1 and entity_id = $2`, [run.id, s.entityId, res.note]);
+        await c.query(`update vendor_feed set last_run_at = now(), last_ok = true, last_note = $3, consecutive_failures = 0 where id = $1 and entity_id = $2`, [f.id, s.entityId, res.note]);
+        return res;
+      }
+    }
+    const etlRows = applyEtl(p.rows, f.etl);
+    need(etlRows.length, "the feed answered, but with no records");
+    const heads = [...new Set(etlRows.flatMap((r) => Object.keys(r)))].filter((k) => !k.startsWith("__"));
     const pricing = f.purpose === "products" && await hasPricingFeed(c, s.entityId, f.vendor_id, f.id);
     const mapping = mapFields(f.purpose, heads, f.mapping);
+    // The import template's grey example row (B1234-38) is not a product, by API, SFTP or email alike.
+    const { TEMPLATE_EXAMPLE_SKU } = await import("./catalog.ts");
+    const rows = etlRows.filter((r) => String(r[mapping.vendor_sku ?? ""] ?? "").trim().toUpperCase() !== TEMPLATE_EXAMPLE_SKU);
+    res.rows = rows.length;
+    need(rows.length, "the only record is the import template's example row (B1234-38); nothing to apply");
     const miss = missingFor(f.purpose, mapping, { costOptional: pricing });
     need(!miss.length, `pulled ${rows.length} records, but no column covers ${miss.join(", ")}; open Field mapping and pick them. Nothing was changed`);
     const a = await applyPurpose(c, s, f, rows, mapping, p.skipped);
     res.added = a.added; res.changed = a.changed; importRun = a.importRun;
-    res.note = a.note;
+    res.note = taken.length ? `${taken.map((x) => x.name).slice(0, 3).join(", ")}${taken.length > 3 ? ` and ${taken.length - 3} more` : ""}: ${a.note}` : a.note;
+    for (const t of taken) {
+      await c.query(`insert into vendor_feed_file (entity_id, feed_id, run_id, via, name, byte_size, modified_at, sha256, sender, rows) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        on conflict (feed_id, sha256) do nothing`, [s.entityId, f.id, run.id, f.kind, t.name.slice(0, 300), t.size, t.modifiedAt ?? null, t.sha256, t.sender ?? null, t.rows]);
+    }
     await c.query(`update vendor_feed set mapping = $3 where id = $1 and entity_id = $2`, [f.id, s.entityId, JSON.stringify(mapping)]);
     await c.query("release savepoint feed_run");
     res.ok = true;
   } catch (e) {
     await c.query("rollback to savepoint feed_run");
-    res.note = e instanceof FeedError || e instanceof CatalogError ? e.message : `the pull failed: ${((e as Error).message || String(e)).slice(0, 200)}`;
+    res.note = e instanceof FeedError || e instanceof CatalogError || ["TransportError", "HostKeyError", "VendorFilesError", "FileError"].includes((e as Error)?.constructor?.name)
+      ? (e as Error).message : `the pull failed: ${((e as Error).message || String(e)).slice(0, 200)}`;
     res.added = res.changed = 0; importRun = null;
   }
   await c.query(`update vendor_feed_run set finished_at = now(), outcome = $3, rows = $4, import_run_id = $5, added = $6, changed = $7, note = $8
@@ -1495,4 +1610,145 @@ export async function importCatalogAppSource(c: Client, s: Scope, env: FeedEnv, 
   await audit(c, s, { table: "vendor_feed", rowId: v.id, action: "insert",
     after: { from: "catalog app", source: src.name ?? null, feeds: out.map((o) => `${o.action} ${o.name}`), secrets: out.flatMap((o) => Object.keys(o.secrets)) } });
   return { vendor: v.name, vendorId: v.id, feeds: out, unplaced, unmatchedShipTos };
+}
+
+// ------------------------------------------------ SFTP and email-in feeds --
+//
+// An SFTP feed reads the vendor's folder on its schedule; an email-in feed is
+// handed the attachments of a vendor's mail (vendor_files.receiveMail routes
+// them here by sender, subject and file pattern). Either way each file (a CSV,
+// an .xlsx, or a zip of them) becomes rows that run through this feed's ETL
+// and field mapping exactly as an API answer does. A file is remembered by
+// its checksum (vendor_feed_file) once applied, so it is never applied twice.
+
+export type GivenFile = { name: string; bytes: Buffer; sender?: string };
+type TakenFile = { name: string; size: number; modifiedAt?: string; sha256: string; sender?: string; rows: number };
+
+const sha = async (b: Buffer) => (await import("node:crypto")).createHash("sha256").update(b).digest("hex");
+
+/** Rows from one file: a zip is opened and each file in it read (CSV, TSV, .xlsx or JSON). */
+async function rowsOfFile(name: string, bytes: Buffer, pattern: string | null): Promise<Record<string, string>[]> {
+  const { tableOf } = await import("./vendor_files.ts");
+  const { unzip, isZip, isXlsx, globTest } = await import("./filekit.ts");
+  need(!/^﻿?\s*ISA/.test(bytes.subarray(0, 80).toString("latin1")), `${name} is an X12 (EDI) file; EDI goes to Vendor EDI, not to a feed`);
+  if (isZip(bytes) && !isXlsx(bytes)) {
+    const rx = pattern ? { test: (n: string) => globTest(n, pattern) } : null;
+    const out: Record<string, string>[] = [];
+    for (const e of unzip(bytes, name)) if (!rx || rx.test(e.name) || /\.(csv|tsv|txt|xlsx|json)$/i.test(e.name)) out.push(...await tableOf(e.name, e.bytes));
+    need(out.length, `${name} holds no readable file`);
+    return out;
+  }
+  return tableOf(name, bytes);
+}
+
+async function feedSftp(c: Client, s: Scope, f: FeedRow, creds: Record<string, string>) {
+  const C = await import("./connections.ts");
+  const o = f.options as Record<string, unknown>;
+  const host = String(o.host ?? "").trim().toLowerCase();
+  const port = o.port == null || o.port === "" ? 22 : Number(o.port);
+  const target = { host, port, user: String(o.user ?? "").trim(), password: creds.sftpPassword, privateKey: creds.sftpKey, passphrase: creds.sftpPassphrase };
+  const pin = C.pinFor(await C.loadPin(c, { kind: "vendor_feed", id: f.id!, entityId: s.entityId }), host, port);
+  const maxBytes = Math.round(Math.min(50, Math.max(1, Number(o.maxMb ?? 20) || 20)) * 1048576);
+  return { C, target, pin, path: String(o.path ?? "").trim() || ".", globs: o.pattern ? [String(o.pattern)] : [], maxBytes };
+}
+
+/** New files in the vendor's folder (not taken before by name, size and time, nor by checksum), read into rows. */
+async function sftpFiles(c: Client, s: Scope, f: FeedRow, creds: Record<string, string>, test: boolean) {
+  const { openSftp } = await import("./transports.ts");
+  const x = await feedSftp(c, s, f, creds);
+  const session = await openSftp(await x.C.netEnv(), { ...x.target, pinned: x.pin }, "require");
+  try {
+    const listed = await session.list(x.path, x.globs);
+    const had = await q<{ k: string; sha256: string }>(c, `select name || '|' || byte_size || '|' || coalesce(modified_at, '') k, sha256 from vendor_feed_file where entity_id = $1 and feed_id = $2`, [s.entityId, f.id]);
+    const known = new Set(had.map((h) => h.k)), shas = new Set(had.map((h) => h.sha256));
+    const rows: Record<string, string>[] = [];
+    const files: TakenFile[] = [];
+    const big: string[] = [];
+    const order = test ? [...listed].sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt)) : listed;
+    for (const r of order) {
+      if (!test && known.has(`${r.name}|${r.size}|${r.modifiedAt}`)) continue;
+      if (r.size > x.maxBytes) { big.push(r.name); continue; }
+      const bytes = await session.get(x.path, r.name, x.maxBytes);
+      const sum = await sha(bytes);
+      if (!test && shas.has(sum)) continue;
+      const got = await rowsOfFile(r.name, bytes, x.globs[0] ?? null);
+      rows.push(...got);
+      files.push({ name: r.name, size: r.size, modifiedAt: r.modifiedAt, sha256: sum, rows: got.length });
+      if (test) break;
+    }
+    need(!big.length || files.length, `${big.join(", ")} ${big.length === 1 ? "is" : "are"} over this feed's size limit and ${big.length === 1 ? "was" : "were"} left on the server`);
+    return { rows, files, listed: listed.length, note: listed.length ? `no new files (${listed.length} on the server, all taken before)` : "no files on the server match" };
+  } finally { session.close(); }
+}
+
+/** Attachments handed to an email-in feed: those not applied before, read into rows. */
+async function givenFiles(c: Client, s: Scope, f: FeedRow, given: GivenFile[]) {
+  const rows: Record<string, string>[] = [];
+  const files: TakenFile[] = [];
+  for (const g of given) {
+    const sum = await sha(g.bytes);
+    if ((await q(c, `select 1 from vendor_feed_file where entity_id = $1 and feed_id = $2 and sha256 = $3`, [s.entityId, f.id, sum])).length) continue;
+    const got = await rowsOfFile(g.name, g.bytes, f.options.pattern ? String(f.options.pattern) : null);
+    rows.push(...got);
+    files.push({ name: g.name, size: g.bytes.length, sha256: sum, sender: g.sender, rows: got.length });
+  }
+  return { rows, files, note: "the attached file was applied before; nothing new" };
+}
+
+/**
+ * Test an SFTP feed: connect, list, show the server's key (recorded on the
+ * first good Test), then read the newest matching file through the mapping.
+ * An email-in feed shows the vendor's own address. Nothing changes but the key.
+ */
+async function testFileFeed(c: Client, s: Scope, env: FeedEnv, f: FeedRow, d: FeedDraft): Promise<TestResult> {
+  const res: TestResult = { ok: false, status: null, url: null, requestHeaders: {}, sample: "", recordsFound: 0, columns: [], mapping: {}, missing: [], rows: [], problem: null, calls: 0 };
+  need(f.id, "save the feed first, then Test");
+  const { mailboxOf, inboundAddress } = await import("./vendor_files.ts");
+  if (f.kind === "email") {
+    res.address = inboundAddress(await mailboxOf(c, s.entityId, s.tenantId, f.vendor_id));
+    res.ok = !!res.address;
+    res.problem = res.address ? null : "inbound email is not set up on this server yet (ERP_INBOUND_EMAIL_ADDRESS)";
+    return res;
+  }
+  const typed = Object.fromEntries(Object.entries((d as { secrets?: Record<string, string | null> }).secrets ?? {})
+    .filter(([k, v]) => SECRET_SET.has(k) && typeof v === "string" && v && v !== "•kept•")) as Record<string, string>;
+  const creds = { ...(await credentialsFor(c, s.entityId, env, f)), ...typed };
+  const x = await feedSftp(c, s, f, creds);
+  const who = s.actor.label;
+  const t = await x.C.testSftp(c, s, { kind: "vendor_feed", id: f.id!, tenantId: s.tenantId, entityId: s.entityId }, x.target, x.path, x.globs, who);
+  res.sftp = { fingerprint: t.fingerprint, keyType: t.keyType, firstTime: t.firstTime, changed: t.changed, recorded: t.recorded, files: t.files, words: t.words, sample: t.sample };
+  res.calls = 1;
+  if (!t.ok) { res.problem = t.words; return res; }
+  if (!t.files) { res.problem = "connected, but no file in the folder matches the pattern"; return res; }
+  await c.query("savepoint feed_test");
+  try {
+    const got = await sftpFiles(c, s, f, creds, true);
+    const rows = applyEtl(got.rows.map((r) => ({ ...r })), f.etl);
+    res.url = `sftp://${x.target.host}${x.target.port === 22 ? "" : `:${x.target.port}`}/${x.path.replace(/^\//, "")}/${got.files[0]?.name ?? ""}`;
+    res.recordsFound = rows.length;
+    res.columns = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+    const pricingFeed = f.purpose === "products" && await hasPricingFeed(c, s.entityId, f.vendor_id, f.id);
+    res.mapping = mapFields(f.purpose, res.columns, f.mapping);
+    res.missing = missingFor(f.purpose, res.mapping, { costOptional: pricingFeed });
+    res.rows = rows.slice(0, 5).map((r) => Object.fromEntries(Object.entries(res.mapping).map(([ours, theirs]) => [ours, String(r[theirs] ?? "")])));
+    res.ok = !res.missing.length && rows.length > 0;
+    if (!rows.length) res.problem = "the newest file holds no rows";
+    else if (res.missing.length) res.problem = `no column found for ${res.missing.join(", ")}; pick them under Field mapping`;
+  } catch (e) {
+    res.problem = (e as Error).message;
+  } finally { await c.query("rollback to savepoint feed_test"); }
+  return res;
+}
+
+/** The owner trusts the new SFTP server key a Test was shown. */
+export async function trustFeedKey(c: Client, s: Scope, feedId: string, fingerprint: string, who: string) {
+  const f = (await q<{ id: string }>(c, `select id from vendor_feed where id = $1 and entity_id = $2`, [feedId, s.entityId]))[0];
+  need(f, "no such feed");
+  const C = await import("./connections.ts");
+  return C.trustOfferedKey(c, s, { kind: "vendor_feed", id: feedId, entityId: s.entityId }, fingerprint, who);
+}
+
+/** The files an SFTP or email-in feed took, newest first. */
+export async function feedFiles(c: Client, entityId: string, feedId: string) {
+  return q(c, `select name, via, byte_size, rows, sender, taken_at, run_id from vendor_feed_file where entity_id = $1 and feed_id = $2 order by taken_at desc limit 50`, [entityId, feedId]);
 }

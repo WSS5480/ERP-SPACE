@@ -3,6 +3,7 @@
 // partners (Setup, Vendor EDI), the EDI inbox and outbox, manual upload,
 // a test 850, polling, the PO's EDI/API trail, and store orders (cart per
 // vendor against freight minimums, submit, approve, PO, send).
+import { TransportError } from "../../packages/core/transports.ts";
 import type { ErpModule, Client, Company, Actor } from "./kit.ts";
 import { ModuleError, need, requireRole, str, uuid, int, minor } from "./kit.ts";
 import { q, tx } from "../../packages/core/db.ts";
@@ -28,7 +29,7 @@ let ediEnv: () => edi.EdiEnv = () => ({ ...currentFeedEnv(), dropDir: process.en
 export const useEdiEnv = (fn: () => edi.EdiEnv) => { ediEnv = fn; };
 export const currentEdiEnv = () => ediEnv();
 
-const KNOWN = [edi.EdiError, so.StoreOrderError, PurchasingError, FeedError, CatalogError, BillError, x12.X12Error];
+const KNOWN = [edi.EdiError, so.StoreOrderError, PurchasingError, FeedError, CatalogError, BillError, x12.X12Error, TransportError];
 const isRefusal = (e: unknown) => KNOWN.some((K) => e instanceof K);
 async function refuse<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn(); }
@@ -101,7 +102,7 @@ export const module: ErpModule = {
     coGet(`/edi/partners/${ID}`, async (c, co, _u, m) => {
       const p = (await edi.listPartners(c, co.id)).find((x) => x.id === m[2]);
       if (!p) return null;
-      return { partner: partnerOut(p), secrets: await edi.partnerSecretStatus(c, co.id, m[2]), items: await edi.itemMap(c, co.id, m[2]) };
+      return { partner: partnerOut(p), secrets: await edi.partnerSecretStatus(c, co.id, m[2]), items: await edi.itemMap(c, co.id, m[2]), pin: await edi.partnerPin(c, co.id, m[2]) };
     });
     coGet("/edi/documents", async (c, co, url) => ({
       documents: await edi.documents(c, co.id, { direction: ["in", "out"].includes(str(url.searchParams.get("direction"), 3)) ? str(url.searchParams.get("direction"), 3) : null,
@@ -155,6 +156,14 @@ export const module: ErpModule = {
       // Each file and each send commits on its own transaction, not the request's, so one failure cannot undo the files already taken in.
       const s = sc(co, a);
       return refuse(() => edi.pollPartner((fn) => tx(s.actor, fn), s, ediEnv(), m[2]));
+    });
+    coPost(`/edi/partners/${ID}/test-sftp`, async (c, co, a, _b, m) => {
+      await requireRole(c, co, a, BUY, "testing a vendor's SFTP");
+      return refuse(() => edi.testPartnerSftp(c, sc(co, a), ediEnv(), m[2], a.personName));
+    });
+    coPost(`/edi/partners/${ID}/trust-key`, async (c, co, a, b, m) => {
+      await requireRole(c, co, a, ["owner"], "trusting a changed SFTP server key");
+      return refuse(() => edi.trustPartnerKey(c, sc(co, a), m[2], str(b.fingerprint, 80), a.personName));
     });
     coPost(`/edi/partners/${ID}/poll-status`, async (c, co, a, _b, m) => {
       await requireRole(c, co, a, BUY, "asking a vendor's API for order status");

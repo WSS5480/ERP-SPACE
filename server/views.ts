@@ -266,15 +266,20 @@ export async function approvals(c: Client, co: Company, personId: string | null)
     let why = "";
     let canDecide = false;
     if (!personId) why = `Pick who you are acting as; ${waiting}`;
-    else if (r.maker_id === personId) why = `You made it, so someone else approves it: ${waiting}`;
+    else if (r.maker_id === personId) {
+      // The owner of a company where nobody else could decide it approves it themselves (recorded as self-approved).
+      const anyoneElse = holders.some((h) => h.id !== personId && (h.role === r.step_role || h.role === "owner" || h.role === "controller"));
+      if (held.has("owner") && !anyoneElse) { canDecide = true; why = "You made it, and nobody else here can approve it, so you can (recorded as self-approved)"; }
+      else why = `You made it, so someone else approves it: ${waiting}`;
+    }
     else if (already.has(personId)) why = `You decided an earlier step; the next is ${waiting}`;
     else if (!held.has(r.step_role)) why = cap(waiting);
     else canDecide = true;
-    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why });
+    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why, self: canDecide && r.maker_id === personId });
   }
 
   const recent = await q(c, `
-    select s.decided_at, s.decision, s.note, s.required_role, u.name as actor_name, r.subject_type, r.subject_id,
+    select s.decided_at, s.decision, s.note, s.required_role, s.self_approved, u.name as actor_name, r.subject_type, r.subject_id,
            r.amount_minor, r.status as request_status
       from approval_step s
       join approval_request r on r.id = s.request_id
@@ -409,7 +414,7 @@ export async function bill(c: Client, co: Company, id: string) {
   const requests = await q(c, `
     select r.id, r.status, r.created_at, r.decided_at, mu.name as maker_name,
            (select json_agg(json_build_object('seq', s.seq, 'role', s.required_role, 'decision', s.decision,
-                    'actor', au.name, 'at', s.decided_at, 'note', s.note) order by s.seq)
+                    'actor', au.name, 'at', s.decided_at, 'note', s.note, 'self_approved', s.self_approved) order by s.seq)
               from approval_step s left join app_user au on au.id = s.actor_id where s.request_id = r.id) as steps
       from approval_request r join app_user mu on mu.id = r.maker_id
      where r.entity_id = $2 and r.subject_type = 'invoice' and r.subject_id = $1
@@ -901,12 +906,13 @@ type ConnRow = {
   consecutive_failures: number; last_error: string | null; last_success_at: string | null;
   last_attempt_at: string | null; credential_ref: string | null; format: string | null;
   mailbox: string | null; host: string | null; account_name: string | null; bank_name: string | null;
-  account_last4: string | null; files: number; last_file_at: string | null;
+  account_last4: string | null; files: number; last_file_at: string | null; secrets: number; pinned: boolean;
 };
 
-// Which network clients this build actually has. The pipeline is wired for
-// both; the clients themselves are the next thing to write.
-export const TRANSPORTS = { sftp: false, http: false };
+// Which network clients this build has: SFTP (ssh2, key pinned on the first
+// Test) and HTTPS (the vendor feeds' checked caller), both in
+// packages/core/transports.ts.
+export const TRANSPORTS = { sftp: true, http: true };
 
 /** What stands between a connection and its first file: setup (arrange it) or build (code still to write). */
 function stepsFor(r: ConnRow): { kind: "setup" | "build"; text: string }[] {
@@ -917,10 +923,11 @@ function stepsFor(r: ConnRow): { kind: "setup" | "build"; text: string }[] {
     steps.push({ kind: "build", text: `${a} ${noun} ${r.direction === "outbound" ? "writer" : "reader"}` });
   }
   const from = r.bank_name ? ` from ${r.bank_name}` : r.host ? ` for ${r.host}` : "";
-  const credentialSet = !!(r.credential_ref && process.env[secretEnvName(r.credential_ref)]);
+  const credentialSet = r.credential_ref === "sealed" ? r.secrets > 0 || r.channel === "api" : !!(r.credential_ref && process.env[secretEnvName(r.credential_ref)]);
   switch (r.channel) {
     case "sftp":
       if (!credentialSet) steps.push({ kind: "setup", text: `SFTP login${from}` });
+      if (!r.pinned) steps.push({ kind: "setup", text: "A Test, to record the server's key" });
       if (!TRANSPORTS.sftp) steps.push({ kind: "build", text: "The SFTP connector" });
       break;
     case "api":
@@ -946,7 +953,9 @@ export async function connections(c: Client, co: Company) {
            c.credential_ref, c.config->>'format' as format, c.config->>'mailbox' as mailbox, c.config->>'host' as host,
            b.name as account_name, b.bank_name, b.account_last4,
            (select count(*) from inbound_file f where f.connection_id = c.id)::int as files,
-           (select max(f.received_at) from inbound_file f where f.connection_id = c.id) as last_file_at
+           (select max(f.received_at) from inbound_file f where f.connection_id = c.id) as last_file_at,
+           (select count(*)::int from connection_secret x where x.connection_id = c.id) as secrets,
+           exists (select 1 from sftp_host_pin p where p.owner_kind = 'connection' and p.owner_id = c.id) as pinned
       from connection c
       join connection_health h on h.connection_id = c.id
       join ingest_source s on s.code = c.source_code

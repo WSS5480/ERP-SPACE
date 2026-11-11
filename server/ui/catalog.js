@@ -523,36 +523,59 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     const d = await coApi('/catalog/vendors');
     const feedChip = (v) => !Number(v.feeds) ? null : Number(v.feeds_failing) ? chip('critical', 'fail', `${plural(Number(v.feeds_failing), 'feed')} failing`)
       : v.feeds_last_run ? chip('good', 'ok', `${plural(Number(v.feeds), 'feed')} ok`) : chip('neutral', 'pending', `${plural(Number(v.feeds), 'feed')}, not run yet`);
-    return section('Vendors', `${d.vendors.length}`, null,
-      el('p', { class: 'lead', text: 'Where orders go, the freight minimum for a prepaid truck, lead time, freight to each place, and the vendor’s APIs: products, prices, quantities, freight and photos, each its own feed.' }),
-      el('div', { class: 'panel' }, d.vendors.map((v) => item({
+    return section('Vendors', `${d.vendors.length}`, [addVendorBtn()],
+      el('p', { class: 'lead', text: 'Where orders go, the freight minimum for a prepaid truck, lead time, freight to each place, and how each vendor’s catalog comes in: by API, from its SFTP server, by email, or as a file you import.' }),
+      d.vendors.length ? null : noVendors(),
+      el('div', { class: 'panel' }, d.vendors.map((v) => v.pending ? item({
+        title: v.name, badge: chip('warning', 'clock', 'Waiting for approval'),
+        detail: v.can_approve ? 'Approve it to set up how its catalog comes in and to order from it.' : 'Its catalog connections open once the owner or controller approves it.',
+        acts: v.can_approve && v.approval_request_id ? [el('button', { class: 'btn small primary', type: 'button', onclick: (e) => act(e.currentTarget,
+          () => post(`/approvals/${v.approval_request_id}`, { decision: 'approved' }), `${v.name} approved`) }, 'Approve')] : null,
+      }) : item({
         title: v.name, amount: `${v.lead_days} days`, badge: feedChip(v),
         detail: [v.order_email || 'no order email', v.account_no ? `account ${v.account_no}` : null, v.sku_prefix ? `SKUs ${v.sku_prefix}-…` : null,
           Number(v.freight_min_minor) ? `freight min ${money(v.freight_min_minor)}` : null, v.freight_min_qty ? `${v.freight_min_qty} pieces min` : null,
           plural(Number(v.products), 'product'), v.last_import ? `imported ${shortDay(String(v.last_import).slice(0, 10))}` : null].filter(Boolean).join(' · '),
-        why: v.freight.length ? `Freight: ${v.freight.map((f) => `${f.location} ${f.freight_bps / 100}%${Number(f.per_unit_minor) ? ` + ${money(f.per_unit_minor)}` : ''}`).join(' · ')}` : null,
-        acts: [el('button', { class: 'btn small primary', type: 'button', onclick: () => openApiSetup(v) }, 'API setup'),
+        why: [v.freight.length ? `Freight: ${v.freight.map((f) => `${f.location} ${f.freight_bps / 100}%${Number(f.per_unit_minor) ? ` + ${money(f.per_unit_minor)}` : ''}`).join(' · ')}` : null,
+          v.inbound_address ? `Email files to ${v.inbound_address}` : null, Number(v.vendor_files) ? `${plural(Number(v.vendor_files), 'file connection')}${Number(v.files_quarantined) ? `, ${v.files_quarantined} quarantined` : ''}` : null].filter(Boolean).join(' · ') || null,
+        acts: [el('button', { class: 'btn small primary', type: 'button', onclick: () => openApiSetup(v) }, 'Catalog connections'),
           el('button', { class: 'btn small', type: 'button', onclick: () => openVendor(v) }, 'Edit'),
           el('button', { class: 'btn small', type: 'button', onclick: () => openFreight(v) }, 'Freight'),
-          el('button', { class: 'btn small', type: 'button', onclick: () => { IMP.vendorId = v.id; go('catalog', 'import'); } }, 'Import file')],
+          el('button', { class: 'btn small', type: 'button', onclick: () => { IMP.vendorId = v.id; go('catalog', 'import'); } }, 'Import file'),
+          E.vendorFiles ? el('button', { class: 'btn small', type: 'button', onclick: () => E.vendorFiles.open(v.id) }, 'Vendor files') : null,
+          templateLink('xlsx', 'Download template')],
       }))));
   }
 
+  /** Add a vendor from Catalog (the Payables form, reused); a new company has none until it does. */
+  const addVendorBtn = (cls = 'btn small') => (E.openAddVendor ? el('button', { class: cls, type: 'button', onclick: () => E.openAddVendor({ merchandise: true }) }, icon('plus'), 'Add vendor') : null);
+  const noVendors = () => el('div', { class: 'panel pad' }, empty('No vendors yet. Add one, then set up how its catalog comes in: API, SFTP, email or file.',
+    'Give it a merchandise category (furniture, appliances…) so it shows here; a new vendor may wait on the controller’s approval first.'), el('div', { class: 'dlg-acts' }, addVendorBtn('btn primary')));
+
   // ------------------------------------------------------- vendor API setup
   const PURPOSE = { products: 'Products', pricing: 'Prices', quantities: 'Quantities', freight: 'Freight by store', images: 'Photos', orders: 'Order sending', acknowledgments: 'Acknowledgments / ship notices' };
-  const SECRET_LABEL = { apiKey: 'Key', token: 'Bearer token', password: 'Password', clientSecret: 'Client secret', atpKeyCode: 'ATP KeyCode', atpPassword: 'ATP password', sftpPassword: 'SFTP password' };
+  const SECRET_LABEL = { apiKey: 'Key', token: 'Bearer token', password: 'Password', clientSecret: 'Client secret', atpKeyCode: 'ATP KeyCode', atpPassword: 'ATP password', sftpPassword: 'SFTP password', sftpKey: 'SFTP private key', sftpPassphrase: 'Key passphrase' };
   const feedHealth = (f) => f.running ? chip('warning', 'clock', 'Running') : !f.active ? chip('neutral', 'pause', 'Off') : f.last_ok === false ? chip('critical', 'fail', 'Failing')
     : f.last_ok ? chip('good', 'ok', 'OK') : chip('neutral', 'pending', 'Not run yet');
   const schedWords = (f) => f.purpose === 'orders' ? 'sends when you send a PO' : f.every_hours ? `every ${f.every_hours} h` : f.schedule_cron ? `cron ${f.schedule_cron}` : 'on demand';
 
   async function openApiSetup(v) {
-    const d = openDialog(`${v.name} · API setup`, 'One feed per endpoint: products, prices, quantities, freight, photos, orders', { wide: true, sheet: true });
+    const d = openDialog(`${v.name} · Catalog connections`, 'How this vendor’s catalog, prices and quantities arrive: API, SFTP, email-in or file import', { wide: true, sheet: true });
     const again = () => { d.close(); openApiSetup(v); };
     await fillDialog(d, async () => {
       const x = await coApi(`/catalog/vendors/${v.id}/feeds`);
       const tplSel = select(x.templates, /ashley/i.test(v.name) ? 'ashley' : 'generic_json');
       const purSel = select(x.purposes.map((p) => [p, PURPOSE[p]]), 'products');
+      const waySel = select([['api', 'API'], ['sftp', 'SFTP (their server)'], ['email', 'Email-in'], ['file', 'File import (by hand)']], 'api');
+      waySel.addEventListener('change', () => { tplSel.closest('.field').hidden = waySel.value !== 'api'; });
       const addOne = el('button', { class: 'btn small primary', type: 'button', onclick: async () => {
+        if (waySel.value === 'file') { d.close(); IMP.vendorId = v.id; go('catalog', 'import'); return; }
+        if (waySel.value !== 'api') {
+          const k = waySel.value;
+          d.close(); openFeedEditor(v, { vendor_id: v.id, purpose: purSel.value, kind: k, template: 'blank', name: uniqueName(`${v.name} ${PURPOSE[purSel.value].toLowerCase()} (${k === 'sftp' ? 'SFTP' : 'email'})`, x.feeds),
+            url: '', method: 'GET', response_format: 'csv', paging: { mode: 'none' }, auth: { mode: 'none' }, mapping: {}, options: {}, schedule_cron: k === 'sftp' ? '30 5 * * *' : null }, x);
+          return;
+        }
         const t = await coApi(`/catalog/vendors/${v.id}/feed-templates?template=${tplSel.value}`);
         let dr = t.drafts.find((y) => y.purpose === purSel.value) || { ...t.drafts[0], purpose: purSel.value, name: `${v.name} ${PURPOSE[purSel.value].toLowerCase()}`, mapping: {} };
         // one tap for another endpoint: same auth shape, borrowing the first feed's keys
@@ -577,19 +600,27 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
         const stop = el('button', { class: 'btn small', type: 'button', onclick: () => act(stop, () => post(`/catalog/feeds/${f.id}/stop`), 'Stop asked; the run ends at its next call', { close: again }) }, 'Stop runs');
         return item({
           title: f.name, badge: frag(chip('neutral', 'feed', PURPOSE[f.purpose] || f.purpose), ' ', feedHealth(f)),
-          detail: [f.kind === 'api' ? hostOf(f.url) : f.kind.toUpperCase(), schedWords(f), f.secrets.length ? `keys ${f.secrets.map((k) => `${SECRET_LABEL[k.name] || k.name} ${k.masked}`).join(', ')}`
+          detail: [f.kind === 'api' ? hostOf(f.url) : f.kind === 'sftp' ? `SFTP ${f.options.host || ''}${f.options.path ? ` ${f.options.path}` : ''}${f.pin ? ` · key ${String(f.pin.fingerprint).slice(0, 19)}…` : ' · key not recorded yet'}`
+            : f.kind === 'email' ? `Email from ${f.options.fromContains || 'no senders yet'}` : f.kind.toUpperCase(), f.kind === 'email' ? 'runs when the mail arrives' : schedWords(f),
+            (f.files || []).length ? `last file ${f.files[0].name}, ${shortDay(String(f.files[0].taken_at).slice(0, 10))}` : null, f.secrets.length ? `keys ${f.secrets.map((k) => `${SECRET_LABEL[k.name] || k.name} ${k.masked}`).join(', ')}`
             : f.secrets_from_feed_id ? `keys from ${(x.feeds.find((y) => y.id === f.secrets_from_feed_id) || {}).name || 'another feed'}` : f.credential_ref ? `keys in ${f.credential_env}${f.credential_set ? '' : ' (not set)'}` : 'no keys',
             f.last_run_at ? `last run ${shortDay(String(f.last_run_at).slice(0, 10))}` : null].filter(Boolean).join(' · '),
           why: f.transport_note || f.last_note || null,
           acts: [el('button', { class: 'btn small', type: 'button', onclick: () => { d.close(); openFeedEditor(v, f, x); } }, 'Edit'),
-            f.kind === 'api' && f.purpose !== 'orders' ? test : null, f.kind === 'api' && f.purpose !== 'orders' ? run : null,
+            f.kind !== 'manual' && f.purpose !== 'orders' ? test : null, (f.kind === 'api' || f.kind === 'sftp') && f.purpose !== 'orders' ? run : null,
+            (f.files || []).length ? el('button', { class: 'btn small', type: 'button', onclick: () => openFeedFiles(f) }, `Files (${f.files.length})`) : null,
             f.running ? stop : null, el('button', { class: 'btn small', type: 'button', onclick: () => openRuns(f) }, 'History')],
         });
       });
       return frag(
         x.secretKeySet ? null : resultBox('warning', 'warn', 'Passwords cannot be stored here yet', 'Add ERP_SECRET_KEY (32 random bytes, base64) to the service’s environment; then keys typed into a feed are kept encrypted. Until then a feed can read keys from an ERP_SECRET_<NAME> variable.'),
-        el('div', { class: 'panel pad' }, el('div', { class: 'form-grid' }, field('Start from', tplSel), field('Endpoint for', purSel)),
+        el('div', { class: 'panel pad' }, el('div', { class: 'form-grid' }, field('Arrives by', waySel), field('For', purSel), field('Start from', tplSel)),
           el('div', { class: 'dlg-acts' }, addOne, addAll)),
+        section('Vendor email', null, null, el('div', { class: 'panel pad' },
+          x.mail && x.mail.address ? frag(el('p', { class: 'fine', text: `${v.name}’s own address. A file mailed here from a sender listed on one of its email-in feeds runs that feed; anything else is held.` }), copyRow(x.mail.address))
+            : resultBox('warning', 'info', 'Inbound email is not set up on this server', 'Set ERP_INBOUND_EMAIL_ADDRESS and ERP_EMAIL_INBOUND_TOKEN; then each vendor gets its own address here.'),
+          x.mail && x.mail.held.length ? el('button', { class: 'btn small', type: 'button', onclick: () => { d.close(); E.vendorFiles && E.vendorFiles.open(null); } }, `${x.mail.held.length} held for a person`) : null,
+          el('div', { class: 'dlg-acts' }, E.vendorFiles ? el('button', { class: 'btn small', type: 'button', onclick: () => { d.close(); E.vendorFiles.open(v.id); } }, 'Vendor files (SFTP, HTTPS, email, EDI)') : null))),
         section('Feeds', `${x.feeds.length}`, null, el('div', { class: 'panel' }, cards.length ? cards : empty('No feeds yet.', 'Add one: products first, then prices, quantities and freight. Each endpoint is its own feed with its own key.', true))),
         section('Photos', `${x.photos.hosted} of ${x.photos.total} hosted`, [hostBtn],
           el('p', { class: 'foot', text: 'Vendor photo links are copied into the ERP’s own store and served from here, so they show even where outside images are blocked.' })),
@@ -598,6 +629,13 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
   }
   const hostOf = (u) => { try { return new URL(u).host; } catch (_) { return u || 'no address'; } };
   const uniqueName = (n, list) => { let k = n, i = 2; while (list.some((f) => f.name === k)) k = `${n} ${i++}`; return k; };
+
+  /** The files an SFTP or email-in feed took. */
+  function openFeedFiles(f) {
+    const d = openDialog(`${f.name} · files`, 'Newest first');
+    d.body.append(el('div', { class: 'panel' }, (f.files || []).map((x) => item({ title: x.name, amount: x.rows == null ? null : `${x.rows} rows`,
+      detail: [x.via === 'sftp' ? 'from SFTP' : `emailed by ${x.sender || 'someone'}`, `${Math.max(1, Math.round(Number(x.byte_size) / 1024))} KB`, shortDay(String(x.taken_at).slice(0, 10))].join(' · ') }))));
+  }
 
   async function openRuns(f) {
     const d = openDialog(`${f.name} · runs`, 'Newest first');
@@ -619,8 +657,22 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
       const r = await post('/catalog/feeds/test', body);
       if (draftFn && r.columns && r.columns.length) LAST_COLS.splice(0, LAST_COLS.length, ...r.columns);
       if (draftFn) refreshColLists();
-      box.replaceChildren(frag(
-        resultBox(r.ok ? 'good' : 'warning', r.ok ? 'ok' : 'warn', r.ok ? `Works: ${r.recordsFound} records in the first call` : 'Not ready', r.problem || `Answer ${r.status}; ${r.columns.length} columns.`),
+      const owner = ((E.S.person && E.S.person.roles) || []).includes('owner');
+      const sftpPart = r.sftp ? frag(
+        resultBox(r.sftp.changed ? 'critical' : r.sftp.fingerprint ? 'good' : 'critical', r.sftp.changed ? 'fail' : r.sftp.fingerprint ? 'ok' : 'fail',
+          r.sftp.changed ? 'The server key changed' : r.sftp.fingerprint ? (r.sftp.firstTime ? 'Connected; server key recorded' : 'Connected; server key matches') : 'Not connected', r.sftp.words),
+        el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Server key', r.sftp.fingerprint || '—'), fact('Files matching', r.sftp.files == null ? '—' : String(r.sftp.files)),
+          r.sftp.recorded && r.sftp.changed ? fact('Recorded key', r.sftp.recorded) : null)),
+        (r.sftp.sample || []).length ? el('p', { class: 'foot', text: `On the server: ${r.sftp.sample.map((x2) => x2.name).join(', ')}` }) : null,
+        r.sftp.changed && owner && f.id ? el('button', { class: 'btn primary', type: 'button', onclick: (ev) => act(ev.currentTarget, () => post(`/catalog/feeds/${f.id}/trust-key`, { fingerprint: r.sftp.fingerprint }),
+          `New key trusted: ${r.sftp.fingerprint}`) }, `Trust the new key ${r.sftp.fingerprint}`) : r.sftp.changed ? el('p', { class: 'fine', text: 'Only the owner can trust a new server key; check with the vendor first.' }) : null) : null;
+      if (r.address !== undefined) {
+        box.replaceChildren(r.address ? frag(resultBox('good', 'ok', 'Ready for the vendor’s email', 'Ask the vendor to send this feed’s file to the address below (or forward it there). A file from one of the listed senders runs this feed; anyone else’s is held under Admin, Connections, Vendor files.'), copyRow(r.address))
+          : resultBox('warning', 'info', 'Inbound email is not set up on this server', r.problem || ''));
+        return;
+      }
+      box.replaceChildren(frag(sftpPart,
+        resultBox(r.ok ? 'good' : 'warning', r.ok ? 'ok' : 'warn', r.ok ? `Works: ${r.recordsFound} records in the first ${r.sftp ? 'file' : 'call'}` : 'Not ready', r.problem || `Answer ${r.status}; ${r.columns.length} columns.`),
         el('div', { class: 'panel' }, el('div', { class: 'facts' }, fact('Answer', r.status == null ? '—' : String(r.status)), fact('Records', String(r.recordsFound)),
           fact('Calls', String(r.calls)), fact('Address', r.url || '—'))),
         r.missing && r.missing.length ? resultBox('warning', 'warn', 'Required fields with no column', r.missing.join(', ')) : null,
@@ -630,6 +682,8 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
         r.sample ? el('details', {}, el('summary', { text: 'Raw answer (first 2,000 characters, keys masked)' }), el('pre', { class: 'pc-raw', text: r.sample })) : null));
     } catch (e) { box.replaceChildren(resultBox('critical', 'fail', 'Test did not run', friendly(e))); }
   }
+  /** An address to copy, wrapped on a phone. */
+  const copyRow = (text) => (E.vendorFiles && E.vendorFiles.copyBox ? E.vendorFiles.copyBox(text) : el('p', { class: 'fine', text }));
   const LAST_COLS = [];
   const COL_LISTS = [];
   const refreshColLists = () => { for (const dl of COL_LISTS) if (dl.isConnected) dl.replaceChildren(...LAST_COLS.map((c2) => el('option', { value: c2 }))); };
@@ -653,9 +707,16 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     const method = select([['GET', 'GET'], ['POST', 'POST']], f.method || 'GET'), url = input({ value: f.url || '', placeholder: 'https://…', inputmode: 'url' });
     const [active, activeL] = chk(f.active !== false, 'On (runs on its schedule and from Run now)');
     const sftp = { host: optIn('host', 'sftp.vendor.com'), port: optIn('port', '22'), user: optIn('user', 'user'), path: optIn('path', '/outbound/ (folder or one file)'), pattern: optIn('pattern', '*.csv') };
-    const email = { fromContains: optIn('fromContains', '@vendor.com'), subjectContains: optIn('subjectContains', 'price file') };
-    const sftpBox = el('div', { class: 'form-grid' }, field('Host', sftp.host), field('Port', sftp.port), field('User', sftp.user), field('Folder or file', sftp.path), field('Pattern', sftp.pattern));
-    const emailBox = el('div', { class: 'form-grid' }, field('Sender contains', email.fromContains), field('Subject contains', email.subjectContains));
+    const email = { fromContains: optIn('fromContains', 'prices@vendor.com, @vendor.com'), subjectContains: optIn('subjectContains', 'price file'), emailPattern: input({ value: f.options.pattern || '', placeholder: '*price*.csv (blank = any CSV, XLSX or zip)' }) };
+    sftp.maxMb = optIn('maxMb', '20');
+    const sftpBox = el('div', { class: 'form-grid' }, field('Host', sftp.host), field('Port', sftp.port, '22, or the vendor’s own (1024 or above)'), field('User', sftp.user), field('Folder', sftp.path),
+      field('File pattern', sftp.pattern, 'CSV, XLSX or a zip of them'), field('Largest file (MB)', sftp.maxMb),
+      el('div', { class: 'wide' }, f.pin ? el('p', { class: 'fine', text: `Server key ${f.pin.fingerprint}, recorded by ${f.pin.pinned_by_name || 'someone'} ${shortDay(String(f.pin.pinned_at).slice(0, 10))}. A different key is refused.` })
+        : el('p', { class: 'fine', text: 'Save, then Test this feed: it shows the server’s key and records it; a different key is refused after that.' })));
+    const emailBox = el('div', { class: 'form-grid' }, field('Who sends it', email.fromContains, 'Addresses, or @vendor.com for anyone there'), field('Subject contains (optional)', email.subjectContains),
+      field('Attachment pattern (optional)', email.emailPattern),
+      el('div', { class: 'wide' }, x.mail && x.mail.address ? frag(el('p', { class: 'fine', text: `Ask ${v.name} to send the file to:` }), copyRow(x.mail.address))
+        : el('p', { class: 'fine', text: 'Inbound email is not set up on this server yet (ERP_INBOUND_EMAIL_ADDRESS).' })));
     const transportNote = el('div');
     // Authentication
     const mode = select([['none', 'None'], ['header', 'Key in a header (e.g. Ocp-Apim-Subscription-Key)'], ['query', 'Key as a query parameter'], ['bearer', 'Bearer token'],
@@ -666,7 +727,8 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
       atpExternalId: input({ value: f.auth.atpExternalId || '', placeholder: 'e.g. Company3989100' }), atpUser: input({ value: f.auth.atpUser || '', placeholder: 'e.g. AD_…_VP' }) };
     const have = Object.fromEntries((f.secrets || []).map((k) => [k.name, k.masked]));
     const secretBoxes = Object.keys(SECRET_LABEL).map((k) => {
-      const i2 = el('input', { type: 'password', autocomplete: 'new-password', placeholder: have[k] ? `${have[k]} kept — type to replace` : 'type to set' });
+      const i2 = k === 'sftpKey' ? el('textarea', { rows: '3', autocomplete: 'off', spellcheck: 'false', placeholder: have[k] ? `${have[k]} kept — paste to replace` : 'Paste an OpenSSH or PEM private key (optional)' })
+        : el('input', { type: 'password', autocomplete: 'new-password', placeholder: have[k] ? `${have[k]} kept — type to replace` : 'type to set' });
       const clr = el('input', { type: 'checkbox' });
       return { k, i: i2, clr, node: field(SECRET_LABEL[k], i2, have[k] ? null : null, false), clrNode: have[k] ? el('label', { class: 'check' }, clr, `Clear the ${SECRET_LABEL[k].toLowerCase()}`) : null };
     });
@@ -732,7 +794,9 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     const sync = () => {
       const k = kind.value;
       for (const [g, n] of Object.entries(groups)) n.hidden = k !== g;
-      transportNote.replaceChildren(k === 'sftp' || k === 'email' ? resultBox('neutral', 'info', `${k === 'sftp' ? 'SFTP' : 'Email-in'} is not built in this version yet`, 'These settings are kept for when it is. Use the Import tab to load a file today.') : '');
+      transportNote.replaceChildren(k === 'sftp' ? resultBox('neutral', 'info', 'Pulled from the vendor’s SFTP server', 'On its schedule, each new file (CSV, XLSX or a zip of them) runs through this feed’s ETL steps and field mapping, as an API answer does. A file is never applied twice.')
+        : k === 'email' ? resultBox('neutral', 'info', 'Taken from the vendor’s email', 'When the vendor mails the file to its address below, the attachment runs through this feed’s ETL steps and field mapping. Mail from anyone not listed is held for a person.') : '');
+      method.closest('.field').hidden = url.closest('.field').hidden = k !== 'api';
       freightSec.hidden = purpose.value !== 'freight';
       bodyF.hidden = reqFmt.value === 'query' && !body.value.trim();
       // Only the boxes the chosen authentication uses; a key header can ride along with OAuth or basic.
@@ -741,7 +805,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
         user: m === 'basic' || m === 'auto', atpExternalId: atp, atpUser: atp };
       for (const [k2, n] of Object.entries(authF)) n.hidden = !showAuth[k2];
       const showSec = { apiKey: ['header', 'query', 'oauth2', 'basic', 'auto'].includes(m), token: m === 'bearer' || m === 'auto', password: m === 'basic' || m === 'auto',
-        clientSecret: m === 'oauth2' || m === 'auto', atpKeyCode: atp, atpPassword: atp, sftpPassword: kind.value === 'sftp' };
+        clientSecret: m === 'oauth2' || m === 'auto', atpKeyCode: atp, atpPassword: atp, sftpPassword: kind.value === 'sftp', sftpKey: kind.value === 'sftp', sftpPassphrase: kind.value === 'sftp' };
       for (const sb of secretBoxes) if (sb.wrap) sb.wrap.hidden = !(showSec[sb.k] || have[sb.k]);
       priceSec.hidden = purpose.value !== 'pricing';
       drawMap();
@@ -754,7 +818,9 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
       const paging = { mode: pmode.value };
       for (const [k, i2] of Object.entries(p)) if (i2.value.trim()) paging[k] = k === 'size' ? Number(i2.value) : i2.value.trim();
       const options = { ...f.options };
-      for (const [k, i2] of Object.entries({ ...o, ...sftp, ...email, unwrap, alertEmail: alert })) { if (i2.value.trim()) options[k] = i2.value.trim(); else delete options[k]; }
+      const { emailPattern, ...emailRest } = email;
+      const byKind = kind.value === 'sftp' ? sftp : kind.value === 'email' ? { ...emailRest, pattern: emailPattern } : {};
+      for (const [k, i2] of Object.entries({ ...o, ...byKind, unwrap, alertEmail: alert })) { if (i2.value.trim()) options[k] = i2.value.trim(); else delete options[k]; }
       options.shipTos = Object.fromEntries(ships.filter(([, i2]) => i2.value.trim()).map(([l, i2]) => [l.id, i2.value.trim()]));
       options.priceRule = prMode.value === 'markup' ? { mode: 'markup', markupBps: Math.round(Number(prMark.value || 0) * 10000), ending99: pr99.checked } : { mode: 'none' };
       options.hostPhotos = hostPh.checked;
@@ -832,21 +898,27 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
       el('div', { class: 'dlg-acts' }, save, el('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Cancel')), err);
   }
 
+  /** The catalog import template (one heading per import field, in order): a plain link, so the browser saves it with the session. */
+  const templateLink = (ext, label) => el('a', { class: 'btn small', href: `/api/c/${E.S.co.id}/catalog/import/template.${ext}`, download: `vendor-catalog-template.${ext}` }, label);
+  const b64 = async (f) => { const bytes = new Uint8Array(await f.arrayBuffer()); let s2 = ''; for (let i = 0; i < bytes.length; i += 0x8000) s2 += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s2); };
+
   // ----------------------------------------------------------------- import
   const IMP = { vendorId: '', csv: '', filename: '', cols: null, mapping: {}, runId: null, show: 'change' };
   async function tabImport() {
+    FORM = null;   // a vendor may have been added or approved since; the picker reads it fresh
     const fo = await form();
     const runs = (await coApi('/catalog/import/runs')).runs;
     const step = el('div');
     const vSel = select([['', 'Which vendor is this file from?'], ...fo.vendors.map((v) => [v.id, v.name])], IMP.vendorId);
     vSel.onchange = () => { IMP.vendorId = vSel.value; };
-    const file = el('input', { type: 'file', accept: '.csv,text/csv' });
+    const file = el('input', { type: 'file', accept: '.csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     file.onchange = async () => {
       const f = file.files[0];
       if (!f) return;
       if (f.size > 8e6) { toast('That file is over 8 MB; split it.', 'critical'); return; }
-      IMP.csv = await f.text(); IMP.filename = f.name; IMP.runId = null;
-      try { IMP.cols = await post('/catalog/import/columns', { csv: IMP.csv }); IMP.mapping = { ...IMP.cols.mapping }; drawMap(); }
+      const isX = /\.xlsx$/i.test(f.name);
+      IMP.xlsx = isX ? await b64(f) : null; IMP.csv = isX ? '' : await f.text(); IMP.filename = f.name; IMP.runId = null;
+      try { IMP.cols = await post('/catalog/import/columns', isX ? { xlsx: IMP.xlsx } : { csv: IMP.csv }); IMP.mapping = { ...IMP.cols.mapping }; drawMap(); }
       catch (e) { step.replaceChildren(resultBox('critical', 'fail', 'Couldn’t read it', friendly(e))); }
     };
     const drawMap = () => {
@@ -863,7 +935,7 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
       };
       miss();
       const pv = el('button', { class: 'btn primary', type: 'button', onclick: () => act(pv, async () => {
-        const r = await post('/catalog/import/preview', { vendorId: IMP.vendorId, csv: IMP.csv, filename: IMP.filename, mapping: IMP.mapping });
+        const r = await post('/catalog/import/preview', { vendorId: IMP.vendorId, ...(IMP.xlsx ? { xlsx: IMP.xlsx } : { csv: IMP.csv }), filename: IMP.filename, mapping: IMP.mapping });
         IMP.runId = r.runId; IMP.show = r.change ? 'change' : 'add';
         return r;
       }, (r) => `${r.rows} rows read`) }, 'Preview');
@@ -895,7 +967,9 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
     } else if (IMP.cols) setTimeout(drawMap, 0);
     return frag(
       el('p', { class: 'lead', text: 'Upload a vendor’s price file, match its columns to ours, preview what it would do, then build. Products are matched by vendor and model number, so the same file twice changes nothing.' }),
-      IMP.runId ? null : el('div', { class: 'panel pad' }, el('div', { class: 'form-grid' }, field('Vendor', vSel), field('CSV file', file))),
+      !IMP.runId && !fo.vendors.length ? noVendors() : null,
+      IMP.runId ? null : el('div', { class: 'panel pad' }, el('div', { class: 'form-grid' }, field('Vendor', vSel), field('CSV or Excel (.xlsx) file', file)),
+        el('div', { class: 'dlg-acts' }, el('span', { class: 'fine', text: 'Start from our template: one column per field, the required ones dark.' }), templateLink('xlsx', 'Download template (.xlsx)'), templateLink('csv', 'Download template (.csv)'))),
       step,
       section('Past imports', `${runs.length}`, null, el('div', { class: 'panel' }, runs.length ? capped(runs.map((r) => item({
         title: `${r.vendor} · ${r.filename || 'file'}`, detail: `${r.rows} rows: ${r.added} added, ${r.changed} changed, ${r.unchanged} unchanged, ${r.skipped} skipped · ${r.created_by || ''}`,

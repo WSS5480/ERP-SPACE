@@ -883,7 +883,7 @@ async function screenApprovals() {
       el('div', { class: 'panel' }, d.others.length ? d.others.map((a) => approvalItem(a, false)) : empty('Nothing else is open.', null, true))),
     section('Recently decided', null, null,
       el('div', { class: 'panel' }, d.recent.length ? d.recent.map((r) => item({
-        title: subjName(r.subject), detail: `${cap(r.decision)} by ${r.actor_name || 'someone'} as ${r.required_role} · ${ago(r.decided_at)}${r.note ? ' · “' + r.note + '”' : ''}`,
+        title: subjName(r.subject), detail: `${cap(r.decision)} by ${r.actor_name || 'someone'} as ${r.required_role}${r.self_approved ? ' (self-approved: they made it and nobody else here could)' : ''} · ${ago(r.decided_at)}${r.note ? ' · “' + r.note + '”' : ''}`,
         amount: r.amount_minor != null ? money(r.amount_minor) : null,
         badge: r.decision === 'approved' ? chip('good', 'ok', 'Approved') : chip('critical', 'fail', 'Rejected'),
         onClick: r.subject.link ? () => openSubject(r.subject.link) : null })) : empty('Nothing decided yet.', null, true))));
@@ -1045,7 +1045,7 @@ function openBill(id) {
       section('Coded to', null, null, el('div', { class: 'panel' }, b.lines.map((l) => item({
         title: `${l.code} ${l.account}`, detail: [l.store || 'Company', l.description].filter(Boolean).join(' · '), amount: money(l.amount_minor) })))),
       b.requests.length ? section('Approvals', null, null, el('div', { class: 'panel' }, b.requests.flatMap((r) => (r.steps || []).map((s) => item({
-        title: `Step ${s.seq}: ${s.role}`, detail: s.decision ? `${cap(s.decision)} by ${s.actor} · ${ago(s.at)}${s.note ? ' · “' + s.note + '”' : ''}` : `Waiting · made by ${r.maker_name}`,
+        title: `Step ${s.seq}: ${s.role}`, detail: s.decision ? `${cap(s.decision)} by ${s.actor}${s.self_approved ? ' (self-approved)' : ''} · ${ago(s.at)}${s.note ? ' · “' + s.note + '”' : ''}` : `Waiting · made by ${r.maker_name}`,
         badge: s.decision === 'approved' ? chip('good', 'ok', 'Approved') : s.decision === 'rejected' ? chip('critical', 'fail', 'Rejected') : chip('neutral', 'pending', 'Open') }))))) : null,
       b.payments.length ? section('Paid', null, null, el('div', { class: 'panel' }, b.payments.map((p) => item({ title: `Payment run for ${dayLabel(p.pay_date)}`, detail: `${p.method.toUpperCase()} · ${p.run_status}`,
         amount: money(p.amount_minor), onClick: () => openPaymentRun(p.run_id) })))) : null,
@@ -1314,16 +1314,18 @@ function vendorForm(o, v) {
   return { f, body, fields };
 }
 
-function openAddVendor() {
-  const d = openDialog('Add a vendor', `${S.co.name} · added as ${S.person ? S.person.name : 'nobody'}`, { wide: true });
+function openAddVendor(opts = {}) {
+  const d = openDialog(opts.merchandise ? 'Add a merchandise vendor' : 'Add a vendor', `${S.co.name} · added as ${S.person ? S.person.name : 'nobody'}`, { wide: true });
   fillDialog(d, async () => {
-    const o = await coApi('/options');
+    const o0 = await coApi('/options');
+    // From Catalog: only merchandise categories, so the vendor shows there.
+    const o = opts.merchandise ? { ...o0, vendorCategories: (o0.vendorCategories || []).filter((c) => c.is_merchandise) } : o0;
     const name = input({ maxlength: '120', placeholder: 'Legal name, as on the W-9' });
     const dba = input({ maxlength: '120', placeholder: 'Optional' });
     const vf = vendorForm(o, null);
     const out = el('div');
-    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/vendors', { name: name.value, dba: dba.value, ...vf.body() }),
-      (r) => r.status === 'active' ? 'Vendor added.' : 'Vendor added; it can take bills once the controller approves it.',
+    const go = el('button', { class: 'btn primary', type: 'button', onclick: () => act(go, () => post('/vendors', { name: name.value, dba: dba.value, ...vf.body(), merchandise: !!opts.merchandise }),
+      (r) => r.status === 'active' ? 'Vendor added.' : opts.merchandise ? 'Vendor added; it shows as waiting for approval until it is approved.' : 'Vendor added; it can take bills once the controller approves it.',
       { close: d.close, errorInto: (e) => out.replaceChildren(resultBox('critical', 'fail', 'Not added', friendly(e))) }) }, 'Add vendor');
     return frag(
       el('p', { class: 'lead', text: 'A new vendor waits on the controller’s approval before bills from it can go through. Bank details are added afterwards, from the vendor, and are approved separately.' }),
@@ -2417,7 +2419,7 @@ window.ERP = {
   api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
   head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input, zonePicker, ZONES,
   drill, drillList, drillItems, drillNode, drillSum, drillRow, opener, openKind: (kind, id) => (OPENERS[kind] ? OPENERS[kind](id) : null),
-  openEntry, NARROW,
+  openEntry, NARROW, openAddVendor,
   // defined further down (sign-in and who you are); wrapped so they resolve when called
   isOperator: () => isOperator(), isCustomer: () => isCustomer(), inSupport: () => inSupport(), managesAccount: () => managesAccount(), boot: () => boot(),
   /** homeCard(async () => node | null): a card on Home, after the tiles */

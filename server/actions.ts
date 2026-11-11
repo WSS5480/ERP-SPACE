@@ -268,6 +268,12 @@ export async function addVendor(c: Client, co: Company, a: Actor, input: Record<
   const name = text(input.name, 120);
   need(name.length >= 2, "enter the vendor's legal name");
   const cat = await categoryFrom(c, co, input.category);
+  if (input.merchandise === true) {
+    // Added from Catalog: a vendor whose goods we sell, or it would not show there.
+    const m = await q<{ is_merchandise: boolean }>(c, `select is_merchandise from vendor_category where id = $1 and tenant_id = $2
+                                                     /* unscoped: the categories are shared across the client's companies */`, [cat.id, co.tenantId]);
+    need(m[0]?.is_merchandise, `${cat.label} is not a merchandise category; a vendor added from Catalog sells goods, so pick a merchandise category (Payables → Vendors adds the rest)`);
+  }
   const dba = text(input.dba, 120) || null;
   const terms = Number(input.termsDays ?? 30);
   need(Number.isInteger(terms) && terms >= 0 && terms <= 120, "terms are a number of days, 0 to 120");

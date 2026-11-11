@@ -675,7 +675,7 @@ async function main() {
   await tx(scope(CONTROLLER, "Controller"), async (c) => {
     const srcs = await q<{ n: string }>(c,
       `select count(*) as n from ingest_source /* unscoped: the catalogue is not per-entity */`);
-    ok("every kind of data has a declared source", Number(srcs[0].n) === 12, `${srcs[0].n} sources`);
+    ok("every kind of data has a declared source", Number(srcs[0].n) === 13, `${srcs[0].n} sources`);
 
     const orphan = await q<{ code: string }>(c,
       `select code from ingest_source s where not exists
