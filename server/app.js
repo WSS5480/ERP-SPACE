@@ -659,6 +659,8 @@ async function render() {
   if (!S.co && isOperator()) return operatorOnly();
   // a screen the person you're acting as doesn't work in sends you to their Home
   if (S.route && !canSee(S.route.screen)) {
+    // a drill opened from that screen goes with it (it would otherwise stay painted over Home)
+    DRILL.length = 0;
     S.route = { screen: 'home', sub: '' };
     history.replaceState(null, '', `#/${S.co.id}/home`);
     renderNav();

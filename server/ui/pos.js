@@ -7,6 +7,9 @@
   const { el, frag, section, head, item, chip, money, openDialog, fillDialog, post, coApi, toast, seg, empty, resultBox,
     tilesRow, tile, plural, dayLabel, shortDay, ago, busy, friendly, go, S, fact, todayIso } = E;
 
+  // A drill row that names an order (Z report sales, a customer's orders, a trade account's on-order) opens it.
+  E.opener('order', (id) => openOrder(id));
+
   const TABS = [['sell', 'Sell'], ['orders', 'Orders'], ['register', 'Register']];
   const words = (s) => String(s || '').replace(/_/g, ' ');
   const FUL = { carry: 'Take with', pickup: 'Pickup', delivery: 'Delivery', ship: 'Direct ship' };

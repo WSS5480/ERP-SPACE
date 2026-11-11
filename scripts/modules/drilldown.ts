@@ -15,6 +15,7 @@ import * as settle from "../../packages/core/ar_settlement.ts";
 import * as pos from "../../packages/core/pos.ts";
 import * as edi from "../../packages/core/edi.ts";
 import * as trade from "../../packages/core/trade.ts";
+import { ROLES as TRADE_SCREEN_ROLES } from "../../server/modules/trade.ts";
 import * as leave from "../../packages/core/leave.ts";
 
 type Res = { status: number; data: Record<string, unknown> & { error?: string } };
@@ -195,6 +196,13 @@ export async function run(t: T) {
     await t.throws("the books' entries are refused to a role that does not see them, in a sentence",
       () => drill.list(c, ENTITY, "gl-lines", { code: "1100" }, 1, new Set(["sales"])), /Seeing the entries in an account needs one of: controller/);
     await t.throws("stock at cost is refused to a role that does not see costs", () => drill.list(c, ENTITY, "stock-value", {}, 1, new Set(["warehouse"])), /needs one of: buyer, controller, store manager/);
+    // a drill shows no more than the screen it opens from: the service desk, the delivery dashboard and trade accounts keep their read rules
+    await t.throws("service tickets are refused to a driver, as the service desk is", () => drill.list(c, ENTITY, "service-open", {}, 1, new Set(["driver"])), /needs one of: store manager/);
+    await t.throws("service cost is refused to a technician alone (the dashboard is for staff)", () => drill.list(c, ENTITY, "service-cost30", {}, 1, new Set(["technician"])), /needs one of/);
+    await t.throws("the day's stops are refused to HR, as the delivery dashboard is", () => drill.list(c, ENTITY, "fleet-stops", { day: "2026-11-11" }, 1, new Set(["hr"])), /needs one of: dispatcher/);
+    await t.throws("a trade account's ledger is refused to a driver, as trade accounts are", () => drill.list(c, ENTITY, "customer-ledger", { customer: "11111111-1111-4111-8111-111111111111" }, 1, new Set(["driver"])), /needs one of: sales/);
+    t.ok("trade drills use the trade screen's own view roles", (drill.DEFS["trade-referrals"].roles ?? []).join() === TRADE_SCREEN_ROLES.view.join());
+    t.ok("a dispatcher still opens the day's stops", (await drill.list(c, ENTITY, "fleet-stops", { day: "2026-11-11" }, 1, new Set(["dispatcher"]))).page === 1);
     // the SQL is the company's own: the same list for Rio Freight never shows the demo's rows
     const rioBills = await drill.all(c, RIO_ENTITY, "bills-due7", {}, owner);
     const demoIds = new Set((await all("bills-due7")).rows.map((r) => r.id));

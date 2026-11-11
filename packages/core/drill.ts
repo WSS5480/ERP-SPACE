@@ -47,6 +47,14 @@ export type Def = {
 const AGE_BUCKETS = ["0–2 days", "3–7 days", "8–14 days", "15+ days"];
 const COST_ROLES = ["owner", "buyer", "controller", "store_manager"];
 const BOOKS_ROLES = ["owner", "controller", "approver", "ap_clerk", "viewer", "ar_clerk", "hr", "buyer", "store_manager"];
+// The screens' own read rules, so a drill shows no more than the screen it opens from:
+/** server/modules/service.ts STAFF (the service dashboard is for store staff) */
+const SERVICE_ROLES = ["owner", "store_manager", "dispatcher", "sales", "cashier", "ar_clerk", "controller", "buyer", "warehouse", "viewer"];
+/** server/modules/fleet.ts: the delivery dashboard (STAFF + sales); booking availability adds cashier */
+const FLEET_ROLES = ["owner", "dispatcher", "store_manager", "warehouse", "sales"];
+const FLEET_BOOK_ROLES = [...FLEET_ROLES, "cashier"];
+/** server/modules/trade.ts ROLES.view (trade accounts are for store staff) */
+const TRADE_ROLES = ["sales", "store_manager", "designer", "controller", "ar_clerk", "marketing", "cashier", "buyer"];
 
 /** a POS drawer session must be this company's, or the list says so plainly */
 async function sessionHere(c: Client, entityId: string, p: Record<string, string | null>) {
@@ -161,7 +169,7 @@ export const DEFS: Record<string, Def> = {
   // ------------------------------------------------------------- Delivery
   /** Delivery → Stops done / On time (fleet.dashboard stops, onTimePct): the day's stops it counts */
   "fleet-stops": {
-    title: "Stops on the day", measure: "count",
+    title: "Stops on the day", measure: "count", roles: FLEET_ROLES, doing: "the day's delivery stops",
     params: [
       { name: "day", kind: "day", missing: "Pick a day first." },
       { name: "show", kind: "word", optional: true, words: ["all", "done", "timed", "on_time", "late", "failed"], missing: "" },
@@ -190,7 +198,7 @@ export const DEFS: Record<string, Def> = {
 
   /** Delivery → a window's "N left" when booking (fleet.availability used.stops): the stops that count against its capacity */
   "window-stops": {
-    title: "Booked in the window", measure: "count",
+    title: "Booked in the window", measure: "count", roles: FLEET_BOOK_ROLES, doing: "what is booked in a delivery window",
     params: [{ name: "window", kind: "uuid", missing: "Pick a delivery window first." }, { name: "day", kind: "day", missing: "Pick a day first." }],
     sql: `
       select s.id, s.number || coalesce(' · ' || cu.name, '') title,
@@ -206,7 +214,7 @@ export const DEFS: Record<string, Def> = {
   // -------------------------------------------------------------- Service
   /** Service → Open tickets (service.dashboard open) */
   "service-open": {
-    title: "Open service tickets", measure: "count",
+    title: "Open service tickets", measure: "count", roles: SERVICE_ROLES, doing: "the service desk's tickets",
     params: [{ name: "age", kind: "word", optional: true, words: AGE_BUCKETS, missing: "" }],
     sql: `
       select t.id, t.number || coalesce(' · ' || coalesce(cu.name, t.contact_name), '') title,
@@ -222,7 +230,7 @@ export const DEFS: Record<string, Def> = {
   },
   /** Service → Due in 24 hours (service.dashboard dueSoon) */
   "service-due24": {
-    title: "Tickets due in the next 24 hours", measure: "count",
+    title: "Tickets due in the next 24 hours", measure: "count", roles: SERVICE_ROLES, doing: "the service desk's tickets",
     sql: `
       select t.id, t.number || coalesce(' · ' || coalesce(cu.name, t.contact_name), '') title,
              concat_ws(' · ', initcap(t.priority) || ' priority', 'due ' || to_char(t.sla_due_at, 'Mon DD HH12:MI am')) detail,
@@ -235,7 +243,7 @@ export const DEFS: Record<string, Def> = {
   },
   /** Service → Fixed first visit (service.dashboard firstTimeFix): resolved tickets with repair visits */
   "service-ftf": {
-    title: "Resolved tickets with repair visits", measure: "count",
+    title: "Resolved tickets with repair visits", measure: "count", roles: SERVICE_ROLES, doing: "the service desk's tickets",
     sql: `
       with v as (
         select t.id, t.number, coalesce(cu.name, t.contact_name) customer, t.resolved_at,
@@ -254,7 +262,7 @@ export const DEFS: Record<string, Def> = {
   },
   /** Service → Service cost, 30 days (service.dashboard cost30dMinor) */
   "service-cost30": {
-    title: "Service cost, last 30 days", measure: "money",
+    title: "Service cost, last 30 days", measure: "money", roles: SERVICE_ROLES, doing: "the service desk's tickets",
     sql: `
       select sc.id, t.number || ' · ' || initcap(replace(sc.kind, '_', ' ')) title,
              concat_ws(' · ', 'charged to ' || replace(sc.charge_to, '_', ' '), sc.note) detail,
@@ -405,7 +413,7 @@ export const DEFS: Record<string, Def> = {
   // ------------------------------------------------------------- Trade
   /** Trade account → Owed (ar.customerBalance as of today): the customer's receivable ledger */
   "customer-ledger": {
-    title: "What the account owes", measure: "money",
+    title: "What the account owes", measure: "money", roles: TRADE_ROLES, doing: "a trade account's figures",
     params: [{ name: "customer", kind: "uuid", missing: "Pick a customer first." }],
     sql: `
       select l.id, initcap(replace(l.kind, '_', ' ')) || coalesce(' · ' || i.number, '') title, concat_ws(' · ', lo.name, l.memo) detail,
@@ -417,7 +425,7 @@ export const DEFS: Record<string, Def> = {
   },
   /** Trade account → On order, unbilled (trade credit pending): open trade orders, less what is paid or billed */
   "trade-onorder": {
-    title: "On order, not billed yet", measure: "money",
+    title: "On order, not billed yet", measure: "money", roles: TRADE_ROLES, doing: "a trade account's figures",
     params: [{ name: "customer", kind: "uuid", missing: "Pick a customer first." }],
     sql: `
       select x.* from (
@@ -434,7 +442,7 @@ export const DEFS: Record<string, Def> = {
   },
   /** Trade account → Referral owed (trade.account referrals.owedMinor): referral events not yet on a bill */
   "trade-referrals": {
-    title: "Referral commission owed", measure: "money",
+    title: "Referral commission owed", measure: "money", roles: TRADE_ROLES, doing: "a trade account's figures",
     params: [{ name: "account", kind: "uuid", missing: "Pick a trade account first." }],
     sql: `
       select e.id, coalesce(so.number, 'Order') || ' · ' || initcap(replace(e.kind, '_', ' ')) title,
