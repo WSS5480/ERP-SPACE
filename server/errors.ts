@@ -113,12 +113,12 @@ export function installProcessHandlers(exit: (code: number) => void = (n) => pro
 // ------------------------------------------------------- operator reads --
 
 export async function listErrors(limit = 100) {
-  return (await pool.query(`select ref, at::text, kind, method, path, status, message, tenant_ref, entity_ref,
+  return (await pool.query(`select ref, at, kind, method, path, status, message, tenant_ref, entity_ref,
       (select name from tenant t where t.id = e.tenant_ref) tenant, (select name from entity x where x.id = e.entity_ref) company, alerted
       from server_error e order by at desc limit $1 /* unscoped: the install's error log */`, [Math.min(500, Math.max(1, limit))])).rows;
 }
 export async function errorByRef(ref: string) {
-  const r = (await pool.query(`select ref, at::text, kind, method, path, status, message, stack, who, tenant_ref, entity_ref,
+  const r = (await pool.query(`select ref, at, kind, method, path, status, message, stack, who, tenant_ref, entity_ref,
       (select name from tenant t where t.id = e.tenant_ref) tenant, (select name from entity x where x.id = e.entity_ref) company, alerted
       from server_error e where ref = upper($1) /* unscoped: the install's error log */`, [ref.trim()])).rows;
   return r[0] ?? null;

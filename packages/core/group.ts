@@ -38,7 +38,7 @@ import { createProduct } from "./catalog.ts";
 import { format } from "./money.ts";
 
 export class GroupError extends Error {}
-const need = (cond: unknown, msg: string): asserts cond => { if (!cond) throw new GroupError(msg); };
+function need(cond: unknown, msg: string): asserts cond { if (!cond) throw new GroupError(msg); }
 const B = (v: unknown) => BigInt(String(v ?? "0"));
 const $ = (m: bigint) => format(m);
 const T = "/* unscoped: the client's own companies, by tenant */";

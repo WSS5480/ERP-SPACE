@@ -32,7 +32,7 @@ import { q, one, audit, type Client, type Scope } from "./db.ts";
 import { WorkforceError, cancelShift } from "./workforce.ts";
 import { addBlackout } from "./fleet.ts";
 
-const need = (cond: unknown, msg: string): asserts cond => { if (!cond) throw new WorkforceError(msg); };
+function need(cond: unknown, msg: string): asserts cond { if (!cond) throw new WorkforceError(msg); }
 const UUIDRX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isId = (v: unknown): v is string => typeof v === "string" && UUIDRX.test(v);
 const isDay = (s: unknown): s is string => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);

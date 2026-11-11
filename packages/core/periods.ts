@@ -135,15 +135,15 @@ export async function keepAhead(c: Client, entityId: string, ahead = 3, by = "pe
 
 export async function list(c: Client, entityId: string) {
   const rows = await q<{ id: string; starts_on: string; ends_on: string; status: string; locked_at: string | null; closed_reason: string | null; entries: number }>(c, `
-    select p.id, p.starts_on::text, p.ends_on::text, p.status, p.locked_at::text, p.closed_reason,
+    select p.id, p.starts_on::text, p.ends_on::text, p.status, p.locked_at, p.closed_reason,
            (select count(*) from journal_entry je where je.entity_id = $1 and je.period_id = p.id)::int entries
       from fiscal_period p where p.entity_id = $1 order by p.starts_on desc`, [entityId]);
   const e = await one<{ fy: number }>(c, `select fiscal_year_end_month fy from entity where id = $1 /* unscoped: the company itself */`, [entityId]);
   const t = await businessToday(c, entityId);
   const years = await q<{ id: string; fy_start: string; fy_end: string; status: string; net_income_minor: string; closed_by: string; closed_at: string; journal_entry_id: string | null }>(c, `
-    select id, fy_start::text, fy_end::text, status, net_income_minor::text, closed_by, closed_at::text, journal_entry_id
+    select id, fy_start::text, fy_end::text, status, net_income_minor::text, closed_by, closed_at, journal_entry_id
       from fiscal_year_close where entity_id = $1 order by fy_end desc, closed_at desc`, [entityId]);
-  const events = await q(c, `select kind, starts_on::text, ends_on::text, reason, by_label, at::text from period_event where entity_id = $1 order by at desc limit 50`, [entityId]);
+  const events = await q(c, `select kind, starts_on::text, ends_on::text, reason, by_label, at from period_event where entity_id = $1 order by at desc limit 50`, [entityId]);
   return { today: t, fiscalYear: fiscalYearOf(t, Number(e.fy)), fyEndMonth: Number(e.fy),
     counts: { open: rows.filter((r) => r.status !== "closed").length, closed: rows.filter((r) => r.status === "closed").length },
     periods: rows.map((r) => ({ ...r, label: monthLabel(r.starts_on), current: t >= r.starts_on && t <= r.ends_on })), years, events };
@@ -190,7 +190,7 @@ export async function checklist(c: Client, tenantId: string, entityId: string, p
 
   await safely("drawers", "Drawer sessions still open", "pos", async () => {
     const rows = await q<{ id: string; number: string; opened_at: string; store: string }>(c, `
-      select s.id, s.number, s.opened_at::text, l.name store from pos_session s join location l on l.id = s.location_id
+      select s.id, s.number, s.opened_at, l.name store from pos_session s join location l on l.id = s.location_id
        where s.entity_id = $1 and s.status = 'open' and (s.opened_at at time zone business_tz($1, s.location_id))::date <= $2::date order by s.opened_at`,
       [entityId, p.ends_on]);
     return { ok: !rows.length, count: rows.length, rows,

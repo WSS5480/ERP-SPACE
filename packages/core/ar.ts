@@ -28,7 +28,7 @@ import { recordFinancingRefund } from "./ar_settlement.ts";
 
 export class ArError extends Error {}
 
-const need = (cond: unknown, msg: string): asserts cond => { if (!cond) throw new ArError(msg); };
+function need(cond: unknown, msg: string): asserts cond { if (!cond) throw new ArError(msg); }
 const B = (v: string | number | bigint | null | undefined) => BigInt(v ?? 0);
 const $ = (m: bigint) => format(m);
 

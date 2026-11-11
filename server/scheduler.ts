@@ -25,7 +25,7 @@ export type JobItem = { tenantId?: string | null; entityId?: string | null; ok: 
 export type JobOutcome = { items: JobItem[]; summary: string };
 export type JobDef = { id: string; label: string; everyMin: number; what: string; run: (now: Date) => Promise<JobOutcome> };
 
-const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+const plural = (n: number, w: string) => `${n} ${n === 1 ? w : w.endsWith("y") ? `${w.slice(0, -1)}ies` : `${w}s`}`;
 
 /** The daily period job: every company of a customer that is not suspended keeps three months ahead open. */
 export async function rollPeriods(_now: Date): Promise<JobOutcome> {
@@ -160,7 +160,7 @@ export function startScheduler(log: (s: string) => void = console.log): () => vo
 /** The jobs with their last run and next run. With an entity: the status is what the last run did for that company. */
 export async function jobsView(c: Client, entityId: string | null) {
   const last = (await c.query<{ job: string; id: string; started_at: string; finished_at: string | null; status: string; summary: string | null; error: string | null }>(`
-    select distinct on (job) job, id, started_at::text, finished_at::text, status, summary, error from job_run
+    select distinct on (job) job, id, started_at, finished_at, status, summary, error from job_run
      order by job, started_at desc /* unscoped: the install's job log */`)).rows;
   const byJob = new Map(last.map((r) => [r.job, r]));
   const mine = entityId ? new Map((await c.query<{ run_id: string; ok: boolean; note: string }>(`
@@ -185,7 +185,7 @@ export async function jobsView(c: Client, entityId: string | null) {
 /** Recent runs of one job (or all). */
 export async function runsView(c: Client, entityId: string | null, job: string | null, limit = 30) {
   const rows = (await c.query<{ id: string; job: string; trigger: string; started_at: string; finished_at: string | null; status: string; summary: string | null; error: string | null; runner: string }>(`
-    select id, job, trigger, started_at::text, finished_at::text, status, summary, error, runner from job_run
+    select id, job, trigger, started_at, finished_at, status, summary, error, runner from job_run
      where ($1::text is null or job = $1) order by started_at desc limit $2 /* unscoped: the install's job log */`, [job, Math.min(200, limit)])).rows;
   if (!entityId) return rows;
   const items = new Map((await c.query<{ run_id: string; ok: boolean; note: string }>(`
@@ -201,10 +201,10 @@ export async function runsView(c: Client, entityId: string | null, job: string |
 
 /** One run in detail: for a company, only its own items; for an operator, everything. */
 export async function runDetail(c: Client, runId: string, entityId: string | null) {
-  const r = (await c.query(`select id, job, trigger, runner, started_at::text, finished_at::text, status, summary, error, detail from job_run where id = $1 /* unscoped: the install's job log */`, [runId])).rows[0];
+  const r = (await c.query(`select id, job, trigger, runner, started_at, finished_at, status, summary, error, detail from job_run where id = $1 /* unscoped: the install's job log */`, [runId])).rows[0];
   if (!r) return null;
   const items = (await c.query(`
-    select i.ok, i.note, i.at::text, e.name company, t.name tenant from job_run_item i
+    select i.ok, i.note, i.at, e.name company, t.name tenant from job_run_item i
       left join entity e on e.id = i.entity_id left join tenant t on t.id = i.tenant_id
      where i.run_id = $1 and ($2::uuid is null or i.entity_id = $2) order by i.ok, i.at /* unscoped: one run's items, filtered to the company when one is named */`, [runId, entityId])).rows;
   const def = jobById(r.job);

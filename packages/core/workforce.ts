@@ -25,7 +25,7 @@ import { format, mulBps } from "./money.ts";
 import { lineSplits, accrueReferrals } from "./trade_commission.ts";
 
 export class WorkforceError extends Error {}
-const need = (cond: unknown, msg: string): asserts cond => { if (!cond) throw new WorkforceError(msg); };
+function need(cond: unknown, msg: string): asserts cond { if (!cond) throw new WorkforceError(msg); }
 const B = (v: string | number | bigint | null | undefined) => BigInt(v ?? 0);
 const isDay = (s: unknown): s is string => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 
