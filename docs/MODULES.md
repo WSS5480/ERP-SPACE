@@ -110,6 +110,7 @@ Data is placed with textContent only, never innerHTML.
 | selling rules (discount limit, quote life, layaway terms, tenders); demo made up | 0055 | 0035 | Setup (Sales tax → Selling rules) |
 | vendor_files (SFTP and HTTPS transports, vendor file connections, vendor email, SFTP/email-in vendor feeds, EDI over SFTP; one-person approvals) | 0057, 0061, 0062 | none | Setup (Connections → Vendor files), Retail (Catalog → Vendors → Catalog connections) |
 | drill (the rows behind every tile; read-only lists) | none | none | no screen of its own |
+| self-approval follow-through (support mode, typed confirmation, owner digest, counts / write-offs / debit memos / time off, run release, bill gates) | 0063, 0064 | none | a Home card (Self-approvals) |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -923,3 +924,64 @@ employee_change, journal_entry and fiscal_period. Catalog → Vendors lists a
 vendor waiting on approval with "Waiting for approval" and an Approve button
 for whoever may decide it; Add vendor from Catalog offers merchandise
 categories only (the server refuses others).
+
+**Self-approval, followed through (migration 0063, Nov 11 2026).** One rule,
+in SQL `self_approve_refusal(entity, user, roles)` / `may_self_approve(...)` and
+in code `approvals.selfApprovalRefusal` / `mayDecideOwn` (checked to agree): the
+maker may decide their own request only as the owner, only when no other
+active person in the company holds owner, controller or one of the roles that
+could decide it, and never from support mode. 0061's approval-step guard now
+calls it. Support mode: `db.tx` carries the support session (`erp.support`)
+for every coPost an operator makes, and coGet marks the read
+(`db.markSupport`), so the code, the Approvals screen and the database all
+refuse an operator acting as the owner ("support mode never self-approves for
+the owner"). Typed confirmation: self-approving new vendor bank details needs
+the payee's name typed (DBA or legal name, any case), a payment or payroll run
+its total (`$1,234.56`, `1234.56` or `1234`); the server checks it
+(`decide(..., { confirm })`), the Approvals screen asks for it
+(`askTypedConfirm`), and the audit row says it was typed. Rejecting your own
+needs nothing typed. The four flows outside the engine that dead-ended in a
+one-person company now carry `self_approved` and a trigger
+(`self_approved_guard(<roles>)`) and relax their maker-checker check to
+`... or self_approved`: stock counts (`inv_count`, store_manager), A/R
+write-offs (`ar_writeoff`, controller), vendor debit memos
+(`vendor_debit_memo`, controller or approver) and time off
+(`leave_request`, hr or store_manager; the owner's own time off included).
+Each writes "self-approved: no other approver" to the audit trail
+(`approvals.auditSelfApproval`) and shows "(self-approved)" in its history;
+the count and write-off lists say `self_ok` when the maker may decide it.
+Roles taken away are kept in `role_removal` (deferred triggers on
+`role_grant` delete and `app_user` leaving active: a "set roles" that keeps a
+role logs nothing; append-only). The daily `owner_digest` job
+(`packages/core/owner_digest.ts`) makes one `owner_notification` per company
+per business day with every self-approval of the last 24 hours and any role
+removed in the 24 hours before one; it shows on the owner's Home
+(Self-approvals, drills to its lines with Back, each line opens its record)
+and is emailed to the owners through the outbox only when the company has
+email connected. Demo and suspended customers are skipped.
+
+The last two one-person dead ends (migration 0064) follow the same rule,
+audit row, "(self-approved)" marking and support-mode refusal. A payment or
+payroll run may be released by its own builder only as the owner when nobody
+else in the company could release it (no other owner or controller, nor an
+approver or A/P clerk for payment runs, nor HR for payroll:
+`approvals.RUN_RELEASERS`); the run's total is typed, the run is marked
+`self_released`, and `self_released_guard(<roles>)` with the relaxed
+`*_two_people` checks holds the same line in the database. A bill stopped at
+the gates may be let through by whoever entered it only as the owner when no
+other owner or controller is here (`approvals.GATE_SIGN_OFF`); nothing is
+typed. The bill now records `accepted_by`, `accepted_at` and `self_accepted`,
+and `invoice_accept_guard` enforces both rules in the database: not the
+enterer, unless it is that self-accepted case. The count, run and bill screens
+offer the action (`self_ok`, `self_accept_ok`) only when the rule allows it.
+Both go into the owner digest (flows `release` and `gate`).
+
+Phones: long words (emails, addresses, key fingerprints) wrap
+(`overflow-wrap:anywhere`) in row notes, leads, result boxes, dialog titles,
+labels and buttons, in the app and in the web store and trade portal.
+
+The reports check's "rows in every dataset" no longer depends on the finance
+smoke: the demo's seeds have no vendor bills, so `vendor_spend` had rows only
+when `npm run smoke` had run on that database since its last reset. The check
+now brings its own bill and rolls it back.
+

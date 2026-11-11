@@ -335,7 +335,8 @@
     vSel.addEventListener('change', () => { st.memoVendor = vSel.value; E.render(); });
     const cards = d.memos.map((m) => item({
       title: `${m.number} · ${m.vendor}`, amount: m.status === 'open' ? money(m.left_minor) : money(m.amount_minor), badge: memoChip(m),
-      detail: [words(m.source), m.reason, m.ticket_number ? `ticket ${m.ticket_number}` : null, m.vendor_ref ? `vendor ref ${m.vendor_ref}` : null, dayLabel(m.memo_date)].filter(Boolean).join(' · '),
+      detail: [words(m.source), m.reason, m.ticket_number ? `ticket ${m.ticket_number}` : null, m.vendor_ref ? `vendor ref ${m.vendor_ref}` : null, dayLabel(m.memo_date),
+        m.decided_by_name && m.status !== 'pending_approval' ? `${m.status === 'rejected' ? 'turned down' : 'approved'} by ${m.decided_by_name}${m.self_approved ? ' (self-approved)' : ''}` : null].filter(Boolean).join(' · '),
       onClick: () => memoDialog(m.id) }));
     return frag(head('Debit memos', [btn('New memo', () => newMemo(d), { primary: true })], 'Back office'),
       el('div', { class: 'toolbar' }, seg(MEMO_TABS, st.memoTab, (v) => { st.memoTab = v; E.render(); }), vSel,
@@ -378,7 +379,7 @@
       return frag(
         el('div', { class: 'facts' }, fact('Memo', m.number), fact('Vendor', m.vendor), fact('Amount', money(m.amount_minor)), fact('Left', money(m.left_minor)),
           fact('Status', words(m.status)), fact('Reason', `${words(m.source)}: ${m.reason}`), fact('Offset', m.offset_code), fact('Written by', m.created_by_name || '—'),
-          m.decided_by_name ? fact('Decided by', `${m.decided_by_name}${m.decision_note ? ' · ' + m.decision_note : ''}`) : null),
+          m.decided_by_name ? fact('Decided by', `${m.decided_by_name}${m.self_approved ? ' (self-approved)' : ''}${m.decision_note ? ' · ' + m.decision_note : ''}`) : null),
         m.applications.length ? section('Applied to', null, null, panel(m.applications.map((a) => item({ title: a.bill_reference || 'bill', amount: money(a.amount_minor),
           detail: [dayLabel(String(a.applied_at).slice(0, 10)), a.applied_by].filter(Boolean).join(' · ') })))) : null,
         apply, err, el('div', { class: 'dlg-acts' }, acts, btn('Vendor statement', () => { d.close(); go('memos', 'vendor:' + m.vendor_id); }), btn('Close', d.close)));
@@ -413,7 +414,7 @@
   // ==================================================== Time off
   const LEAVE_TONE = { requested: 'warning', approved: 'good', declined: 'critical', cancelled: 'neutral' };
   const reqCard = (r, acts) => item({ title: `${r.employee} · ${r.type}`, amount: hours(r.total_hours), badge: chip(LEAVE_TONE[r.status] || 'neutral', r.status === 'approved' ? 'ok' : 'clock', words(r.status)),
-    detail: [r.starts_on === r.ends_on ? dayLabel(r.starts_on) : `${dayLabel(r.starts_on)} to ${dayLabel(r.ends_on)}`, r.note, r.decided_by ? `by ${r.decided_by}` : null].filter(Boolean).join(' · '),
+    detail: [r.starts_on === r.ends_on ? dayLabel(r.starts_on) : `${dayLabel(r.starts_on)} to ${dayLabel(r.ends_on)}`, r.note, r.decided_by ? `by ${r.decided_by}${r.self_approved ? ' (self-approved)' : ''}` : null].filter(Boolean).join(' · '),
     why: r.decision_note || r.cancel_reason || null, acts });
 
   async function screenTimeOff() {

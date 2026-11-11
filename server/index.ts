@@ -58,7 +58,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { pool, tx, q, type Scope, type Client } from "../packages/core/db.ts";
+import { pool, tx, q, markSupport, type Scope, type Client } from "../packages/core/db.ts";
 import {
   ingest, loadConnection, openQuarantine, releaseQuarantine, handlerFor,
   ChannelRefused, type Offered, type Connection,
@@ -649,6 +649,8 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
       const co = await companyFor(c, who, m[1]);
       const a = await acting(c, co, req, who!, false);
       markLookOnly(c, !!a?.preview || (who?.kind === "customer" && who.prospect));
+      // the install-wide token speaks for the operator, as a support session does: it never self-approves for the owner either
+      markSupport(c, (who?.kind === "operator" && !!who.support) || who?.kind === "system");
       const out = await fn(c, co, url, m, a?.personId ?? null);
       if (out === null) throw new HttpError(404, "not found");
       // A printable page (a tear sheet) goes out with every header and the CSP, like any page.
@@ -658,6 +660,7 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
       return [200, out];
     } finally {
       markLookOnly(c, false);
+      markSupport(c, false);
       c.release();
     }
   });
@@ -678,7 +681,9 @@ function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body:
       c0.release();
     }
     const body = await readJson(req, opts.maxBody);
-    const out = await tx({ kind: "user", id: actor.personId, label: actor.label }, async (c) => {
+    // An operator's support session, or the install-wide token (the operator's own key): neither self-approves for the owner.
+    const support = who?.kind === "operator" && who.support ? who.support.id : who?.kind === "system" ? "install-token" : null;
+    const out = await tx({ kind: "user", id: actor.personId, label: actor.label, support }, async (c) => {
       const r = await fn(c, co, actor, body, m);
       if (who?.kind === "operator" && who.support) {
         await P.audit(c, auditActor(who), "support.write", co.tenantId, { path: url.pathname, as: actor.personName }, co.id);
@@ -1148,10 +1153,10 @@ coGet("/options", (c, co) => views.formOptions(c, co));
 
 coGet("/approvals", (c, co, _u, _m, p) => views.approvals(c, co, p));
 coPost("/approvals/([0-9a-fA-F-]{36})", (c, co, a, b, m) =>
-  act.decideRequest(c, co, a, { requestId: m[2], decision: b.decision, note: b.note, callback: b.callback }));
+  act.decideRequest(c, co, a, { requestId: m[2], decision: b.decision, note: b.note, callback: b.callback, confirm: b.confirm }));
 
 coGet("/bills", (c, co, url) => views.bills(c, co, param(url, "tab") || "attention"));
-coGet("/bills/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.bill(c, co, m[2]));
+coGet("/bills/([0-9a-fA-F-]{36})", (c, co, _u, m, p) => views.bill(c, co, m[2], p));
 coPost("/bills", (c, co, a, b) => act.newBill(c, co, a, b));
 coPost("/bills/([0-9a-fA-F-]{36})/accept", (c, co, a, b, m) => act.acceptBill(c, co, a, { id: m[2], reason: b.reason }));
 coPost("/bills/([0-9a-fA-F-]{36})/reject", (c, co, a, b, m) => act.rejectBill(c, co, a, { id: m[2], reason: b.reason }));
@@ -1162,20 +1167,20 @@ coGet("/vendors/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.vendor(c, co, m[2])
 coPost("/vendors/([0-9a-fA-F-]{36})", (c, co, a, b, m) => act.updateVendor(c, co, a, { ...b, id: m[2] }));
 coPost("/vendors/([0-9a-fA-F-]{36})/bank", (c, co, a, b, m) => act.requestVendorBank(c, co, a, { ...b, vendorId: m[2] }));
 
-coGet("/payment-runs", (c, co) => views.paymentRuns(c, co));
-coGet("/payment-runs/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.paymentRun(c, co, m[2]));
+coGet("/payment-runs", (c, co, _u, _m, p) => views.paymentRuns(c, co, p));
+coGet("/payment-runs/([0-9a-fA-F-]{36})", (c, co, _u, m, p) => views.paymentRun(c, co, m[2], p));
 coPost("/payment-runs", (c, co, a, b) => act.createPaymentRun(c, co, a, b));
 coPost("/payment-runs/([0-9a-fA-F-]{36})/submit", (c, co, a, _b, m) => act.submitPaymentRun(c, co, a, { id: m[2] }));
-coPost("/payment-runs/([0-9a-fA-F-]{36})/release", (c, co, a, _b, m) => act.releasePaymentRun(c, co, a, { id: m[2] }));
+coPost("/payment-runs/([0-9a-fA-F-]{36})/release", (c, co, a, b, m) => act.releasePaymentRun(c, co, a, { id: m[2], confirm: b.confirm }));
 coPost("/payment-runs/([0-9a-fA-F-]{36})/cancel", (c, co, a, _b, m) => act.cancelPaymentRun(c, co, a, { id: m[2] }));
 
-coGet("/payroll", (c, co) => views.payroll(c, co));
-coGet("/payroll/runs/([0-9a-fA-F-]{36})", (c, co, _u, m) => views.payrollRun(c, co, m[2]));
+coGet("/payroll", (c, co, _u, _m, p) => views.payroll(c, co, p));
+coGet("/payroll/runs/([0-9a-fA-F-]{36})", (c, co, _u, m, p) => views.payrollRun(c, co, m[2], p));
 coGet("/payroll/periods/([0-9a-fA-F-]{36})/timecards", (c, co, _u, m) => views.timecards(c, co, m[2]));
 coPost("/payroll/periods/([0-9a-fA-F-]{36})/approve-timecards", (c, co, a, _b, m) => act.approveTimecards(c, co, a, { periodId: m[2] }));
 coPost("/payroll/periods/([0-9a-fA-F-]{36})/build", (c, co, a, _b, m) => act.buildPayroll(c, co, a, { periodId: m[2] }));
 coPost("/payroll/runs/([0-9a-fA-F-]{36})/request", (c, co, a, _b, m) => act.requestPayroll(c, co, a, { runId: m[2] }));
-coPost("/payroll/runs/([0-9a-fA-F-]{36})/release", (c, co, a, _b, m) => act.releasePayroll(c, co, a, { runId: m[2] }));
+coPost("/payroll/runs/([0-9a-fA-F-]{36})/release", (c, co, a, b, m) => act.releasePayroll(c, co, a, { runId: m[2], confirm: b.confirm }));
 coPost("/payroll/runs/([0-9a-fA-F-]{36})/post", (c, co, a, _b, m) => act.postPayroll(c, co, a, { runId: m[2] }));
 coPost("/payroll/next-period", (c, co, a, b) => act.openNextPeriod(c, co, a, { payGroupId: b.payGroupId }));
 coPost("/payroll/groups", (c, co, a, b) => act.addPayGroup(c, co, a, b));

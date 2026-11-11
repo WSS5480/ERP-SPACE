@@ -12,7 +12,7 @@ import { today as bizToday } from "../packages/core/clock.ts";
 import { periodFor } from "../packages/core/periods.ts";
 import { type Client, type Scope, q, one, audit } from "../packages/core/db.ts";
 import { categoryInfo, VendorCategoryError } from "../packages/core/vendor_categories.ts";
-import { decide, openRequest } from "../packages/core/approvals.ts";
+import { decide, openRequest, selfApprovalFor, auditSelfApproval, needTypedTotal, RUN_RELEASERS, GATE_SIGN_OFF, releaseRoles, RELEASE_WORDS } from "../packages/core/approvals.ts";
 import { runGates, postToLedger, transition } from "../packages/core/invoice.ts";
 import { buildRun, requestRelease, release, postRun, IllustrativeTaxProvider, type Frequency, isFrequency,
          nextPeriod, periodStartingOn, periodStartProblem, PERIODS_PER_YEAR } from "../packages/core/payroll.ts";
@@ -56,7 +56,7 @@ function money(v: unknown): bigint {
  * payment run is cancelled so it can be rebuilt.
  */
 export async function decideRequest(c: Client, co: Company, a: Actor,
-                                    input: { requestId: unknown; decision: unknown; note: unknown; callback?: unknown }) {
+                                    input: { requestId: unknown; decision: unknown; note: unknown; callback?: unknown; confirm?: unknown }) {
   need(typeof input.requestId === "string" && UUID.test(input.requestId), "no such request");
   const decision = input.decision === "approved" ? "approved" : input.decision === "rejected" ? "rejected" : null;
   need(decision, "decide approved or rejected");
@@ -68,7 +68,7 @@ export async function decideRequest(c: Client, co: Company, a: Actor,
   need(req.length, "no such request");
   const s = scopeOf(co, a);
   const status = await decide(c, s, { requestId: input.requestId as string, actorId: a.personId, decision: decision!,
-                                      note: note || undefined, callbackLogged: input.callback === true });
+                                      note: note || undefined, callbackLogged: input.callback === true, confirm: input.confirm });
   const { subject_type: type, subject_id: id } = req[0];
 
   if (status === "approved") {
@@ -195,9 +195,13 @@ export async function acceptBill(c: Client, co: Company, a: Actor, input: { id: 
   // and never by the person who entered the bill.
   const held = await rolesOf(c, co, a.personId);
   need(SIGN_OFF.some((r) => held.has(r)), "letting a stopped bill through is for the controller or the owner");
-  need(inv.created_by !== a.personId, "whoever entered a bill cannot also let it through the gates");
+  // Never whoever entered it -- unless they are the owner and nobody else here could sign it off (0064).
+  const selfAccepted = await selfApprovalFor(c, co.id, a.personId, [inv.created_by], GATE_SIGN_OFF,
+    "whoever entered a bill cannot also let it through the gates");
   const s = scopeOf(co, a);
-  await transition(c, s, inv.id, "validated", `accepted by ${a.personName}: ${reason}`);
+  await q(c, `update invoice set accepted_by = $3, accepted_at = now(), self_accepted = $4 where id = $1 and entity_id = $2`, [inv.id, co.id, a.personId, selfAccepted]);
+  if (selfAccepted) await auditSelfApproval(c, s, "invoice", inv.id, { decision: "let through the gates", reason });
+  await transition(c, s, inv.id, "validated", `accepted by ${a.personName}${selfAccepted ? " (self-approved)" : ""}: ${reason}`);
   const approval = await openRequest(c, s, {
     subjectType: "invoice", subjectId: inv.id, amountMinor: BigInt(inv.total_minor),
     makerId: inv.created_by ?? a.personId,
@@ -445,12 +449,12 @@ async function makeBankCurrent(c: Client, co: Company, a: Actor, id: string, not
 
 // ------------------------------------------------------------ payment runs
 
-async function runOf(c: Client, co: Company, id: unknown) {
+async function runOf(c: Client, co: Company, id: unknown, lock = false) {
   need(typeof id === "string" && UUID.test(id), "no such payment run");
   const rows = await q<{ id: string; status: string; built_by: string; pay_date: string; method: string;
                           bank_account_id: string }>(c, `
     select id, status, built_by, pay_date::text, method, bank_account_id
-      from payment_run where id = $1 and entity_id = $2`, [id, co.id]);
+      from payment_run where id = $1 and entity_id = $2 ${lock ? "for update" : ""}`, [id, co.id]);
   need(rows.length, "no such payment run");
   return rows[0];
 }
@@ -518,18 +522,27 @@ export async function submitPaymentRun(c: Client, co: Company, a: Actor, input: 
  * leaves the operating account in the books on the pay date. The bank file
  * itself is the payment-file writer's job, which is still to build.
  */
-export async function releasePaymentRun(c: Client, co: Company, a: Actor, input: { id: unknown }) {
-  const run = await runOf(c, co, input.id);
+export async function releasePaymentRun(c: Client, co: Company, a: Actor, input: { id: unknown; confirm?: unknown }) {
+  const run = await runOf(c, co, input.id, true);
   need(run.status === "pending_release", run.status === "building" ? "send it for approval first" : `this run is already ${run.status}`);
-  need(run.built_by !== a.personId, "whoever built the run cannot release it");
+  // Releasing moves money: only someone who holds a releasing role (the same roles self-release counts).
+  const held = await rolesOf(c, co, a.personId);
+  need(releaseRoles("payment_run").some((r) => held.has(r)), RELEASE_WORDS.payment_run);
+  // Never whoever built it -- unless they are the owner and nobody else here could release it (0064): then the total is typed.
+  const selfReleased = await selfApprovalFor(c, co.id, a.personId, [run.built_by], RUN_RELEASERS.payment_run, "whoever built the run cannot release it");
   const req = await q<{ status: string }>(c, `
     select status from approval_request where entity_id = $1 and subject_type = 'payment_run' and subject_id = $2
      order by created_at desc limit 1`, [co.id, run.id]);
   need(!req.length || req[0].status === "approved", req[0]?.status === "open" ? "the approval is still open" : "the approval was not given");
 
   const s = scopeOf(co, a);
-  await q(c, `update payment_run set status = 'released', released_by = $2, released_at = now()
-               where id = $1 and entity_id = $3`, [run.id, a.personId, co.id]);
+  if (selfReleased) {
+    const t = await one<{ t: string }>(c, `select coalesce(sum(p.amount_minor), 0)::text t from payment p join payment_run pr on pr.id = p.payment_run_id and pr.entity_id = $2 where pr.id = $1`, [run.id, co.id]);
+    needTypedTotal(BigInt(t.t), input.confirm);
+  }
+  await q(c, `update payment_run set status = 'released', released_by = $2, released_at = now(), self_released = $4
+               where id = $1 and entity_id = $3`, [run.id, a.personId, co.id, selfReleased]);
+  if (selfReleased) await auditSelfApproval(c, s, "payment_run", run.id, { decision: "released" });
   await q(c, `update payment set status = 'sent'
                where payment_run_id = (select id from payment_run where id = $1 and entity_id = $2)`, [run.id, co.id]);
 
@@ -636,15 +649,22 @@ export async function requestPayroll(c: Client, co: Company, a: Actor, input: { 
   return await requestRelease(c, scopeOf(co, a), id, built.built_by);
 }
 
-export async function releasePayroll(c: Client, co: Company, a: Actor, input: { runId: unknown }) {
+export async function releasePayroll(c: Client, co: Company, a: Actor, input: { runId: unknown; confirm?: unknown }) {
   const id = await payrollRunOf(c, co, input.runId);
-  const st = await one<{ status: string }>(c, `select status from payroll_run where id = $1 and entity_id = $2`, [id, co.id]);
+  const st = await one<{ status: string; built_by: string; net_minor: string }>(c, `select status, built_by, net_minor from payroll_run where id = $1 and entity_id = $2 for update`, [id, co.id]);
   need(st.status === "pending_release", st.status === "building" ? "send it for approval first" : `this run is ${st.status}`);
+  // Releasing moves money: only someone who holds a releasing role (the same roles self-release counts).
+  const held = await rolesOf(c, co, a.personId);
+  need(releaseRoles("payroll_run").some((r) => held.has(r)), RELEASE_WORDS.payroll_run);
   const req = await q<{ status: string }>(c, `
     select status from approval_request where entity_id = $1 and subject_type = 'payroll_run' and subject_id = $2
      order by created_at desc limit 1`, [co.id, id]);
   need(!req.length || req[0].status === "approved", req[0]?.status === "open" ? "the approval is still open" : "the approval was not given");
-  await release(c, scopeOf(co, a), id, a.personId);
+  // Never whoever built it -- unless they are the owner and nobody else here could release it (0064): then the total is typed.
+  const selfReleased = await selfApprovalFor(c, co.id, a.personId, [st.built_by], RUN_RELEASERS.payroll_run, "whoever built the run cannot release it");
+  if (selfReleased) needTypedTotal(BigInt(st.net_minor), input.confirm);
+  await release(c, scopeOf(co, a), id, a.personId, { selfReleased });
+  if (selfReleased) await auditSelfApproval(c, scopeOf(co, a), "payroll_run", id, { decision: "released", net: st.net_minor });
   await q(c, `update pay_period set status = 'released'
                where id = (select pay_period_id from payroll_run where id = $1 and entity_id = $2)`, [id, co.id]);
   return { status: "released" };

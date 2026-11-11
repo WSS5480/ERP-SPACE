@@ -514,9 +514,10 @@
     const me = E.S.person ? E.S.person.id : null;
     return section('Write-offs', 'a second person approves each one', null, list(rows.map((w) => item({
       title: `${w.customer} · ${w.target}`, amount: money(w.amount_minor),
-      detail: `${w.method === 'direct' ? 'Bad debt (6900)' : 'Allowance (1190)'} · asked by ${w.requested_by_name || '?'} ${fmtDay(w.requested_at)}${w.decided_by_name ? ` · ${w.status} by ${w.decided_by_name}` : ''}${Number(w.recovered_minor) ? ` · ${money(w.recovered_minor)} recovered` : ''}`,
+      detail: `${w.method === 'direct' ? 'Bad debt (6900)' : 'Allowance (1190)'} · asked by ${w.requested_by_name || '?'} ${fmtDay(w.requested_at)}${w.decided_by_name ? ` · ${w.status} by ${w.decided_by_name}${w.self_approved ? ' (self-approved)' : ''}` : ''}${Number(w.recovered_minor) ? ` · ${money(w.recovered_minor)} recovered` : ''}`,
       why: w.reason, badge: chip(w.status === 'posted' ? 'good' : w.status === 'rejected' ? 'neutral' : 'warning', w.status === 'posted' ? 'ok' : w.status === 'rejected' ? 'x' : 'clock', cap(w.status)),
-      acts: w.status === 'pending' ? (w.requested_by === me ? [el('span', { class: 'ar-sub', text: 'Someone else approves this one.' })] : [
+      acts: w.status === 'pending' ? (w.requested_by === me && !w.self_ok ? [el('span', { class: 'ar-sub', text: 'Someone else approves this one.' })] : [
+        w.self_ok ? el('span', { class: 'ar-sub', text: 'You asked for it, and nobody else here can approve it, so you can (recorded as self-approved).' }) : null,
         el('button', { class: 'btn small primary', type: 'button', onclick: (e) => act(e.currentTarget, () => post(`/ar/writeoffs/${w.id}/decide`, { decision: 'approved' }), 'Written off') }, 'Approve'),
         el('button', { class: 'btn small', type: 'button', onclick: async (e) => { const note = await E.askReason({ title: 'Reject the write-off', confirm: 'Reject' }); if (note) act(e.target, () => post(`/ar/writeoffs/${w.id}/decide`, { decision: 'rejected', note }), 'Rejected'); } }, 'Reject')])
         : w.status === 'posted' && Number(w.recovered_minor) < Number(w.amount_minor) ? [el('button', { class: 'btn small', type: 'button', onclick: () => formDialog('Money in on a written-off balance', `${w.customer} · ${w.target}`, () => {

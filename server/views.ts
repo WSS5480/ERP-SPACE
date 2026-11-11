@@ -9,6 +9,8 @@
 import { today as bizToday } from "../packages/core/clock.ts";
 import { type Client, q, one } from "../packages/core/db.ts";
 import { handlerFor } from "../packages/core/connections.ts";
+import { recentDigests } from "../packages/core/owner_digest.ts";
+import { selfApprovalRefusal, selfConfirmFor, SUPPORT_SELF_APPROVAL, RUN_RELEASERS, GATE_SIGN_OFF, releaseRoles, type SelfConfirm } from "../packages/core/approvals.ts";
 
 export type Company = {
   id: string;
@@ -265,17 +267,22 @@ export async function approvals(c: Client, co: Company, personId: string | null)
     const waiting = who.length ? `waiting on ${either(who)}, the ${role}` : `nobody here holds the ${role} role yet; the owner can grant it`;
     let why = "";
     let canDecide = false;
+    let confirm: SelfConfirm | null = null;
     if (!personId) why = `Pick who you are acting as; ${waiting}`;
     else if (r.maker_id === personId) {
       // The owner of a company where nobody else could decide it approves it themselves (recorded as self-approved).
-      const anyoneElse = holders.some((h) => h.id !== personId && (h.role === r.step_role || h.role === "owner" || h.role === "controller"));
-      if (held.has("owner") && !anyoneElse) { canDecide = true; why = "You made it, and nobody else here can approve it, so you can (recorded as self-approved)"; }
+      // The same rule decide() applies (selfApprovalRefusal), so the screen never offers what the server refuses.
+      const refusal = await selfApprovalRefusal(c, co.id, personId, [r.step_role]);
+      if (refusal === null) { canDecide = true; why = "You made it, and nobody else here can approve it, so you can (recorded as self-approved)"; confirm = await selfConfirmFor(c, co.id, r.id); }
+      else if (refusal === SUPPORT_SELF_APPROVAL) why = "In support mode you cannot approve the owner's own request for them; the owner approves it signed in as themselves";
       else why = `You made it, so someone else approves it: ${waiting}`;
     }
     else if (already.has(personId)) why = `You decided an earlier step; the next is ${waiting}`;
     else if (!held.has(r.step_role)) why = cap(waiting);
     else canDecide = true;
-    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why, self: canDecide && r.maker_id === personId });
+    // a self-approval of new bank details or a run asks for the payee or the total to be typed (the server checks it)
+    const ask = confirm ? { kind: confirm.kind, prompt: confirm.prompt, expect: confirm.expect } : null;
+    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why, self: canDecide && r.maker_id === personId, confirm: ask });
   }
 
   const recent = await q(c, `
@@ -387,11 +394,12 @@ export async function bills(c: Client, co: Company, tab: string) {
   return { tab: BILL_TABS[tab] ? tab : "attention", rows: await plainReasons(c, co, rows), counts: tabCounts };
 }
 
-export async function bill(c: Client, co: Company, id: string) {
+export async function bill(c: Client, co: Company, id: string, personId: string | null = null) {
   const head = await q(c, `
     select i.id, i.vendor_id, coalesce(v.dba, v.legal_name) as vendor, v.legal_name, i.reference, i.kind,
            i.invoice_date::text, i.due_date::text, i.total_minor, i.status, i.confidence_bps, i.created_at,
-           i.created_by, u.name as created_by_name, i.purchase_order_id,
+           i.created_by, u.name as created_by_name, i.purchase_order_id, i.self_accepted,
+           (select au.name from app_user au where au.id = i.accepted_by) as accepted_by_name,
            (select t.expected_amount_minor from vendor_template t
               join vendor_entity ve on ve.id = t.vendor_entity_id and ve.entity_id = i.entity_id
              where ve.vendor_id = i.vendor_id and t.status = 'active' limit 1) as usual_minor
@@ -431,7 +439,11 @@ export async function bill(c: Client, co: Company, id: string) {
      order by je.posting_date, je.posted_at`, [id, co.id]);
   const steps = (requests as { steps: { role: string }[] | null }[]).map((r) => ({
     ...r, steps: (r.steps ?? []).map((s) => ({ ...s, role: roleWord(s.role) })) }));
-  return { ...head[0], lines, timeline: await plainReasons(c, co, timeline), requests: steps, payments, entries };
+  // the owner who entered a stopped bill may let it through themselves when nobody else here could (0064)
+  const h = head[0] as { created_by: string | null; status: string };
+  const selfAcceptOk = !!personId && h.created_by === personId && ["exception", "held"].includes(h.status)
+    && (await selfApprovalRefusal(c, co.id, personId, GATE_SIGN_OFF)) === null;
+  return { ...head[0], self_accept_ok: selfAcceptOk, lines, timeline: await plainReasons(c, co, timeline), requests: steps, payments, entries };
 }
 
 export async function vendors(c: Client, co: Company) {
@@ -488,9 +500,21 @@ export async function vendor(c: Client, co: Company, id: string) {
   return { ...rows[0], banks, bills, phone_changed_at: await phoneChangedAt(c, co, id) };
 }
 
-export async function paymentRuns(c: Client, co: Company) {
-  const runs = await q(c, `
-    select pr.id, pr.pay_date::text, pr.method, pr.status, pr.created_at, pr.released_at,
+/** A run the person built and may release themselves (0064): only the owner, only when nobody else could release it. */
+async function withSelfOk<R extends { built_by: string; status: string }>(c: Client, co: Company, runs: R[], personId: string | null, kind: "payment_run" | "payroll_run") {
+  const theirs = personId ? runs.filter((r) => r.built_by === personId && r.status === "pending_release") : [];
+  const ok = theirs.length ? (await selfApprovalRefusal(c, co.id, personId!, RUN_RELEASERS[kind])) === null : false;
+  // may this person release at all (the server's rule: a releasing role)?
+  const held = personId ? await q<{ role: string }>(c, `
+    select distinct g.role from role_grant g join app_user u on u.id = g.app_user_id
+     where g.app_user_id = $2 and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $3))`, [co.id, personId, co.tenantId]) : [];
+  const mayRelease = held.some((h) => releaseRoles(kind).includes(h.role));
+  return runs.map((r) => ({ ...r, may_release: mayRelease, self_ok: ok && r.built_by === personId && r.status === "pending_release" }));
+}
+
+export async function paymentRuns(c: Client, co: Company, personId: string | null = null) {
+  const runs0 = await q<{ id: string; built_by: string; status: string }>(c, `
+    select pr.id, pr.pay_date::text, pr.method, pr.status, pr.created_at, pr.released_at, pr.self_released,
            bu.name as built_by_name, ru.name as released_by_name, pr.built_by,
            ba.name as bank_account, ba.account_last4,
            (select count(*) from payment p where p.payment_run_id = pr.id)::int as payments,
@@ -507,6 +531,7 @@ export async function paymentRuns(c: Client, co: Company) {
       left join bank_account ba on ba.id = pr.bank_account_id
      where pr.entity_id = $1
      order by pr.pay_date desc, pr.created_at desc limit 20`, [co.id]);
+  const runs = await withSelfOk(c, co, runs0, personId, "payment_run");
   const eligible = await q(c, `
     select i.id, coalesce(v.dba, v.legal_name) as vendor, i.reference, i.invoice_date::text, i.due_date::text,
            i.total_minor, (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as credited_minor, i.total_minor - (select coalesce(sum(a.amount_minor), 0) from vendor_memo_application a where a.invoice_id = i.id and a.entity_id = i.entity_id) as net_minor,
@@ -522,8 +547,8 @@ export async function paymentRuns(c: Client, co: Company) {
   return { runs, eligible, operating: bank[0] ?? null };
 }
 
-export async function paymentRun(c: Client, co: Company, id: string) {
-  const runs = (await paymentRuns(c, co)).runs as { id: string }[];
+export async function paymentRun(c: Client, co: Company, id: string, personId: string | null = null) {
+  const runs = (await paymentRuns(c, co, personId)).runs as { id: string }[];
   const run = runs.find((r) => r.id === id) ?? (await q(c, `
     select pr.id, pr.pay_date::text, pr.method, pr.status from payment_run pr where pr.id = $1 and pr.entity_id = $2`,
     [id, co.id]))[0];
@@ -545,7 +570,7 @@ export async function paymentRun(c: Client, co: Company, id: string) {
  * Payroll, one pay group at a time: each group runs on its own schedule, with
  * its own period open and its own people.
  */
-export async function payroll(c: Client, co: Company) {
+export async function payroll(c: Client, co: Company, personId: string | null = null) {
   const groups = await q<{ id: string }>(c, `
     select pg.id, pg.name, pg.frequency, pg.pay_lag_days, pg.workweek_start_dow, pg.overtime_after_hours,
            ba.name as bank_account, ba.account_last4,
@@ -567,10 +592,10 @@ export async function payroll(c: Client, co: Company) {
       from pay_period pp join pay_group pg on pg.id = pp.pay_group_id
      where pg.entity_id = $1 and pp.status not in ('posted','cancelled')
      order by pp.pay_date`, [co.id]);
-  const runs = await q(c, `
+  const runs0 = await q<{ id: string; built_by: string; status: string }>(c, `
     select pr.id, pg.name as pay_group, pp.pay_date::text, pp.starts_on::text, pp.ends_on::text, pr.status, pr.gross_minor, pr.net_minor,
            pr.employee_tax_minor, pr.employer_tax_minor, pr.deductions_minor, pr.tax_provider,
-           pr.built_by, bu.name as built_by_name, ru.name as released_by_name, pr.released_at,
+           pr.built_by, bu.name as built_by_name, ru.name as released_by_name, pr.released_at, pr.self_released,
            (select count(*) from payroll_line pl where pl.payroll_run_id = pr.id)::int as employees,
            (select r.status from approval_request r where r.subject_type = 'payroll_run' and r.subject_id = pr.id
              order by r.created_at desc limit 1) as approval_status,
@@ -585,6 +610,7 @@ export async function payroll(c: Client, co: Company) {
       left join app_user ru on ru.id = pr.released_by
      where pr.entity_id = $1
      order by pp.pay_date desc, pr.created_at desc limit 12`, [co.id]);
+  const runs = await withSelfOk(c, co, runs0, personId, "payroll_run");
   const employees = await q(c, `
     select e.id, e.employee_no, e.first_name || ' ' || e.last_name as name, e.position, e.pay_type, e.base_rate_minor, e.status,
            e.hired_on::text, e.terminated_on::text, po.name as store, e.comp_class_code, e.work_state,
@@ -639,8 +665,8 @@ export async function employee(c: Client, co: Company, id: string) {
   return { ...rows[0], pending: pending[0] ?? null, history, pay };
 }
 
-export async function payrollRun(c: Client, co: Company, id: string) {
-  const runs = (await payroll(c, co)).runs as { id: string }[];
+export async function payrollRun(c: Client, co: Company, id: string, personId: string | null = null) {
+  const runs = (await payroll(c, co, personId)).runs as { id: string }[];
   const run = runs.find((r) => r.id === id);
   if (!run) return null;
   const lines = await q(c, `
@@ -1107,6 +1133,10 @@ export async function home(c: Client, co: Company, personId: string | null) {
     cash: { total: cashTotal.toString(), operating, byPurpose: cashRows },
     bills: billStats,
     approvals: { mine: appr.mine, othersCount: appr.others.length },
+    selfDigests: personId && (await q(c, `
+      select 1 from role_grant g join app_user u on u.id = g.app_user_id
+       where g.app_user_id = $2 and g.role = 'owner' and (g.entity_id = $1 or (g.entity_id is null and u.tenant_id = $3)) limit 1`, [co.id, personId, co.tenantId])).length
+      ? await recentDigests(c, co.id) : [],
     payroll: nextPay,
     payGroups: payGroups.n,
     hires: (await q<{ n: number }>(c, `select count(*)::int as n from employee where entity_id = $1 and status = 'applicant'`, [co.id]))[0].n,

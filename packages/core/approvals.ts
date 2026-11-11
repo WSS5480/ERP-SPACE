@@ -6,7 +6,7 @@
 //   3. a decided request is immutable; a change opens a new one
 //   4. an agent calls this through the same interface a person does
 
-import { type Client, type Scope, audit, one, q } from "./db.ts";
+import { type Client, type Scope, audit, one, q, inSupport } from "./db.ts";
 
 export type SubjectType =
   | "invoice"
@@ -121,23 +121,141 @@ async function holdsRole(c: Client, userId: string, entityId: string, role: stri
   return rows.length > 0;
 }
 
+/** Said when an operator in support mode, acting as the owner, would self-approve. */
+export const SUPPORT_SELF_APPROVAL =
+  "support mode never self-approves for the owner: the owner decides their own request, signed in as themselves";
+
 /**
- * May the maker decide their own request's step? Only the owner, and only when
- * no one else active in the company holds the step's role, the owner role or
- * the controller role (a controller is a real second pair of eyes even where
- * the step names another role, so a company that has one keeps maker-checker).
- * The approval types this frees in a one-person company are every type the
- * engine routes: vendor, vendor_bank_account, invoice, payment_run,
- * payroll_run, employee, employee_change, journal_entry, fiscal_period.
+ * Why may this person not decide their own request here (null: they may)?
+ * Only the owner, and only when no one else active in the company holds the
+ * owner role, the controller role or one of the roles that could decide it (a
+ * controller is a real second pair of eyes even where the step names another
+ * role, so a company that has one keeps maker-checker). Never an operator in
+ * support mode acting as the owner. The database says the same in
+ * self_approve_refusal() (migration 0063), which every self_approved row is
+ * checked against.
  */
-export async function mayDecideOwn(c: Client, userId: string, entityId: string, role: string): Promise<boolean> {
-  if (!(await holdsRole(c, userId, entityId, "owner"))) return false;
+export async function selfApprovalRefusal(c: Client, entityId: string, userId: string, roles: string[]): Promise<string | null> {
+  if (await inSupport(c)) return SUPPORT_SELF_APPROVAL;
+  if (!(await holdsRole(c, userId, entityId, "owner"))) return "only the owner may approve their own request";
   const others = await q(c, `
     select 1 from role_grant g join app_user u on u.id = g.app_user_id join entity e on e.id = $2
-     where u.id <> $1 and u.status = 'active' and g.role in ($3, 'owner', 'controller')
+     where u.id <> $1 and u.status = 'active' and g.role = any (array['owner', 'controller'] || $3::text[])
        and (g.entity_id = $2 or (g.entity_id is null and u.tenant_id = e.tenant_id))
-     limit 1`, [userId, entityId, role]);
-  return others.length === 0;
+     limit 1`, [userId, entityId, roles]);
+  return others.length ? "someone else in this company can approve it, so the maker may not" : null;
+}
+
+/**
+ * May the maker decide their own request's step? (selfApprovalRefusal is null.)
+ * The approval types this frees in a one-person company are every type the
+ * engine routes: vendor, vendor_bank_account, invoice, payment_run,
+ * payroll_run, employee, employee_change, journal_entry, fiscal_period; and,
+ * outside the engine, stock counts, A/R write-offs, debit memos and time off.
+ */
+export async function mayDecideOwn(c: Client, userId: string, entityId: string, role: string | string[]): Promise<boolean> {
+  return (await selfApprovalRefusal(c, entityId, userId, Array.isArray(role) ? role : [role])) === null;
+}
+
+/**
+ * A flow outside the engine decides its own maker's request: null when the
+ * decider is not the maker (the flow's usual rules apply), true when the maker
+ * may decide it as a self-approval, and a refusal (thrown) otherwise.
+ */
+export async function selfApprovalFor(c: Client, entityId: string, deciderId: string, makerIds: (string | null | undefined)[], roles: string[], refusal: string): Promise<boolean> {
+  if (!makerIds.some((m) => m && m === deciderId)) return false;
+  const why = await selfApprovalRefusal(c, entityId, deciderId, roles);
+  if (why === SUPPORT_SELF_APPROVAL) throw new ApprovalError(SUPPORT_SELF_APPROVAL);
+  if (why) throw new ApprovalError(refusal);
+  return true;
+}
+
+/**
+ * Who could release a run besides its builder (with the owner and a controller,
+ * who always count), and who could let a bill through the gates: a builder or
+ * an enterer may do it themselves only when none of these is anyone else (0064).
+ */
+export const RUN_RELEASERS: Record<"payment_run" | "payroll_run", string[]> = { payment_run: ["approver", "ap_clerk"], payroll_run: ["hr"] };
+export const GATE_SIGN_OFF = ["controller"];
+/**
+ * Who may release a run at all: the owner, a controller, and the run's releasing roles. The same set
+ * self-release counts as "someone else who could release it", so the two rules cannot drift apart.
+ */
+export const releaseRoles = (kind: "payment_run" | "payroll_run") => ["owner", "controller", ...RUN_RELEASERS[kind]];
+export const RELEASE_WORDS: Record<"payment_run" | "payroll_run", string> = {
+  payment_run: "releasing a payment run is for the owner, a controller, an approver or an A/P clerk",
+  payroll_run: "releasing payroll is for the owner, a controller or HR",
+};
+
+/** Dollars and cents as the screens show them ($1,234.56). */
+export const usdText = (minor: bigint) => fmtUsd(minor);
+
+/** The owner releasing their own run types its total; refused in a sentence otherwise. */
+export function needTypedTotal(totalMinor: bigint, typed: unknown) {
+  const m = typedMinor(typeof typed === "string" ? typed : "");
+  if (m === null || m !== totalMinor) throw new ApprovalError(`to release your own run, type its total exactly: ${fmtUsd(totalMinor)}`);
+}
+
+/** Audit the maker's own decision (every flow writes the same row). */
+export async function auditSelfApproval(c: Client, scope: Scope, table: string, rowId: string, after: Record<string, unknown>) {
+  await audit(c, scope, { table, rowId, action: "transition", reason: "self-approved: no other approver", after });
+}
+
+// ------------------------------------------------- typed confirmation --
+
+/**
+ * Self-approving money going out of the door needs the owner to type what it
+ * is: the payee's name for new vendor bank details, the total for a payment or
+ * payroll run. Null when the subject needs no typed confirmation.
+ */
+export type SelfConfirm = { kind: "payee"; prompt: string; expect: string; accept: string[] } | { kind: "amount"; prompt: string; expect: string; minor: string };
+
+const fmtUsd = (minor: bigint) => {
+  const neg = minor < 0n; const v = neg ? -minor : minor;
+  const d = (v / 100n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${neg ? "-" : ""}$${d}.${(v % 100n).toString().padStart(2, "0")}`;
+};
+const squash = (s: string) => s.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+/** Dollars and cents a person typed ("$1,284.55", "1284.55", "1284.5", "1284") in minor units, or null. */
+export function typedMinor(s: string): bigint | null {
+  const t = String(s ?? "").replace(/[$,\s]/g, "");
+  const m = /^(\d{1,12})(?:\.(\d{1,2}))?$/.exec(t);
+  if (!m) return null;
+  return BigInt(m[1]) * 100n + BigInt((m[2] ?? "0").padEnd(2, "0"));
+}
+
+export async function selfConfirmFor(c: Client, entityId: string, requestId: string): Promise<SelfConfirm | null> {
+  const r = (await q<{ subject_type: string; subject_id: string; amount_minor: string | null }>(c,
+    `select subject_type, subject_id, amount_minor from approval_request where id = $1 and entity_id = $2`, [requestId, entityId]))[0];
+  if (!r) return null;
+  if (r.subject_type === "vendor_bank_account") {
+    const v = (await q<{ dba: string | null; legal_name: string }>(c, `
+      select v.dba, v.legal_name from vendor_bank_account b join vendor v on v.id = b.vendor_id
+       where b.id = $1 and b.vendor_id in (select vendor_id from vendor_entity where entity_id = $2)`, [r.subject_id, entityId]))[0];
+    if (!v) return null;
+    const name = v.dba || v.legal_name;
+    return { kind: "payee", prompt: "Type the payee's name to approve your own bank change", expect: name,
+             accept: [...new Set([v.dba, v.legal_name].filter((x): x is string => !!x).map(squash))] };
+  }
+  if (r.subject_type === "payment_run" || r.subject_type === "payroll_run") {
+    let total = r.amount_minor;
+    if (total == null) {
+      total = r.subject_type === "payment_run"
+        ? (await one<{ t: string }>(c, `select coalesce(sum(p.amount_minor), 0)::text t from payment p join payment_run pr on pr.id = p.payment_run_id and pr.entity_id = $2 where pr.id = $1`, [r.subject_id, entityId])).t
+        : (await one<{ t: string }>(c, `select coalesce(net_minor, 0)::text t from payroll_run where id = $1 and entity_id = $2`, [r.subject_id, entityId])).t;
+    }
+    return { kind: "amount", prompt: `Type the ${r.subject_type === "payment_run" ? "run's total" : "payroll's total"} to approve your own run`,
+             expect: fmtUsd(BigInt(total)), minor: String(total) };
+  }
+  return null;
+}
+
+/** Does what the person typed match? */
+export function confirmMatches(conf: SelfConfirm, typed: unknown): boolean {
+  const s = typeof typed === "string" ? typed : "";
+  if (conf.kind === "payee") return !!s.trim() && conf.accept.includes(squash(s));
+  const m = typedMinor(s);
+  return m !== null && m === BigInt(conf.minor);
 }
 
 export type Decision = "approved" | "rejected";
@@ -155,6 +273,8 @@ export async function decide(
     decision: Decision;
     note?: string;
     callbackLogged?: boolean;
+    /** what the owner typed to confirm their own approval (payee name, or the run's total) */
+    confirm?: unknown;
   }
 ): Promise<"open" | "approved" | "rejected"> {
   const req = await one<{
@@ -193,10 +313,20 @@ export async function decide(
   // The maker is never the checker -- unless they are the owner and nobody else in the company
   // could decide this step (a one-person store would otherwise wait forever). Checked again by the database.
   let selfApproved = false;
+  let confirmed: SelfConfirm | null = null;
   if (req.maker_id === input.actorId) {
-    if (!(await mayDecideOwn(c, input.actorId, req.entity_id, next.required_role)))
-      throw new ApprovalError("the maker cannot approve their own request");
+    const why = await selfApprovalRefusal(c, req.entity_id, input.actorId, [next.required_role]);
+    if (why === SUPPORT_SELF_APPROVAL) throw new ApprovalError(SUPPORT_SELF_APPROVAL);
+    if (why) throw new ApprovalError("the maker cannot approve their own request");
     selfApproved = true;
+    if (input.decision === "approved") {
+      confirmed = await selfConfirmFor(c, req.entity_id, input.requestId);
+      if (confirmed && !confirmMatches(confirmed, input.confirm)) {
+        throw new ApprovalError(confirmed.kind === "payee"
+          ? `to approve your own bank change, type the payee's name as it is on file: ${confirmed.expect}`
+          : `to approve your own run, type its total exactly: ${confirmed.expect}`);
+      }
+    }
   }
 
   if (!selfApproved && !(await holdsRole(c, input.actorId, req.entity_id, next.required_role)))
@@ -217,7 +347,8 @@ export async function decide(
   if (selfApproved) {
     await audit(c, scope, { table: "approval_request", rowId: input.requestId, action: "transition",
       reason: "self-approved: no other approver",
-      after: { subject: req.subject_type, subjectId: req.subject_id, step: next.seq, role: next.required_role, decision: input.decision } });
+      after: { subject: req.subject_type, subjectId: req.subject_id, step: next.seq, role: next.required_role, decision: input.decision,
+               ...(confirmed ? { typedConfirmation: confirmed.kind, confirmedAs: confirmed.expect } : {}) } });
   }
 
   let status: "open" | "approved" | "rejected" = "open";
