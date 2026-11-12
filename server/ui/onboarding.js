@@ -70,7 +70,7 @@
     const live = d.wentLive;
     if (live) {
       return el('div', { class: 'ob-pad' }, resultBox('good', 'ok', live.bySale ? 'Trading has begun' : 'Gone live',
-        live.bySale ? 'This company has posted a sale, so it counts as live: ERP setup no longer approves anything for it.'
+        live.bySale ? 'This company has begun trading (money in or out, or a sale, is in its books), so it counts as live: ERP setup no longer approves anything for it.'
           : `Went live ${ago(live.at)}, by ${live.by}${live.setupItems ? `, after reviewing ${plural(live.setupItems, 'approval')} made by ERP setup` : ''}. From then on ERP setup approves nothing for this company.`),
         list.length ? el('button', { class: 'btn small', type: 'button', onclick: () => setupDrill(list, 'Approved by ERP setup') }, `What ERP setup approved (${list.length})`) : null);
     }
@@ -81,7 +81,7 @@
     const ready = s.status === 'done';
     const go = el('button', { class: 'btn primary', type: 'button', disabled: !owner || !ready || null, onclick: (e) => {
       if (list.length && !tick.checked) { err.replaceChildren(resultBox('warning', 'warn', 'Tick the review first', 'Look over what ERP setup approved, then tick that you reviewed it.')); return; }
-      act(e.currentTarget, () => post('/onboarding/go-live', { reviewed: tick.checked }), 'Gone live', { errorInto: (x) => err.replaceChildren(resultBox('critical', 'fail', 'Not live yet', E.friendly(x))) });
+      act(e.currentTarget, () => post('/onboarding/go-live', { reviewed: tick.checked ? list.map((x) => x.requestId) : null }), 'Gone live', { errorInto: (x) => err.replaceChildren(resultBox('critical', 'fail', 'Not live yet', E.friendly(x))) });
     } }, E.icon('check'), 'Go live');
     return el('div', { class: 'ob-pad' },
       el('div', { class: 'k', text: 'Approved by ERP setup' }),

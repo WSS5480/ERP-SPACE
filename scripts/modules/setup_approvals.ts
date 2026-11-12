@@ -222,13 +222,47 @@ export async function run(t: T) {
     const viaSupport = await asA("POST", "/onboarding/go-live", { reviewed: true });
     t.ok("go-live: ERP setup cannot press Go live in support mode (409)", viaSupport.status === 409 && /owner's own step/.test(String(viaSupport.data.error)), `${viaSupport.status} ${viaSupport.data.error}`);
     await t.throws("go-live: the owner is asked to tick the review first when ERP setup approved anything",
-      () => tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => ob.goLive(c, A.scope, { reviewed: false })), /reviewed what ERP setup approved/);
-    const went = await tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => ob.goLive(c, A.scope, { reviewed: true }));
+      () => tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => ob.goLive(c, A.scope, { reviewed: null })), /reviewed what ERP setup approved/);
+    // review of 0066: the operator mints a tenant API token in support mode; with it, "as the owner", Go live is refused
+    const minted = await call("POST", "/api/tenant/tokens", { cookie, body: { name: `Probe app ${A.tag}` } });
+    const viaToken = await fetch(`${base}/api/c/${A.entityId}/onboarding/go-live`, { method: "POST", headers: { "content-type": "application/json", "x-erp-page": "1",
+      "x-erp-as": A.ownerId, authorization: `Bearer ${minted.data.token}`, "x-forwarded-for": "198.51.100.91" }, body: JSON.stringify({ reviewed: review.map((r) => r.requestId) }) });
+    const viaTokenErr = String(((await viaToken.json()) as { error?: string }).error ?? "");
+    t.ok("go-live: a tenant API token acting as the owner cannot press Go live (only the owner signed in as themselves)", !!minted.data.token && viaToken.status === 409 && /signed in as themselves/.test(viaTokenErr), `${viaToken.status} ${viaTokenErr}`);
+    // review of 0066: ERP setup approves one more after the owner opened the list; the old tick no longer covers it
+    const raceV = await asA("POST", "/vendors", { name: `Race Vendor ${A.tag}`, category: merch.code, merchandise: true });
+    const lateReq = await reqFor(A, "vendor", String(raceV.data.id));
+    const lateOk = await asA("POST", `/approvals/${lateReq}`, { decision: "approved" });
+    await t.throws("go-live: something ERP setup approved after the owner opened the list sends them back to it",
+      () => tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => ob.goLive(c, A.scope, { reviewed: review.map((r) => r.requestId) })), /approved 1 more since you opened this list/);
+    t.ok("go-live: (that late approval was a setup approval)", lateOk.status === 200 && lateOk.data.status === "approved", `${lateOk.status} ${lateOk.data.error ?? ""}`);
+    review.push(...(await read(t, (c) => ob.setupApprovals(c, A.entityId))).filter((r) => r.requestId === lateReq));
+    // review of 0066: a setup approval in flight when the owner presses Go live: go-live waits for it, then lists it and refuses (no write skew)
+    {
+      const skewV = await asA("POST", "/vendors", { name: `Skew Vendor ${A.tag}`, category: merch.code, merchandise: true });
+      const skewReq = await reqFor(A, "vendor", String(skewV.data.id));
+      const c1 = await t.pool.connect();
+      await c1.query("begin");
+      await c1.query("select set_config('erp.support', $1, true)", [session]);
+      await c1.query(`update approval_step set decision = 'approved', actor_id = $2, decided_at = now(), setup_session = $3 where request_id = $1 and decision is null /* unscoped: check */`, [skewReq, A.ownerId, session]);
+      let waited = "";
+      const goLiveTx = tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => ob.goLive(c, A.scope, { reviewed: review.map((r) => r.requestId) }))
+        .then(() => { waited = "went live"; }, (e: Error) => { waited = e.message; });
+      await new Promise((r) => setTimeout(r, 400));
+      const stillWaiting = waited === "";
+      await c1.query(`update approval_request set status = 'approved', decided_at = now() where id = $1 /* unscoped: check */`, [skewReq]);
+      await c1.query("commit"); c1.release();
+      await goLiveTx;
+      t.ok("go-live: a setup approval in flight when the owner presses Go live: go-live waits, then lists it and sends the owner back", stillWaiting && /approved 1 more/.test(waited), `${stillWaiting} ${waited}`);
+      review.push(...(await read(t, (c) => ob.setupApprovals(c, A.entityId))).filter((r) => r.requestId === skewReq));
+    }
+    const went = await tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => ob.goLive(c, A.scope, { reviewed: review.map((r) => r.requestId) }));
     const gl = (await rows<{ setup_items: number; reviewed_setup: boolean }>(t, `select setup_items, reviewed_setup from company_go_live where entity_id = $1`, [A.entityId]))[0];
     t.ok("go-live: the owner ticks the review and goes live; recorded with what was reviewed", went.wentLive && gl?.reviewed_setup === true && gl.setup_items === review.length, JSON.stringify(gl));
     await t.throws("go-live: it cannot be undone (no delete)", () => tx(SYS, (c) => c.query(`delete from company_go_live where entity_id = $1`, [A.entityId])), /append-only/);
+    await t.throws("go-live: nor emptied (truncate)", () => tx(SYS, (c) => c.query(`truncate company_go_live`)), /append-only/);
     await t.throws("go-live: nor changed", () => tx(SYS, (c) => c.query(`update company_go_live set went_live_at = now() - interval '1 day' where entity_id = $1`, [A.entityId])), /append-only/);
-    await t.throws("go-live: nor pressed twice", () => tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => ob.goLive(c, A.scope, { reviewed: true })), /already gone live/);
+    await t.throws("go-live: nor pressed twice", () => tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => ob.goLive(c, A.scope, { reviewed: [] })), /already gone live/);
 
     // ---- after go-live: ERP setup is refused
     const late = await asA("POST", "/vendors", { name: `Late Vendor ${A.tag}`, category: merch.code, merchandise: true });
@@ -267,6 +301,14 @@ export async function run(t: T) {
     // ======================================================= both recorded
     const live = await read(t, async (c) => (await q<{ a: boolean; b: boolean }>(c, `select company_went_live($1) a, company_went_live($2) b /* unscoped: check */`, [A.entityId, B.entityId]))[0]);
     t.ok("go-live: company_went_live() sees both recorded go-lives", live.a && live.b);
+    // review of 0066: money taken in (a receipt, a deposit, a bill) counts as trading, not only a handed-over sale
+    const C = await freshCompany(t, "Deposit Furniture");
+    const before = await read(t, async (c) => (await q<{ l: boolean }>(c, `select company_went_live($1) l /* unscoped: check */`, [C.entityId]))[0].l);
+    const cash = (await rows<{ code: string }>(t, `select g.code from bank_account b join gl_account g on g.id = b.gl_account_id where b.entity_id = $1 limit 1`, [C.entityId]))[0].code;
+    await tx({ kind: "user", id: C.ownerId, label: "Owner" }, (c) => post(c, C.scope, { date: C.today, sourceType: "receipt", sourceId: null, description: "Deposit on a sofa",
+      lines: [{ code: cash, debit: 50000n }, { code: "2300", credit: 50000n }] }));
+    const after = await read(t, async (c) => (await q<{ l: boolean }>(c, `select company_went_live($1) l /* unscoped: check */`, [C.entityId]))[0].l);
+    t.ok("go-live: a company that has taken a deposit (a receipt, no sale yet) counts as live", before === false && after === true, `${before} ${after}`);
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
     if (saved.logins === undefined) delete process.env.ERP_LOGINS; else process.env.ERP_LOGINS = saved.logins;

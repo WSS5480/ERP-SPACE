@@ -676,7 +676,7 @@ function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body:
       // The company is checked before the body is even read.
       co = await companyFor(c0, who, m[1]);
       const a = (await acting(c0, co, req, who!, true))!;
-      actor = { personId: a.personId, personName: a.personName, label: a.label };
+      actor = { personId: a.personId, personName: a.personName, label: a.label, via: who!.kind };
     } finally {
       c0.release();
     }

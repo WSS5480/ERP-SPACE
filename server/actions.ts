@@ -26,7 +26,8 @@ import { PRESETS, presetPack, applyPresetSwitches } from "../packages/core/servi
 /** A refusal a person can act on. The server turns it into a 409 with the message. */
 export class ActionError extends Error {}
 
-export type Actor = { personId: string; personName: string; label: string };
+/** via: how the request came in (a signed-in customer, an operator, the install token, a tenant API token). */
+export type Actor = { personId: string; personName: string; label: string; via?: "customer" | "operator" | "system" | "tenant" };
 
 export const scopeOf = (co: Company, a: Actor, kind: "user" | "agent" | "system" = "user"): Scope => ({
   tenantId: co.tenantId,

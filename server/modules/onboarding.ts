@@ -69,7 +69,10 @@ export const module: ErpModule = {
     // ---- go live (0066): the owner's own step, once the go-live check passes; ends ERP setup's approvals for good
     coPost("/onboarding/go-live", async (c, co, a, b) => {
       await requireRole(c, co, a, ["owner"], "taking the company live");
-      return plain(() => ob.goLive(c, scopeOf(co, a), { reviewed: b.reviewed === true }));
+      // the owner signed in as themselves: not an API token (a tenant token can be minted by ERP setup in support mode), not support mode
+      need(a.via === "customer", "Go live is the owner's own step, signed in as themselves (not with an API token or in support mode)");
+      const reviewed = Array.isArray(b.reviewed) ? b.reviewed.filter((x: unknown): x is string => typeof x === "string").slice(0, 1000) : b.reviewed === true ? [] : null;
+      return plain(() => ob.goLive(c, scopeOf(co, a), { reviewed }));
     });
 
     // ---- company details

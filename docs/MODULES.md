@@ -1037,18 +1037,24 @@ result and on the Go-live step, one line per request with its record
 (`vendor:`, `person:`, `entry:`, `period:`).
 
 **Go live** (`company_go_live`, one row per company, append-only through
-`role_removal_keep`): `POST /onboarding/go-live`, the owner's, never from
-support mode or the install token; needs the checklist complete (the go-live
-check passes) and, when ERP setup approved anything, `reviewed: true` (the
-"I've reviewed what ERP setup approved" tick). Records who, when, how many
-setup approvals and that they were reviewed. Before 0066 go-live was only
+`role_removal_keep`, truncate refused too): `POST /onboarding/go-live`, the
+owner's, signed in as themselves only (a customer session: never support mode,
+the install token or a tenant API token, which ERP setup can mint in support
+mode); needs the checklist complete (the go-live check passes) and, when ERP
+setup approved anything, `reviewed: [request ids]`: the list the owner was
+shown. Anything ERP setup approved that is not in it sends the owner back to
+the list. Go-live locks the company row for update and the approval-step guard
+takes it for share on a setup approval, so an approval in flight is either
+listed (and refuses go-live) or sees the go-live (and is refused). Records who,
+when, how many setup approvals and that they were reviewed. Before 0066 go-live was only
 computed (the go-live step turns done when the tie-outs pass, and can turn
 back), so it is now a recorded moment that nothing undoes; the step's status
 is still computed as before. `company_went_live(entity)` is true once that row
-exists **or the company has posted a sale** (a customer that trades without
-pressing the button does not keep the window open). 0066 records companies
-already trading (journal entries other than opening, closing and stock
-adjustments) as live (`kind = 'migration'`). The demo reset removes the
+exists **or the company has begun trading** (`company_traded`: a sale,
+receipt, refund, deposit, A/R, finance, bill, payment, payroll, service,
+commission or fleet entry; opening balances, opening stock, manual
+corrections and transfers do not count). 0066 records companies already
+trading by the same test as live (`kind = 'migration'`). The demo reset removes the
 demo's row like its other rows; the demo is allowed either way.
 
 **Screens.** Approvals: in support mode a banner says whether ERP setup may

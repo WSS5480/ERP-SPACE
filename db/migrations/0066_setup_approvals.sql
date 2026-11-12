@@ -50,17 +50,32 @@ create table company_go_live (
 create trigger company_go_live_keep before update or delete on company_go_live
   for each row execute function role_removal_keep();
 
-/** Has this company gone live: the owner pressed Go live, or it has posted a sale (trading has begun)? */
-create or replace function company_went_live(p_entity uuid) returns boolean
+-- nor emptied (row triggers do not see truncate)
+create trigger company_go_live_no_truncate before truncate on company_go_live
+  for each statement execute function role_removal_keep();
+
+/**
+ * Has this company begun trading: money in or out, or a sale, posted in its
+ * books (review of 0066: a deposit, a web order paid, a bill, a payroll or an
+ * A/R payment counts, not only a handed-over sale). Setup-only entries
+ * (opening balances, opening stock, corrections, transfers) do not.
+ */
+create or replace function company_traded(p_entity uuid) returns boolean
 language sql stable as $$
-  select exists (select 1 from company_go_live g where g.entity_id = p_entity)
-      or exists (select 1 from journal_entry je where je.entity_id = p_entity and je.source_type = 'sale')
+  select exists (select 1 from journal_entry je where je.entity_id = p_entity
+                  and je.source_type in ('sale', 'receipt', 'refund', 'deposit', 'ar', 'finance', 'invoice', 'payment', 'payroll', 'service', 'commission', 'fleet'))
 $$;
 
--- Companies already trading when this runs are live (their onboarding is over).
+/** Has this company gone live: the owner pressed Go live, or it has begun trading? */
+create or replace function company_went_live(p_entity uuid) returns boolean
+language sql stable as $$
+  select exists (select 1 from company_go_live g where g.entity_id = p_entity) or company_traded(p_entity)
+$$;
+
+-- Companies already trading when this runs are live (their onboarding is over): the same test as company_went_live().
 insert into company_go_live (tenant_id, entity_id, by_label, kind)
 select e.tenant_id, e.id, 'migration 0066 (already trading)', 'migration' from entity e
- where exists (select 1 from journal_entry je where je.entity_id = e.id and je.source_type not in ('opening', 'closing', 'inventory'));
+ where company_traded(e.id);
 
 -- ------------------------------------------------------ the setup rule --
 
@@ -180,6 +195,9 @@ begin
 
   -- ERP setup, before go-live: the shared rule told the subject, under the session making it
   if new.setup_session is not null then
+    -- Go live (onboarding.goLive) locks the company row for update: a setup approval waits for it and then sees
+    -- the go-live, or go-live waits for the approval and then lists it (no write skew between the two).
+    perform 1 from entity where id = v_entity for share;
     if new.setup_session is distinct from nullif(current_setting('erp.support', true), '') then
       raise exception 'a setup approval is marked with the support session making it' using errcode = 'check_violation';
     end if;

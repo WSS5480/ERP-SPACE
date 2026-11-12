@@ -425,8 +425,8 @@ export async function goneLive(c: Client, entityId: string) {
   const r = await q<{ at: string; by: string; kind: string; setup_items: number; reviewed_setup: boolean }>(c, `
     select went_live_at::text at, by_label by, kind, setup_items, reviewed_setup from company_go_live where entity_id = $1`, [entityId]);
   if (r[0]) return { at: r[0].at, by: r[0].by, kind: r[0].kind, setupItems: r[0].setup_items, reviewed: r[0].reviewed_setup, bySale: false };
-  const sale = await q(c, `select 1 from journal_entry where entity_id = $1 and source_type = 'sale' limit 1`, [entityId]);
-  return sale.length ? { at: null, by: null, kind: "sale", setupItems: 0, reviewed: false, bySale: true } : null;
+  const traded = await one<{ t: boolean }>(c, `select company_traded($1) t /* unscoped: the function reads entity_id = $1 */`, [entityId]);
+  return traded.t ? { at: null, by: null, kind: "sale", setupItems: 0, reviewed: false, bySale: true } : null;
 }
 
 /**
@@ -437,15 +437,22 @@ export async function goneLive(c: Client, entityId: string) {
  * approves nothing for this company. Never from support mode: the owner does
  * it signed in as themselves.
  */
-export async function goLive(c: Client, scope: Scope, x: { reviewed: boolean }) {
+export async function goLive(c: Client, scope: Scope, x: { reviewed: string[] | null }) {
   need(!(await inSupport(c)), "Go live is the owner's own step, signed in as themselves: ERP setup cannot press it in support mode");
+  // One at a time with ERP setup's approvals: the approval-step guard takes this row for share, so an approval in
+  // flight finishes first (and is listed below) or waits and then sees the go-live (review of 0066: no write skew).
+  await q(c, `select 1 from entity where id = $1 for update /* unscoped: the company row itself */`, [scope.entityId]);
   const rec = await q(c, `select 1 from company_go_live where entity_id = $1`, [scope.entityId]);
   need(!rec.length, "this company has already gone live");
   const d = await checklist(c, scope.tenantId, scope.entityId);
   const g = d.steps.find((s) => s.id === "golive");
   need(d.complete && g && g.status === "done", `the go-live check has not passed yet: ${(g?.checks ?? []).filter((x) => !x.ok).map((x) => x.detail ? `${x.label} (${x.detail})` : x.label).join("; ") || "finish the steps above"}`);
   const items = d.setupApprovals;
-  need(!items.length || x.reviewed === true, `tick "I've reviewed what ERP setup approved" first: ${items.length} item${items.length === 1 ? "" : "s"} were approved during setup`);
+  need(!items.length || Array.isArray(x.reviewed), `tick "I've reviewed what ERP setup approved" first: ${items.length} item${items.length === 1 ? "" : "s"} were approved during setup`);
+  // The tick covers the list the owner was shown: ERP setup deciding something after it was opened sends them back to it.
+  const seen = new Set((x.reviewed ?? []).map(String));
+  const unseen = items.filter((i) => !seen.has(i.requestId));
+  need(!unseen.length, `ERP setup approved ${unseen.length} more since you opened this list (${unseen.map((i) => i.title).join("; ")}); look over the list again, tick it, then go live`);
   const r = await one<{ id: string; at: string }>(c, `
     insert into company_go_live (tenant_id, entity_id, by_label, by_id, kind, setup_items, reviewed_setup)
     values ($1, $2, $3, $4, 'owner', $5, $6) returning id, went_live_at::text at`,
