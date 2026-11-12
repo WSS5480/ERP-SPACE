@@ -650,7 +650,7 @@ function coGet(tail: string, fn: (c: Client, co: views.Company, url: URL, m: Reg
       const a = await acting(c, co, req, who!, false);
       markLookOnly(c, !!a?.preview || (who?.kind === "customer" && who.prospect));
       // the install-wide token speaks for the operator, as a support session does: it never self-approves for the owner either
-      markSupport(c, (who?.kind === "operator" && !!who.support) || who?.kind === "system");
+      markSupport(c, who?.kind === "operator" && who.support ? who.support.id : who?.kind === "system" ? "install-token" : false);
       const out = await fn(c, co, url, m, a?.personId ?? null);
       if (out === null) throw new HttpError(404, "not found");
       // A printable page (a tear sheet) goes out with every header and the CSP, like any page.

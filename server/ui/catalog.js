@@ -528,9 +528,12 @@ input[type=search]{width:100%;font-size:16px;color:var(--ink);background:var(--p
       d.vendors.length ? null : noVendors(),
       el('div', { class: 'panel' }, d.vendors.map((v) => v.pending ? item({
         title: v.name, badge: chip('warning', 'clock', 'Waiting for approval'),
-        detail: v.can_approve ? 'Approve it to set up how its catalog comes in and to order from it.' : 'Its catalog connections open once the owner or controller approves it.',
+        detail: v.setup_approve ? 'ERP setup can approve this new vendor for the owner before go-live, so its catalog connections can be set up now. It is recorded as approved during setup and listed for the owner to review at go-live.'
+          : v.can_approve ? 'Approve it to set up how its catalog comes in and to order from it.' : 'Its catalog connections open once the owner or controller approves it.',
+        why: v.setup_note || null,
         acts: v.can_approve && v.approval_request_id ? [el('button', { class: 'btn small primary', type: 'button', onclick: (e) => act(e.currentTarget,
-          () => post(`/approvals/${v.approval_request_id}`, { decision: 'approved' }), `${v.name} approved`) }, 'Approve')] : null,
+          () => post(`/approvals/${v.approval_request_id}`, { decision: 'approved' }), v.setup_approve ? `${v.name} approved during setup` : `${v.name} approved`) },
+          v.setup_approve ? 'Approve (setup)' : 'Approve')] : null,
       }) : item({
         title: v.name, amount: `${v.lead_days} days`, badge: feedChip(v),
         detail: [v.order_email || 'no order email', v.account_no ? `account ${v.account_no}` : null, v.sku_prefix ? `SKUs ${v.sku_prefix}-…` : null,

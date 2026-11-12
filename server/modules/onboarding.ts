@@ -3,7 +3,7 @@
 // opening stock from a CSV and a bank account's opening balance.
 //
 // Who: the owner and controllers see and work the checklist. Company details
-// are the owner's. Opening stock and bank balances post to opening equity, so
+// and Go live are the owner's (Go live never from support mode). Opening stock and bank balances post to opening equity, so
 // they are the owner's or a controller's.
 
 import type { ErpModule, Client, Company } from "./kit.ts";
@@ -64,6 +64,12 @@ export const module: ErpModule = {
     coPost("/onboarding/dismiss", async (c, co, a, b) => {
       await requireRole(c, co, a, WHO, "hiding the setup checklist from Home");
       return plain(() => ob.dismiss(c, scopeOf(co, a), b.dismissed !== false));
+    });
+
+    // ---- go live (0066): the owner's own step, once the go-live check passes; ends ERP setup's approvals for good
+    coPost("/onboarding/go-live", async (c, co, a, b) => {
+      await requireRole(c, co, a, ["owner"], "taking the company live");
+      return plain(() => ob.goLive(c, scopeOf(co, a), { reviewed: b.reviewed === true }));
     });
 
     // ---- company details

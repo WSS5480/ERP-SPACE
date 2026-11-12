@@ -111,6 +111,7 @@ Data is placed with textContent only, never innerHTML.
 | vendor_files (SFTP and HTTPS transports, vendor file connections, vendor email, SFTP/email-in vendor feeds, EDI over SFTP; one-person approvals) | 0057, 0061, 0062 | none | Setup (Connections → Vendor files), Retail (Catalog → Vendors → Catalog connections) |
 | drill (the rows behind every tile; read-only lists) | none | none | no screen of its own |
 | self-approval follow-through (support mode, typed confirmation, owner digest, counts / write-offs / debit memos / time off, run release, bill gates) | 0063, 0064 | none | a Home card (Self-approvals) |
+| setup approvals (ERP setup approves setup records in support mode before go-live; the recorded Go live with its review list) | 0066 | none | Setup (Setup checklist → Go-live step), Approvals, Catalog → Vendors |
 
 ## Sales tax, deposits, quote holds, tear sheets (migration 0037, extends setup/pos/ar/reports)
 
@@ -985,3 +986,90 @@ smoke: the demo's seeds have no vendor bills, so `vendor_spend` had rows only
 when `npm run smoke` had run on that database since its last reset. The check
 now brings its own bill and rolls it back.
 
+## Setup approvals: ERP setup before go-live (migration 0066, Nov 12 2026)
+
+The product owner: "YES. FOR EVERY NEW CUSTOMER BEFORE GO LIVE." We onboard
+each new customer in support mode, and support mode never self-approves for
+the owner (0063), so a vendor added for a one-owner store waited for the owner
+to sign in before its catalog connections could be set up. Now, until the
+company goes live, ERP setup -- an operator in support mode, or the
+install-wide API token acting as a person (`erp.support` = the session id or
+`install-token`) -- may decide **setup** approval types for the owner:
+
+| type | only when |
+|---|---|
+| `vendor` | a new vendor: `vendor.status = 'pending'`, never approved before |
+| `employee` | a new hire: `employee.status = 'applicant'` |
+| `fiscal_period` | the company's own period |
+| `journal_entry` | an opening-balance entry: `source_type = 'opening'` (bank opening balance, opening receivables) or an `inventory` entry of an `opening_balance` stock adjustment (`is_opening_entry()`) |
+
+Never `vendor_bank_account`, `invoice`, `payment_run`, `payroll_run`,
+`employee_change`, nor anything outside the engine (releases, A/R write-offs,
+debit memos, stock counts, bill gates): those keep 0063's refusal.
+
+**One rule, code and database.** `setup_approve_refusal(entity, user, roles,
+subject_type, subject_id, support)` says why not (null: allowed): support
+present; a setup type; the company not live; the support session open and
+this customer's (or `install-token`); the acting person holds owner or the
+step's role; the subject is new/opening as above. `self_approve_refusal` has a
+five-argument overload (and `may_self_approve`) that answers with it in
+support mode and with 0063's rule otherwise. `approval_step_guard` checks
+every step marked `setup_session` with that overload, requires the mark to be
+the transaction's own `erp.support`, and fills `setup_by` / `setup_reason`
+from `platform_support_session` itself. The code (`approvals.setupApprovalRefusal`)
+calls the same SQL function, so the screen, the server and the trigger cannot
+disagree. `decide()` takes the setup path in support mode when the rule
+allows it: an approval decides every open step (a rejection the waiting one),
+each marked, `self_approved` false; otherwise the old rules apply, and the
+maker's own setup-type request is refused with the rule's sentence ("this
+company has gone live, so ERP setup no longer approves anything for it...").
+Reads in support mode now carry the marker (`markSupport(c, sessionId |
+'install-token')`, `supportMarker(c)`), so Approvals and Catalog → Vendors
+can offer **Approve (setup)**.
+
+**Recorded.** The step: `setup_session`, `setup_by`, `setup_reason`. An audit
+row: "approved by ERP setup (opsy), support session <id>, during setup before
+go-live; support reason: ...". The Approvals history: "Approved by ERP setup
+(opsy), support session <id>, acting as Owner (approved during setup)". The
+owner's digest: flow `setup`, "(approved during setup)" (roles removed are
+only looked up for self-approvals). The checklist: `setupApprovals` on the
+result and on the Go-live step, one line per request with its record
+(`vendor:`, `person:`, `entry:`, `period:`).
+
+**Go live** (`company_go_live`, one row per company, append-only through
+`role_removal_keep`): `POST /onboarding/go-live`, the owner's, never from
+support mode or the install token; needs the checklist complete (the go-live
+check passes) and, when ERP setup approved anything, `reviewed: true` (the
+"I've reviewed what ERP setup approved" tick). Records who, when, how many
+setup approvals and that they were reviewed. Before 0066 go-live was only
+computed (the go-live step turns done when the tie-outs pass, and can turn
+back), so it is now a recorded moment that nothing undoes; the step's status
+is still computed as before. `company_went_live(entity)` is true once that row
+exists **or the company has posted a sale** (a customer that trades without
+pressing the button does not keep the window open). 0066 records companies
+already trading (journal entries other than opening, closing and stock
+adjustments) as live (`kind = 'migration'`). The demo reset removes the
+demo's row like its other rows; the demo is allowed either way.
+
+**Screens.** Approvals: in support mode a banner says whether ERP setup may
+approve here; setup rows are "Setup can approve" with **Approve (setup)**;
+after go-live they show why not. Catalog → Vendors: a pending vendor's card
+offers **Approve (setup)** (`setup_approve`), or after go-live a sentence
+(`setup_note`). Setup checklist, Go-live step: the list grouped as vendors,
+employees, opening entries and periods (each opens its record), a tile that
+drills to the whole list with Back, the review tick and **Go live**; once
+live, who and when.
+
+Checks: `scripts/modules/setup_approvals.ts` (operator adds and approves
+Ashley and adds its feeds without the owner; a hire, an opening entry and a
+period; refused on bank details, a payment run, payroll, a bill and a
+non-opening entry; direct SQL refused; digest and go-live list; go-live
+needs the tick, cannot be pressed in support mode, undone or repeated; after
+go-live refused with the reason on both screens; the install token the same).
+`self_approval.ts`'s support-mode checks now run on a company that has gone
+live.
+
+Not wired: nothing in the code opens `journal_entry` or `fiscal_period`
+approval requests today (their policies exist; periods open by hand with a
+reason), so those two setup types are reached only when a future flow opens
+such requests; the rule and the trigger already cover them.

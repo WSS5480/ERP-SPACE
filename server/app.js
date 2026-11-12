@@ -811,7 +811,7 @@ function openDigest(g) {
   return drillItems(g.title, g.items.map((x) => item({ title: x.title,
     detail: [x.detail, `by ${x.by || 'someone'}`, ago(x.at)].filter(Boolean).join(' · '),
     amount: x.amountMinor != null && x.flow !== 'count' ? money(x.amountMinor) : null,
-    badge: x.decision === 'rejected' || x.decision === 'declined' ? chip('critical', 'fail', cap(x.decision)) : chip('good', 'ok', 'Self-approved'),
+    badge: x.decision === 'rejected' || x.decision === 'declined' ? chip('critical', 'fail', cap(x.decision)) : x.flow === 'setup' ? chip('neutral', 'ok', 'Approved during setup') : chip('good', 'ok', 'Self-approved'),
     onClick: x.link ? () => openSubject(x.link) : x.screen && canSee(x.screen) ? () => go(x.screen) : null })),
   { noun: 'self-approval', before: removed, none: 'Nothing was self-approved that day.',
     foot: 'A self-approval is the maker deciding their own request because nobody else in the company holds a role that could. It ends the moment a second owner, a controller or an approver for that kind of request is added.' });
@@ -896,30 +896,35 @@ async function screenApprovals() {
   return frag(
     head('Approvals', [el('button', { class: 'btn', type: 'button', onclick: openPersonPicker }, icon('user'), 'Switch person')]),
     el('p', { class: 'lead', text: `Acting as ${S.person ? S.person.name : 'nobody'} (${held}). Each decision is recorded against that person, and the maker of anything can never be the one who approves it.` }),
+    // support mode: whether ERP setup may approve setup records here (before go-live), and if not why not
+    d.setupMode ? resultBox(d.setupMode.live ? 'neutral' : 'warning', d.setupMode.live ? 'info' : 'warn', d.setupMode.live ? 'ERP setup approvals have ended' : 'Setup mode: before go-live', d.setupMode.note) : null,
     section('Waiting on you', d.mine.length ? `${d.mine.length}` : null, null,
       el('div', { class: 'panel' }, d.mine.length ? d.mine.map((a) => approvalItem(a, true)) : empty('Nothing is waiting on you.', d.others.length ? 'What is open needs someone else; see below.' : null))),
     section('Waiting on someone else', d.others.length ? `${d.others.length}` : null, null,
       el('div', { class: 'panel' }, d.others.length ? d.others.map((a) => approvalItem(a, false)) : empty('Nothing else is open.', null, true))),
     section('Recently decided', null, null,
       el('div', { class: 'panel' }, d.recent.length ? d.recent.map((r) => item({
-        title: subjName(r.subject), detail: `${cap(r.decision)} by ${r.actor_name || 'someone'} as ${r.required_role}${r.self_approved ? ' (self-approved: they made it and nobody else here could)' : ''} · ${ago(r.decided_at)}${r.note ? ' · “' + r.note + '”' : ''}`,
+        title: subjName(r.subject), detail: `${r.setup_session ? setupWords(r) : `${cap(r.decision)} by ${r.actor_name || 'someone'} as ${r.required_role}`}${r.self_approved ? ' (self-approved: they made it and nobody else here could)' : ''} · ${ago(r.decided_at)}${r.note ? ' · “' + r.note + '”' : ''}`,
         amount: r.amount_minor != null ? money(r.amount_minor) : null,
         badge: r.decision === 'approved' ? chip('good', 'ok', 'Approved') : chip('critical', 'fail', 'Rejected'),
         onClick: r.subject.link ? () => openSubject(r.subject.link) : null })) : empty('Nothing decided yet.', null, true))));
 }
+/** "Approved by ERP setup (opsy), support session …, as Owner (approved during setup)": a decision ERP setup made before go-live. */
+const setupWho = (r) => (r.setup_session === 'install-token' ? 'ERP setup (install-wide API token)' : `ERP setup (${r.setup_by || 'operator'}), support session ${r.setup_session}`);
+const setupWords = (r) => `${cap(r.decision)} by ${setupWho(r)}, acting as ${r.actor_name || 'someone'} (approved during setup)`;
 function approvalItem(a, canDecide) {
   const step = a.steps > 1 ? `step ${a.step_seq} of ${a.steps}` : null;
   return item({
     title: subjName(a.subject),
     detail: [subjDetail(a.subject), `from ${a.maker_name}, ${ago(a.created_at)}`, canDecide ? [step, `as ${a.step_role_word}`].filter(Boolean).join(', ') : step].filter(Boolean).join(' · '),
     amount: a.amount_minor != null ? money(a.amount_minor) : null,
-    badge: canDecide ? chip('warning', 'clock', 'Your turn') : chip('neutral', 'pending', 'Waiting'),
-    why: canDecide ? null : sentence(a.why),
+    badge: canDecide ? (a.setup ? chip('warning', 'clock', 'Setup can approve') : chip('warning', 'clock', 'Your turn')) : chip('neutral', 'pending', 'Waiting'),
+    why: canDecide ? (a.setup ? sentence(a.why) : null) : sentence(a.why),
     acts: canDecide ? decisionButtons(a) : (a.subject.link ? [el('button', { class: 'btn small', type: 'button', onclick: () => openSubject(a.subject.link) }, 'Open')] : null),
   });
 }
 function decisionButtons(a, after) {
-  const yes = el('button', { class: 'btn small primary', type: 'button', onclick: () => decide(a, 'approved', yes, after) }, icon('check'), 'Approve');
+  const yes = el('button', { class: 'btn small primary', type: 'button', onclick: () => decide(a, 'approved', yes, after) }, icon('check'), a.setup ? 'Approve (setup)' : 'Approve');
   const no = el('button', { class: 'btn small', type: 'button', onclick: () => decide(a, 'rejected', no, after) }, 'Reject…');
   return [yes, no, a.subject.link ? el('button', { class: 'btn small', type: 'button', onclick: () => openSubject(a.subject.link) }, 'Open') : null];
 }
@@ -941,7 +946,8 @@ async function decide(a, decision, btn, after) {
     if (confirm == null) return;
   }
   await act(btn, () => post(`/approvals/${a.id}`, { decision, note, callback, confirm }), (r) =>
-    r.status === 'approved' ? (a.subject_type === 'invoice' ? 'Approved, and posted to the books.'
+    r.status === 'approved' && a.setup ? 'Approved during setup. The owner sees it in their digest and on the go-live step.'
+    : r.status === 'approved' ? (a.subject_type === 'invoice' ? 'Approved, and posted to the books.'
       : a.subject.kind === 'vendor_bank' ? 'Approved. The new details are in use; the first payment to them waits three days.' : 'Approved.')
     : r.status === 'rejected' ? 'Rejected, with your reason on record.' : 'Your step is done; it moves on to the next person.', { close: after });
 }
@@ -1019,6 +1025,8 @@ function openSubject(link) {
   if (kind === 'person') openPerson(id);
   if (kind === 'vendor') openVendor(id);
   if (kind === 'vendors') go('payables', 'vendors');
+  if (kind === 'entry') openEntry(id);
+  if (kind === 'period') go('periods');
 }
 
 // ============================================================= payables
@@ -2480,6 +2488,9 @@ function openUpload(targets, id, accounts) {
 
 opener('bill', (id) => openBill(id));
 opener('entry', (id) => openEntry(id));
+opener('vendor', (id) => openVendor(id));
+opener('person', (id) => openPerson(id));
+opener('period', () => go('periods'));
 const RENDER = { home: screenHome, approvals: screenApprovals, payables: screenPayables, payroll: screenPayroll, books: screenBooks, cash: screenCash, recon: screenRecon, feeds: screenFeeds, setup: screenSetup };
 
 // ========================================================== module screens
@@ -2490,7 +2501,7 @@ window.ERP = {
   api, coApi, post, go, show, toast, busy, act, openDialog, resultBox, loadingNode, fillDialog, askReason,
   head, section, tile, tilesRow, empty, item, capped, seg, errorBox, tbl, td, fact, friendly, render, field, select, input, zonePicker, ZONES,
   drill, drillList, drillItems, drillNode, drillSum, drillRow, opener, openKind: (kind, id) => (OPENERS[kind] ? OPENERS[kind](id) : null),
-  openEntry, NARROW, openAddVendor,
+  openEntry, NARROW, openAddVendor, openSubject: (link) => openSubject(link),
   // defined further down (sign-in and who you are); wrapped so they resolve when called
   isOperator: () => isOperator(), isCustomer: () => isCustomer(), inSupport: () => inSupport(), managesAccount: () => managesAccount(), boot: () => boot(),
   /** homeCard(async () => node | null): a card on Home, after the tiles */

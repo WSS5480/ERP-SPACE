@@ -82,14 +82,23 @@ export async function tx<T>(actor: Actor, fn: (c: Client) => Promise<T>): Promis
   }
 }
 
-const SUPPORT = new WeakSet<object>();
-/** A read done in support mode (coGet marks its client, as it marks a look-only read). */
-export const markSupport = (c: object, on: boolean) => { if (on) SUPPORT.add(c); else SUPPORT.delete(c); };
+const SUPPORT = new WeakMap<object, string>();
+/**
+ * A read done in support mode (coGet marks its client, as it marks a look-only read). Pass the support
+ * session's id (or 'install-token') so the read can tell whether ERP setup may approve; true marks it
+ * as support without naming a session (setup approvals are then not offered).
+ */
+export const markSupport = (c: object, on: boolean | string | null) => { if (on) SUPPORT.set(c, on === true ? "read" : on); else SUPPORT.delete(c); };
 /** Is this client working for an operator in support mode: a marked read, or a transaction carrying erp.support? */
 export async function inSupport(c: Client): Promise<boolean> {
-  if (SUPPORT.has(c)) return true;
+  return (await supportMarker(c)) !== null;
+}
+/** The support session this client works under (its id, or 'install-token'), or null outside support mode. */
+export async function supportMarker(c: Client): Promise<string | null> {
+  const m = SUPPORT.get(c);
+  if (m) return m;
   const r = await c.query<{ s: string | null }>("select current_setting('erp.support', true) s");
-  return !!r.rows[0]?.s;
+  return r.rows[0]?.s || null;
 }
 
 const AFTER = new WeakMap<Client, (() => Promise<void>)[]>();

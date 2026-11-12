@@ -11,7 +11,8 @@ import { xlsxRows, isXlsx, FileError } from "../../packages/core/filekit.ts";
 import { loadPin } from "../../packages/core/connections.ts";
 import { TransportError } from "../../packages/core/transports.ts";
 import * as vfiles from "../../packages/core/vendor_files.ts";
-import { canDecideNow } from "../../packages/core/approvals.ts";
+import { decisionFor, wentLive } from "../../packages/core/approvals.ts";
+import { supportMarker } from "../../packages/core/db.ts";
 import { productSheet } from "./tearsheet.ts";
 import { q } from "../../packages/core/db.ts";
 import { scopeOf } from "../actions.ts";
@@ -307,9 +308,15 @@ async function vendors(c: Client, co: Company, personId: string | null = null) {
   const freight = await q(c, `select f.vendor_id, f.location_id, l.name location, f.freight_bps, f.per_unit_minor
                                 from vendor_freight f join location l on l.id = f.location_id where f.entity_id = $1 order by l.name`, [co.id]);
   const out = [];
+  // ERP setup (support mode) before go-live approves a new vendor for the owner ("Approve (setup)"); after go-live it says why not
+  const support = !!(await supportMarker(c));
+  const live = support ? await wentLive(c, co.id) : false;
   for (const { mailbox_key, ...v } of rows) {
     const requestId = v.status === "hold" ? waiting.get(String(v.id)) ?? null : null;
-    out.push({ ...v, pending: v.status === "hold", approval_request_id: requestId, can_approve: requestId ? await canDecideNow(c, co.id, requestId, personId) : false,
+    const dec = requestId ? await decisionFor(c, co.id, requestId, personId) : { can: false, setup: false, setupWhy: null };
+    out.push({ ...v, pending: v.status === "hold", approval_request_id: requestId, can_approve: dec.can, setup_approve: dec.setup,
+      setup_note: requestId && support && !dec.setup ? (live ? "This company has gone live, so ERP setup no longer approves vendors for it; the owner approves this one signed in as themselves."
+        : dec.setupWhy ? `ERP setup cannot approve this one: ${dec.setupWhy.replace(/^support mode never self-approves for the owner: /, "")}.` : null) : null,
       inbound_address: mailbox_key ? vfiles.inboundAddress(String(mailbox_key)) : null, freight: freight.filter((f) => f.vendor_id === v.id) });
   }
   return { vendors: out };

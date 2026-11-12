@@ -10,7 +10,9 @@ import { today as bizToday } from "../packages/core/clock.ts";
 import { type Client, q, one } from "../packages/core/db.ts";
 import { handlerFor } from "../packages/core/connections.ts";
 import { recentDigests } from "../packages/core/owner_digest.ts";
-import { selfApprovalRefusal, selfConfirmFor, SUPPORT_SELF_APPROVAL, RUN_RELEASERS, GATE_SIGN_OFF, releaseRoles, type SelfConfirm } from "../packages/core/approvals.ts";
+import { selfApprovalRefusal, selfConfirmFor, SUPPORT_SELF_APPROVAL, RUN_RELEASERS, GATE_SIGN_OFF, releaseRoles, type SelfConfirm,
+  setupApprovalRefusal, isSetupType, wentLive } from "../packages/core/approvals.ts";
+import { supportMarker } from "../packages/core/db.ts";
 
 export type Company = {
   id: string;
@@ -259,6 +261,9 @@ export async function approvals(c: Client, co: Company, personId: string | null)
 
   const mine = [];
   const others = [];
+  // ERP setup (support mode, or the install-wide token) on a company that has not gone live approves setup records for the owner
+  const marker = await supportMarker(c);
+  const live = marker ? await wentLive(c, co.id) : false;
   for (const r of open) {
     const subject = await subjectSummary(c, co, r.subject_type, r.subject_id);
     const already = decided.get(r.id) ?? new Set<string>();
@@ -267,8 +272,15 @@ export async function approvals(c: Client, co: Company, personId: string | null)
     const waiting = who.length ? `waiting on ${either(who)}, the ${role}` : `nobody here holds the ${role} role yet; the owner can grant it`;
     let why = "";
     let canDecide = false;
+    let setup = false;
     let confirm: SelfConfirm | null = null;
-    if (!personId) why = `Pick who you are acting as; ${waiting}`;
+    const setupWhy = marker && personId ? await setupApprovalRefusal(c, co.id, personId, [r.step_role], r.subject_type, r.subject_id) : "no";
+    if (marker && personId && setupWhy === null) { canDecide = true; setup = true; why = "ERP setup can approve this before the company goes live (recorded as approved during setup, and listed for the owner at go-live)"; }
+    else if (marker && personId && isSetupType(r.subject_type) && (live || r.maker_id === personId)) {
+      why = live ? "This company has gone live, so ERP setup no longer approves anything for it; the owner approves it signed in as themselves"
+        : `ERP setup cannot approve this one: ${String(setupWhy).replace(/^support mode never self-approves for the owner: /, "")}`;
+    }
+    else if (!personId) why = `Pick who you are acting as; ${waiting}`;
     else if (r.maker_id === personId) {
       // The owner of a company where nobody else could decide it approves it themselves (recorded as self-approved).
       // The same rule decide() applies (selfApprovalRefusal), so the screen never offers what the server refuses.
@@ -282,11 +294,11 @@ export async function approvals(c: Client, co: Company, personId: string | null)
     else canDecide = true;
     // a self-approval of new bank details or a run asks for the payee or the total to be typed (the server checks it)
     const ask = confirm ? { kind: confirm.kind, prompt: confirm.prompt, expect: confirm.expect } : null;
-    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why, self: canDecide && r.maker_id === personId, confirm: ask });
+    (canDecide ? mine : others).push({ ...r, step_role_word: role, who, subject, why, self: canDecide && !setup && r.maker_id === personId, setup, confirm: ask });
   }
 
   const recent = await q(c, `
-    select s.decided_at, s.decision, s.note, s.required_role, s.self_approved, u.name as actor_name, r.subject_type, r.subject_id,
+    select s.decided_at, s.decision, s.note, s.required_role, s.self_approved, s.setup_session, s.setup_by, u.name as actor_name, r.subject_type, r.subject_id,
            r.amount_minor, r.status as request_status
       from approval_step s
       join approval_request r on r.id = s.request_id
@@ -297,7 +309,10 @@ export async function approvals(c: Client, co: Company, personId: string | null)
   for (const r of recent as { subject_type: string; subject_id: string; required_role: string }[]) {
     recentWithSubject.push({ ...r, required_role: roleWord(r.required_role), subject: await subjectSummary(c, co, r.subject_type, r.subject_id) });
   }
-  return { mine, others, recent: recentWithSubject, roles: [...held].map(roleWord) };
+  // what the screen says in support mode: whether ERP setup approves here, and if not why not
+  const setupMode = marker ? { live, note: live ? "This company has gone live, so ERP setup no longer approves anything for it: new vendors, hires, opening entries and periods now wait for the owner, signed in as themselves."
+    : "Before go-live, ERP setup may approve setup records for the owner: a new vendor, a new hire, an opening-balance entry, an accounting period. Never bank details, bills, payment runs, payroll or anything else that moves money." } : null;
+  return { mine, others, recent: recentWithSubject, roles: [...held].map(roleWord), setupMode };
 }
 
 // ------------------------------------------------------------------ reasons

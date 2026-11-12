@@ -54,7 +54,51 @@
       el('span', {}, el('span', { text: x.label }), x.detail ? el('span', { class: 'dt', text: ` · ${x.detail}` }) : null))));
   }
 
-  function stepCard(s, can) {
+  /** Go-live (0066): what ERP setup approved during setup, for the owner to review, then the Go live button. */
+  function setupLine(x) {
+    return item({ title: x.title, detail: [x.detail, x.reason ? `Support reason: ${x.reason}` : null, ago(x.at)].filter(Boolean).join(' · '),
+      amount: x.amountMinor != null ? money(x.amountMinor) : null,
+      badge: x.decision === 'rejected' ? chip('critical', 'fail', 'Rejected during setup') : chip('neutral', 'ok', 'Approved during setup'),
+      onClick: x.link ? () => E.openSubject(x.link) : null });
+  }
+  function setupDrill(list, title) {
+    return E.drillItems(title, list.map(setupLine), { noun: 'approval', none: 'Nothing here.',
+      foot: 'ERP setup approved these for you in support mode, before go-live. Tap one to open its record; Back returns to the checklist.' });
+  }
+  function goLivePanel(d, s) {
+    const list = s.setupApprovals || [];
+    const live = d.wentLive;
+    if (live) {
+      return el('div', { class: 'ob-pad' }, resultBox('good', 'ok', live.bySale ? 'Trading has begun' : 'Gone live',
+        live.bySale ? 'This company has posted a sale, so it counts as live: ERP setup no longer approves anything for it.'
+          : `Went live ${ago(live.at)}, by ${live.by}${live.setupItems ? `, after reviewing ${plural(live.setupItems, 'approval')} made by ERP setup` : ''}. From then on ERP setup approves nothing for this company.`),
+        list.length ? el('button', { class: 'btn small', type: 'button', onclick: () => setupDrill(list, 'Approved by ERP setup') }, `What ERP setup approved (${list.length})`) : null);
+    }
+    const groups = ['Vendors', 'Employees', 'Opening entries', 'Periods'].map((k) => [k, list.filter((x) => x.kind === k)]).filter(([, l]) => l.length);
+    const tick = el('input', { type: 'checkbox' });
+    const err = el('div', { role: 'alert' });
+    const owner = isOwner() && !E.inSupport();
+    const ready = s.status === 'done';
+    const go = el('button', { class: 'btn primary', type: 'button', disabled: !owner || !ready || null, onclick: (e) => {
+      if (list.length && !tick.checked) { err.replaceChildren(resultBox('warning', 'warn', 'Tick the review first', 'Look over what ERP setup approved, then tick that you reviewed it.')); return; }
+      act(e.currentTarget, () => post('/onboarding/go-live', { reviewed: tick.checked }), 'Gone live', { errorInto: (x) => err.replaceChildren(resultBox('critical', 'fail', 'Not live yet', E.friendly(x))) });
+    } }, E.icon('check'), 'Go live');
+    return el('div', { class: 'ob-pad' },
+      el('div', { class: 'k', text: 'Approved by ERP setup' }),
+      list.length
+        ? frag(el('p', { class: 'd', text: `ERP setup approved ${plural(list.length, 'record')} for you in support mode while setting the company up. Look them over before going live; tap one to open it.` }),
+          tilesRow(tile({ label: 'Approved during setup', value: String(list.length), tone: 'warning', ic: 'info', text: 'Tap for the list', onClick: () => setupDrill(list, 'Approved by ERP setup') })),
+          groups.map(([k, l]) => section(k, String(l.length), null, el('div', { class: 'panel' }, l.map(setupLine)))),
+          el('label', { class: 'li check-row' }, tick, el('div', { class: 't', text: 'I’ve reviewed what ERP setup approved' })))
+        : el('p', { class: 'd', text: 'ERP setup has not approved anything for this company.' }),
+      E.inSupport() ? el('p', { class: 'fine', text: 'Go live is the owner’s own step, signed in as themselves; ERP setup cannot press it in support mode. Until then, ERP setup may approve new vendors, new hires, opening entries and periods.' })
+        : !isOwner() ? el('p', { class: 'fine', text: 'Only the owner takes the company live.' })
+          : !ready ? el('p', { class: 'fine', text: 'Go live opens once the check above passes.' }) : null,
+      el('p', { class: 'fine', text: 'Once you go live, ERP setup approves nothing more for this company, and that cannot be undone.' }),
+      el('div', { class: 'dlg-acts' }, go), err);
+  }
+
+  function stepCard(s, can, d) {
     const [tone, ic, word] = STATUS[s.status] || STATUS.todo;
     const extra = [];
     if (s.missingAccounts && s.missingAccounts.length) {
@@ -70,7 +114,7 @@
       can && s.skip && s.status === 'skipped' ? btn('Take back the skip', (e) => act(e.currentTarget, () => post('/onboarding/unskip', { step: s.id }), 'Back on the list')) : null,
     ].filter(Boolean);
     return el('div', { class: 'panel ob-step' }, item({ title: s.title, badge: chip(tone, ic, word), detail: s.why, why: s.detail, acts }),
-      el('div', { class: 'ob-pad' }, checksList(s), extra));
+      el('div', { class: 'ob-pad' }, checksList(s), extra), s.id === 'golive' && d ? goLivePanel(d, s) : null);
   }
 
   const backBtn = (label, go) => el('button', { class: 'btn', type: 'button', onclick: go }, E.icon('chev'), label);
@@ -108,7 +152,7 @@
       el('p', { class: 'lead', text: 'What is left before this company can trade on the system. Each step turns done by itself when its data is there; nothing is ticked by hand. Steps for services that are off do not show.' }),
       top,
       homeNote ? el('div', { class: 'panel' }, homeNote) : null,
-      section('Steps', `${d.finished} of ${d.total}`, null, el('div', {}, d.steps.map((s) => stepCard(s, can)))));
+      section('Steps', `${d.finished} of ${d.total}`, null, el('div', {}, d.steps.map((s) => stepCard(s, can, d)))));
   }
 
   // ------------------------------------------------------- company details

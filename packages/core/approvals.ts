@@ -6,7 +6,7 @@
 //   3. a decided request is immutable; a change opens a new one
 //   4. an agent calls this through the same interface a person does
 
-import { type Client, type Scope, audit, one, q, inSupport } from "./db.ts";
+import { type Client, type Scope, audit, one, q, inSupport, supportMarker } from "./db.ts";
 
 export type SubjectType =
   | "invoice"
@@ -170,6 +170,43 @@ export async function selfApprovalFor(c: Client, entityId: string, deciderId: st
   return true;
 }
 
+// ------------------------------------------------------- setup approvals --
+
+/**
+ * What ERP setup may approve in support mode before the company goes live
+ * (migration 0066): a new vendor, a new hire, an accounting period, an
+ * opening-balance journal entry. Never money movement or bank details.
+ */
+export const SETUP_TYPES: readonly SubjectType[] = ["vendor", "employee", "fiscal_period", "journal_entry"];
+export const isSetupType = (t: string) => (SETUP_TYPES as readonly string[]).includes(t);
+
+/**
+ * Why may ERP setup (this support session) not decide this request here, or
+ * null when it may. The database's own setup_approve_refusal() answers, so the
+ * screens, the server and the approval-step guard say the same thing.
+ */
+export async function setupApprovalRefusal(c: Client, entityId: string, userId: string | null, roles: string[], subjectType: string, subjectId: string): Promise<string | null> {
+  const marker = await supportMarker(c);
+  if (!marker) return "setup approvals are made only by ERP setup, in support mode";
+  if (marker === "read") return "the support session making this approval is not open for this customer";
+  const r = await one<{ why: string | null }>(c, `select setup_approve_refusal($1, $2, $3, $4, $5, $6) why /* unscoped: the function checks entity_id = $1 itself */`, [entityId, userId, roles, subjectType, subjectId, marker]);
+  return r.why;
+}
+
+/** Who ERP setup is in words, for the record: the operator and support session, or the install-wide token. */
+export async function setupWho(c: Client, marker: string): Promise<{ operator: string; session: string; reason: string; label: string }> {
+  if (marker === "install-token") return { operator: "install-wide API token", session: "install-token", reason: "the install-wide API token",
+    label: "approved by ERP setup (install-wide API token)" };
+  const s = (await q<{ operator: string; reason: string }>(c, `select operator, reason from platform_support_session where id = $1
+     /* unscoped: the support session is the operator's, checked against this customer by setup_approve_refusal */`, [marker]))[0];
+  return { operator: s?.operator ?? "operator", session: marker, reason: s?.reason ?? "", label: `approved by ERP setup (${s?.operator ?? "operator"}), support session ${marker}` };
+}
+
+/** Has the company gone live (the owner pressed Go live, or it has posted a sale)? */
+export async function wentLive(c: Client, entityId: string): Promise<boolean> {
+  return (await one<{ live: boolean }>(c, `select company_went_live($1) live /* unscoped: the function reads entity_id = $1 */`, [entityId])).live;
+}
+
 /**
  * Who could release a run besides its builder (with the owner and a controller,
  * who always count), and who could let a bill through the gates: a builder or
@@ -310,6 +347,16 @@ export async function decide(
   const next = steps.find((s) => s.decision === null);
   if (!next) throw new ApprovalError("no step is waiting");
 
+  // ERP setup, in support mode, before the company goes live: a setup record (a new vendor, a new hire, an opening
+  // entry, a period) is decided for the owner, marked as a setup approval. Anything else keeps the rules below.
+  const marker = await supportMarker(c);
+  if (marker) {
+    const why = await setupApprovalRefusal(c, req.entity_id, input.actorId, [next.required_role], req.subject_type, req.subject_id);
+    if (why === null) return decideAsSetup(c, scope, { ...input, req, steps, marker });
+    // the maker's own request: say why ERP setup cannot decide it (gone live, not a setup record, not new...)
+    if (req.maker_id === input.actorId && (isSetupType(req.subject_type) || /setup records/.test(why))) throw new ApprovalError(why);
+  }
+
   // The maker is never the checker -- unless they are the owner and nobody else in the company
   // could decide this step (a one-person store would otherwise wait forever). Checked again by the database.
   let selfApproved = false;
@@ -373,11 +420,67 @@ export async function decide(
   return status;
 }
 
+/**
+ * ERP setup decides a setup request (decide() has checked the rule): an approval
+ * decides every step still open, a rejection the waiting one; each step is
+ * marked with the support session (the database checks it again and fills in
+ * the operator and reason). The audit row names ERP setup, the session and its
+ * reason; the history shows "(approved during setup)" and the owner's digest
+ * and the go-live review list it.
+ */
+async function decideAsSetup(c: Client, scope: Scope, x: {
+  requestId: string; actorId: string; decision: Decision; note?: string; callbackLogged?: boolean; marker: string;
+  req: { entity_id: string; subject_type: string; subject_id: string; requires_callback: boolean };
+  steps: { id: string; seq: number; required_role: string; decision: string | null }[];
+}): Promise<"open" | "approved" | "rejected"> {
+  if (x.req.requires_callback && x.decision === "approved" && !x.callbackLogged)
+    throw new ApprovalError("this subject needs a callback to a number already on file, logged before approval");
+  const who = await setupWho(c, x.marker);
+  const open = x.steps.filter((s) => s.decision === null);
+  const todo = x.decision === "approved" ? open : open.slice(0, 1);
+  for (const st of todo) {
+    const why = await setupApprovalRefusal(c, x.req.entity_id, x.actorId, [st.required_role], x.req.subject_type, x.req.subject_id);
+    if (why) throw new ApprovalError(why);
+    await c.query(`update approval_step set decision = $2, actor_id = $3, decided_at = now(), note = $4,
+                          callback_logged_at = case when $5 then now() else null end, self_approved = false, setup_session = $6
+                    where id = $1`, [st.id, x.decision, x.actorId, x.note ?? null, x.callbackLogged ?? false, x.marker]);
+  }
+  const status: "approved" | "rejected" = x.decision === "rejected" ? "rejected" : "approved";
+  await c.query(`update approval_request set status = $2, decided_at = now() where id = $1`, [x.requestId, status]);
+  const words = x.decision === "approved" ? who.label : who.label.replace(/^approved/, "rejected");
+  await audit(c, scope, { table: "approval_request", rowId: x.requestId, action: "transition",
+    reason: `${words}, during setup before go-live; support reason: ${who.reason}`,
+    after: { subject: x.req.subject_type, subjectId: x.req.subject_id, decision: x.decision, requestStatus: status, setup: true,
+             operator: who.operator, supportSession: who.session, supportReason: who.reason, steps: todo.map((s) => s.seq) } });
+  return status;
+}
+
 /** Could this person decide the request's waiting step now (the same rules decide() applies)? For screens that offer an Approve button. */
 export async function canDecideNow(c: Client, entityId: string, requestId: string, personId: string | null): Promise<boolean> {
-  if (!personId) return false;
-  const r = (await q<{ maker_id: string; status: string }>(c, `select maker_id, status from approval_request where id = $1 and entity_id = $2`, [requestId, entityId]))[0];
-  if (!r || r.status !== "open") return false;
+  return (await decisionFor(c, entityId, requestId, personId)).can;
+}
+
+/**
+ * What a screen offers on an open request: can this person decide it now, is
+ * that ERP setup's approval (support mode, before go-live), and, in support
+ * mode when it is not, why not (a sentence for the screen).
+ */
+export async function decisionFor(c: Client, entityId: string, requestId: string, personId: string | null): Promise<{ can: boolean; setup: boolean; setupWhy: string | null }> {
+  const r = (await q<{ maker_id: string; status: string; subject_type: string; subject_id: string }>(c,
+    `select maker_id, status, subject_type, subject_id from approval_request where id = $1 and entity_id = $2`, [requestId, entityId]))[0];
+  if (!personId || !r || r.status !== "open") return { can: false, setup: false, setupWhy: null };
+  let setupWhy: string | null = null;
+  if (await supportMarker(c)) {
+    const st = (await q<{ required_role: string }>(c, `select s.required_role from approval_step s join approval_request r on r.id = s.request_id and r.entity_id = $2
+       where s.request_id = $1 and s.decision is null order by s.seq limit 1`, [requestId, entityId]))[0];
+    setupWhy = st ? await setupApprovalRefusal(c, entityId, personId, [st.required_role], r.subject_type, r.subject_id) : "no step is waiting";
+    if (setupWhy === null) return { can: true, setup: true, setupWhy: null };
+  }
+  return { can: await canDecideByRules(c, entityId, requestId, personId, r.maker_id), setup: false, setupWhy };
+}
+
+async function canDecideByRules(c: Client, entityId: string, requestId: string, personId: string, makerId: string): Promise<boolean> {
+  const r = { maker_id: makerId };
   const steps = await q<{ required_role: string; decision: string | null; actor_id: string | null }>(c, `
     select s.required_role, s.decision, s.actor_id from approval_step s join approval_request r on r.id = s.request_id and r.entity_id = $2
      where s.request_id = $1 order by s.seq`, [requestId, entityId]);

@@ -15,7 +15,7 @@
 import { today as bizToday } from "./clock.ts";
 import { periodFor, PeriodError } from "./periods.ts";
 import { validTimeZone } from "./clock.ts";
-import { q, one, audit, type Client, type Scope } from "./db.ts";
+import { q, one, audit, inSupport, type Client, type Scope } from "./db.ts";
 import { post, PostingError } from "./posting.ts";
 import { effectiveServices } from "./services.ts";
 import { parseCsv, type ModuleId } from "./setup.ts";
@@ -143,7 +143,7 @@ export const STEPS: StepDef[] = [
     skipped: "The web store and trade portal have no site to show." },
   { id: "golive", title: "Go-live check", screen: "checklist", label: "Run the check", skippable: false,
     why: "Before real trading starts, the system's own tie-outs must agree.",
-    what: "Runs the checks the books depend on: stock at cost against inventory account 1300, sales tax by jurisdiction against 2100, financing receivables against 1110, and inter-company balances netting to zero. It also needs every other step finished or skipped.",
+    what: "Runs the checks the books depend on: stock at cost against inventory account 1300, sales tax by jurisdiction against 2100, financing receivables against 1110, and inter-company balances netting to zero. It also needs every other step finished or skipped. Then the owner presses Go live: first they look over everything ERP setup approved for them during setup (new vendors, new hires, opening entries, periods) and tick that they reviewed it. From go-live on, ERP setup approves nothing for this company.",
     skipped: "This step cannot be skipped: it is how you know the opening balances and setup agree." },
 ];
 
@@ -154,6 +154,7 @@ export type Step = StepDef & {
   detail: string | null;
   missingAccounts?: { code: string; services: string[]; inactive: boolean }[];
   tieOuts?: { id: string; label: string; ok: boolean; detail: string }[];
+  setupApprovals?: SetupApproval[];
   skip: { reason: string; by: string; at: string } | null;
 };
 
@@ -360,21 +361,99 @@ export async function checklist(c: Client, tenantId: string, entityId: string, o
     add("web", [{ label: "Site settings saved", ok: site.length > 0, detail: site[0] ? `${site[0].display_name} (${site[0].status})` : null }]);
   }
 
-  // ---- go-live check
+  // ---- go-live check (and what ERP setup approved, for the owner to review before going live)
+  const setup = await setupApprovals(c, entityId);
+  const live = await goneLive(c, entityId);
   const rest = steps.filter((s) => s.status === "todo");
   const ties = opts.tieOuts === false ? [] : await tieOuts(c, tenantId, entityId, L.multiCompany);
   if (opts.tieOuts === false) ties.push({ id: "skipped", label: "Tie-outs", ok: false, detail: "not run here; open the checklist to run them" });
   add("golive", [
     { label: "Every other step done, skipped or optional", ok: !rest.length, detail: rest.length ? `Still to do: ${rest.map((s) => s.title).join(", ")}` : null },
     ...ties.map((t) => ({ label: t.label, ok: t.ok, detail: t.detail })),
-  ], { extra: { tieOuts: ties } });
+  ], { extra: { tieOuts: ties, setupApprovals: setup } });
 
   const shown = steps;
   const finished = shown.filter((s) => s.status !== "todo").length;
   return {
     company: e.name, layout: L, steps: shown, finished, total: shown.length, complete: finished === shown.length,
     dismissed: dismissed[0] ? { by: dismissed[0].dismissed_by, at: dismissed[0].dismissed_at } : null,
+    wentLive: live, setupApprovals: setup,
   };
+}
+
+// ======================================================== go-live (0066)
+
+export type SetupApproval = { requestId: string; subjectType: string; subjectId: string; kind: string; title: string; detail: string;
+  decision: string; at: string; operator: string | null; session: string; reason: string | null; link: string | null; amountMinor: string | null };
+
+const SETUP_KIND: Record<string, string> = { vendor: "Vendors", employee: "Employees", journal_entry: "Opening entries", fiscal_period: "Periods" };
+
+/**
+ * Everything ERP setup decided for the owner in support mode before go-live
+ * (approval steps marked setup_session), one line per request, newest first,
+ * each with the record it opens.
+ */
+export async function setupApprovals(c: Client, entityId: string): Promise<SetupApproval[]> {
+  const rows = await q<{ id: string; subject_type: string; subject_id: string; decision: string; at: string; setup_by: string | null; setup_session: string;
+                         setup_reason: string | null; amount_minor: string | null; vendor: string | null; person: string | null; position: string | null;
+                         entry: string | null; entry_day: string | null; p_start: string | null; p_end: string | null }>(c, `
+    select distinct on (r.id) r.id, r.subject_type, r.subject_id, s.decision, s.decided_at::text at, s.setup_by, s.setup_session, s.setup_reason, r.amount_minor::text,
+           (select coalesce(v.dba, v.legal_name) from vendor v join vendor_entity ve on ve.vendor_id = v.id and ve.entity_id = r.entity_id where v.id = r.subject_id) vendor,
+           (select e.first_name || ' ' || e.last_name from employee e where e.id = r.subject_id and e.entity_id = r.entity_id) person,
+           (select e.position from employee e where e.id = r.subject_id and e.entity_id = r.entity_id) position,
+           (select je.description from journal_entry je where je.id = r.subject_id and je.entity_id = r.entity_id) entry,
+           (select je.posting_date::text from journal_entry je where je.id = r.subject_id and je.entity_id = r.entity_id) entry_day,
+           (select f.starts_on::text from fiscal_period f where f.id = r.subject_id and f.entity_id = r.entity_id) p_start,
+           (select f.ends_on::text from fiscal_period f where f.id = r.subject_id and f.entity_id = r.entity_id) p_end
+      from approval_request r join approval_step s on s.request_id = r.id
+     where r.entity_id = $1 and s.setup_session is not null
+     order by r.id, s.decided_at desc`, [entityId]);
+  return rows.map((r) => {
+    const title = r.subject_type === "vendor" ? `New vendor · ${r.vendor ?? "vendor"}` : r.subject_type === "employee" ? `New hire · ${r.person ?? "someone"}`
+      : r.subject_type === "journal_entry" ? `Opening entry · ${r.entry ?? "journal entry"}` : `Accounting period · ${r.p_start ?? ""} to ${r.p_end ?? ""}`;
+    const link = r.subject_type === "vendor" ? `vendor:${r.subject_id}` : r.subject_type === "employee" ? `person:${r.subject_id}`
+      : r.subject_type === "journal_entry" ? `entry:${r.subject_id}` : r.subject_type === "fiscal_period" ? `period:${r.subject_id}` : null;
+    const who = r.setup_session === "install-token" ? "ERP setup (install-wide API token)" : `ERP setup (${r.setup_by ?? "operator"}), support session ${r.setup_session}`;
+    return { requestId: r.id, subjectType: r.subject_type, subjectId: r.subject_id, kind: SETUP_KIND[r.subject_type] ?? r.subject_type, title,
+      detail: [r.subject_type === "employee" ? r.position : r.subject_type === "journal_entry" ? r.entry_day : null, `${r.decision === "rejected" ? "Rejected" : "Approved"} by ${who}`].filter(Boolean).join(" · "),
+      decision: r.decision, at: r.at, operator: r.setup_by, session: r.setup_session, reason: r.setup_reason, link, amountMinor: r.amount_minor };
+  }).sort((a, b) => b.at.localeCompare(a.at));
+}
+
+/** The company's recorded go-live, or null. (A posted sale also counts as live for setup approvals: company_went_live() in SQL.) */
+export async function goneLive(c: Client, entityId: string) {
+  const r = await q<{ at: string; by: string; kind: string; setup_items: number; reviewed_setup: boolean }>(c, `
+    select went_live_at::text at, by_label by, kind, setup_items, reviewed_setup from company_go_live where entity_id = $1`, [entityId]);
+  if (r[0]) return { at: r[0].at, by: r[0].by, kind: r[0].kind, setupItems: r[0].setup_items, reviewed: r[0].reviewed_setup, bySale: false };
+  const sale = await q(c, `select 1 from journal_entry where entity_id = $1 and source_type = 'sale' limit 1`, [entityId]);
+  return sale.length ? { at: null, by: null, kind: "sale", setupItems: 0, reviewed: false, bySale: true } : null;
+}
+
+/**
+ * The owner presses Go live: the go-live check passes (every step done,
+ * skipped or optional, and the tie-outs agree), and, when ERP setup approved
+ * anything, the owner ticks that they reviewed it. Recorded once
+ * (company_go_live, never changed or removed); from then on ERP setup
+ * approves nothing for this company. Never from support mode: the owner does
+ * it signed in as themselves.
+ */
+export async function goLive(c: Client, scope: Scope, x: { reviewed: boolean }) {
+  need(!(await inSupport(c)), "Go live is the owner's own step, signed in as themselves: ERP setup cannot press it in support mode");
+  const rec = await q(c, `select 1 from company_go_live where entity_id = $1`, [scope.entityId]);
+  need(!rec.length, "this company has already gone live");
+  const d = await checklist(c, scope.tenantId, scope.entityId);
+  const g = d.steps.find((s) => s.id === "golive");
+  need(d.complete && g && g.status === "done", `the go-live check has not passed yet: ${(g?.checks ?? []).filter((x) => !x.ok).map((x) => x.detail ? `${x.label} (${x.detail})` : x.label).join("; ") || "finish the steps above"}`);
+  const items = d.setupApprovals;
+  need(!items.length || x.reviewed === true, `tick "I've reviewed what ERP setup approved" first: ${items.length} item${items.length === 1 ? "" : "s"} were approved during setup`);
+  const r = await one<{ id: string; at: string }>(c, `
+    insert into company_go_live (tenant_id, entity_id, by_label, by_id, kind, setup_items, reviewed_setup)
+    values ($1, $2, $3, $4, 'owner', $5, $6) returning id, went_live_at::text at`,
+    [scope.tenantId, scope.entityId, scope.actor.label, scope.actor.id ?? null, items.length, items.length ? true : false]);
+  await audit(c, scope, { table: "company_go_live", rowId: r.id, action: "insert",
+    after: { setupItems: items.length, reviewed: items.length ? true : false, requests: items.map((i) => i.requestId) },
+    reason: items.length ? `went live; the owner reviewed ${items.length} approval${items.length === 1 ? "" : "s"} made by ERP setup` : "went live" });
+  return { wentLive: true, at: r.at, setupItems: items.length };
 }
 
 // ============================================================ skip, dismiss
