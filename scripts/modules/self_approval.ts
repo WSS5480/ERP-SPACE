@@ -151,6 +151,9 @@ export async function run(t: T) {
     /function askTypedConfirm\(a\)/.test(appJs) && /a\.self && a\.confirm\) \{\s*confirm = await askTypedConfirm\(a\)/.test(appJs) && /post\(`\/approvals\/\$\{a\.id\}`, \{ decision, note, callback, confirm \}\)/.test(appJs));
 
   // ---- support mode: never self-approves for the owner
+  // 0066: before go-live, ERP setup in support mode may approve a new vendor (scripts/modules/setup_approvals.ts checks that);
+  // these checks are about a company that has gone live, where support mode never decides the owner's own request
+  await tx(SYS, (c) => c.query(`insert into company_go_live (tenant_id, entity_id, by_label, kind) values ($1, $2, 'check: gone live', 'owner')`, [A.tenantId, A.entityId]));
   const vend2 = await A.as((c) => act.addVendor(c, A.co, A.a, { name: `Support Test Vendor ${A.tag}`, category: merch.code, merchandise: true }));
   const sReq = (await rows<{ id: string }>(t, `select id from approval_request where entity_id = $1 and subject_type = 'vendor' and subject_id = $2`, [A.entityId, vend2.id]))[0].id;
   const supActor = { kind: "user" as const, id: A.ownerId, label: "opsy (support) as Owner", support: randomUUID() };
@@ -166,7 +169,7 @@ export async function run(t: T) {
     /support mode never self-approves/);
   const supView = await read(t, async (c) => { markSupport(c, true); try { return await views.approvals(c, A.co, A.ownerId); } finally { markSupport(c, false); } });
   const sRow = supView.others.find((r: { id: string }) => r.id === sReq) as { why: string } | undefined;
-  t.ok("support mode: the Approvals screen does not offer it, and says why", !supView.mine.some((r: { id: string }) => r.id === sReq) && /support mode/i.test(sRow?.why ?? ""), sRow?.why);
+  t.ok("support mode: the Approvals screen does not offer it, and says why", !supView.mine.some((r: { id: string }) => r.id === sReq) && /support mode|gone live/i.test(sRow?.why ?? ""), sRow?.why);
   t.ok("support mode: the same request is still the owner's own to decide when they sign in themselves",
     (await read(t, (c) => views.approvals(c, A.co, A.ownerId))).mine.some((r: { id: string }) => r.id === sReq));
   {
@@ -198,7 +201,7 @@ export async function run(t: T) {
         sup.status === 200 && tried.status === 409 && /support mode never self-approves/.test(String(tried.data.error)), `${sup.status} ${tried.status} ${tried.data.error}`);
       const list = await call("GET", `/api/c/${A.entityId}/approvals`, { cookie, as: A.ownerId });
       const lr = (list.data.others as { id: string; why: string }[] | undefined)?.find((r) => r.id === sReq);
-      t.ok("support mode: and the route's Approvals list shows it as not theirs, saying why", list.status === 200 && /support mode/i.test(lr?.why ?? ""), lr?.why);
+      t.ok("support mode: and the route's Approvals list shows it as not theirs, saying why", list.status === 200 && /support mode|gone live/i.test(lr?.why ?? ""), lr?.why);
       const still = await rows<{ status: string }>(t, `select status from approval_request where entity_id = $1 and id = $2`, [A.entityId, sReq]);
       t.ok("support mode: nothing was decided", still[0]?.status === "open");
       await call("POST", "/api/platform/support/end", { cookie, body: {} });

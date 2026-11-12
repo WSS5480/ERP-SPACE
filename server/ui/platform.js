@@ -49,6 +49,20 @@ function formDialog(title, sub, fields, goLabel, submit) {
   return d;
 }
 const statusChip = (t) => (t.kind === 'demo' ? chip('neutral', 'info', 'Demo') : t.status === 'suspended' ? chip('critical', 'hold', 'Suspended') : chip('good', 'ok', 'Active'));
+/**
+ * Setup mode (0066), as a countdown: ERP setup may approve new vendors and hires until the company goes live,
+ * begins trading, or 60 days after its first setup approval. One chip for the customer: the company with the
+ * fewest days left, or "not started" while none has a setup approval yet; nothing once every company is live.
+ */
+function setupChip(list) {
+  const open = (list || []).filter((x) => !x.live && x.daysLeft !== 0);
+  if (!open.length) return (list || []).some((x) => !x.live) ? chip('neutral', 'clock', 'Setup ended (60 days)') : null;
+  const started = open.filter((x) => x.daysLeft != null).sort((a, b) => a.daysLeft - b.daysLeft);
+  if (!started.length) return chip('neutral', 'clock', 'Setup: 60 days from first approval');
+  const d = started[0].daysLeft;
+  return chip(d <= 7 ? 'warning' : 'neutral', 'clock', `Setup: ${plural(d, 'day')} left${open.length > 1 ? ` (${started[0].company})` : ''}`);
+}
+E.setupChip = setupChip;
 
 // ========================================================= operator console
 async function screenOperator() {
@@ -61,7 +75,7 @@ async function screenOperator() {
   ], 'The ERP team');
   const open = (t, focus) => () => customerDialog(t.id, focus);
   const custCards = customers.map((t) => card({
-    title: t.name, badge: statusChip(t), onClick: open(t),
+    title: t.name, badge: E.frag(statusChip(t), setupChip(t.setup)), onClick: open(t),
     rows: [['Plan', t.plan], ['Companies', t.companies, open(t, 'companies')], ['Stores', t.stores, open(t, 'stores')],
       ['Sign-ins', `${t.users} (${plural(t.people, 'person', 'people')})`, open(t, 'users')],
       ['Services on', t.services.length, open(t, 'services')], ['Last activity', when(t.last_activity), open(t, 'log')]],
@@ -173,12 +187,13 @@ async function newCustomer() {
   });
 }
 function inviteResult(r, title) {
+  if (!r.inviteLink && r.emailed) return resultBox('good', 'ok', title, r.note || 'The invite is on its way by email.');
   if (!r.inviteLink) return resultBox(r.note && /not connected/.test(r.note) ? 'warning' : 'good', r.note && /not connected/.test(r.note) ? 'warn' : 'ok', title, r.note || 'Done.');
   return E.frag(resultBox('good', 'ok', title, r.emailed ? 'The invite is on its way by email. The link below works too, once, for 7 days.'
     : 'No email is connected, so nothing was sent. Copy this link and send it to them yourself; it works once, for 7 days.'), copyBox(r.inviteLink));
 }
 
-const FOCUS = { companies: 'Companies', stores: 'Stores', users: 'Sign-ins', services: 'Services on', log: 'Platform log' };
+const FOCUS = { companies: 'Companies', stores: 'Stores', users: 'Sign-ins', services: 'Services on', log: 'Platform log', tokens: 'API tokens made in support mode' };
 /** A customer's detail. A figure tapped on a card opens just what is behind it, with Back to the whole customer. */
 function customerDialog(id, focus) {
   const d = openDialog('Customer', null, { wide: true });
@@ -194,6 +209,11 @@ function customerDialog(id, focus) {
     services: () => section('Services on', null, null, t.services.length ? el('div', { class: 'cards' }, t.services.map((x) => card({ title: x }))) : empty('No services on', null, true)),
     log: () => section('Platform log', null, null, t.recent.length ? el('div', { class: 'cards' }, t.recent.map((a) => card({ title: a.action, rows: [['When', new Date(a.at).toLocaleString()], ['Who', a.actor]] })))
       : empty('Nothing recorded yet', null, true)),
+    // review of 0066: API tokens made (or rotated) in support mode are no longer allowed; any made before are listed to revoke with the owner
+    tokens: () => section('API tokens made in support mode', null, null, (t.tokensMadeInSupport || []).length ? el('div', { class: 'cards' }, t.tokensMadeInSupport.map((k) => card({
+      title: k.name || 'API token', badge: k.active ? chip('critical', 'warn', 'Still active') : chip('neutral', 'none', 'Revoked'),
+      rows: [['Made', new Date(k.at).toLocaleString()], ['By', k.actor], ['What to do', k.active ? 'Revoke it with the owner unless they asked for it; it acts as the customer, not as support mode.' : 'Nothing; it no longer works.']] })))
+      : empty('None', 'No API token was made in support mode.', true)),
   };
   function userCard(u) {
     return card({
@@ -222,7 +242,11 @@ function customerDialog(id, focus) {
     d.body.replaceChildren(
       facts([['Status', t.status === 'suspended' ? `Suspended: ${t.status_reason || ''}` : t.kind === 'demo' ? 'Demo' : 'Active'], ['Plan', t.plan],
         ['Companies', t.companies, () => show('companies')], ['Stores', t.stores, () => show('stores')], ['Sign-ins', t.users.length, () => show('users')],
-        ['Services on', t.services.length, () => show('services')], ['API tokens', t.activeTokens], ['Last activity', when(t.last_activity), () => show('log')]]),
+        ['Services on', t.services.length, () => show('services')], ['API tokens', t.activeTokens], ['Last activity', when(t.last_activity), () => show('log')],
+        ['Made in support mode', (t.tokensMadeInSupport || []).filter((k) => k.active).length, () => show('tokens')]]),
+      setupChip(t.setup) ? el('p', {}, setupChip(t.setup)) : null,
+      (t.tokensMadeInSupport || []).some((k) => k.active) ? resultBox('serious', 'warn', 'API tokens made in support mode',
+        'A token made by the ERP team in support mode acts as the customer, not as support mode. Revoke it with the owner unless they asked for it.') : null,
       el('div', { class: 'dlg-acts' }, acts),
       sections.companies(), sections.users(), sections.log());
   }
@@ -278,8 +302,11 @@ async function screenAccount() {
   }
   if (owner) {
     const [users, tokens] = await Promise.all([api('/api/tenant/users'), api('/api/tenant/tokens')]);
+    // support mode never mints an identity that is not support mode: no invites or links, no new or rotated tokens (the owner does these)
+    const sup = E.inSupport();
+    const supNote = sup ? el('p', { class: 'fine', text: 'In support mode you cannot invite people, send invite links, or make or rotate API tokens: each would give a sign-in or a key that is not support mode. The owner does these from Account, signed in as themselves. Revoking a token is still allowed.' }) : null;
     blocks.push(section('Sign-ins', plural(users.length, 'person', 'people'), null,
-      el('div', { class: 'row-acts' }, el('button', { class: 'btn primary', type: 'button', onclick: inviteSomeone }, icon('plus'), 'Invite someone')),
+      sup ? supNote : el('div', { class: 'row-acts' }, el('button', { class: 'btn primary', type: 'button', onclick: inviteSomeone }, icon('plus'), 'Invite someone')),
       el('div', { class: 'cards' }, users.map((u) => card({
         title: u.name, badge: u.status === 'active' ? chip('good', 'ok', 'Active') : u.status === 'invited' ? chip('warning', 'clock', 'Invited') : chip('neutral', 'none', 'Off'),
         rows: [['Email', u.email], ['Roles', u.roles.map((r) => `${r.role.replace(/_/g, ' ')} (${r.company})`).join(', ') || 'none'], ['Last sign-in', when(u.last_sign_in_at)]],
@@ -287,11 +314,11 @@ async function screenAccount() {
       })))));
     const live = tokens.filter((k) => k.status === 'active');
     blocks.push(section('API tokens', 'For your own integrations, like a catalog app', null,
-      el('div', { class: 'row-acts' }, el('button', { class: 'btn', type: 'button', onclick: newToken }, icon('plus'), 'New token')),
+      sup ? null : el('div', { class: 'row-acts' }, el('button', { class: 'btn', type: 'button', onclick: newToken }, icon('plus'), 'New token')),
       live.length ? el('div', { class: 'cards' }, live.map((k) => card({
-        title: k.name, badge: chip('good', 'ok', 'Active'),
-        rows: [['Starts', `${k.prefix}…`], ['Made', `${new Date(k.created_at).toLocaleDateString()} by ${k.created_by}`], ['Last used', when(k.last_used_at)]],
-        acts: [el('button', { class: 'btn', type: 'button', onclick: () => tokenAction(k, 'rotate') }, 'Rotate'), el('button', { class: 'btn', type: 'button', onclick: () => tokenAction(k, 'revoke') }, 'Revoke')],
+        title: k.name, badge: k.made_in_support ? chip('critical', 'warn', 'Made in support mode') : chip('good', 'ok', 'Active'),
+        rows: [['Starts', `${k.prefix}…`], k.made_in_support ? ['Note', 'Made by the ERP team in support mode: it acts as you, not as support. Revoke it unless you asked for it.'] : null, ['Made', `${new Date(k.created_at).toLocaleDateString()} by ${k.created_by}`], ['Last used', when(k.last_used_at)]],
+        acts: [sup ? null : el('button', { class: 'btn', type: 'button', onclick: () => tokenAction(k, 'rotate') }, 'Rotate'), el('button', { class: 'btn', type: 'button', onclick: () => tokenAction(k, 'revoke') }, 'Revoke')].filter(Boolean),
       }))) : empty('No API tokens', 'A token is shown once when it is made; only its fingerprint is kept here.', true)));
   }
   return E.frag(...blocks);
@@ -299,6 +326,7 @@ async function screenAccount() {
 function userActs(u) {
   const me = E.isCustomer() && u.person_id === E.S.me.viewer.personId;
   const post = (path, ok) => (e) => E.act(e.currentTarget, () => api(path, { method: 'POST', body: {} }), ok);
+  if (u.status === 'invited' && E.inSupport()) return [];
   if (u.status === 'invited') return [el('button', { class: 'btn', type: 'button', onclick: async (e) => {
     busy(e.currentTarget, true);
     try { const r = await api(`/api/tenant/users/${u.id}/invite`, { method: 'POST', body: {} }); const d = openDialog('New invite link', u.email); d.body.append(inviteResult(r, 'Invite sent again')); }

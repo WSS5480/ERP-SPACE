@@ -10,7 +10,7 @@
 
 import { today as bizToday } from "../packages/core/clock.ts";
 import { periodFor } from "../packages/core/periods.ts";
-import { type Client, type Scope, q, one, audit } from "../packages/core/db.ts";
+import { type Client, type Scope, q, one, audit, inSupport } from "../packages/core/db.ts";
 import { categoryInfo, VendorCategoryError } from "../packages/core/vendor_categories.ts";
 import { decide, openRequest, selfApprovalFor, auditSelfApproval, needTypedTotal, RUN_RELEASERS, GATE_SIGN_OFF, releaseRoles, RELEASE_WORDS } from "../packages/core/approvals.ts";
 import { runGates, postToLedger, transition } from "../packages/core/invoice.ts";
@@ -26,7 +26,8 @@ import { PRESETS, presetPack, applyPresetSwitches } from "../packages/core/servi
 /** A refusal a person can act on. The server turns it into a 409 with the message. */
 export class ActionError extends Error {}
 
-export type Actor = { personId: string; personName: string; label: string };
+/** via: how the request came in (a signed-in customer, an operator, the install token, a tenant API token). */
+export type Actor = { personId: string; personName: string; label: string; via?: "customer" | "operator" | "system" | "tenant" };
 
 export const scopeOf = (co: Company, a: Actor, kind: "user" | "agent" | "system" = "user"): Scope => ({
   tenantId: co.tenantId,
@@ -1356,9 +1357,16 @@ export async function addBankAccount(c: Client, co: Company, a: Actor, input: Re
   return { id: row.id };
 }
 
+/** Review of 0066: support mode never makes someone an owner (an owner the ERP team could sign in as is not support mode). */
+async function noOwnerFromSupport(c: Client, roles: string[], already: boolean) {
+  if (roles.includes("owner") && !already && await inSupport(c))
+    throw new ActionError("support mode never makes someone an owner; the account owner does that, signed in as themselves");
+}
+
 export async function addPerson(c: Client, co: Company, a: Actor, input: Record<string, unknown>) {
   await mustOwn(c, co, a, "adding a person");
   const p = personIn(input);
+  await noOwnerFromSupport(c, p.roles, false);
   const found = await q<{ id: string }>(c, `
     select id from app_user where tenant_id = $1 and lower(email) = $2 /* unscoped: people belong to the client */`, [co.tenantId, p.email]);
   const userId = found.length ? found[0].id : (await one<{ id: string }>(c, `
@@ -1380,6 +1388,8 @@ export async function setRoles(c: Client, co: Company, a: Actor, input: Record<s
     select u.id, u.name from app_user u where u.id = $1 and u.tenant_id = $2
     /* unscoped: people belong to the client */`, [input.personId, co.tenantId]);
   need(person.length, "that person is not part of this client");
+  const wasOwner = (await q(c, `select 1 from role_grant where app_user_id = $1 and role = 'owner' and (entity_id = $2 or entity_id is null)`, [input.personId, co.id])).length > 0;
+  await noOwnerFromSupport(c, roles, wasOwner);
   if (!roles.includes("owner")) {
     // Who is still an owner afterwards: anyone else, or this person through a
     // client-wide grant, which this screen does not touch.

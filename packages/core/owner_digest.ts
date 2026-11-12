@@ -8,13 +8,15 @@
 // owner_notification row, shown on the owner's Home with each line openable;
 // it is emailed to the owners only when the company has email connected
 // (through the outbox). Demo and suspended customers are skipped, and a day's
-// digest is made once.
+// digest is made once. It also lists what ERP setup approved for the owner in
+// support mode before go-live (flow "setup", migration 0066), marked
+// "(approved during setup)" with the operator and support session.
 
 import { type Client, type Scope, q } from "./db.ts";
 import { isConnected, queueEmail } from "./messaging.ts";
 
 export type DigestItem = {
-  flow: "approval" | "count" | "writeoff" | "debit_memo" | "time_off" | "release" | "gate";
+  flow: "approval" | "count" | "writeoff" | "debit_memo" | "time_off" | "release" | "gate" | "setup" | "signin";
   id: string; at: string; decision: string; by: string | null; title: string; detail: string;
   amountMinor: string | null; link: string | null; screen: string | null;
 };
@@ -27,6 +29,10 @@ const SUBJECT_WORD: Record<string, string> = {
 const ROLE_WORD: Record<string, string> = { owner: "owner", controller: "controller", approver: "approver", ap_clerk: "A/P clerk", viewer: "viewer",
   store_manager: "store manager", hr: "HR", ar_clerk: "A/R clerk", web_admin: "web admin" };
 export const roleWord = (r: string) => ROLE_WORD[r] ?? r.replace(/_/g, " ");
+/** What the digest tells the owner about a sign-in set from a link the ERP team handled. */
+export const SIGNIN_LINE = "Your sign-in was set up from a link your ERP setup team handled; if you didn't set this password, reset it.";
+/** "New vendor · Ashley Furniture": the kind of request and who or what it is about. */
+const titled = (type: string, name: string | null) => `${SUBJECT_WORD[type] ?? type.replace(/_/g, " ")}${name ? ` · ${name}` : ""}`;
 const usd = (minor: string | null) => {
   if (minor == null) return "";
   const n = BigInt(minor); const neg = n < 0n; const v = neg ? -n : n;
@@ -36,8 +42,14 @@ const usd = (minor: string | null) => {
 /** Every self-approval in the company in (from, to]. One query per flow, each scoped to the company. */
 export async function selfApprovals(c: Client, entityId: string, from: string, to: string): Promise<DigestItem[]> {
   const out: DigestItem[] = [];
-  const eng = await q<{ id: string; at: string; decision: string; by: string | null; subject_type: string; subject_id: string; amount_minor: string | null; role: string; vendor_id: string | null }>(c, `
+  const eng = await q<{ id: string; at: string; decision: string; by: string | null; subject_type: string; subject_id: string; amount_minor: string | null; role: string; vendor_id: string | null; name: string | null }>(c, `
     select r.id, to_char(s.decided_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') at, s.decision, u.name by, r.subject_type, r.subject_id, r.amount_minor::text, s.required_role role,
+           (case r.subject_type
+             when 'vendor' then (select coalesce(v.dba, v.legal_name) from vendor v where v.id = r.subject_id)
+             when 'vendor_bank_account' then (select coalesce(v.dba, v.legal_name) from vendor_bank_account b join vendor v on v.id = b.vendor_id where b.id = r.subject_id)
+             when 'employee' then (select e.first_name || ' ' || e.last_name from employee e where e.id = r.subject_id and e.entity_id = r.entity_id)
+             when 'invoice' then (select coalesce(v.dba, v.legal_name) || coalesce(' ' || i.reference, '') from invoice i join vendor v on v.id = i.vendor_id where i.id = r.subject_id and i.entity_id = r.entity_id)
+           end) as name,
            case when r.subject_type = 'vendor_bank_account' then (select b.vendor_id from vendor_bank_account b where b.id = r.subject_id) end vendor_id
       from approval_step s join approval_request r on r.id = s.request_id left join app_user u on u.id = s.actor_id
      where r.entity_id = $1 and s.self_approved and s.decided_at > $2::timestamptz and s.decided_at <= $3::timestamptz
@@ -46,9 +58,43 @@ export async function selfApprovals(c: Client, entityId: string, from: string, t
     const link = e.subject_type === "invoice" ? `bill:${e.subject_id}` : e.subject_type === "payroll_run" ? `payrun:${e.subject_id}`
       : e.subject_type === "payment_run" ? `payment:${e.subject_id}` : e.subject_type === "employee" ? `person:${e.subject_id}`
       : e.subject_type === "vendor" ? `vendor:${e.subject_id}` : e.vendor_id ? `vendor:${e.vendor_id}` : null;
-    out.push({ flow: "approval", id: e.id, at: e.at, decision: e.decision, by: e.by, title: SUBJECT_WORD[e.subject_type] ?? e.subject_type.replace(/_/g, " "),
+    out.push({ flow: "approval", id: e.id, at: e.at, decision: e.decision, by: e.by, title: titled(e.subject_type, e.name),
       detail: `${e.decision} as ${roleWord(e.role)}`, amountMinor: e.amount_minor, link, screen: link ? null : "approvals" });
   }
+  // 0066: what ERP setup approved for the owner in support mode before go-live (one line per request)
+  const setup = await q<{ id: string; at: string; decision: string; by: string | null; subject_type: string; subject_id: string; amount_minor: string | null;
+                          setup_by: string | null; setup_session: string; setup_reason: string | null; name: string | null; rate: string | null; pay_type: string | null }>(c, `
+    select distinct on (r.id) r.id, to_char(s.decided_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') at, s.decision, u.name by,
+           r.subject_type, r.subject_id, r.amount_minor::text, s.setup_by, s.setup_session, s.setup_reason,
+           (case r.subject_type
+             when 'vendor' then (select coalesce(v.dba, v.legal_name) from vendor v where v.id = r.subject_id)
+             when 'vendor_bank_account' then (select coalesce(v.dba, v.legal_name) from vendor_bank_account b join vendor v on v.id = b.vendor_id where b.id = r.subject_id)
+             when 'employee' then (select e.first_name || ' ' || e.last_name from employee e where e.id = r.subject_id and e.entity_id = r.entity_id)
+             when 'invoice' then (select coalesce(v.dba, v.legal_name) || coalesce(' ' || i.reference, '') from invoice i join vendor v on v.id = i.vendor_id where i.id = r.subject_id and i.entity_id = r.entity_id)
+           end) as name,
+           (select e.base_rate_minor::text from employee e where e.id = r.subject_id and e.entity_id = r.entity_id) rate,
+           (select e.pay_type from employee e where e.id = r.subject_id and e.entity_id = r.entity_id) pay_type
+      from approval_step s join approval_request r on r.id = s.request_id left join app_user u on u.id = s.actor_id
+     where r.entity_id = $1 and s.setup_session is not null and s.decided_at > $2::timestamptz and s.decided_at <= $3::timestamptz
+     order by r.id, s.decided_at desc`, [entityId, from, to]);
+  for (const e of setup) {
+    const link = e.subject_type === "employee" ? `person:${e.subject_id}` : e.subject_type === "vendor" ? `vendor:${e.subject_id}` : null;
+    const words = setupWords(e.decision, e.setup_by, e.setup_session);
+    // a hire shows their pay ($18.50 an hour), not the request's yearly figure
+    const pay = e.subject_type === "employee" && e.rate != null ? `pay ${usd(e.rate)} ${e.pay_type === "salary" ? "a year" : "an hour"}; ` : "";
+    out.push({ flow: "setup", id: e.id, at: e.at, decision: e.decision, by: e.setup_by ? `ERP setup (${e.setup_by})` : "ERP setup",
+      title: titled(e.subject_type, e.name),
+      detail: `${pay}${words} (approved during setup)${e.setup_reason ? `; support reason: ${e.setup_reason}` : ""}`,
+      amountMinor: e.subject_type === "employee" ? null : e.amount_minor, link, screen: link ? null : "approvals" });
+  }
+  // review of 0066: a password set from an invite link the ERP team handled (shown to an operator while email was not connected)
+  const handled = await q<{ id: string; at: string; email: string | null }>(c, `
+    select a.id::text id, to_char(a.at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') at, a.detail->>'email' email
+      from platform_audit a join entity e on e.id = $1 and e.tenant_id = a.tenant_id
+     where a.action = 'login.set_from_handled_link' and a.at > $2::timestamptz and a.at <= $3::timestamptz
+     order by a.at /* unscoped: the company's client's platform log */`, [entityId, from, to]);
+  for (const x of handled) out.push({ flow: "signin", id: x.id, at: x.at, decision: "set up", by: x.email, title: `Sign-in set up${x.email ? ` · ${x.email}` : ""}`,
+    detail: SIGNIN_LINE, amountMinor: null, link: null, screen: "account" });
   const counts = await q<{ id: string; at: string; status: string; by: string | null; number: string; variance_minor: string | null }>(c, `
     select ct.id, to_char(ct.decided_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') at, ct.status, u.name by, ct.number, ct.variance_minor::text
       from inv_count ct left join app_user u on u.id = ct.decided_by
@@ -96,6 +142,13 @@ export async function selfApprovals(c: Client, entityId: string, from: string, t
   return out.sort((a, b) => a.at.localeCompare(b.at));
 }
 
+/** "approved by ERP setup (opsy), support session <id>", as the history and the digest say it. */
+export function setupWords(decision: string, operator: string | null, session: string | null): string {
+  const verb = decision === "rejected" ? "rejected" : "approved";
+  if (session === "install-token") return `${verb} by ERP setup (install-wide API token)`;
+  return `${verb} by ERP setup (${operator ?? "operator"})${session ? `, support session ${session}` : ""}`;
+}
+
 /** Roles taken away in this company (or client-wide) in the 24 hours before any of these instants. */
 export async function removalsBefore(c: Client, entityId: string, instants: string[]): Promise<DigestRemoval[]> {
   if (!instants.length) return [];
@@ -114,17 +167,24 @@ const localAt = (iso: string, tz: string) => {
 };
 
 export function digestText(company: string, items: DigestItem[], removals: DigestRemoval[], tz = "UTC"): { title: string; body: string } {
-  const title = `${items.length} self-approval${items.length === 1 ? "" : "s"} in ${company} in the last 24 hours`;
+  const nSetup = items.filter((i) => i.flow === "setup").length, nSignin = items.filter((i) => i.flow === "signin").length, nSelf = items.length - nSetup - nSignin;
+  const title = [nSelf ? `${nSelf} self-approval${nSelf === 1 ? "" : "s"}` : null, nSetup ? `${nSetup} approved during setup` : null,
+    nSignin ? `${nSignin} sign-in${nSignin === 1 ? "" : "s"} set from a link your ERP setup team handled` : null].filter(Boolean).join(" and ")
+    + ` in ${company} in the last 24 hours`;
   const lines = [
-    `${company}: what was approved by the person who asked for it, because nobody else in the company could.`,
+    nSelf ? `${company}: what was approved by the person who asked for it, because nobody else in the company could.` : nSetup ? `${company}: what ERP setup approved for you before go-live.` : `${company}: about your sign-ins.`,
+    nSelf && nSetup ? "Lines marked (approved during setup) were approved by ERP setup in support mode, before go-live." : null,
     "",
     ...items.map((i) => `- ${i.title}: ${i.detail}${i.amountMinor != null && i.flow !== "count" ? `, ${usd(i.amountMinor)}` : ""}, by ${i.by ?? "someone"} at ${localAt(i.at, tz)}`),
-  ];
+  ].filter((x): x is string => x !== null);
   if (removals.length) {
     lines.push("", "Roles taken away in the 24 hours before a self-approval:");
     for (const r of removals) lines.push(`- ${r.person ?? "someone"} lost ${roleWord(r.role)}${r.companyWide ? " (every company)" : ""}${r.kind === "person_inactive" ? " (no longer active)" : ""} at ${localAt(r.at, tz)}${r.by ? `, by ${r.by}` : ""}`);
   }
-  lines.push("", "Each one is on Home in the ERP, under Self-approvals. If any of these was not you, change your password and look at Setup, People.");
+  lines.push("");
+  if (nSelf) lines.push(`Each one is on Home in the ERP, under Self-approvals. If any ${nSetup ? "self-approval " : ""}was not you, change your password and look at Setup, People.`);
+  if (nSetup) lines.push(`${nSelf ? "Lines marked (approved during setup) were" : "These were"} approved by your ERP setup team during onboarding; tell them if anything looks wrong.`);
+  if (nSignin) lines.push(SIGNIN_LINE);
   return { title, body: lines.join("\n") };
 }
 
@@ -146,7 +206,9 @@ export async function makeDigest(c: Client, scope: Scope, at: Date, since: Date 
   if (from >= to) return { made: false, items: 0, removals: 0, emailed: false, note: "nothing new since the last digest" };
   const items = await selfApprovals(c, scope.entityId, from, to);
   if (!items.length) return { made: false, items: 0, removals: 0, emailed: false, note: "no self-approvals" };
-  const removals = await removalsBefore(c, scope.entityId, items.map((i) => i.at));
+  // roles removed matter before a self-approval; a setup approval is ERP setup's, not reached by removing anyone
+  const selfOnly = items.filter((i) => i.flow !== "setup" && i.flow !== "signin");
+  const removals = await removalsBefore(c, scope.entityId, selfOnly.map((i) => i.at));
   const co = (await q<{ name: string; tz: string }>(c, `select name, business_tz(id) tz from entity where id = $1 /* unscoped: the company itself */`, [scope.entityId]))[0];
   const { title, body } = digestText(co?.name ?? "Your company", items, removals, co?.tz ?? "UTC");
   const row = (await q<{ id: string }>(c, `
@@ -170,7 +232,9 @@ export async function makeDigest(c: Client, scope: Scope, at: Date, since: Date 
     }
   }
   return { made: true, items: items.length, removals: removals.length, emailed,
-    note: `${items.length} self-approval${items.length === 1 ? "" : "s"}${removals.length ? `, ${removals.length} role${removals.length === 1 ? "" : "s"} removed before` : ""}${emailed ? ", emailed" : ""}` };
+    note: `${[selfOnly.length ? `${selfOnly.length} self-approval${selfOnly.length === 1 ? "" : "s"}` : null,
+      items.some((i) => i.flow === "setup") ? `${items.filter((i) => i.flow === "setup").length} approved during setup` : null,
+      items.some((i) => i.flow === "signin") ? `${items.filter((i) => i.flow === "signin").length} sign-in set from a handled link` : null].filter(Boolean).join(", ")}${removals.length ? `, ${removals.length} role${removals.length === 1 ? "" : "s"} removed before` : ""}${emailed ? ", emailed" : ""}` };
 }
 
 /** The companies the digest job walks: customers only (never the demo), not suspended, companies active. */

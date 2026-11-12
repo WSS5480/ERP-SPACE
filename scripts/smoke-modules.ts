@@ -6,7 +6,7 @@ import { harness } from "./modules/harness.ts";
 import { pool } from "../packages/core/db.ts";
 
 // platform runs last: it ends by resetting the demo.
-const ORDER = ["setup", "catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "chart", "crm", "service", "reports", "group", "edi", "wms", "tax", "ops", "lots", "trade", "configurator", "admin", "drilldown", "periods", "harden_review", "vendor_files", "onboarding", "self_approval", "platform"];
+const ORDER = ["setup", "catalog", "purchasing", "inventory", "pos", "ar", "workforce", "fleet", "shop", "chart", "crm", "service", "reports", "group", "edi", "wms", "tax", "ops", "lots", "trade", "configurator", "admin", "drilldown", "periods", "harden_review", "vendor_files", "setup_approvals", "onboarding", "self_approval", "platform"];
 
 const { t, counts } = harness();
 for (const id of ORDER) {
