@@ -117,7 +117,7 @@ begin
     return 'support mode never self-approves for the owner: this company has gone live, so ERP setup no longer approves anything for it; the owner decides it signed in as themselves';
   end if;
   v_end := setup_window_end(p_entity);
-  if v_end is not null and erp_now() > v_end then
+  if v_end is not null and now() > v_end then
     return 'support mode never self-approves for the owner: ERP setup''s 60 days for this company ended on ' || to_char(v_end at time zone business_tz(p_entity), 'Mon FMDD, YYYY')
         || ' (they start at its first setup approval); the owner decides it signed in as themselves';
   end if;
@@ -264,12 +264,33 @@ create index if not exists approval_step_setup on approval_step (decided_at) whe
 -- Review of 0066: a tenant API token made (or rotated) by an operator in
 -- support mode is not support mode when it is used, so it could act as the
 -- owner. Making and rotating tokens is now refused in support mode; any made
--- before are flagged on the customer's platform log for the ERP team to
--- revoke with the owner.
-insert into platform_audit (actor, actor_kind, tenant_id, support_id, action, detail)
-select 'migration 0066', 'system', a.tenant_id, a.support_id, 'token.made_in_support',
-       jsonb_build_object('tokenId', a.detail->>'id', 'name', a.detail->>'name', 'by', a.actor, 'at', a.at,
-                          'active', exists (select 1 from platform_api_token k where k.id::text = a.detail->>'id' and k.status = 'active'),
-                          'note', 'made in support mode; revoke it with the owner unless they asked for it')
-  from platform_audit a
- where a.action in ('token.create') and a.support_id is not null;
+-- before are flagged on the customer's platform log and revoked here (the
+-- live install is in development, so nothing depends on them). The flag row
+-- keeps whether the token was still active.
+create or replace function revoke_support_made_tokens(p_by text) returns int
+language plpgsql as $$
+declare n int;
+begin
+  insert into platform_audit (actor, actor_kind, tenant_id, support_id, action, detail)
+  select p_by, 'system', a.tenant_id, a.support_id, 'token.made_in_support',
+         jsonb_build_object('tokenId', a.detail->>'id', 'name', a.detail->>'name', 'by', a.actor, 'at', a.at,
+                            'active', exists (select 1 from platform_api_token k where k.id::text = a.detail->>'id' and k.status = 'active'),
+                            'note', 'made in support mode; revoked by ' || p_by)
+    from platform_audit a
+   where a.action = 'token.create' and a.support_id is not null
+     and not exists (select 1 from platform_audit f where f.action = 'token.made_in_support' and f.detail->>'tokenId' = a.detail->>'id');
+  update platform_api_token k set status = 'revoked', revoked_at = now(), revoked_by = p_by
+   where k.status = 'active'
+     and exists (select 1 from platform_audit a where a.action = 'token.create' and a.support_id is not null
+                  and a.tenant_id = k.tenant_id and a.detail->>'id' = k.id::text);
+  get diagnostics n = row_count;
+  return n;
+end $$;
+
+select revoke_support_made_tokens('migration 0066 (made in support mode)');
+
+-- ------------------------------- invite links an operator handled (review) --
+-- An invite link shown to an operator (email not connected) is marked, so a
+-- password set from it writes login.set_from_handled_link to the platform log
+-- and the owner's digest tells them.
+alter table platform_login_token add column if not exists shown_to_operator boolean not null default false;

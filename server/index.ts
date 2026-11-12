@@ -1036,12 +1036,18 @@ route("POST", new RegExp(`^/api/platform/customers/${TID}/(suspend|reactivate)$`
   return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) =>
     P.setTenantStatus(c, by, tenantParam(m), m[2] === "suspend" ? "suspended" : "active", body.reason))];
 });
+/** Final review of 0066: the install-wide token never invites anyone or gets an invite link; an operator signed in does. */
+function notInstallToken(who: Who | null, what: string) {
+  if (who?.kind === "system") throw new HttpError(403, `${what} is for an operator signed in to the Operator console, not the install-wide API token: an invite link is a way in as that person`);
+}
 route("POST", new RegExp(`^/api/platform/customers/${TID}/users$`), "token", async (req, _u, m, who) => {
+  notInstallToken(who, "inviting someone");
   const by = operator(who);
   const body = await readJson(req);
   return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.inviteUser(c, by, tenantParam(m), body, publicBase(), { reveal: true }))];
 });
 route("POST", new RegExp(`^/api/platform/customers/${TID}/logins/${TID}/invite$`), "token", async (_req, _u, m, who) => {
+  notInstallToken(who, "a new invite link");
   const by = operator(who);
   return [200, await tx({ kind: "user", label: `${by.actor} (operator)` }, (c) => P.reinvite(c, by, tenantParam(m), m[2], publicBase(), { reveal: true }))];
 });

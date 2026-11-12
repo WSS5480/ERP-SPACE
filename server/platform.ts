@@ -130,8 +130,8 @@ export async function issueToken(c: Client, login: { id: string; tenant_id: stri
 /** The login a link token belongs to, locked; null when it is unknown, used, replaced or out of date. */
 async function tokenLogin(c: Client, token: string, purpose: "invite" | "reset", lock: boolean) {
   if (!/^[A-Za-z0-9_-]{20,100}$/.test(token)) return null;
-  const r = await q<{ id: string; login_id: string; expires_at: Date; used_at: Date | null; retired_at: Date | null }>(c, `
-    select id, login_id, expires_at, used_at, retired_at from platform_login_token
+  const r = await q<{ id: string; login_id: string; expires_at: Date; used_at: Date | null; retired_at: Date | null; shown_to_operator: boolean }>(c, `
+    select id, login_id, expires_at, used_at, retired_at, shown_to_operator from platform_login_token
      where token_hash = $1 and purpose = $2 ${lock ? "for update" : ""} /* unscoped: a token names its own login */`, [sha256(`${purpose}:${token}`), purpose]);
   const t = r[0];
   if (!t || t.used_at || t.retired_at || t.expires_at.getTime() <= Date.now()) return null;
@@ -166,6 +166,8 @@ export async function usePasswordToken(c: Client, token: string, password: unkno
   const nm = text(name, 80);
   if (purpose === "invite" && nm.length >= 2) await c.query(`update app_user set name = $2 where id = $1 and tenant_id = $3`, [l.app_user_id, nm, l.tenant_id]);
   await audit(c, { actor: l.email, kind: "customer" }, purpose === "invite" ? "login.invite_accepted" : "login.password_reset", l.tenant_id, { login: l.id });
+  // a link the ERP team handled (shown to an operator because email was not connected): the platform log and the owner's digest say so
+  if (t.shown_to_operator) await audit(c, { actor: l.email, kind: "customer" }, "login.set_from_handled_link", l.tenant_id, { login: l.id, email: l.email });
   return (await loginById(c, l.id))!;
 }
 
@@ -287,6 +289,11 @@ export async function createCustomer(c: Client, who: AuditActor, input: Record<s
 async function linkForOperator<R extends { inviteLink: string | null; emailed: boolean }>(c: Client, who: AuditActor, tenantId: string, r: R, email: string): Promise<R> {
   if (!r.inviteLink) return r;
   if (r.emailed) return { ...r, inviteLink: null, note: `The invite went to ${email} by email; it works once, for 7 days.` };
+  // the install-wide token is a key, not a person on the ERP team: it never receives an invite link (final review of 0066)
+  if (who.kind === "system") return { ...r, inviteLink: null, note: `Email is not connected, so the invite to ${email} was not sent; an operator signed in can hand the link over.` };
+  // the token behind the link is marked, so a password set from it is told to the owner (login.set_from_handled_link)
+  const tok = /#invite=([A-Za-z0-9_-]+)$/.exec(r.inviteLink)?.[1];
+  if (tok) await c.query(`update platform_login_token set shown_to_operator = true where token_hash = $1 and purpose = 'invite' and tenant_id = $2`, [sha256(`invite:${tok}`), tenantId]);
   await audit(c, who, "invite.link_shown", tenantId, { email, why: "no email connected, so the operator hands the link over" });
   return r;
 }
@@ -416,7 +423,7 @@ export async function setupStatus(c: Client, tenantId: string) {
   return q<{ entityId: string; company: string; live: boolean; endsAt: string | null; daysLeft: number | null }>(c, `
     select e.id "entityId", e.name company, company_went_live(e.id) live, setup_window_end(e.id)::text "endsAt",
            case when setup_window_end(e.id) is null then null
-                else greatest(0, ceil(extract(epoch from setup_window_end(e.id) - erp_now()) / 86400))::int end "daysLeft"
+                else greatest(0, ceil(extract(epoch from setup_window_end(e.id) - now()) / 86400))::int end "daysLeft"
       from entity e where e.tenant_id = $1 and e.status <> 'closed' order by e.name /* unscoped: the client's companies */`, [tenantId]);
 }
 
@@ -432,7 +439,7 @@ export async function customers(c: Client) {
              where e.tenant_id = t.id and m.enabled) as services,
            (select coalesce(jsonb_agg(jsonb_build_object('company', e.name, 'live', company_went_live(e.id),
                      'daysLeft', case when setup_window_end(e.id) is null then null
-                                      else greatest(0, ceil(extract(epoch from setup_window_end(e.id) - erp_now()) / 86400))::int end) order by e.name), '[]'::jsonb)
+                                      else greatest(0, ceil(extract(epoch from setup_window_end(e.id) - now()) / 86400))::int end) order by e.name), '[]'::jsonb)
               from entity e where e.tenant_id = t.id and e.status <> 'closed') as setup
       from tenant t
      order by (t.kind = 'demo'), t.name /* unscoped: the operator's list of every customer */`);
@@ -486,8 +493,12 @@ export async function supportSession(c: Client, id: string, operator: string) {
 export const API_TOKEN_PREFIX = "erpt_";
 
 export async function apiTokens(c: Client, tenantId: string) {
-  return q(c, `select id, name, prefix, status, created_at, created_by, revoked_at, revoked_by, last_used_at from platform_api_token
-                where tenant_id = $1 order by status, created_at desc /* unscoped: the client's tokens */`, [tenantId]);
+  // made_in_support: made (or rotated) by an operator in a support session, before that was refused (review of 0066)
+  return q(c, `select k.id, k.name, k.prefix, k.status, k.created_at, k.created_by, k.revoked_at, k.revoked_by, k.last_used_at,
+                      exists (select 1 from platform_audit a where a.tenant_id = k.tenant_id and a.action = 'token.create' and a.support_id is not null
+                               and a.detail->>'id' = k.id::text) as made_in_support
+                 from platform_api_token k
+                where k.tenant_id = $1 order by k.status, k.created_at desc /* unscoped: the client's tokens */`, [tenantId]);
 }
 
 export async function createApiToken(c: Client, who: AuditActor, tenantId: string, name: unknown) {

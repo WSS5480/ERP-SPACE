@@ -316,8 +316,8 @@ async function screenAccount() {
     blocks.push(section('API tokens', 'For your own integrations, like a catalog app', null,
       sup ? null : el('div', { class: 'row-acts' }, el('button', { class: 'btn', type: 'button', onclick: newToken }, icon('plus'), 'New token')),
       live.length ? el('div', { class: 'cards' }, live.map((k) => card({
-        title: k.name, badge: chip('good', 'ok', 'Active'),
-        rows: [['Starts', `${k.prefix}…`], ['Made', `${new Date(k.created_at).toLocaleDateString()} by ${k.created_by}`], ['Last used', when(k.last_used_at)]],
+        title: k.name, badge: k.made_in_support ? chip('critical', 'warn', 'Made in support mode') : chip('good', 'ok', 'Active'),
+        rows: [['Starts', `${k.prefix}…`], k.made_in_support ? ['Note', 'Made by the ERP team in support mode: it acts as you, not as support. Revoke it unless you asked for it.'] : null, ['Made', `${new Date(k.created_at).toLocaleDateString()} by ${k.created_by}`], ['Last used', when(k.last_used_at)]],
         acts: [sup ? null : el('button', { class: 'btn', type: 'button', onclick: () => tokenAction(k, 'rotate') }, 'Rotate'), el('button', { class: 'btn', type: 'button', onclick: () => tokenAction(k, 'revoke') }, 'Revoke')].filter(Boolean),
       }))) : empty('No API tokens', 'A token is shown once when it is made; only its fingerprint is kept here.', true)));
   }

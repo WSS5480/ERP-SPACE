@@ -207,6 +207,18 @@ export async function run(t: T) {
       const migSql = readFileSync(ROOT + "db/migrations/0066_setup_approvals.sql", "utf8");
       t.ok("tokens: a token made in support mode is flagged on the customer (still active, revoke it with the owner), and 0066 flags the old ones on the platform log",
         detail.status === 200 && flag?.active === true && /'token\.made_in_support'/.test(migSql), JSON.stringify(flag));
+      const acct = await call("GET", "/api/tenant/tokens", { cookie });
+      t.ok("tokens: the Account screen marks it as made in support mode",
+        (acct.data as unknown as { id: string; made_in_support: boolean }[]).find?.((k) => k.id === old.id)?.made_in_support === true
+        && /k\.made_in_support \? chip\('critical', 'warn', 'Made in support mode'\)/.test(readFileSync(ROOT + "server/ui/platform.js", "utf8")));
+      // 0066 revokes them (the same function it runs at migration time): the token stops working, the flag row is kept
+      const worksBefore = await fetch(`${base}/api/clients`, { headers: { authorization: `Bearer ${old.token}`, "x-forwarded-for": "198.51.100.91" } });
+      const n = await tx(SYS, async (c) => (await q<{ n: number }>(c, `select revoke_support_made_tokens('check: 0066') n /* unscoped: check */`))[0].n);
+      const worksAfter = await fetch(`${base}/api/clients`, { headers: { authorization: `Bearer ${old.token}`, "x-forwarded-for": "198.51.100.91" } });
+      const flagRow = await rows<{ detail: { active: boolean } }>(t, `select detail from platform_audit where tenant_id = $1 and action = 'token.made_in_support' and detail->>'tokenId' = $2 /* unscoped: check */`, [A.tenantId, old.id]);
+      t.ok("tokens: 0066 revokes tokens made in support mode: the token stops working (401), and the flag row says it was active",
+        worksBefore.status === 200 && n >= 1 && worksAfter.status === 401 && flagRow[0]?.detail.active === true && /select revoke_support_made_tokens\('migration 0066/.test(migSql),
+        `${worksBefore.status} ${n} ${worksAfter.status} ${JSON.stringify(flagRow[0])}`);
       // no new owner from support mode or the console
       const addOwner = await asA("POST", "/setup/people", { name: "Second Owner", email: `owner2-${A.tag}@example.com`, roles: ["owner"] });
       const addClerk = await asA("POST", "/setup/people", { name: "Setup Clerk", email: `clerk-${A.tag}@example.com`, roles: ["ap_clerk"] });
@@ -223,6 +235,24 @@ export async function run(t: T) {
       const shown = await rows(t, `select 1 from platform_audit where tenant_id = $1 and action = 'invite.link_shown' /* unscoped: check */`, [A.tenantId]);
       t.ok("invites: the console shows an invite link only when no email is connected, and the platform log says it was shown",
         consoleLink.status === 200 && !!consoleLink.data.inviteLink && consoleLink.data.emailed === false && shown.length > 0, `${consoleLink.status} ${consoleLink.data.error ?? ""}`);
+      // final review: the install-wide token never gets an invite link (the console routes refuse it; createCustomer hides it)
+      const tokInvite = await call("POST", `/api/platform/customers/${A.tenantId}/users`, { token: true, body: { name: "Tok Person", email: `tok-${A.tag}@example.com`, entityId: A.entityId, roles: ["sales"] } });
+      const tokReinvite = await call("POST", `/api/platform/customers/${A.tenantId}/logins/${ownerLogin}/invite`, { token: true, body: {} });
+      const tokCustomer = await call("POST", "/api/platform/customers", { token: true, body: { tenantName: `Token Made ${A.tag}`, legalName: `Token Made ${A.tag} LLC`, state: "TX",
+        pack: "furniture", ownerName: "Tok Owner", ownerEmail: `tokowner-${A.tag}@example.com`, plan: "standard" } });
+      t.ok("install token: the console's invite routes refuse it (403, in a sentence), and a customer it makes comes back with no invite link",
+        tokInvite.status === 403 && !tokInvite.data.inviteLink && /not the install-wide API token/.test(String(tokInvite.data.error)) && tokReinvite.status === 403 && !tokReinvite.data.inviteLink
+        && tokCustomer.status === 200 && !tokCustomer.data.inviteLink, `${tokInvite.status} ${tokReinvite.status} ${tokCustomer.status} link=${!!tokCustomer.data.inviteLink}`);
+      // final review: a password set from a link the ERP team handled is logged and told to the owner in the digest
+      const tokenOf = (link: string) => link.split("#invite=")[1];
+      const accepted = await call("POST", "/account/accept", { body: { token: tokenOf(String(consoleLink.data.inviteLink)), password: "setup-owner-pass-1" } });
+      const handledRows = await rows(t, `select 1 from platform_audit where tenant_id = $1 and action = 'login.set_from_handled_link' /* unscoped: check */`, [A.tenantId]);
+      const signin = (await read(t, (c) => OD.selfApprovals(c, A.entityId, started, new Date().toISOString()))).find((i) => i.flow === "signin");
+      t.ok("handled link: setting the password from a link shown to an operator writes a platform-log row and a digest line for the owner",
+        accepted.status === 200 && handledRows.length === 1 && signin?.detail === "Your sign-in was set up from a link your ERP setup team handled; if you didn't set this password, reset it.",
+        `${accepted.status} ${accepted.data.error ?? ""} ${handledRows.length} ${signin?.detail}`);
+      const fromEmail = await rows(t, `select 1 from platform_audit where tenant_id = $1 and action = 'login.set_from_handled_link' /* unscoped: check */`, [B.tenantId]);
+      t.ok("handled link: nothing is logged for a customer whose links were never shown to an operator", fromEmail.length === 0);
     }
 
     // ---- review of 0066: setup mode ends 60 days after the first setup approval; the countdown on the console and the banner
@@ -235,14 +265,24 @@ export async function run(t: T) {
       t.ok("60 days: the countdown is 60 days from the first setup approval, on the Operator console card and in the support banner",
         !!st && !st.live && (st.daysLeft === 60 || st.daysLeft === 59) && card?.setup.some((x) => x.daysLeft === st.daysLeft) === true && bannerSt?.daysLeft === st.daysLeft,
         JSON.stringify({ st, banner: bannerSt }));
+      // the 60 days run on the database's own clock (now()), so the check moves the first setup approval back, not the clock
       const later = await read(t, async (c) => {
+        await c.query("begin");
+        try {
+          await c.query(`update approval_step s set decided_at = s.decided_at - interval '61 days' from approval_request r
+                          where r.id = s.request_id and r.entity_id = $1 and s.setup_session is not null`, [A.entityId]);
+          return (await q<{ w: string | null }>(c, `select setup_approve_refusal($1, $2, array['owner'], 'vendor', $3, $4) w /* unscoped: check */`, [A.entityId, A.ownerId, randomUUID(), session]))[0].w;
+        } finally { await c.query("rollback"); }
+      });
+      t.ok("60 days: after 60 days ERP setup is refused, saying when its 60 days ended", /60 days for this company ended on/.test(later ?? ""), String(later));
+      const pinned = await read(t, async (c) => {
         await c.query("begin");
         try {
           await c.query("select set_config('erp.now', (now() + interval '61 days')::text, true)");
           return (await q<{ w: string | null }>(c, `select setup_approve_refusal($1, $2, array['owner'], 'vendor', $3, $4) w /* unscoped: check */`, [A.entityId, A.ownerId, randomUUID(), session]))[0].w;
         } finally { await c.query("rollback"); }
       });
-      t.ok("60 days: after 60 days ERP setup is refused, saying when its 60 days ended", /60 days for this company ended on/.test(later ?? ""), String(later));
+      t.ok("60 days: a pinned business clock (erp.now) does not move the 60 days", !/60 days/.test(pinned ?? ""), String(pinned));
       const plJs = readFileSync(ROOT + "server/ui/platform.js", "utf8");
       t.ok("60 days: the console card carries the countdown chip and the banner shows the days left",
         /badge: E\.frag\(statusChip\(t\), setupChip\(t\.setup\)\)/.test(plJs) && /Setup: \$\{plural\(st\.daysLeft, 'day'\)\} left/.test(appJs));

@@ -16,7 +16,7 @@ import { type Client, type Scope, q } from "./db.ts";
 import { isConnected, queueEmail } from "./messaging.ts";
 
 export type DigestItem = {
-  flow: "approval" | "count" | "writeoff" | "debit_memo" | "time_off" | "release" | "gate" | "setup";
+  flow: "approval" | "count" | "writeoff" | "debit_memo" | "time_off" | "release" | "gate" | "setup" | "signin";
   id: string; at: string; decision: string; by: string | null; title: string; detail: string;
   amountMinor: string | null; link: string | null; screen: string | null;
 };
@@ -29,6 +29,8 @@ const SUBJECT_WORD: Record<string, string> = {
 const ROLE_WORD: Record<string, string> = { owner: "owner", controller: "controller", approver: "approver", ap_clerk: "A/P clerk", viewer: "viewer",
   store_manager: "store manager", hr: "HR", ar_clerk: "A/R clerk", web_admin: "web admin" };
 export const roleWord = (r: string) => ROLE_WORD[r] ?? r.replace(/_/g, " ");
+/** What the digest tells the owner about a sign-in set from a link the ERP team handled. */
+export const SIGNIN_LINE = "Your sign-in was set up from a link your ERP setup team handled; if you didn't set this password, reset it.";
 /** "New vendor · Ashley Furniture": the kind of request and who or what it is about. */
 const titled = (type: string, name: string | null) => `${SUBJECT_WORD[type] ?? type.replace(/_/g, " ")}${name ? ` · ${name}` : ""}`;
 const usd = (minor: string | null) => {
@@ -85,6 +87,14 @@ export async function selfApprovals(c: Client, entityId: string, from: string, t
       detail: `${pay}${words} (approved during setup)${e.setup_reason ? `; support reason: ${e.setup_reason}` : ""}`,
       amountMinor: e.subject_type === "employee" ? null : e.amount_minor, link, screen: link ? null : "approvals" });
   }
+  // review of 0066: a password set from an invite link the ERP team handled (shown to an operator while email was not connected)
+  const handled = await q<{ id: string; at: string; email: string | null }>(c, `
+    select a.id::text id, to_char(a.at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') at, a.detail->>'email' email
+      from platform_audit a join entity e on e.id = $1 and e.tenant_id = a.tenant_id
+     where a.action = 'login.set_from_handled_link' and a.at > $2::timestamptz and a.at <= $3::timestamptz
+     order by a.at /* unscoped: the company's client's platform log */`, [entityId, from, to]);
+  for (const x of handled) out.push({ flow: "signin", id: x.id, at: x.at, decision: "set up", by: x.email, title: `Sign-in set up${x.email ? ` · ${x.email}` : ""}`,
+    detail: SIGNIN_LINE, amountMinor: null, link: null, screen: "account" });
   const counts = await q<{ id: string; at: string; status: string; by: string | null; number: string; variance_minor: string | null }>(c, `
     select ct.id, to_char(ct.decided_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') at, ct.status, u.name by, ct.number, ct.variance_minor::text
       from inv_count ct left join app_user u on u.id = ct.decided_by
@@ -157,11 +167,12 @@ const localAt = (iso: string, tz: string) => {
 };
 
 export function digestText(company: string, items: DigestItem[], removals: DigestRemoval[], tz = "UTC"): { title: string; body: string } {
-  const nSetup = items.filter((i) => i.flow === "setup").length, nSelf = items.length - nSetup;
-  const title = [nSelf ? `${nSelf} self-approval${nSelf === 1 ? "" : "s"}` : null, nSetup ? `${nSetup} approved during setup` : null].filter(Boolean).join(" and ")
+  const nSetup = items.filter((i) => i.flow === "setup").length, nSignin = items.filter((i) => i.flow === "signin").length, nSelf = items.length - nSetup - nSignin;
+  const title = [nSelf ? `${nSelf} self-approval${nSelf === 1 ? "" : "s"}` : null, nSetup ? `${nSetup} approved during setup` : null,
+    nSignin ? `${nSignin} sign-in${nSignin === 1 ? "" : "s"} set from a link your ERP setup team handled` : null].filter(Boolean).join(" and ")
     + ` in ${company} in the last 24 hours`;
   const lines = [
-    nSelf ? `${company}: what was approved by the person who asked for it, because nobody else in the company could.` : `${company}: what ERP setup approved for you before go-live.`,
+    nSelf ? `${company}: what was approved by the person who asked for it, because nobody else in the company could.` : nSetup ? `${company}: what ERP setup approved for you before go-live.` : `${company}: about your sign-ins.`,
     nSelf && nSetup ? "Lines marked (approved during setup) were approved by ERP setup in support mode, before go-live." : null,
     "",
     ...items.map((i) => `- ${i.title}: ${i.detail}${i.amountMinor != null && i.flow !== "count" ? `, ${usd(i.amountMinor)}` : ""}, by ${i.by ?? "someone"} at ${localAt(i.at, tz)}`),
@@ -173,6 +184,7 @@ export function digestText(company: string, items: DigestItem[], removals: Diges
   lines.push("");
   if (nSelf) lines.push(`Each one is on Home in the ERP, under Self-approvals. If any ${nSetup ? "self-approval " : ""}was not you, change your password and look at Setup, People.`);
   if (nSetup) lines.push(`${nSelf ? "Lines marked (approved during setup) were" : "These were"} approved by your ERP setup team during onboarding; tell them if anything looks wrong.`);
+  if (nSignin) lines.push(SIGNIN_LINE);
   return { title, body: lines.join("\n") };
 }
 
@@ -195,7 +207,7 @@ export async function makeDigest(c: Client, scope: Scope, at: Date, since: Date 
   const items = await selfApprovals(c, scope.entityId, from, to);
   if (!items.length) return { made: false, items: 0, removals: 0, emailed: false, note: "no self-approvals" };
   // roles removed matter before a self-approval; a setup approval is ERP setup's, not reached by removing anyone
-  const selfOnly = items.filter((i) => i.flow !== "setup");
+  const selfOnly = items.filter((i) => i.flow !== "setup" && i.flow !== "signin");
   const removals = await removalsBefore(c, scope.entityId, selfOnly.map((i) => i.at));
   const co = (await q<{ name: string; tz: string }>(c, `select name, business_tz(id) tz from entity where id = $1 /* unscoped: the company itself */`, [scope.entityId]))[0];
   const { title, body } = digestText(co?.name ?? "Your company", items, removals, co?.tz ?? "UTC");
@@ -220,7 +232,9 @@ export async function makeDigest(c: Client, scope: Scope, at: Date, since: Date 
     }
   }
   return { made: true, items: items.length, removals: removals.length, emailed,
-    note: `${[selfOnly.length ? `${selfOnly.length} self-approval${selfOnly.length === 1 ? "" : "s"}` : null, items.length > selfOnly.length ? `${items.length - selfOnly.length} approved during setup` : null].filter(Boolean).join(", ")}${removals.length ? `, ${removals.length} role${removals.length === 1 ? "" : "s"} removed before` : ""}${emailed ? ", emailed" : ""}` };
+    note: `${[selfOnly.length ? `${selfOnly.length} self-approval${selfOnly.length === 1 ? "" : "s"}` : null,
+      items.some((i) => i.flow === "setup") ? `${items.filter((i) => i.flow === "setup").length} approved during setup` : null,
+      items.some((i) => i.flow === "signin") ? `${items.filter((i) => i.flow === "signin").length} sign-in set from a handled link` : null].filter(Boolean).join(", ")}${removals.length ? `, ${removals.length} role${removals.length === 1 ? "" : "s"} removed before` : ""}${emailed ? ", emailed" : ""}` };
 }
 
 /** The companies the digest job walks: customers only (never the demo), not suspended, companies active. */

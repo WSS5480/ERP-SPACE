@@ -1012,7 +1012,8 @@ live; the company **begins trading** (`company_traded`: a sale, receipt,
 refund, deposit, A/R, finance, bill, payment, payroll, service, commission or
 fleet entry; opening balances, opening stock, manual corrections and transfers
 do not count); or **60 days after its first setup approval**
-(`setup_window_end(entity)`, compared with `erp_now()`). The Operator console's
+(`setup_window_end(entity)`, compared with the database's own `now()`, never
+the pinnable business clock `erp_now()`, in SQL and in the countdown). The Operator console's
 customer card carries a countdown chip (`platform.setupStatus`, `customers().setup`;
 "Setup: N days left", "Setup: 60 days from first approval" before any,
 "Setup ended (60 days)"), and the support banner shows the days left for the
@@ -1075,19 +1076,28 @@ an invite link or a new owner made by an operator would act as the customer,
 not as support mode, and could self-approve or press Go live. So:
 
 - `/api/tenant/tokens` create and rotate (both return a secret) are refused in
-  support mode and with the install-wide token; revoke is allowed. 0066 writes
-  a `token.made_in_support` platform-log row for every token made (or rotated)
-  in a support session before this, and the customer detail lists them
-  (`tokensMadeInSupport`, "Still active: revoke it with the owner").
+  support mode and with the install-wide token; revoke is allowed. 0066 runs
+  `revoke_support_made_tokens()`: every token made (or rotated) in a support
+  session is revoked, with a `token.made_in_support` platform-log row saying
+  whether it was still active. The customer detail lists them
+  (`tokensMadeInSupport`) and the Account screen marks any such token "Made in
+  support mode".
 - `/api/tenant/users` invite and `/api/tenant/users/:id/invite` are refused in
   support mode (the owner invites from Account).
 - Support mode never makes someone an owner: Setup → People add or roles
   (`addPerson`, `setRoles`) and adding a company with a new owner in `people`.
 - The Operator console never invites an owner (the first owner, made with the
   customer, is the only one), and shows an invite link (create customer, add a
-  person, New invite link) only when it could not be emailed; the platform log
-  then says `invite.link_shown`. With email connected the link goes to the
-  person's inbox only.
+  person, New invite link) only to an operator signed in, and only when it
+  could not be emailed; the platform log then says `invite.link_shown` and the
+  token is marked (`platform_login_token.shown_to_operator`). A password set
+  from such a link writes `login.set_from_handled_link`, and the owner's
+  digest says "Your sign-in was set up from a link your ERP setup team
+  handled; if you didn't set this password, reset it." (flow `signin`). With
+  email connected the link goes to the person's inbox only.
+- The install-wide token never gets an invite link: the console's add-a-person
+  and New invite link routes refuse it, and a customer it creates comes back
+  without the link.
 - Not routed: password resets (`/account/forgot`, emailed to the address on
   file), sign-in codes (emailed), the customer's own password change (needs a
   customer session). No route changes a sign-in's email.
@@ -1101,12 +1111,14 @@ employees (each opens its record), a tile that drills to the whole list with
 Back, the review tick and **Go live**; once live, who and when. Account in
 support mode: no invite, link, new-token or rotate buttons, with a sentence why.
 
-Checks: `scripts/modules/setup_approvals.ts` (64): operator adds and approves
+Checks: `scripts/modules/setup_approvals.ts` (70): operator adds and approves
 Ashley and adds its feeds without the owner; a hire; journal entries and
 periods refused as not setup types; refused on bank details, a payment run,
 payroll and a bill; direct SQL refused; no tokens, invites or owners minted
-from support mode, old tokens flagged, console links only without email; the
-60-day countdown and refusal; digest (names, pay, footer) and go-live list;
+from support mode, support-made tokens revoked (401) and marked, console links
+only without email and never to the install token, a handled link's password
+logged and in the digest; the 60-day countdown and refusal on the database
+clock; digest (names, pay, footer) and go-live list;
 go-live needs the ticked list, only signed in as the owner, cannot be pressed
 in support mode or with a tenant token, undone, emptied or repeated, and waits
 for an approval in flight; after go-live refused with the reason on both

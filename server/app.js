@@ -811,10 +811,11 @@ function openDigest(g) {
   return drillItems(g.title, g.items.map((x) => item({ title: x.title,
     detail: [x.detail, `by ${x.by || 'someone'}`, ago(x.at)].filter(Boolean).join(' · '),
     amount: x.amountMinor != null && x.flow !== 'count' ? money(x.amountMinor) : null,
-    badge: x.decision === 'rejected' || x.decision === 'declined' ? chip('critical', 'fail', cap(x.decision)) : x.flow === 'setup' ? chip('neutral', 'ok', 'Approved during setup') : chip('good', 'ok', 'Self-approved'),
+    badge: x.decision === 'rejected' || x.decision === 'declined' ? chip('critical', 'fail', cap(x.decision)) : x.flow === 'setup' ? chip('neutral', 'ok', 'Approved during setup')
+      : x.flow === 'signin' ? chip('warning', 'warn', 'Sign-in from a handled link') : chip('good', 'ok', 'Self-approved'),
     onClick: x.link ? () => openSubject(x.link) : x.screen && canSee(x.screen) ? () => go(x.screen) : null })),
   { noun: 'self-approval', before: removed, none: 'Nothing was self-approved that day.',
-    foot: [g.items.some((x) => x.flow !== 'setup') ? 'A self-approval is the maker deciding their own request because nobody else in the company holds a role that could. It ends the moment a second owner, a controller or an approver for that kind of request is added.' : null,
+    foot: [g.items.some((x) => x.flow !== 'setup' && x.flow !== 'signin') ? 'A self-approval is the maker deciding their own request because nobody else in the company holds a role that could. It ends the moment a second owner, a controller or an approver for that kind of request is added.' : null,
       g.items.some((x) => x.flow === 'setup') ? 'Lines marked approved during setup were approved by your ERP setup team during onboarding; tell them if anything looks wrong.' : null].filter(Boolean).join(' ') });
 }
 /** Home for someone outside the back office: just the screens they work in. */
