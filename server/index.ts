@@ -683,7 +683,9 @@ function coPost(tail: string, fn: (c: Client, co: views.Company, a: Actor, body:
     const body = await readJson(req, opts.maxBody);
     // An operator's support session, or the install-wide token (the operator's own key): neither self-approves for the owner.
     const support = who?.kind === "operator" && who.support ? who.support.id : who?.kind === "system" ? "install-token" : null;
-    const out = await tx({ kind: "user", id: actor.personId, label: actor.label, support }, async (c) => {
+    // the install-wide token says why it is acting (x-erp-reason); a setup approval made with it needs that reason
+    const supportReason = who?.kind === "system" ? String(req.headers["x-erp-reason"] ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 500) || null : null;
+    const out = await tx({ kind: "user", id: actor.personId, label: actor.label, support, supportReason }, async (c) => {
       const r = await fn(c, co, actor, body, m);
       if (who?.kind === "operator" && who.support) {
         await P.audit(c, auditActor(who), "support.write", co.tenantId, { path: url.pathname, as: actor.personName }, co.id);
@@ -902,7 +904,8 @@ route("GET", /^\/api\/me$/, "token", async (_req, _url, _m, who) => {
     const viewer: Record<string, unknown> = w.via === "session"
       ? { name: w.name, via: "session", kind: w.kind, until: new Date(w.exp * 1000).toISOString() }
       : { name: w.name, via: "token", kind: w.kind };
-    if (w.kind === "operator") viewer.support = w.support ? { tenantId: w.support.tenantId, tenantName: w.support.tenantName, since: w.support.since, reason: w.support.reason } : null;
+    if (w.kind === "operator") viewer.support = w.support ? { tenantId: w.support.tenantId, tenantName: w.support.tenantName, since: w.support.since, reason: w.support.reason,
+      setup: await P.setupStatus(c, w.support.tenantId) } : null;
     if (w.kind === "customer") {
       Object.assign(viewer, { personId: w.userId, email: w.email, tenantId: w.tenantId, tenantName: w.tenantName, demo: w.tenantKind === "demo",
         prospect: w.prospect, expiresAt: w.expiresAt, owner: !w.prospect && await P.isTenantOwner(c, w.userId, w.tenantId) });
@@ -972,6 +975,15 @@ route("POST", /^\/api\/companies$/, "token", async (req, _url, _m, who) => {
   if (w.kind === "operator") {
     if (!w.support) throw new HttpError(403, "create customers from the Operator console, or enter a customer in support mode to add a company to it");
     body.clientId = w.support.tenantId;
+    // review of 0066: support mode never makes someone an owner who is not one already (an owner the ERP team could sign in as is not support mode)
+    const ownersIn = (Array.isArray(body.people) ? body.people : []).filter((p: { roles?: unknown }) => Array.isArray(p?.roles) && p.roles.map(String).includes("owner"))
+      .map((p: { email?: unknown }) => String(p.email ?? "").trim().toLowerCase());
+    if (ownersIn.length) {
+      const known = await read((c) => q<{ email: string }>(c, `select lower(u.email) email from app_user u join role_grant g on g.app_user_id = u.id and g.role = 'owner'
+         where u.tenant_id = $1 /* unscoped: the client's owners */`, [w.support!.tenantId]));
+      if (ownersIn.some((e: string) => !known.some((k) => k.email === e)))
+        throw new HttpError(403, "support mode never makes someone an owner; name one of the account's owners, or the owner adds the company signed in as themselves");
+    }
   } else if (w.kind === "customer") {
     const c0 = await pool.connect();
     try {
@@ -1118,17 +1130,28 @@ async function ownerTenant(who: Who | null): Promise<{ tenantId: string; by: P.A
   throw new HttpError(403, "managing sign-ins and API tokens is for the account owner");
 }
 const ownerTx = <T>(o: { by: P.AuditActor }, fn: (c: Client) => Promise<T>) => tx({ kind: "user", label: o.by.actor }, fn);
+/**
+ * Review of 0066: nothing from support mode (or the install-wide token) may mint an identity that is not support
+ * mode -- an API token whose secret comes back, or an invite link the operator could use to set a password. Such an
+ * identity could then act as the owner (self-approve, press Go live). The account owner does these, signed in.
+ */
+function notFromSupport(who: Who | null, what: string) {
+  if ((who?.kind === "operator" && who.support) || who?.kind === "system")
+    throw new HttpError(403, `${what} is the account owner's own step, signed in as themselves; support mode cannot do it, so no identity is made that is not support mode`);
+}
 
 route("GET", /^\/api\/tenant\/users$/, "token", async (_r, _u, _m, who) => {
   const o = await ownerTenant(who);
   return [200, await read((c) => P.users(c, o.tenantId))];
 });
 route("POST", /^\/api\/tenant\/users$/, "token", async (req, _u, _m, who) => {
+  notFromSupport(who, "inviting someone to sign in");
   const o = await ownerTenant(who);
   const body = await readJson(req);
   return [200, await ownerTx(o, (c) => P.inviteUser(c, o.by, o.tenantId, body, publicBase(), { reveal: o.reveal }))];
 });
 route("POST", new RegExp(`^/api/tenant/users/${TID}/(invite|disable|enable)$`), "token", async (_req, _u, m, who) => {
+  if (m[2] === "invite") notFromSupport(who, "sending a new invite link");
   const o = await ownerTenant(who);
   return [200, await ownerTx(o, (c) => m[2] === "invite" ? P.reinvite(c, o.by, o.tenantId, m[1], publicBase(), { reveal: o.reveal })
     : P.setLoginStatus(c, o.by, o.tenantId, m[1], m[2] === "enable", o.selfUserId))];
@@ -1138,11 +1161,13 @@ route("GET", /^\/api\/tenant\/tokens$/, "token", async (_r, _u, _m, who) => {
   return [200, await read((c) => P.apiTokens(c, o.tenantId))];
 });
 route("POST", /^\/api\/tenant\/tokens$/, "token", async (req, _u, _m, who) => {
+  notFromSupport(who, "making an API token");
   const o = await ownerTenant(who);
   const body = await readJson(req);
   return [200, await ownerTx(o, (c) => P.createApiToken(c, o.by, o.tenantId, body.name))];
 });
 route("POST", new RegExp(`^/api/tenant/tokens/${TID}/(rotate|revoke)$`), "token", async (_req, _u, m, who) => {
+  if (m[2] === "rotate") notFromSupport(who, "rotating an API token (it shows the new secret)");
   const o = await ownerTenant(who);
   return [200, await ownerTx(o, (c) => m[2] === "rotate" ? P.rotateApiToken(c, o.by, o.tenantId, m[1]) : P.revokeApiToken(c, o.by, o.tenantId, m[1]))];
 });

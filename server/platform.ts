@@ -274,7 +274,21 @@ export async function createCustomer(c: Client, who: AuditActor, input: Record<s
   const link = `${base}/#invite=${token}`;
   const mail = await sendAccountEmail(c, { ...login, name: ownerName, tenant_name: tenantName }, "invite", token, link, who.actor);
   await audit(c, who, "customer.create", made.tenantId, { tenantName, companyName, pack: packId, plan, owner: ownerEmail, emailed: mail.sent }, made.id);
-  return { tenantId: made.tenantId, entityId: made.id, ownerId: owner.id, loginId: login.id, pack: pack.id, inviteLink: link, emailed: mail.sent };
+  return { tenantId: made.tenantId, entityId: made.id, ownerId: owner.id, loginId: login.id, pack: pack.id,
+    ...(await linkForOperator(c, who, made.tenantId, { inviteLink: link, emailed: mail.sent }, ownerEmail)) };
+}
+
+/**
+ * Review of 0066: an invite link handed to an operator lets whoever holds it set that person's password, an
+ * identity that is not support mode. So an operator sees the link only when it could not be emailed (no email
+ * connected yet, the onboarding case), and the platform log says it was shown. Once email works, invites go to
+ * the person's own inbox only.
+ */
+async function linkForOperator<R extends { inviteLink: string | null; emailed: boolean }>(c: Client, who: AuditActor, tenantId: string, r: R, email: string): Promise<R> {
+  if (!r.inviteLink) return r;
+  if (r.emailed) return { ...r, inviteLink: null, note: `The invite went to ${email} by email; it works once, for 7 days.` };
+  await audit(c, who, "invite.link_shown", tenantId, { email, why: "no email connected, so the operator hands the link over" });
+  return r;
 }
 
 /**
@@ -298,6 +312,8 @@ export async function inviteUser(c: Client, who: AuditActor, tenantId: string, i
   const roles = [...new Set((Array.isArray(input.roles) ? input.roles : []).map(String).filter((r) => allowed.includes(r)))];
   need(roles.length, "give them at least one role");
   if (opts.reveal) {
+    // an operator never makes an owner (beyond the first, made with the customer): an owner the ERP team could sign in as is not support mode
+    need(!roles.includes("owner"), "the ERP team does not add owners; the account owner adds another owner from Account, signed in as themselves");
     const elsewhere = await q(c, `select 1 from platform_login where email = $1 and tenant_id <> $2 /* unscoped: one email, one sign-in */`, [email, tenantId]);
     need(!elsewhere.length, `${email} already signs in to another customer's account; use another address`);
   }
@@ -307,7 +323,7 @@ export async function inviteUser(c: Client, who: AuditActor, tenantId: string, i
   const existing = await q<{ status: string }>(c, `select status from platform_login where app_user_id = $1 /* unscoped: the person's sign-in */`, [userId]);
   need(!existing[0] || existing[0].status !== "active", `${email} already signs in here; their new roles are in place`);
   const sent = await inviteFor(c, who, tenantId, userId, base, "user.invite", { roles, entityId }, entityId);
-  return opts.reveal ? { userId, ...sent } : { userId, ...neutral(sent) };
+  return opts.reveal ? { userId, ...(await linkForOperator(c, who, tenantId, sent, email)) } : { userId, ...neutral(sent) };
 }
 
 /** What a tenant owner is told about an invite: the same whatever became of it. */
@@ -349,7 +365,8 @@ export async function reinvite(c: Client, who: AuditActor, tenantId: string, id:
   const sent = await inviteFor(c, who, tenantId, r[0].user_id, base, "user.reinvite", {}, null);
   if (opts.reveal) {
     need(sent.inviteLink, "that email already signs in to another customer's account; change their email first");
-    return sent;
+    const em = (await one<{ email: string }>(c, `select email from app_user where id = $1 and tenant_id = $2 /* unscoped: the client's person */`, [r[0].user_id, tenantId])).email;
+    return linkForOperator(c, who, tenantId, sent, em);
   }
   return neutral(sent);
 }
@@ -390,6 +407,19 @@ export async function setTenantStatus(c: Client, who: AuditActor, tenantId: stri
   return { status };
 }
 
+/**
+ * Setup mode per company of a customer (0066): live (gone live or begun trading), when its 60 days end (they
+ * start at the first setup approval; null: none yet) and the whole days left. For the Operator console's
+ * countdown chip and the support banner.
+ */
+export async function setupStatus(c: Client, tenantId: string) {
+  return q<{ entityId: string; company: string; live: boolean; endsAt: string | null; daysLeft: number | null }>(c, `
+    select e.id "entityId", e.name company, company_went_live(e.id) live, setup_window_end(e.id)::text "endsAt",
+           case when setup_window_end(e.id) is null then null
+                else greatest(0, ceil(extract(epoch from setup_window_end(e.id) - erp_now()) / 86400))::int end "daysLeft"
+      from entity e where e.tenant_id = $1 and e.status <> 'closed' order by e.name /* unscoped: the client's companies */`, [tenantId]);
+}
+
 export async function customers(c: Client) {
   return q(c, `
     select t.id, t.name, t.kind, t.status, t.plan, t.vertical, t.created_at, t.status_reason,
@@ -399,7 +429,11 @@ export async function customers(c: Client) {
            (select count(*) from platform_login l where l.tenant_id = t.id and l.status <> 'disabled')::int as users,
            (select count(*) from app_user u where u.tenant_id = t.id and u.status = 'active')::int as people,
            (select coalesce(array_agg(distinct m.module order by m.module), '{}') from entity_module m join entity e on e.id = m.entity_id
-             where e.tenant_id = t.id and m.enabled) as services
+             where e.tenant_id = t.id and m.enabled) as services,
+           (select coalesce(jsonb_agg(jsonb_build_object('company', e.name, 'live', company_went_live(e.id),
+                     'daysLeft', case when setup_window_end(e.id) is null then null
+                                      else greatest(0, ceil(extract(epoch from setup_window_end(e.id) - erp_now()) / 86400))::int end) order by e.name), '[]'::jsonb)
+              from entity e where e.tenant_id = t.id and e.status <> 'closed') as setup
       from tenant t
      order by (t.kind = 'demo'), t.name /* unscoped: the operator's list of every customer */`);
 }
@@ -414,7 +448,11 @@ export async function customerDetail(c: Client, tenantId: string) {
   const stores = await q(c, `select lo.id, lo.code, lo.name, lo.state, lo.kind, e.name as company from location lo join entity e on e.id = lo.entity_id
       where e.tenant_id = $1 and lo.status = 'active' order by e.name, lo.name /* unscoped: the client's stores */`, [tenantId]);
   const tokens = await q(c, `select count(*)::int as n from platform_api_token where tenant_id = $1 and status = 'active' /* unscoped: the client's tokens */`, [tenantId]);
-  return { ...t, companiesList: companies, storesList: stores, users: await users(c, tenantId), activeTokens: tokens[0].n, recent };
+  // review of 0066: tokens made (or rotated) by an operator in support mode, flagged so the ERP team revokes them with the owner
+  const madeInSupport = await q(c, `select a.at, a.actor, a.detail->>'name' as name, a.detail->>'id' as id,
+      exists (select 1 from platform_api_token k where k.id::text = a.detail->>'id' and k.status = 'active') as active
+      from platform_audit a where a.tenant_id = $1 and a.action = 'token.create' and a.support_id is not null order by a.at desc /* unscoped: the client's platform log */`, [tenantId]);
+  return { ...t, companiesList: companies, storesList: stores, users: await users(c, tenantId), activeTokens: tokens[0].n, tokensMadeInSupport: madeInSupport, recent };
 }
 
 // ------------------------------------------------------------- support mode

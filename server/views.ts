@@ -311,7 +311,7 @@ export async function approvals(c: Client, co: Company, personId: string | null)
   }
   // what the screen says in support mode: whether ERP setup approves here, and if not why not
   const setupMode = marker ? { live, note: live ? "This company has gone live, so ERP setup no longer approves anything for it: new vendors, hires, opening entries and periods now wait for the owner, signed in as themselves."
-    : "Before go-live, ERP setup may approve setup records for the owner: a new vendor, a new hire, an opening-balance entry, an accounting period. Never bank details, bills, payment runs, payroll or anything else that moves money." } : null;
+    : "Before go-live, ERP setup may approve setup records for the owner: a new vendor or a new hire, for at most 60 days from the first one and never once the company has begun trading. Never bank details, bills, payment runs, payroll or anything else that moves money." } : null;
   return { mine, others, recent: recentWithSubject, roles: [...held].map(roleWord), setupMode };
 }
 

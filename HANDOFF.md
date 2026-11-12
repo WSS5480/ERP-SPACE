@@ -30,8 +30,8 @@ Read this first if you are a new AI session picking up this repo. Update it **in
   - Refusals are plain sentences.
   - `post()` posts by account code.
 - **Database:**
-  - Migrations: `db/migrations/NNNN_*.sql`. Highest live is 0065. The 0066 branch is in review.
-  - Seeds: `db/seed/`. Highest is 0036.
+  - Migrations: `db/migrations/NNNN_*.sql`. Highest live is 0065. 0066 (setup approvals) is on branch `mod-setupops`, reviewed, not merged.
+  - Seeds: `db/seed/`. Highest is 0037 (on `mod-setupops`: the demo is live), then 0099.
   - The server migrates itself at startup; `scripts/migrate.ts` does the same job by hand.
 - **Multi-tenant platform:**
   - The platform layer is `server/platform.ts`.
@@ -49,7 +49,7 @@ npm ci            # ssh2 is required; the module runner fails loudly if a depend
 bash db/apply.sh --reset --seed && npm run -s smoke:modules && npm run -s smoke
 ```
 
-- **Expected results:** smoke 139/0. Module checks as of 7bce1e0: 2736/0.
+- **Expected results:** smoke 139/0. Module checks as of 7bce1e0: 2736/0; on `mod-setupops`: 2800/0.
 - **If Postgres is down:** run `service postgresql start`.
 - **Parallel work:** use git worktrees at `/home/claude/wt-<name>` on branch `mod-<name>`, each with its own DB `erp_<name>`.
 - **Deploy:**
@@ -66,7 +66,8 @@ bash db/apply.sh --reset --seed && npm run -s smoke:modules && npm run -s smoke
 
 ## Change log (newest first)
 
-- 2026-11-12: setup-mode approvals before go-live (branch `mod-setupops`, in review). HANDOFF.md added.
+- 2026-11-12: setup-mode approvals before go-live (branch `mod-setupops`, 0066 + seed 0037): ERP setup approves new vendors and new hires only; ends at Go live, first trading entry, or 60 days after the first; countdown chip on the console and in the support banner; the install token needs `x-erp-reason`; Go live only signed in as the owner, after ticking the list shown; digest names each line and shows a hire's pay. Review fixes: no API tokens, invite links or owners minted from support mode (a live hole), old support-made tokens flagged.
+- 2026-11-12: HANDOFF.md added.
 - 2026-11-11, 7bce1e0: self-approval for one-owner stores across every flow; release needs a releasing role; owner digest.
 - 2026-11-11, 39fd9ce: SFTP, HTTPS pulls, vendor email-in, EDI over SFTP, catalog template and xlsx import.
 - 2026-11-11, f17cb17: periods and close, store-local dates, scheduler, error refs, CI, selling rules, demo scrub; drill-downs.
@@ -81,9 +82,19 @@ bash db/apply.sh --reset --seed && npm run -s smoke:modules && npm run -s smoke
 - 2026-11-11: vendor email applies automatically only with an SPF pass aligned to the From address. Forwarded mail is held for one-tap review, to block faked price files.
 - 2026-11-11: an owner may self-approve only when no other active owner, controller or step-role holder exists. Never in support mode. Bank details, payments and payroll need the typed payee or total. Everything self-approved appears in the daily digest.
 - 2026-11-11: releasing a run needs a releasing role: owner, controller, approver or A/P clerk for payments; owner, controller or HR for payroll.
-- 2026-11-12: before go-live, an operator in support mode may approve setup items only (vendor, hire, period, opening entry). The owner reviews them at Go-live. This ends for good once the company is live. Steve asked for it for every new customer.
+- 2026-11-12: before go-live, an operator in support mode may approve setup items only: new vendors and new hires. The owner reviews them at Go-live. Steve asked for it for every new customer.
+- 2026-11-12: journal entries and periods dropped from the setup types, because no flow opens those requests.
+- 2026-11-12: setup mode ends at whichever comes first: Go live, the first trading entry (money in or out, a sale, a bill, payroll...), or 60 days after the first setup approval. So a customer who trades or stalls does not keep the window open.
+- 2026-11-12: Go live is recorded once and can never be undone (append-only table), because the computed go-live step can flip back when a tie-out fails.
+- 2026-11-12: Go live only by the owner signed in as themselves, never support mode or any token, after ticking the exact list shown. The review is the owner's, so nobody else can press it.
+- 2026-11-12: support mode and the install token never mint an identity that is not support mode: no API token create or rotate, no invites or invite links, no new owners. Such an identity could self-approve or go live as the owner. Revoking stays allowed.
+- 2026-11-12: the Operator console shows an invite link only when email is not connected (the onboarding case), and logs that it was shown. Otherwise the link goes to the person's inbox only.
+- 2026-11-12: the install-wide token needs an `x-erp-reason` header for setup approvals, so every one carries a reason like a support session's.
 
 ## Open items
+
+- Merge `mod-setupops` into `retail-erp` and ship (0066, seed 0037). After deploying, check the Operator console for any "API tokens made in support mode" still active, and revoke them with the owner.
+- Residual: before email is connected, the Operator console still shows the owner's invite link (logged as `invite.link_shown`). Whoever holds it can set the owner's password. Connect platform email (`ERP_PLATFORM_MAIL_COMPANY`) so invites go to the owner's inbox only.
 
 - Product name and domain: waiting on Steve.
 - Paid Render setup (Starter plus its own database) and email: waiting on Steve.

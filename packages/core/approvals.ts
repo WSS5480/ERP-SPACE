@@ -174,10 +174,11 @@ export async function selfApprovalFor(c: Client, entityId: string, deciderId: st
 
 /**
  * What ERP setup may approve in support mode before the company goes live
- * (migration 0066): a new vendor, a new hire, an accounting period, an
- * opening-balance journal entry. Never money movement or bank details.
+ * (migration 0066): a new vendor, a new hire. Never money movement or bank
+ * details. Setup mode ends at go-live, at the first trading entry, or 60 days
+ * after the company's first setup approval, whichever comes first.
  */
-export const SETUP_TYPES: readonly SubjectType[] = ["vendor", "employee", "fiscal_period", "journal_entry"];
+export const SETUP_TYPES: readonly SubjectType[] = ["vendor", "employee"];
 export const isSetupType = (t: string) => (SETUP_TYPES as readonly string[]).includes(t);
 
 /**
@@ -195,8 +196,10 @@ export async function setupApprovalRefusal(c: Client, entityId: string, userId: 
 
 /** Who ERP setup is in words, for the record: the operator and support session, or the install-wide token. */
 export async function setupWho(c: Client, marker: string): Promise<{ operator: string; session: string; reason: string; label: string }> {
-  if (marker === "install-token") return { operator: "install-wide API token", session: "install-token", reason: "the install-wide API token",
-    label: "approved by ERP setup (install-wide API token)" };
+  if (marker === "install-token") {
+    const why = (await one<{ r: string | null }>(c, `select nullif(trim(current_setting('erp.support_reason', true)), '') r /* unscoped: a setting */`)).r;
+    return { operator: "install-wide API token", session: "install-token", reason: why ?? "", label: "approved by ERP setup (install-wide API token)" };
+  }
   const s = (await q<{ operator: string; reason: string }>(c, `select operator, reason from platform_support_session where id = $1
      /* unscoped: the support session is the operator's, checked against this customer by setup_approve_refusal */`, [marker]))[0];
   return { operator: s?.operator ?? "operator", session: marker, reason: s?.reason ?? "", label: `approved by ERP setup (${s?.operator ?? "operator"}), support session ${marker}` };
@@ -436,6 +439,8 @@ async function decideAsSetup(c: Client, scope: Scope, x: {
   if (x.req.requires_callback && x.decision === "approved" && !x.callbackLogged)
     throw new ApprovalError("this subject needs a callback to a number already on file, logged before approval");
   const who = await setupWho(c, x.marker);
+  if (x.marker === "install-token" && who.reason.length < 3)
+    throw new ApprovalError("the install-wide API token must say why (an x-erp-reason header) to approve during setup");
   const open = x.steps.filter((s) => s.decision === null);
   const todo = x.decision === "approved" ? open : open.slice(0, 1);
   for (const st of todo) {

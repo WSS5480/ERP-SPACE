@@ -63,12 +63,13 @@ export async function run(t: T) {
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   type Res = { status: number; data: Record<string, any>; cookie: string | null };
-  const call = async (method: string, path: string, o: { body?: unknown; cookie?: string | null; as?: string; token?: boolean } = {}): Promise<Res> => {
+  const call = async (method: string, path: string, o: { body?: unknown; cookie?: string | null; as?: string; token?: boolean; reason?: string } = {}): Promise<Res> => {
     const headers: Record<string, string> = { "x-erp-page": "1", "x-forwarded-for": "198.51.100.91" };
     if (o.body !== undefined) headers["content-type"] = "application/json";
     if (o.cookie) headers.cookie = o.cookie;
     if (o.as) headers["x-erp-as"] = o.as;
     if (o.token) headers.authorization = `Bearer ${process.env.ERP_API_TOKEN}`;
+    if (o.reason) headers["x-erp-reason"] = o.reason;
     const r = await fetch(base + path, { method, headers, body: o.body === undefined ? undefined : JSON.stringify(o.body) });
     const sc = r.headers.get("set-cookie");
     let data: Record<string, any> = {};
@@ -136,17 +137,19 @@ export async function run(t: T) {
       hire.status === 200 && hOk?.status === 200 && hOk.data.status === "approved" && (await stepOf(hReq!)).every((s) => s.setup_session === session)
       && (await rows<{ status: string }>(t, `select status from employee where entity_id = $1 and id = $2`, [A.entityId, hire.data.id]))[0]?.status === "active", `${hire.status} ${hire.data.error ?? ""} ${hOk?.status} ${hOk?.data.error ?? ""}`);
 
+    const supTx = <R>(fn: (c: Client) => Promise<R>) => tx({ kind: "user", id: A.ownerId, label: "opsy (support) as Owner", support: session }, fn);
+    // review of 0066: journal entries and periods are not setup types (no flow opens those requests)
     const ob1 = await asA("POST", "/onboarding/opening-bank", { bankAccountId: bank, asOf: A.today, amount: "12500.00" });
     const openJe = (await rows<{ id: string }>(t, `select journal_entry_id id from opening_bank_balance where entity_id = $1`, [A.entityId]))[0]?.id;
-    const supTx = <R>(fn: (c: Client) => Promise<R>) => tx({ kind: "user", id: A.ownerId, label: "opsy (support) as Owner", support: session }, fn);
     const jReq = await supTx((c) => AP.openRequest(c, A.scope, { subjectType: "journal_entry", subjectId: openJe, amountMinor: 1_250_000n, makerId: A.ownerId })) as { requestId: string };
-    const jOk = await asA("POST", `/approvals/${jReq.requestId}`, { decision: "approved" });
-    t.ok("setup: an opening-balance entry (the bank opening balance, source 'opening') is approved by ERP setup",
-      ob1.status === 200 && !!openJe && jOk.status === 200 && jOk.data.status === "approved", `${ob1.status} ${ob1.data.error ?? ""} ${jOk.status} ${jOk.data.error ?? ""}`);
+    const jTry = await asA("POST", `/approvals/${jReq.requestId}`, { decision: "approved" });
     const period = (await rows<{ id: string }>(t, `select id from fiscal_period where entity_id = $1 order by starts_on limit 1`, [A.entityId]))[0]?.id;
     const pReq = await supTx((c) => AP.openRequest(c, A.scope, { subjectType: "fiscal_period", subjectId: period, amountMinor: null, makerId: A.ownerId })) as { requestId: string };
-    const pOk = await asA("POST", `/approvals/${pReq.requestId}`, { decision: "approved" });
-    t.ok("setup: an accounting period is approved by ERP setup", pOk.status === 200 && pOk.data.status === "approved", `${pOk.status} ${pOk.data.error ?? ""}`);
+    const pTry = await asA("POST", `/approvals/${pReq.requestId}`, { decision: "approved" });
+    t.ok("setup types: an opening-balance entry and an accounting period are not ERP setup's to approve (vendors and new hires only)",
+      ob1.status === 200 && jTry.status === 409 && /only setup records \(a new vendor, a new hire\)/.test(String(jTry.data.error)) && pTry.status === 409 && /only setup records/.test(String(pTry.data.error)),
+      `${ob1.status} ${jTry.status} ${jTry.data.error} | ${pTry.status}`);
+    t.ok("setup types: the code says the same list", AP.SETUP_TYPES.join(",") === "vendor,employee");
 
     // ---- never money or bank details
     const bankReq = await asA("POST", `/vendors/${ashley}/bank`, { bankName: "First Test Bank", routingLast4: "1234", accountLast4: "5678", heldAt: "the bank's payee record", reason: "letter on letterhead" });
@@ -161,12 +164,6 @@ export async function run(t: T) {
       t.ok(`refused: ERP setup cannot approve ${word} (409, in a sentence; still open)`, tried.status === 409 && /support mode never self-approves/.test(String(tried.data.error))
         && (await rows<{ status: string }>(t, `select status from approval_request where entity_id = $1 and id = $2`, [A.entityId, r.requestId]))[0]?.status === "open", `${tried.status} ${tried.data.error}`);
     }
-    const manual = await tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => post(c, A.scope, { date: A.today, sourceType: "manual", sourceId: null,
-      description: "Not an opening balance", lines: [{ code: "6900", debit: 1000n }, { code: "3000", credit: 1000n }] }));
-    const mReq = await supTx((c) => AP.openRequest(c, A.scope, { subjectType: "journal_entry", subjectId: manual, amountMinor: 1_000_000n, makerId: A.ownerId })) as { requestId: string };
-    const mTry = await asA("POST", `/approvals/${mReq.requestId}`, { decision: "approved" });
-    t.ok("refused: a journal entry that is not an opening balance waits for the owner", mTry.status === 409 && /only opening-balance entries/.test(String(mTry.data.error)), `${mTry.status} ${mTry.data.error}`);
-
     // ---- the database, directly
     const payReq = await supTx((c) => AP.openRequest(c, A.scope, { subjectType: "payment_run", subjectId: randomUUID(), amountMinor: 100n, makerId: A.ownerId })) as { requestId: string };
     await t.throws("database: a step marked as a setup approval with no support session is refused (direct SQL)",
@@ -189,21 +186,89 @@ export async function run(t: T) {
     });
     t.ok("rule: the SQL rule lets ERP setup approve a new vendor before go-live", codeSql === null, String(codeSql));
 
+    // ---- review of 0066: nothing from support mode mints an identity that is not support mode
+    {
+      const { createApiToken } = await import("../../server/platform.ts");
+      const own = await tx(SYS, (c) => createApiToken(c, { actor: "owner@example.com", kind: "customer" }, A.tenantId, `Owner integration ${A.tag}`));
+      const rot = await call("POST", `/api/tenant/tokens/${own.id}/rotate`, { cookie, body: {} });
+      const inv = await call("POST", "/api/tenant/users", { cookie, body: { name: "Op Self", email: `op-${A.tag}@example.com`, entityId: A.entityId, roles: ["controller"] } });
+      const ownerLogin = (await rows<{ id: string }>(t, `select id from platform_login where tenant_id = $1 /* unscoped: check */`, [A.tenantId]))[0].id;
+      const reinv = await call("POST", `/api/tenant/users/${ownerLogin}/invite`, { cookie, body: {} });
+      const viaInstall = await call("POST", "/api/tenant/tokens", { token: true, body: { name: "install probe" } });
+      t.ok("tokens: in support mode rotating a token (it shows the new secret), inviting someone and sending an invite link are refused (403)",
+        rot.status === 403 && !rot.data.token && inv.status === 403 && reinv.status === 403 && !reinv.data.inviteLink, `${rot.status} ${inv.status} ${reinv.status}`);
+      t.ok("tokens: the install-wide token cannot make a customer API token either (403)", viaInstall.status === 403, `${viaInstall.status} ${viaInstall.data.error}`);
+      const revoke = await call("POST", `/api/tenant/tokens/${own.id}/revoke`, { cookie, body: {} });
+      t.ok("tokens: revoking a token is still allowed in support mode", revoke.status === 200, `${revoke.status} ${revoke.data.error}`);
+      // a token made in support mode before this fix: flagged for the ERP team on the customer's detail
+      const old = await tx(SYS, (c) => createApiToken(c, { actor: "opsy", kind: "operator", supportId: session }, A.tenantId, `Made in support ${A.tag}`));
+      const detail = await call("GET", `/api/platform/customers/${A.tenantId}`, { cookie });
+      const flag = (detail.data.tokensMadeInSupport as { id: string; active: boolean }[] | undefined)?.find((k) => k.id === old.id);
+      const migSql = readFileSync(ROOT + "db/migrations/0066_setup_approvals.sql", "utf8");
+      t.ok("tokens: a token made in support mode is flagged on the customer (still active, revoke it with the owner), and 0066 flags the old ones on the platform log",
+        detail.status === 200 && flag?.active === true && /'token\.made_in_support'/.test(migSql), JSON.stringify(flag));
+      // no new owner from support mode or the console
+      const addOwner = await asA("POST", "/setup/people", { name: "Second Owner", email: `owner2-${A.tag}@example.com`, roles: ["owner"] });
+      const addClerk = await asA("POST", "/setup/people", { name: "Setup Clerk", email: `clerk-${A.tag}@example.com`, roles: ["ap_clerk"] });
+      const promote = await asA("POST", `/setup/people/${addClerk.data.id}/roles`, { roles: ["owner"] });
+      t.ok("owners: support mode cannot add an owner or make someone an owner (409, in a sentence); other people are fine",
+        addOwner.status === 409 && /never makes someone an owner/.test(String(addOwner.data.error)) && addClerk.status === 200 && promote.status === 409 && /never makes someone an owner/.test(String(promote.data.error)),
+        `${addOwner.status} ${addOwner.data.error} | ${addClerk.status} | ${promote.status}`);
+      const coOwner = await call("POST", "/api/companies", { cookie, body: { name: "Second Co", legalName: "Second Co LLC", state: "TX", setup: "pack:furniture",
+        people: [{ name: "New Owner", email: `newowner-${A.tag}@example.com`, roles: ["owner"] }] } });
+      t.ok("owners: adding a company in support mode cannot name a new owner (403)", coOwner.status === 403 && /never makes someone an owner/.test(String(coOwner.data.error)), `${coOwner.status} ${coOwner.data.error}`);
+      const consoleOwner = await call("POST", `/api/platform/customers/${A.tenantId}/users`, { cookie, body: { name: "Console Owner", email: `cons-${A.tag}@example.com`, entityId: A.entityId, roles: ["owner"] } });
+      t.ok("owners: the Operator console cannot invite another owner (409)", consoleOwner.status === 409 && /does not add owners/.test(String(consoleOwner.data.error)), `${consoleOwner.status} ${consoleOwner.data.error}`);
+      const consoleLink = await call("POST", `/api/platform/customers/${A.tenantId}/logins/${ownerLogin}/invite`, { cookie, body: {} });
+      const shown = await rows(t, `select 1 from platform_audit where tenant_id = $1 and action = 'invite.link_shown' /* unscoped: check */`, [A.tenantId]);
+      t.ok("invites: the console shows an invite link only when no email is connected, and the platform log says it was shown",
+        consoleLink.status === 200 && !!consoleLink.data.inviteLink && consoleLink.data.emailed === false && shown.length > 0, `${consoleLink.status} ${consoleLink.data.error ?? ""}`);
+    }
+
+    // ---- review of 0066: setup mode ends 60 days after the first setup approval; the countdown on the console and the banner
+    {
+      const P = await import("../../server/platform.ts");
+      const st = (await read(t, (c) => P.setupStatus(c, A.tenantId))).find((x) => x.entityId === A.entityId);
+      const card = ((await call("GET", "/api/platform/customers", { cookie })).data as unknown as { id: string; setup: { daysLeft: number | null; live: boolean }[] }[]).find((x) => x.id === A.tenantId);
+      const me = (await call("GET", "/api/me", { cookie })).data;
+      const bannerSt = (me.viewer?.support?.setup as { entityId: string; daysLeft: number }[] | undefined)?.find((x) => x.entityId === A.entityId);
+      t.ok("60 days: the countdown is 60 days from the first setup approval, on the Operator console card and in the support banner",
+        !!st && !st.live && (st.daysLeft === 60 || st.daysLeft === 59) && card?.setup.some((x) => x.daysLeft === st.daysLeft) === true && bannerSt?.daysLeft === st.daysLeft,
+        JSON.stringify({ st, banner: bannerSt }));
+      const later = await read(t, async (c) => {
+        await c.query("begin");
+        try {
+          await c.query("select set_config('erp.now', (now() + interval '61 days')::text, true)");
+          return (await q<{ w: string | null }>(c, `select setup_approve_refusal($1, $2, array['owner'], 'vendor', $3, $4) w /* unscoped: check */`, [A.entityId, A.ownerId, randomUUID(), session]))[0].w;
+        } finally { await c.query("rollback"); }
+      });
+      t.ok("60 days: after 60 days ERP setup is refused, saying when its 60 days ended", /60 days for this company ended on/.test(later ?? ""), String(later));
+      const plJs = readFileSync(ROOT + "server/ui/platform.js", "utf8");
+      t.ok("60 days: the console card carries the countdown chip and the banner shows the days left",
+        /badge: E\.frag\(statusChip\(t\), setupChip\(t\.setup\)\)/.test(plJs) && /Setup: \$\{plural\(st\.daysLeft, 'day'\)\} left/.test(appJs));
+    }
+
     // ---- the owner's digest and the go-live review list
     const items = await read(t, (c) => OD.selfApprovals(c, A.entityId, started, new Date().toISOString()));
     const setupItems = items.filter((i) => i.flow === "setup");
-    t.ok("digest: the owner's digest lists what ERP setup approved (vendor, hire, opening entry, period), each marked (approved during setup) and naming the operator",
-      ["vendor:", "person:", "entry:", "period:"].every((k) => setupItems.some((i) => (i.link ?? "").startsWith(k))) && setupItems.every((i) => /approved during setup/.test(i.detail) && /ERP setup \(opsy\)/.test(i.by ?? "")),
+    const hireLine = setupItems.find((i) => (i.link ?? "").startsWith("person:"));
+    t.ok("digest: the owner's digest lists what ERP setup approved (the vendor and the hire, each named), marked (approved during setup) and naming the operator",
+      ["vendor:", "person:"].every((k) => setupItems.some((i) => (i.link ?? "").startsWith(k))) && setupItems.every((i) => /approved during setup/.test(i.detail) && /ERP setup \(opsy\)/.test(i.by ?? ""))
+      && setupItems.some((i) => i.title === `New vendor · ${ashleyName}`) && hireLine?.title === `New hire · Dana Setup${A.tag}`,
       JSON.stringify(setupItems.map((i) => [i.title, i.link, i.by])));
+    t.ok("digest: the hire's line shows the pay rate ($18.50 an hour), not a yearly figure", /pay \$18\.50 an hour/.test(hireLine?.detail ?? "") && hireLine?.amountMinor === null, hireLine?.detail);
     const dig = await tx(SYS, (c) => OD.makeDigest(c, { ...A.scope, actor: SYS }, new Date()));
     const note = (await rows<{ title: string; body: string; items: { flow: string }[] }>(t, `select title, body, items from owner_notification where entity_id = $1 order by created_at desc limit 1`, [A.entityId]))[0];
     t.ok("digest: the daily digest is made for them, its text saying \"approved during setup\" and the support session",
-      dig.made && !!note && /approved during setup/.test(note.title) && note.body.includes(`support session ${session}`) && note.items.filter((i) => i.flow === "setup").length >= 4, `${dig.note} | ${note?.title}`);
+      dig.made && !!note && /approved during setup/.test(note.title) && note.body.includes(`support session ${session}`) && note.items.filter((i) => i.flow === "setup").length >= 2, `${dig.note} | ${note?.title}`);
+    t.ok("digest: for setup approvals the footer says the ERP setup team approved them, not the change-your-password line",
+      /approved by your ERP setup team during onboarding; tell them if anything looks wrong/.test(note?.body ?? "") && !/change your password/.test(note?.body ?? ""), note?.body.split("\n").slice(-2).join(" / "));
     const cl = await read(t, (c) => ob.checklist(c, A.tenantId, A.entityId));
     const review = cl.setupApprovals;
     const kinds = new Set(review.map((r) => r.kind));
-    t.ok("go-live review: the Go-live step lists everything approved during setup (vendors, employees, opening entries, periods), each with its record",
-      ["Vendors", "Employees", "Opening entries", "Periods"].every((k) => kinds.has(k)) && review.every((r) => !!r.link && /ERP setup \(opsy\)/.test(r.detail))
+    t.ok("go-live review: the Go-live step lists everything approved during setup (vendors, employees), each with its record; the hire with its pay rate",
+      ["Vendors", "Employees"].every((k) => kinds.has(k)) && kinds.size === 2 && review.every((r) => !!r.link && /ERP setup \(opsy\)/.test(r.detail))
+      && review.some((r) => r.kind === "Employees" && r.pay === "$18.50 an hour" && /pay \$18\.50 an hour/.test(r.detail))
       && !!cl.steps.find((s) => s.id === "golive")?.setupApprovals?.length && cl.wentLive === null, JSON.stringify(review.map((r) => [r.kind, r.title, r.link])));
     const obJs = readFileSync(ROOT + "server/ui/onboarding.js", "utf8");
     t.ok("go-live review: the step shows the list with drill-down (Back) to each record, and the review tick",
@@ -224,7 +289,12 @@ export async function run(t: T) {
     await t.throws("go-live: the owner is asked to tick the review first when ERP setup approved anything",
       () => tx({ kind: "user", id: A.ownerId, label: "Owner" }, (c) => ob.goLive(c, A.scope, { reviewed: null })), /reviewed what ERP setup approved/);
     // review of 0066: the operator mints a tenant API token in support mode; with it, "as the owner", Go live is refused
-    const minted = await call("POST", "/api/tenant/tokens", { cookie, body: { name: `Probe app ${A.tag}` } });
+    const refusedMint = await call("POST", "/api/tenant/tokens", { cookie, body: { name: `Probe app ${A.tag}` } });
+    t.ok("tokens: an operator in support mode cannot make a customer API token (403, no secret back)", refusedMint.status === 403 && !refusedMint.data.token
+      && /support mode cannot do it/.test(String(refusedMint.data.error)), `${refusedMint.status} ${refusedMint.data.error}`);
+    // a token the owner made themselves, used "as the owner": still not the owner signed in
+    const { createApiToken } = await import("../../server/platform.ts");
+    const minted = { data: await tx(SYS, (c) => createApiToken(c, { actor: "owner@example.com", kind: "customer" }, A.tenantId, `Owner app ${A.tag}`)) };
     const viaToken = await fetch(`${base}/api/c/${A.entityId}/onboarding/go-live`, { method: "POST", headers: { "content-type": "application/json", "x-erp-page": "1",
       "x-erp-as": A.ownerId, authorization: `Bearer ${minted.data.token}`, "x-forwarded-for": "198.51.100.91" }, body: JSON.stringify({ reviewed: review.map((r) => r.requestId) }) });
     const viaTokenErr = String(((await viaToken.json()) as { error?: string }).error ?? "");
@@ -283,11 +353,15 @@ export async function run(t: T) {
     const bv = await asB("POST", "/vendors", { name: `Ashley Furniture ${B.tag}`, category: merch.code, merchandise: true, contactPhone: "555-555-0102" });
     const bvReq = await reqFor(B, "vendor", String(bv.data.id));
     const bvCard = (await asB("GET", "/catalog/vendors")).data.vendors?.find((v: { id: string }) => v.id === bv.data.id);
-    const bvOk = await asB("POST", `/approvals/${bvReq}`, { decision: "approved" });
+    const noReason = await asB("POST", `/approvals/${bvReq}`, { decision: "approved" });
+    t.ok("install token: a setup approval without an x-erp-reason header is refused (409, in a sentence)", noReason.status === 409 && /x-erp-reason/.test(String(noReason.data.error)), `${noReason.status} ${noReason.data.error}`);
+    const WHY = "onboarding import for ticket 4471";
+    const bvOk = await call("POST", `/api/c/${B.entityId}/approvals/${bvReq}`, { token: true, as: B.ownerId, reason: WHY, body: { decision: "approved" } });
     const bvSteps = bvReq ? await stepOf(bvReq) : [];
-    t.ok("install token: before go-live it approves a new vendor as ERP setup (marked install-token)",
-      bvCard?.setup_approve === true && bvOk.status === 200 && bvOk.data.status === "approved" && bvSteps.every((s) => s.setup_session === "install-token" && s.setup_by === "install-wide API token"),
-      `${bvOk.status} ${bvOk.data.error ?? ""} ${JSON.stringify(bvSteps)}`);
+    const bvAud = await rows<{ reason: string }>(t, `select reason from audit_event where entity_id = $1 and table_name = 'approval_request' and row_id = $2`, [B.entityId, bvReq]);
+    t.ok("install token: with its reason, before go-live it approves a new vendor as ERP setup (marked install-token, the reason recorded on the step and the audit row)",
+      bvCard?.setup_approve === true && bvOk.status === 200 && bvOk.data.status === "approved" && bvSteps.every((s) => s.setup_session === "install-token" && s.setup_by === "install-wide API token" && s.setup_reason === WHY)
+      && bvAud.some((r) => r.reason.includes(WHY)), `${bvOk.status} ${bvOk.data.error ?? ""} ${JSON.stringify(bvSteps)}`);
     const bb = await asB("POST", `/vendors/${bv.data.id}/bank`, { bankName: "First Test Bank", routingLast4: "4321", accountLast4: "8765", heldAt: "the bank's payee record", reason: "letter" });
     const bbReq = await reqFor(B, "vendor_bank_account", String(bb.data.id));
     const bbTry = await asB("POST", `/approvals/${bbReq}`, { decision: "approved", note: "called", callback: true, confirm: `Ashley Furniture ${B.tag}` });
@@ -295,12 +369,14 @@ export async function run(t: T) {
     await tx({ kind: "user", id: B.ownerId, label: "Owner" }, (c) => c.query(`insert into company_go_live (tenant_id, entity_id, by_label, by_id) values ($1, $2, 'Owner', $3)`, [B.tenantId, B.entityId, B.ownerId]));
     const bv2 = await asB("POST", "/vendors", { name: `After Live ${B.tag}`, category: merch.code, merchandise: true });
     const bv2Req = await reqFor(B, "vendor", String(bv2.data.id));
-    const bv2Try = await asB("POST", `/approvals/${bv2Req}`, { decision: "approved" });
+    const bv2Try = await call("POST", `/api/c/${B.entityId}/approvals/${bv2Req}`, { token: true, as: B.ownerId, reason: WHY, body: { decision: "approved" } });
     t.ok("install token: after go-live it is refused on a vendor too", bv2Try.status === 409 && /gone live/.test(String(bv2Try.data.error)), `${bv2Try.status} ${bv2Try.data.error}`);
 
     // ======================================================= both recorded
     const live = await read(t, async (c) => (await q<{ a: boolean; b: boolean }>(c, `select company_went_live($1) a, company_went_live($2) b /* unscoped: check */`, [A.entityId, B.entityId]))[0]);
     t.ok("go-live: company_went_live() sees both recorded go-lives", live.a && live.b);
+    const demoLive = await read(t, async (c) => (await q<{ l: boolean }>(c, `select company_went_live('22222222-2222-2222-2222-222222222222') l /* unscoped: check */`))[0].l);
+    t.ok("demo: the demo company is live (seeded), so a demo reset keeps it live", demoLive && /insert into company_go_live/.test(readFileSync(ROOT + "db/seed/0037_demo_live.sql", "utf8")));
     // review of 0066: money taken in (a receipt, a deposit, a bill) counts as trading, not only a handed-over sale
     const C = await freshCompany(t, "Deposit Furniture");
     const before = await read(t, async (c) => (await q<{ l: boolean }>(c, `select company_went_live($1) l /* unscoped: check */`, [C.entityId]))[0].l);

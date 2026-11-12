@@ -17,6 +17,8 @@ export type Actor = {
   label: string;
   /** An operator's support session acting inside the tenant: never self-approves for the owner (db.tx sets erp.support). */
   support?: string | null;
+  /** Why the install-wide token is acting (its x-erp-reason header): a setup approval made with it needs one (db.tx sets erp.support_reason). */
+  supportReason?: string | null;
 };
 
 export type Scope = {
@@ -62,6 +64,7 @@ export async function tx<T>(actor: Actor, fn: (c: Client) => Promise<T>): Promis
     await c.query("select set_config('erp.actor_label', $1, true)", [actor.label]);
     await c.query("select set_config('erp.actor_id', $1, true)", [actor.id ?? ""]);
     if (actor.support) await c.query("select set_config('erp.support', $1, true)", [actor.support]);
+    if (actor.supportReason) await c.query("select set_config('erp.support_reason', $1, true)", [actor.supportReason]);
     // a check that pinned the clock: SQL's erp_now() / business_today() see the same instant as the code
     const at = pinnedIso();
     if (at) await c.query("select set_config('erp.now', $1, true)", [at]);

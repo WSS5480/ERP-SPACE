@@ -143,7 +143,7 @@ export const STEPS: StepDef[] = [
     skipped: "The web store and trade portal have no site to show." },
   { id: "golive", title: "Go-live check", screen: "checklist", label: "Run the check", skippable: false,
     why: "Before real trading starts, the system's own tie-outs must agree.",
-    what: "Runs the checks the books depend on: stock at cost against inventory account 1300, sales tax by jurisdiction against 2100, financing receivables against 1110, and inter-company balances netting to zero. It also needs every other step finished or skipped. Then the owner presses Go live: first they look over everything ERP setup approved for them during setup (new vendors, new hires, opening entries, periods) and tick that they reviewed it. From go-live on, ERP setup approves nothing for this company.",
+    what: "Runs the checks the books depend on: stock at cost against inventory account 1300, sales tax by jurisdiction against 2100, financing receivables against 1110, and inter-company balances netting to zero. It also needs every other step finished or skipped. Then the owner presses Go live: first they look over everything ERP setup approved for them during setup (new vendors and new hires) and tick that they reviewed it. Only the owner, signed in as themselves, can press it. From go-live on, ERP setup approves nothing for this company.",
     skipped: "This step cannot be skipped: it is how you know the opening balances and setup agree." },
 ];
 
@@ -384,39 +384,39 @@ export async function checklist(c: Client, tenantId: string, entityId: string, o
 // ======================================================== go-live (0066)
 
 export type SetupApproval = { requestId: string; subjectType: string; subjectId: string; kind: string; title: string; detail: string;
-  decision: string; at: string; operator: string | null; session: string; reason: string | null; link: string | null; amountMinor: string | null };
+  decision: string; at: string; operator: string | null; session: string; reason: string | null; link: string | null; amountMinor: string | null; pay: string | null };
 
-const SETUP_KIND: Record<string, string> = { vendor: "Vendors", employee: "Employees", journal_entry: "Opening entries", fiscal_period: "Periods" };
+const SETUP_KIND: Record<string, string> = { vendor: "Vendors", employee: "Employees" };
+
+/** "$18.50 an hour" / "$52,000.00 a year": a hire's pay as the go-live list and the digest show it. */
+export const payWords = (minor: string | null, payType: string | null) =>
+  minor == null ? null : `${fmt(BigInt(minor))} ${payType === "salary" ? "a year" : "an hour"}`;
 
 /**
  * Everything ERP setup decided for the owner in support mode before go-live
  * (approval steps marked setup_session), one line per request, newest first,
- * each with the record it opens.
+ * each with the record it opens; a hire with their position and pay.
  */
 export async function setupApprovals(c: Client, entityId: string): Promise<SetupApproval[]> {
   const rows = await q<{ id: string; subject_type: string; subject_id: string; decision: string; at: string; setup_by: string | null; setup_session: string;
-                         setup_reason: string | null; amount_minor: string | null; vendor: string | null; person: string | null; position: string | null;
-                         entry: string | null; entry_day: string | null; p_start: string | null; p_end: string | null }>(c, `
-    select distinct on (r.id) r.id, r.subject_type, r.subject_id, s.decision, s.decided_at::text at, s.setup_by, s.setup_session, s.setup_reason, r.amount_minor::text,
+                         setup_reason: string | null; vendor: string | null; person: string | null; position: string | null; rate: string | null; pay_type: string | null }>(c, `
+    select distinct on (r.id) r.id, r.subject_type, r.subject_id, s.decision, s.decided_at::text at, s.setup_by, s.setup_session, s.setup_reason,
            (select coalesce(v.dba, v.legal_name) from vendor v join vendor_entity ve on ve.vendor_id = v.id and ve.entity_id = r.entity_id where v.id = r.subject_id) vendor,
            (select e.first_name || ' ' || e.last_name from employee e where e.id = r.subject_id and e.entity_id = r.entity_id) person,
            (select e.position from employee e where e.id = r.subject_id and e.entity_id = r.entity_id) position,
-           (select je.description from journal_entry je where je.id = r.subject_id and je.entity_id = r.entity_id) entry,
-           (select je.posting_date::text from journal_entry je where je.id = r.subject_id and je.entity_id = r.entity_id) entry_day,
-           (select f.starts_on::text from fiscal_period f where f.id = r.subject_id and f.entity_id = r.entity_id) p_start,
-           (select f.ends_on::text from fiscal_period f where f.id = r.subject_id and f.entity_id = r.entity_id) p_end
+           (select e.base_rate_minor::text from employee e where e.id = r.subject_id and e.entity_id = r.entity_id) rate,
+           (select e.pay_type from employee e where e.id = r.subject_id and e.entity_id = r.entity_id) pay_type
       from approval_request r join approval_step s on s.request_id = r.id
      where r.entity_id = $1 and s.setup_session is not null
      order by r.id, s.decided_at desc`, [entityId]);
   return rows.map((r) => {
-    const title = r.subject_type === "vendor" ? `New vendor · ${r.vendor ?? "vendor"}` : r.subject_type === "employee" ? `New hire · ${r.person ?? "someone"}`
-      : r.subject_type === "journal_entry" ? `Opening entry · ${r.entry ?? "journal entry"}` : `Accounting period · ${r.p_start ?? ""} to ${r.p_end ?? ""}`;
-    const link = r.subject_type === "vendor" ? `vendor:${r.subject_id}` : r.subject_type === "employee" ? `person:${r.subject_id}`
-      : r.subject_type === "journal_entry" ? `entry:${r.subject_id}` : r.subject_type === "fiscal_period" ? `period:${r.subject_id}` : null;
+    const title = r.subject_type === "vendor" ? `New vendor · ${r.vendor ?? "vendor"}` : `New hire · ${r.person ?? "someone"}`;
+    const link = r.subject_type === "vendor" ? `vendor:${r.subject_id}` : r.subject_type === "employee" ? `person:${r.subject_id}` : null;
     const who = r.setup_session === "install-token" ? "ERP setup (install-wide API token)" : `ERP setup (${r.setup_by ?? "operator"}), support session ${r.setup_session}`;
+    const pay = r.subject_type === "employee" ? payWords(r.rate, r.pay_type) : null;
     return { requestId: r.id, subjectType: r.subject_type, subjectId: r.subject_id, kind: SETUP_KIND[r.subject_type] ?? r.subject_type, title,
-      detail: [r.subject_type === "employee" ? r.position : r.subject_type === "journal_entry" ? r.entry_day : null, `${r.decision === "rejected" ? "Rejected" : "Approved"} by ${who}`].filter(Boolean).join(" · "),
-      decision: r.decision, at: r.at, operator: r.setup_by, session: r.setup_session, reason: r.setup_reason, link, amountMinor: r.amount_minor };
+      detail: [r.subject_type === "employee" ? r.position : null, pay ? `pay ${pay}` : null, `${r.decision === "rejected" ? "Rejected" : "Approved"} by ${who}`].filter(Boolean).join(" · "),
+      decision: r.decision, at: r.at, operator: r.setup_by, session: r.setup_session, reason: r.setup_reason, link, amountMinor: null, pay };
   }).sort((a, b) => b.at.localeCompare(a.at));
 }
 

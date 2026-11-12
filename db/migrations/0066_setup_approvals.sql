@@ -10,20 +10,22 @@
 --
 --   vendor          a new vendor (still pending: never approved before)
 --   employee        a new hire (still an applicant)
---   fiscal_period   an accounting period of this company
---   journal_entry   an opening-balance entry only: source_type 'opening'
---                   (bank opening balance, opening receivables) or an
---                   'inventory' entry of an opening_balance stock adjustment
 --
--- Never money movement or bank details: vendor bank accounts, bills, payment
--- runs, payroll, releases, write-offs, debit memos and stock counts keep
--- 0063's rule (support mode never decides them for the owner).
+-- (Journal entries and periods were dropped in review: no flow opens those
+-- requests.) Never money movement or bank details: vendor bank accounts,
+-- bills, payment runs, payroll, releases, write-offs, debit memos and stock
+-- counts keep 0063's rule (support mode never decides them for the owner).
+--
+-- Setup mode ends at whichever comes first: the owner pressing Go live, the
+-- company beginning to trade, or 60 days after its first setup approval
+-- (setup_window_end()). The install-wide token must say why
+-- (x-erp-reason, carried as erp.support_reason) to make a setup approval.
 --
 -- Go-live is now a recorded moment (company_go_live, one row per company,
 -- append-only): the owner presses Go live on the checklist once the go-live
 -- check passes, after ticking that they reviewed what ERP setup approved. From
 -- then on setup approvals end for that company for good; nothing can take
--- the row back. A company that has posted a sale is treated as live too, so a
+-- the row back. A company that has begun trading is treated as live too, so a
 -- customer that trades without pressing the button does not keep the window
 -- open.
 --
@@ -41,7 +43,7 @@ create table company_go_live (
   went_live_at    timestamptz not null default now(),
   by_label        text not null,
   by_id           uuid references app_user(id),
-  kind            text not null default 'owner' check (kind in ('owner', 'migration')),
+  kind            text not null default 'owner' check (kind in ('owner', 'migration', 'demo')),
   setup_items     int not null default 0,         -- what ERP setup had approved when it went live
   reviewed_setup  boolean not null default false  -- the owner ticked "I've reviewed what ERP setup approved"
 );
@@ -79,12 +81,17 @@ select e.tenant_id, e.id, 'migration 0066 (already trading)', 'migration' from e
 
 -- ------------------------------------------------------ the setup rule --
 
-/** Is this journal entry an opening balance (the onboarding imports)? */
-create or replace function is_opening_entry(p_entity uuid, p_entry uuid) returns boolean
+-- the setup marking on an approval step (described with the guard below; needed here by setup_window_end)
+alter table approval_step add column if not exists setup_session text;   -- the support session id, or 'install-token'
+alter table approval_step add column if not exists setup_by text;        -- the operator, filled by the guard from the session
+alter table approval_step add column if not exists setup_reason text;    -- the support session's reason, or the install token's x-erp-reason
+
+/** When this company's setup mode ends by the calendar: 60 days after ERP setup's first setup approval (null: none yet). */
+create or replace function setup_window_end(p_entity uuid) returns timestamptz
 language sql stable as $$
-  select exists (select 1 from journal_entry je where je.id = p_entry and je.entity_id = p_entity and je.source_type = 'opening')
-      or exists (select 1 from journal_entry je join inv_adjustment a on a.journal_entry_id = je.id and a.entity_id = je.entity_id
-                  where je.id = p_entry and je.entity_id = p_entity and je.source_type = 'inventory' and a.reason_code = 'opening_balance')
+  select min(s.decided_at) + interval '60 days'
+    from approval_step s join approval_request r on r.id = s.request_id
+   where r.entity_id = p_entity and s.setup_session is not null and s.decided_at is not null
 $$;
 
 /**
@@ -98,15 +105,21 @@ returns text
 language plpgsql stable as $$
 declare
   v_tenant uuid;
+  v_end    timestamptz;
 begin
   if coalesce(p_support, '') = '' then
     return 'setup approvals are made only by ERP setup, in support mode';
   end if;
-  if p_subject_type is null or p_subject_type not in ('vendor', 'employee', 'fiscal_period', 'journal_entry') then
-    return 'support mode never self-approves for the owner: ERP setup approves only setup records (a new vendor, a new hire, an opening-balance entry, an accounting period), and this one waits for the owner';
+  if p_subject_type is null or p_subject_type not in ('vendor', 'employee') then
+    return 'support mode never self-approves for the owner: ERP setup approves only setup records (a new vendor, a new hire), and this one waits for the owner';
   end if;
   if company_went_live(p_entity) then
     return 'support mode never self-approves for the owner: this company has gone live, so ERP setup no longer approves anything for it; the owner decides it signed in as themselves';
+  end if;
+  v_end := setup_window_end(p_entity);
+  if v_end is not null and erp_now() > v_end then
+    return 'support mode never self-approves for the owner: ERP setup''s 60 days for this company ended on ' || to_char(v_end at time zone business_tz(p_entity), 'Mon FMDD, YYYY')
+        || ' (they start at its first setup approval); the owner decides it signed in as themselves';
   end if;
   select tenant_id into v_tenant from entity where id = p_entity;
   if p_support <> 'install-token' then
@@ -133,13 +146,6 @@ begin
   if p_subject_type = 'employee' and not exists (
       select 1 from employee e where e.id = p_subject_id and e.entity_id = p_entity and e.status = 'applicant') then
     return 'ERP setup approves only a new hire; changes to someone already hired wait for the owner';
-  end if;
-  if p_subject_type = 'fiscal_period' and not exists (
-      select 1 from fiscal_period f where f.id = p_subject_id and f.entity_id = p_entity) then
-    return 'that accounting period is not this company''s';
-  end if;
-  if p_subject_type = 'journal_entry' and not is_opening_entry(p_entity, p_subject_id) then
-    return 'ERP setup approves only opening-balance entries; any other journal entry waits for the owner';
   end if;
   return null;
 end $$;
@@ -206,8 +212,12 @@ begin
       raise exception '% (user %)', v_why, new.actor_id using errcode = 'check_violation';
     end if;
     if new.setup_session = 'install-token' then
+      -- the install-wide token says why, in its x-erp-reason header (carried as erp.support_reason)
+      if length(trim(coalesce(current_setting('erp.support_reason', true), ''))) < 3 then
+        raise exception 'the install-wide API token must say why (an x-erp-reason header) to approve during setup' using errcode = 'check_violation';
+      end if;
       new.setup_by := 'install-wide API token';
-      new.setup_reason := 'the install-wide API token';
+      new.setup_reason := left(trim(current_setting('erp.support_reason', true)), 500);
     else
       select operator, reason into v_sess from platform_support_session where id = new.setup_session::uuid;
       new.setup_by := v_sess.operator;
@@ -249,3 +259,17 @@ begin
 end $$;
 
 create index if not exists approval_step_setup on approval_step (decided_at) where setup_session is not null;
+
+-- ------------------------------------- API tokens made in support mode --
+-- Review of 0066: a tenant API token made (or rotated) by an operator in
+-- support mode is not support mode when it is used, so it could act as the
+-- owner. Making and rotating tokens is now refused in support mode; any made
+-- before are flagged on the customer's platform log for the ERP team to
+-- revoke with the owner.
+insert into platform_audit (actor, actor_kind, tenant_id, support_id, action, detail)
+select 'migration 0066', 'system', a.tenant_id, a.support_id, 'token.made_in_support',
+       jsonb_build_object('tokenId', a.detail->>'id', 'name', a.detail->>'name', 'by', a.actor, 'at', a.at,
+                          'active', exists (select 1 from platform_api_token k where k.id::text = a.detail->>'id' and k.status = 'active'),
+                          'note', 'made in support mode; revoke it with the owner unless they asked for it')
+  from platform_audit a
+ where a.action in ('token.create') and a.support_id is not null;

@@ -74,7 +74,7 @@
           : `Went live ${ago(live.at)}, by ${live.by}${live.setupItems ? `, after reviewing ${plural(live.setupItems, 'approval')} made by ERP setup` : ''}. From then on ERP setup approves nothing for this company.`),
         list.length ? el('button', { class: 'btn small', type: 'button', onclick: () => setupDrill(list, 'Approved by ERP setup') }, `What ERP setup approved (${list.length})`) : null);
     }
-    const groups = ['Vendors', 'Employees', 'Opening entries', 'Periods'].map((k) => [k, list.filter((x) => x.kind === k)]).filter(([, l]) => l.length);
+    const groups = ['Vendors', 'Employees'].map((k) => [k, list.filter((x) => x.kind === k)]).filter(([, l]) => l.length);
     const tick = el('input', { type: 'checkbox' });
     const err = el('div', { role: 'alert' });
     const owner = isOwner() && !E.inSupport();
@@ -91,7 +91,7 @@
           groups.map(([k, l]) => section(k, String(l.length), null, el('div', { class: 'panel' }, l.map(setupLine)))),
           el('label', { class: 'li check-row' }, tick, el('div', { class: 't', text: 'I’ve reviewed what ERP setup approved' })))
         : el('p', { class: 'd', text: 'ERP setup has not approved anything for this company.' }),
-      E.inSupport() ? el('p', { class: 'fine', text: 'Go live is the owner’s own step, signed in as themselves; ERP setup cannot press it in support mode. Until then, ERP setup may approve new vendors, new hires, opening entries and periods.' })
+      E.inSupport() ? el('p', { class: 'fine', text: 'Go live is the owner’s own step, signed in as themselves; ERP setup cannot press it in support mode. Until then (at most 60 days from its first setup approval, and never once the company has begun trading), ERP setup may approve new vendors and new hires.' })
         : !isOwner() ? el('p', { class: 'fine', text: 'Only the owner takes the company live.' })
           : !ready ? el('p', { class: 'fine', text: 'Go live opens once the check above passes.' }) : null,
       el('p', { class: 'fine', text: 'Once you go live, ERP setup approves nothing more for this company, and that cannot be undone.' }),

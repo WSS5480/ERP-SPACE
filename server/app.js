@@ -814,7 +814,8 @@ function openDigest(g) {
     badge: x.decision === 'rejected' || x.decision === 'declined' ? chip('critical', 'fail', cap(x.decision)) : x.flow === 'setup' ? chip('neutral', 'ok', 'Approved during setup') : chip('good', 'ok', 'Self-approved'),
     onClick: x.link ? () => openSubject(x.link) : x.screen && canSee(x.screen) ? () => go(x.screen) : null })),
   { noun: 'self-approval', before: removed, none: 'Nothing was self-approved that day.',
-    foot: 'A self-approval is the maker deciding their own request because nobody else in the company holds a role that could. It ends the moment a second owner, a controller or an approver for that kind of request is added.' });
+    foot: [g.items.some((x) => x.flow !== 'setup') ? 'A self-approval is the maker deciding their own request because nobody else in the company holds a role that could. It ends the moment a second owner, a controller or an approver for that kind of request is added.' : null,
+      g.items.some((x) => x.flow === 'setup') ? 'Lines marked approved during setup were approved by your ERP setup team during onboarding; tell them if anything looks wrong.' : null].filter(Boolean).join(' ') });
 }
 /** Home for someone outside the back office: just the screens they work in. */
 async function screenRoleHome() {
@@ -2651,8 +2652,15 @@ function platformBanners() {
   const out = [];
   if (inSupport()) {
     const s = S.me.viewer.support;
+    // setup mode (0066) for the company open now: the days left for ERP setup's approvals
+    const st = S.co && (s.setup || []).find((x) => x.entityId === S.co.id);
+    const setupNote = !st ? null : st.live ? 'This company has gone live: ERP setup approves nothing for it.'
+      : st.daysLeft == null ? 'Setup mode: ERP setup may approve new vendors and hires until go-live (60 days from the first one).'
+        : st.daysLeft === 0 ? 'Setup mode has ended (60 days): the owner approves everything now.' : null;
     out.push(el('div', { class: 'banner support', role: 'status' }, icon('warn'), el('span', {}, el('b', { text: `Support mode: ${s.tenantName}. ` }),
       'Everything you do here is recorded on the customer’s log.',
+      st && !st.live && st.daysLeft ? chip(st.daysLeft <= 7 ? 'warning' : 'neutral', 'clock', `Setup: ${plural(st.daysLeft, 'day')} left`) : null,
+      setupNote ? el('span', { text: ` ${setupNote}` }) : null,
       el('button', { type: 'button', class: 'linkbtn', onclick: leaveSupport }, 'Leave support mode'))));
   }
   if (previewing()) {
